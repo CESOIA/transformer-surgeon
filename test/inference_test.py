@@ -1,6 +1,10 @@
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    # Qwen2VLForConditionalGeneration
+)
 from qwen_vl_utils import process_vision_info
 from qwen2_vl_c.modeling_qwen2_vl_c import Qwen2VLForConditionalGenerationCompress
 
@@ -9,6 +13,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Model name
 model_name = "Qwen/Qwen2-VL-7B-Instruct"
+
+print(Qwen2VLForConditionalGenerationCompress)
 
 # Load processor, model and tokenizer
 processor = AutoProcessor.from_pretrained(model_name)
@@ -43,6 +49,19 @@ messages = [
             },
             {
                 "type": "text",
+                "text": "What kind of oranges are these?"
+            },
+        ],
+    },
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "image": "example_image.jpg",
+            },
+            {
+                "type": "text",
                 "text": "Describe the picture in a sentence."
             },
         ],
@@ -61,8 +80,6 @@ messages = [
         ],
     }
 ]
-
-image = Image.open("example_image.jpg").convert("RGB")
 
 # Process each message separately
 print("Generating text...")

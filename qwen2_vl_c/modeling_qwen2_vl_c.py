@@ -18,7 +18,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch Qwen2-VL model."""
+"""PyTorch Qwen2-VL model - patched for compression algorithms."""
 
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
@@ -42,7 +42,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import (
-    TransformersKwargs,
+    # TransformersKwargs,
     auto_docstring,
     can_return_tuple,
     is_torchdynamo_compiling,
@@ -50,68 +50,122 @@ from transformers.utils import (
 )
 from .configuration_qwen2_vl_c import Qwen2VLConfigCompress, Qwen2VLTextConfigCompress, Qwen2VLVisionConfigCompress
 
-# Directly import from transformers: no modifications required
+### -----------------------------------
+### CESOIA PATCH
+### -----------------------------------
+
+# Directly import from original transformers package: no modifications required
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLModelOutputWithPast,
     Qwen2VLCausalLMOutputWithPast,
     Qwen2VLRotaryEmbedding,
-    rotate_half,
     apply_multimodal_rotary_pos_emb,
     apply_rotary_pos_emb_vision,
+    eager_attention_forward,
+    VisionRotaryEmbedding,
     PatchEmbed,
     PatchMerger,
-    repeat_kv,
+    Qwen2RMSNorm
 )
+
+### -----------------------------------
 
 logger = logging.get_logger(__name__)
 
-# THIS HAS TO BE MODIFIED
-class VisionMlp(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, hidden_act: str) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
-        self.act = ACT2FN[hidden_act]
-        self.fc2 = nn.Linear(hidden_dim, dim)
+### -----------------------------------
+### CESOIA PATCH
+### -----------------------------------
+# Custom linear layer for low-rank decomposition
 
+# Note on low-rank decomposition:
+#   when using low-rank decomposition, concatenate the two decomposed matrices into a single weight tensor.
+#   weight = torch.cat((weightA, weightB.T), dim=0)
+
+class LinearLRD(nn.Linear):
+    def __init__(self, 
+                 in_features, 
+                 out_features,
+                 bias=False,
+                 lrd_rank: Union[int, str] = "full"):
+        
+        self.lrd_rank = lrd_rank
+        if isinstance(lrd_rank, int):
+            if lrd_rank < 1:
+                raise ValueError("Low-rank decomposition rank must be at least 1.")
+            # use "weight" tensor to pack both the two decomposed matrices
+            # weightA = weight[:in_features, :]; weightB = weight[in_features:, :]
+            in_features = in_features + out_features
+            out_features = lrd_rank
+        
+        super().__init__(in_features, out_features, bias)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Skip the layer if pruning ratio is at least 1.0
+        if self.skip:
+            return input
+        # Perform normally if lrd_rank is full
+        if self.lrd_rank == "full":
+            # Full linear layer
+            return super().forward(input)
+        # Perform with low-rank decomposition
+        elif isinstance(self.lrd_rank, int):
+            weight1 = self.weight[:self.in_features, :]
+            weight2 = self.weight[self.in_features:, :]
+            # Compute: x @ weight1 @ weight2.T + bias
+            output = input @ weight1 @ weight2.t()
+            if self.bias is not None:
+                output += self.bias
+            return output
+        # Manage value errors
+        else:
+            raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")
+        
+    def __str__(self):
+        return super().__str__() + f"(lrd_rank={self.lrd_rank})"
+
+### -------------------------------------
+
+class VisionMlpCompress(nn.Module):
+    ### -----------------------------------
+    ### CESOIA PATCH
+    ### -----------------------------------
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, hidden_act: str, lrd_rank_i: Union[int, str], lrd_rank_o: Union[int, str]) -> None:
+        super().__init__()
+        self.fc1 = nn.LinearLRD(in_dim, hidden_dim, lrd_rank=lrd_rank_i)
+        self.act = ACT2FN[hidden_act]
+        self.fc2 = nn.LinearLRD(hidden_dim, out_dim, lrd_rank=lrd_rank_o)
+
+    ### -----------------------------------
+        
     def forward(self, x) -> torch.Tensor:
         return self.fc2(self.act(self.fc1(x)))
 
-# SHOULD BE MODIFIED WITH LOW RANK DECOMPOSITION
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-# REVIEW AND MODIFY
-class VisionAttention(nn.Module):
-    def __init__(self, config: Qwen2VLVisionConfigCompress) -> None:
+# KEEP AND MODIFY
+class VisionAttentionCompress(nn.Module):
+    def __init__(self, config: Qwen2VLVisionConfigCompress, layer_id: int) -> None:
         super().__init__()
         self.dim = config.embed_dim
         self.num_heads = config.num_heads
         self.head_dim = self.dim // self.num_heads
         self.num_key_value_groups = 1  # needed for eager attention
-        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
-        self.proj = nn.Linear(self.dim, self.dim)
+
+        ### -----------------------------------
+        ### CESOIA PATCH
+        ### -----------------------------------
+
+        # Retrieve pruning ratio and low-rank decomposition rank
+        if layer_id > 0:
+            qkv_in_dim = int(self.dim*(1-config.pruning_ratio_lists["sa_qkv"][layer_id-1]))
+        else:
+            qkv_in_dim = self.dim
+        qkv_out_dim = int(self.dim*(1-config.pruning_ratio_lists["sa_qkv"][layer_id]))
+        proj_out_dim = int(self.dim*(1-config.pruning_ratio_lists["sa_out"][layer_id]))
+
+        self.qkv = nn.LinearLRD(self.dim, self.dim * 3, bias=True, lrd_rank=config.lrd_rank_lists["sa_qkv"][layer_id])
+        self.proj = nn.LinearLRD(self.dim, self.dim, lrd_rank=config.lrd_rank_lists["sa_out"][layer_id])
+
+        ### -----------------------------------
+
         self.scaling = self.head_dim**-0.5
         self.config = config
         self.attention_dropout = 0.0
@@ -196,7 +250,7 @@ class VisionAttention(nn.Module):
         attn_output = self.proj(attn_output)
         return attn_output
 
-# REVIEW AND MODIFY
+# KEEP AND MODIFY
 class Qwen2VLVisionBlock(GradientCheckpointingLayer):
     def __init__(self, config, attn_implementation: str = "sdpa") -> None:
         super().__init__()
@@ -225,29 +279,7 @@ class Qwen2VLVisionBlock(GradientCheckpointingLayer):
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
-
-# MAYBE NOT TO BE MODIFIED (DEPENDS ON INSTANTIATION)
-class Qwen2RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        Qwen2RMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
-# PROBABLY TO BE MODIFIED FOR LOW RANK DECOMPOSITION
+# KEEP AND MODIFY (hidden and intermediate should be inferred from config pruning; not all the layers are equal)
 class Qwen2MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -263,14 +295,14 @@ class Qwen2MLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
-# REVIEW AND MODIFY
+# KEEP AND MODIFY
 class Qwen2VLAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
     and "Generating Long Sequences with Sparse Transformers".
     """
 
-    def __init__(self, config: Qwen2VLTextConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: Qwen2VLTextConfigCompress, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -355,9 +387,9 @@ class Qwen2VLAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-
+# KEEP AND MODIFY
 class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen2VLTextConfig, layer_idx: int):
+    def __init__(self, config: Qwen2VLTextConfigCompress, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -438,10 +470,10 @@ class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
 
         return outputs
 
-
+# KEEP AND MODIFY
 @auto_docstring
 class Qwen2VLPreTrainedModel(PreTrainedModel):
-    config: Qwen2VLConfig
+    config: Qwen2VLConfigCompress
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen2VLDecoderLayer", "Qwen2VLVisionBlock"]
@@ -468,10 +500,10 @@ class Qwen2VLPreTrainedModel(PreTrainedModel):
         elif isinstance(module, Qwen2RMSNorm):
             module.weight.data.fill_(1.0)
 
-
+# KEEP AND MODIFY
 @auto_docstring
 class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
-    config: Qwen2VLVisionConfig
+    config: Qwen2VLVisionConfigCompress
     _no_split_modules = ["Qwen2VLVisionBlock"]
 
     def __init__(self, config) -> None:
@@ -565,12 +597,12 @@ class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
 
         return self.merger(hidden_states)
 
-
+# KEEP AND MODIFY
 @auto_docstring
 class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
-    config: Qwen2VLTextConfig
+    config: Qwen2VLTextConfigCompress
 
-    def __init__(self, config: Qwen2VLTextConfig):
+    def __init__(self, config: Qwen2VLTextConfigCompress):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -712,13 +744,13 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
             attentions=all_self_attns,
         )
 
-
+# KEEP AND MODIFY
 @auto_docstring
 class Qwen2VLModel(Qwen2VLPreTrainedModel):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {"^model": "language_model"}
 
-    def __init__(self, config: Qwen2VLConfig):
+    def __init__(self, config: Qwen2VLConfigCompress):
         super().__init__(config)
         self.visual = Qwen2VisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Qwen2VLTextModel._from_config(config.text_config)
@@ -940,7 +972,8 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
+        # **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen2VLModelOutputWithPast]:
         r"""
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
@@ -1069,8 +1102,13 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         )
         return output if return_dict else output.to_tuple()
 
-
+# KEEP AND MODIFY
+# original class: `Qwen2VLForConditionalGeneration`
 class Qwen2VLForConditionalGenerationCompress(Qwen2VLPreTrainedModel, GenerationMixin):
+    # compatibility definitions
+    config_class = Qwen2VLConfigCompress
+    _supports_cache_class = True
+    #
     _checkpoint_conversion_mapping = {
         "^visual": "model.visual",
         r"^model(?!\.(language_model|visual))": "model.language_model",
@@ -1138,7 +1176,8 @@ class Qwen2VLForConditionalGenerationCompress(Qwen2VLPreTrainedModel, Generation
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
+        # **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen2VLCausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1238,7 +1277,6 @@ class Qwen2VLForConditionalGenerationCompress(Qwen2VLPreTrainedModel, Generation
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
-
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
