@@ -68,95 +68,14 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2RMSNorm
 )
 
+from ..utils import (
+    LinearLRD,
+    get_validated_dict_value,
+)
+
 ### -----------------------------------
 
 logger = logging.get_logger(__name__)
-
-### -----------------------------------
-### CESOIA PATCH
-### -----------------------------------
-# Custom linear layer for low-rank decomposition
-
-# Note on low-rank decomposition:
-#   when using low-rank decomposition, concatenate the two decomposed matrices into a single weight tensor.
-#   weight = torch.cat((weightA, weightB.T), dim=0)
-
-class LinearLRD(nn.Linear):
-    def __init__(self, 
-                 in_features, 
-                 out_features,
-                 bias=False,
-                 lrd_rank: Union[int, str] = "full"):
-        
-        self.lrd_rank = lrd_rank
-        if isinstance(lrd_rank, int):
-            if lrd_rank < 1:
-                raise ValueError("Low-rank decomposition rank must be at least 1.")
-            # use "weight" tensor to pack both the two decomposed matrices
-            # weightA = weight[:in_features, :]; weightB = weight[in_features:, :]
-            in_features = in_features + out_features
-            out_features = lrd_rank
-        
-        if out_features <= 0:
-            # If out_features is 0, skip the layer
-            self.skip = True
-        else:
-            self.skip = False
-            super().__init__(in_features, out_features, bias)
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # Skip the layer if out_features is 0
-        if self.skip:
-            return input
-        # Perform normally if lrd_rank is full
-        if self.lrd_rank == "full":
-            # Full linear layer
-            return super().forward(input)
-        # Perform with low-rank decomposition
-        elif isinstance(self.lrd_rank, int):
-            weight1 = self.weight[:self.in_features, :]
-            weight2 = self.weight[self.in_features:, :]
-            # Compute: x @ weight1 @ weight2.T + bias
-            output = input @ weight1 @ weight2.t()
-            if self.bias is not None:
-                output += self.bias
-            return output
-        # Manage value errors
-        else:
-            raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")
-        
-    def __str__(self):
-        return super().__str__() + f"(lrd_rank={self.lrd_rank})"
-
-# Config checker
-
-def get_validated_value(value, default, min_value=None, max_value=None):
-    """
-    Returns `value` if it is not None and valid.
-    If `value` is None, returns `default`.
-    If `value` is outside [min_value, max_value], raises ValueError.
-    """
-    if value is None:
-        return default
-    if min_value is not None and value < min_value:
-        raise ValueError(f"Value ({value}) is less than minimum allowed ({min_value}).")
-    if max_value is not None and value > max_value:
-        raise ValueError(f"Value ({value}) is greater than maximum allowed ({max_value}).")
-    return value
-
-def get_validated_dict_value(dictionary, key, index, default, min_value=None, max_value=None):
-    """
-    Returns the value for `key` in `dictionary` if present and valid.
-    If the key is missing or the value is None, returns `default`.
-    If the value is outside [min_value, max_value], raises ValueError.
-    """
-    value = dictionary.get(key, None)
-    if value is not None:
-        value = value[index] if isinstance(value, list) else value
-    value = get_validated_value(value, default, min_value, max_value)
-    return value
-
-### -------------------------------------
 
 class VisionMlpCompress(nn.Module):
     ### -----------------------------------
@@ -182,8 +101,7 @@ class VisionAttentionCompress(nn.Module):
         ### -----------------------------------
 
         # Dim depends on the pruning ratio of layers bound to skip connections
-        dim_pruning_ratio = get_validated_value(config.pruning_ratio_skip_connections, 0.0, 0.0, 1.0)
-        self.dim = int(config.embed_dim * (1 - dim_pruning_ratio))
+        self.dim = config.pruned_embed_dim
 
         ### -----------------------------------
 
@@ -834,7 +752,7 @@ class Qwen2VLTextModelCompress(Qwen2VLPreTrainedModelCompress):
         )
 
 @auto_docstring(custom_intro="This is a custom class for compressed Qwen2VL blocks.")
-class Qwen2VLModel(Qwen2VLPreTrainedModelCompress):
+class Qwen2VLModelCompress(Qwen2VLPreTrainedModelCompress):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {"^model": "language_model"}
 
@@ -1205,7 +1123,7 @@ class Qwen2VLForConditionalGenerationCompress(Qwen2VLPreTrainedModelCompress, Ge
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen2VLModel(config)
+        self.model = Qwen2VLModelCompress(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
         self.post_init()
@@ -1533,4 +1451,7 @@ class Qwen2VLForConditionalGenerationCompress(Qwen2VLPreTrainedModelCompress, Ge
         return input_ids, model_kwargs
 
 
-__all__ = ["Qwen2VLForConditionalGenerationCompress", "Qwen2VLModelCompress", "Qwen2VLPreTrainedModelCompress", "Qwen2VLTextModelCompress"]
+__all__ = ["Qwen2VLForConditionalGenerationCompress",
+           "Qwen2VLModelCompress",
+           "Qwen2VLPreTrainedModelCompress",
+           "Qwen2VLTextModelCompress"]
