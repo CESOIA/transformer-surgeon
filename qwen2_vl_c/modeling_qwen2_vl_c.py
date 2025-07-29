@@ -97,10 +97,15 @@ class LinearLRD(nn.Linear):
             in_features = in_features + out_features
             out_features = lrd_rank
         
-        super().__init__(in_features, out_features, bias)
+        if out_features <= 0:
+            # If out_features is 0, skip the layer
+            self.skip = True
+        else:
+            self.skip = False
+            super().__init__(in_features, out_features, bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # Skip the layer if pruning ratio is at least 1.0
+        # Skip the layer if out_features is 0
         if self.skip:
             return input
         # Perform normally if lrd_rank is full
@@ -123,6 +128,34 @@ class LinearLRD(nn.Linear):
     def __str__(self):
         return super().__str__() + f"(lrd_rank={self.lrd_rank})"
 
+# Config checker
+
+def get_validated_value(value, default, min_value=None, max_value=None):
+    """
+    Returns `value` if it is not None and valid.
+    If `value` is None, returns `default`.
+    If `value` is outside [min_value, max_value], raises ValueError.
+    """
+    if value is None:
+        return default
+    if min_value is not None and value < min_value:
+        raise ValueError(f"Value ({value}) is less than minimum allowed ({min_value}).")
+    if max_value is not None and value > max_value:
+        raise ValueError(f"Value ({value}) is greater than maximum allowed ({max_value}).")
+    return value
+
+def get_validated_dict_value(dictionary, key, index, default, min_value=None, max_value=None):
+    """
+    Returns the value for `key` in `dictionary` if present and valid.
+    If the key is missing or the value is None, returns `default`.
+    If the value is outside [min_value, max_value], raises ValueError.
+    """
+    value = dictionary.get(key, None)
+    if value is not None:
+        value = value[index] if isinstance(value, list) else value
+    value = get_validated_value(value, default, min_value, max_value)
+    return value
+
 ### -------------------------------------
 
 class VisionMlpCompress(nn.Module):
@@ -131,38 +164,47 @@ class VisionMlpCompress(nn.Module):
     ### -----------------------------------
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, hidden_act: str, lrd_rank_i: Union[int, str], lrd_rank_o: Union[int, str]) -> None:
         super().__init__()
-        self.fc1 = nn.LinearLRD(in_dim, hidden_dim, lrd_rank=lrd_rank_i)
+        self.fc1 = LinearLRD(in_dim, hidden_dim, lrd_rank=lrd_rank_i)
         self.act = ACT2FN[hidden_act]
-        self.fc2 = nn.LinearLRD(hidden_dim, out_dim, lrd_rank=lrd_rank_o)
+        self.fc2 = LinearLRD(hidden_dim, out_dim, lrd_rank=lrd_rank_o)
 
     ### -----------------------------------
         
     def forward(self, x) -> torch.Tensor:
         return self.fc2(self.act(self.fc1(x)))
 
-# KEEP AND MODIFY
 class VisionAttentionCompress(nn.Module):
-    def __init__(self, config: Qwen2VLVisionConfigCompress, layer_id: int) -> None:
+    def __init__(self, config: Qwen2VLVisionConfigCompress, layer_idx: int) -> None:
         super().__init__()
-        self.dim = config.embed_dim
-        self.num_heads = config.num_heads
-        self.head_dim = self.dim // self.num_heads
-        self.num_key_value_groups = 1  # needed for eager attention
 
         ### -----------------------------------
         ### CESOIA PATCH
         ### -----------------------------------
 
-        # Retrieve pruning ratio and low-rank decomposition rank
-        if layer_id > 0:
-            qkv_in_dim = int(self.dim*(1-config.pruning_ratio_lists["sa_qkv"][layer_id-1]))
-        else:
-            qkv_in_dim = self.dim
-        qkv_out_dim = int(self.dim*(1-config.pruning_ratio_lists["sa_qkv"][layer_id]))
-        proj_out_dim = int(self.dim*(1-config.pruning_ratio_lists["sa_out"][layer_id]))
+        # Dim depends on the pruning ratio of layers bound to skip connections
+        dim_pruning_ratio = get_validated_value(config.pruning_ratio_skip_connections, 0.0, 0.0, 1.0)
+        self.dim = int(config.embed_dim * (1 - dim_pruning_ratio))
 
-        self.qkv = nn.LinearLRD(self.dim, self.dim * 3, bias=True, lrd_rank=config.lrd_rank_lists["sa_qkv"][layer_id])
-        self.proj = nn.LinearLRD(self.dim, self.dim, lrd_rank=config.lrd_rank_lists["sa_out"][layer_id])
+        ### -----------------------------------
+
+        self.num_heads = config.num_heads
+        self.head_dim = self.dim // self.num_heads
+        self.num_key_value_groups = 1  # needed for eager attention        
+
+        ### -----------------------------------
+        ### CESOIA PATCH
+        ### -----------------------------------
+
+        # Retrieve inner dimension from pruning ratio
+
+        inner_pruning_ratio = get_validated_dict_value(config.pruning_ratio_lists, "sa_qkv", index=layer_idx, default=0.0, min_value=0.0, max_value=1.0)
+        self.inner_dim = int(self.dim * (1 - inner_pruning_ratio))
+
+        self.qkv_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_qkv", index=layer_idx, default="full", min_value=1)
+        self.proj_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_proj", index=layer_idx, default="full", min_value=1)
+
+        self.qkv = LinearLRD(self.dim, self.inner_dim * 3, bias=True, lrd_rank=self.qkv_rank)
+        self.proj = LinearLRD(self.inner_dim, self.dim, lrd_rank=self.proj_rank)
 
         ### -----------------------------------
 
@@ -250,16 +292,31 @@ class VisionAttentionCompress(nn.Module):
         attn_output = self.proj(attn_output)
         return attn_output
 
-# KEEP AND MODIFY
-class Qwen2VLVisionBlock(GradientCheckpointingLayer):
-    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+class Qwen2VLVisionBlockCompress(GradientCheckpointingLayer):
+    def __init__(self, config, layer_idx: int, attn_implementation: str = "sdpa") -> None:
         super().__init__()
         self.norm1 = LayerNorm(config.embed_dim, eps=1e-6)
         self.norm2 = LayerNorm(config.embed_dim, eps=1e-6)
-        mlp_hidden_dim = int(config.embed_dim * config.mlp_ratio)
 
-        self.attn = VisionAttention(config=config)
-        self.mlp = VisionMlp(dim=config.embed_dim, hidden_dim=mlp_hidden_dim, hidden_act=config.hidden_act)
+        ### -----------------------------------
+        ### CESOIA PATCH
+        ### -----------------------------------
+
+        mlp_hidden_pruning_ratio = get_validated_dict_value(config.pruning_ratio_lists, "mlp_down", layer_idx, default=0.0, min_value=0.0, max_value=1.0)
+        mlp_hidden_dim = int(int(config.embed_dim * config.mlp_ratio) * (1 - mlp_hidden_pruning_ratio))
+
+        lrd_rank_i = get_validated_dict_value(config.lrd_rank_lists, "mlp_down", index=layer_idx, default="full", min_value=1)
+        lrd_rank_o = get_validated_dict_value(config.lrd_rank_lists, "mlp_up", index=layer_idx, default="full", min_value=1)
+
+        self.attn = VisionAttentionCompress(config=config, layer_idx=layer_idx)
+        self.mlp = VisionMlpCompress(in_dim=config.pruned_embed_dim,
+                                     out_dim=config.pruned_embed_dim,
+                                     hidden_dim=mlp_hidden_dim,
+                                     hidden_act=config.hidden_act,
+                                     lrd_rank_i=lrd_rank_i,
+                                     lrd_rank_o=lrd_rank_o)
+
+        ### -----------------------------------
 
     def forward(
         self,
@@ -279,24 +336,37 @@ class Qwen2VLVisionBlock(GradientCheckpointingLayer):
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
-# KEEP AND MODIFY (hidden and intermediate should be inferred from config pruning; not all the layers are equal)
-class Qwen2MLP(nn.Module):
-    def __init__(self, config):
+class Qwen2MLPCompress(nn.Module):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+        ### -----------------------------------
+        ### CESOIA PATCH
+        ### -----------------------------------
+
+        self.hidden_size = config.pruned_hidden_size
+
+        intermediate_pruning_ratio = get_validated_dict_value(config.pruning_ratio_lists, "mlp_down", index=layer_idx, default=0.0, min_value=0.0, max_value=1.0)
+        self.intermediate_size = int(config.intermediate_size * (1 - intermediate_pruning_ratio))
+
+        lrd_rank_gate = get_validated_dict_value(config.lrd_rank_lists, "mlp_gate", index=layer_idx, default="full", min_value=1)
+        lrd_rank_up = get_validated_dict_value(config.lrd_rank_lists, "mlp_up", index=layer_idx, default="full", min_value=1)
+        lrd_rank_down = get_validated_dict_value(config.lrd_rank_lists, "mlp_down", index=layer_idx, default="full", min_value=1)
+
+        self.gate_proj = LinearLRD(self.hidden_size, self.intermediate_size, bias=False, lrd_rank=lrd_rank_gate)
+        self.up_proj = LinearLRD(self.hidden_size, self.intermediate_size, bias=False, lrd_rank=lrd_rank_up)
+        self.down_proj = LinearLRD(self.intermediate_size, self.hidden_size, bias=False, lrd_rank=lrd_rank_down)
+
+        ### -----------------------------------
+
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
-# KEEP AND MODIFY
-class Qwen2VLAttention(nn.Module):
+class Qwen2VLAttentionCompress(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
     and "Generating Long Sequences with Sparse Transformers".
@@ -313,9 +383,19 @@ class Qwen2VLAttention(nn.Module):
                 "when creating this class."
             )
 
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.pruned_hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+
+        ### -----------------------------------
+        ### CESOIA PATCH
+        ### -----------------------------------
+
+        inner_pruning_ratio = get_validated_dict_value(config.pruning_ratio_lists, "sa_qkv", index=layer_idx, default=0.0, min_value=0.0, max_value=1.0)
+        self.inner_dim = (int(self.hidden_size * (1 - inner_pruning_ratio))//self.num_heads)*self.num_heads
+        self.head_dim = self.inner_dim // self.num_heads
+
+        ### -----------------------------------
+        
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.is_causal = True
@@ -328,10 +408,23 @@ class Qwen2VLAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        
+        ### -----------------------------------
+        # CESOIA PATCH
+        ### -----------------------------------
+
+        lrd_rank_q = get_validated_dict_value(config.lrd_rank_lists, "sa_q", index=layer_idx, default="full", min_value=1)
+        lrd_rank_k = get_validated_dict_value(config.lrd_rank_lists, "sa_k", index=layer_idx, default="full", min_value=1)
+        lrd_rank_v = get_validated_dict_value(config.lrd_rank_lists, "sa_v", index=layer_idx, default="full", min_value=1)
+        lrd_rank_o = get_validated_dict_value(config.lrd_rank_lists, "sa_out", index=layer_idx, default="full", min_value=1)
+
+        self.q_proj = LinearLRD(self.hidden_size, self.num_heads * self.head_dim, bias=True, lrd_rank=lrd_rank_q)
+        self.k_proj = LinearLRD(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lrd_rank=lrd_rank_k)
+        self.v_proj = LinearLRD(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lrd_rank=lrd_rank_v)
+        self.o_proj = LinearLRD(self.num_heads * self.head_dim, self.hidden_size, bias=False, lrd_rank=lrd_rank_o)
+
+        ### -----------------------------------
+
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
 
         self.rotary_emb = Qwen2VLRotaryEmbedding(config=config)
@@ -387,8 +480,7 @@ class Qwen2VLAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-# KEEP AND MODIFY
-class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
+class Qwen2VLDecoderLayerCompress(GradientCheckpointingLayer):
     def __init__(self, config: Qwen2VLTextConfigCompress, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -398,9 +490,9 @@ class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
             )
-        self.self_attn = Qwen2VLAttention(config, layer_idx)
+        self.self_attn = Qwen2VLAttentionCompress(config, layer_idx)
 
-        self.mlp = Qwen2MLP(config)
+        self.mlp = Qwen2MLPCompress(config, layer_idx=layer_idx)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
@@ -470,9 +562,8 @@ class Qwen2VLDecoderLayer(GradientCheckpointingLayer):
 
         return outputs
 
-# KEEP AND MODIFY
-@auto_docstring
-class Qwen2VLPreTrainedModel(PreTrainedModel):
+@auto_docstring(custom_intro="This is a custom class for compressed Qwen2VL blocks.")
+class Qwen2VLPreTrainedModelCompress(PreTrainedModel):
     config: Qwen2VLConfigCompress
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -500,9 +591,8 @@ class Qwen2VLPreTrainedModel(PreTrainedModel):
         elif isinstance(module, Qwen2RMSNorm):
             module.weight.data.fill_(1.0)
 
-# KEEP AND MODIFY
-@auto_docstring
-class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
+@auto_docstring(custom_intro="This is a custom class for compressed Qwen2VL blocks.")
+class Qwen2VisionTransformerPretrainedModelCompress(Qwen2VLPreTrainedModelCompress):
     config: Qwen2VLVisionConfigCompress
     _no_split_modules = ["Qwen2VLVisionBlock"]
 
@@ -520,7 +610,7 @@ class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
         head_dim = config.embed_dim // config.num_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
 
-        self.blocks = nn.ModuleList([Qwen2VLVisionBlock(config) for _ in range(config.depth)])
+        self.blocks = nn.ModuleList([Qwen2VLVisionBlockCompress(config, layer_idx) for layer_idx in range(config.depth)])
         self.merger = PatchMerger(
             dim=config.hidden_size, context_dim=config.embed_dim, spatial_merge_size=config.spatial_merge_size
         )
@@ -597,9 +687,8 @@ class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
 
         return self.merger(hidden_states)
 
-# KEEP AND MODIFY
-@auto_docstring
-class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
+@auto_docstring(custom_intro="This is a custom class for compressed Qwen2VL blocks.")
+class Qwen2VLTextModelCompress(Qwen2VLPreTrainedModelCompress):
     config: Qwen2VLTextConfigCompress
 
     def __init__(self, config: Qwen2VLTextConfigCompress):
@@ -609,7 +698,7 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [Qwen2VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen2VLDecoderLayerCompress(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -744,16 +833,15 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
             attentions=all_self_attns,
         )
 
-# KEEP AND MODIFY
-@auto_docstring
-class Qwen2VLModel(Qwen2VLPreTrainedModel):
+@auto_docstring(custom_intro="This is a custom class for compressed Qwen2VL blocks.")
+class Qwen2VLModel(Qwen2VLPreTrainedModelCompress):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {"^model": "language_model"}
 
     def __init__(self, config: Qwen2VLConfigCompress):
         super().__init__(config)
-        self.visual = Qwen2VisionTransformerPretrainedModel._from_config(config.vision_config)
-        self.language_model = Qwen2VLTextModel._from_config(config.text_config)
+        self.visual = Qwen2VisionTransformerPretrainedModelCompress._from_config(config.vision_config)
+        self.language_model = Qwen2VLTextModelCompress._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
 
         # Initialize weights and apply final processing
@@ -1104,7 +1192,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
 # KEEP AND MODIFY
 # original class: `Qwen2VLForConditionalGeneration`
-class Qwen2VLForConditionalGenerationCompress(Qwen2VLPreTrainedModel, GenerationMixin):
+class Qwen2VLForConditionalGenerationCompress(Qwen2VLPreTrainedModelCompress, GenerationMixin):
     # compatibility definitions
     config_class = Qwen2VLConfigCompress
     _supports_cache_class = True
@@ -1445,4 +1533,4 @@ class Qwen2VLForConditionalGenerationCompress(Qwen2VLPreTrainedModel, Generation
         return input_ids, model_kwargs
 
 
-__all__ = ["Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLPreTrainedModel", "Qwen2VLTextModel"]
+__all__ = ["Qwen2VLForConditionalGenerationCompress", "Qwen2VLModelCompress", "Qwen2VLPreTrainedModelCompress", "Qwen2VLTextModelCompress"]
