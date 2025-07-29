@@ -6,7 +6,7 @@ from transformers import (
     # Qwen2VLForConditionalGeneration
 )
 from qwen_vl_utils import process_vision_info
-from qwen2_vl_c.modeling_qwen2_vl_c import Qwen2VLForConditionalGenerationCompress
+from transformersurgeon import Qwen2VLForConditionalGenerationCompress
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
