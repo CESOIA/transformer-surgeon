@@ -63,9 +63,11 @@ logger = logging.get_logger(__name__)
         - When the value is a positive integer, it represents the rank for that weight.
 '''
 
-### Large-size modules left out from compression
-# PatchMerger for the vision module
-# Tokenizer for the text module
+'''
+    Large-size modules left out from compression:
+        - PatchMerger for the vision module
+        - Tokenizer for the text module
+'''
 
 class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
     def __init__(
@@ -86,7 +88,6 @@ class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
             # Use general-type keys to substitute the keys for each layer type
             if pruning_ratio_lists.get("all") is not None:
                 self.pruning_ratio_lists["sa_qkv"] = pruning_ratio_lists["all"]
-                self.pruning_ratio_lists["sa_out"] = pruning_ratio_lists["all"]
                 self.pruning_ratio_lists["mlp_up"] = pruning_ratio_lists["all"]
             if pruning_ratio_lists.get("sa") is not None:
                 self.pruning_ratio_lists["sa_qkv"] = pruning_ratio_lists["sa"]
@@ -147,7 +148,6 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
             # Use general-type keys to substitute the keys for each layer type
             if pruning_ratio_lists.get("all") is not None:
                 self.pruning_ratio_lists["sa_qkv"] = pruning_ratio_lists["all"]
-                self.pruning_ratio_lists["sa_out"] = pruning_ratio_lists["all"]
                 self.pruning_ratio_lists["mlp_gate"] = pruning_ratio_lists["all"]
                 self.pruning_ratio_lists["mlp_up"] = pruning_ratio_lists["all"]
             if pruning_ratio_lists.get("sa") is not None:
@@ -178,6 +178,10 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
                 self.lrd_rank_lists["sa_k"] = lrd_rank_lists["sa"]
                 self.lrd_rank_lists["sa_v"] = lrd_rank_lists["sa"]
                 self.lrd_rank_lists["sa_out"] = lrd_rank_lists["sa"]
+            if lrd_rank_lists.get("sa_qkv") is not None:
+                self.lrd_rank_lists["sa_q"] = lrd_rank_lists["sa_qkv"]
+                self.lrd_rank_lists["sa_k"] = lrd_rank_lists["sa_qkv"]
+                self.lrd_rank_lists["sa_v"] = lrd_rank_lists["sa_qkv"]
             if lrd_rank_lists.get("mlp") is not None:
                 self.lrd_rank_lists["mlp_gate"] = lrd_rank_lists["mlp"]
                 self.lrd_rank_lists["mlp_up"] = lrd_rank_lists["mlp"]

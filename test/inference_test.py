@@ -24,6 +24,7 @@ model = Qwen2VLForConditionalGenerationCompress.from_pretrained(model_name).to(d
 print(processor)
 print(tokenizer)
 print(model)
+print(model.config)
 
 # Message
 messages = [
