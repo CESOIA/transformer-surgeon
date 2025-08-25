@@ -15,61 +15,24 @@
 # limitations under the License.
 """Qwen2VL model configuration - patched for compression algorithms."""
 
-### -----------------------------------
-### CESOIA PATCH
-### -----------------------------------
-
 from transformers.models.qwen2_vl.configuration_qwen2_vl import (
     Qwen2VLVisionConfig,
     Qwen2VLTextConfig,
     Qwen2VLConfig,
 )
-
-### -----------------------------------
-
 from transformers.utils import logging
+
+from ..utils.config import init_compression_config
 
 logger = logging.get_logger(__name__)
 
 ### -----------------------------------
-### CESOIA PATCH
+### COMPRESSION CONFIG CLASSES
 ### -----------------------------------
-
-''' pruning_ratio_lists and lrd_rank_lists are dictionaries containing lists of pruning ratios and ranks for each layer.
-    The keys of the dictionaries are:
-        - "sa_qkv": for self-attention query, key, and value weights (vision model only)
-        - "sa_q": for self-attention query weights (text model only)
-        - "sa_k": for self-attention key weights (text model only)
-        - "sa_v": for self-attention value weights (text model only)
-        - "sa_out": for self-attention output weights (lrd only)
-        - "mlp_gate": for MLP gate weights # ONLY FOR TEXT CONFIG
-        - "mlp_up": for MLP up weights
-        - "mlp_down": for MLP down weights (lrd only)
-    General-type keys can be used to prune multiple layer-types in one go:
-        - "sa": apply to all the self-attention layers equally
-        - "mlp": apply to all the mlp layers equally
-        - "all": apply to all the layers equally
-
-    Because of skip connections, the pruning ratio for all the layers whose output connects to skip connections should be the same.
-    For this purpose, use config
-        pruning_ratio_skip_connections
-
-    For pruning_ratio_lists:
-        - When the value in the list is None or 0, it means that the corresponding weight will not be pruned.
-        - When the value is a float between 0 and 1, it represents the pruning ratio for that weight.
-        - When the value is True or 1.0, it means that the entire block will be removed (block pruning).
-    For lrd_rank_lists:
-        - When the value in the list is None or 0, it means that the corresponding weight will not be compressed.
-        - When the value is a positive integer, it represents the rank for that weight.
-'''
-
-'''
-    Large-size modules left out from compression:
-        - PatchMerger for the vision module
-        - Tokenizer for the text module
-'''
 
 class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
+    """Vision configuration with compression support."""
+    
     def __init__(
         self,
         pruning_ratio_lists=None,
@@ -78,58 +41,38 @@ class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        # Assign pruning ratio for the skip connections - must be equal for all the layers connecting to skip connections
-        self.pruning_ratio_skip_connections = pruning_ratio_skip_connections
-
-        self.pruning_ratio_lists = {}
-
-        if pruning_ratio_lists is not None:
-            # Use general-type keys to substitute the keys for each layer type
-            if pruning_ratio_lists.get("all") is not None:
-                self.pruning_ratio_lists["sa_qkv"] = pruning_ratio_lists["all"]
-                self.pruning_ratio_lists["mlp_up"] = pruning_ratio_lists["all"]
-            if pruning_ratio_lists.get("sa") is not None:
-                self.pruning_ratio_lists["sa_qkv"] = pruning_ratio_lists["sa"]
-            if pruning_ratio_lists.get("mlp") is not None:
-                self.pruning_ratio_lists["mlp_up"] = pruning_ratio_lists["mlp"]
-
-            # Substitute the keys for each layer type if they are defined
-            self.pruning_ratio_lists.update(pruning_ratio_lists)
-
-        self.lrd_rank_lists = {}
-
-        if lrd_rank_lists is not None:
-            # Use general-type keys to substitute the keys for each layer type
-            if lrd_rank_lists.get("all") is not None:
-                self.lrd_rank_lists["sa_qkv"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["sa_out"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["mlp_up"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["mlp_down"] = lrd_rank_lists["all"]
-            if lrd_rank_lists.get("sa") is not None:
-                self.lrd_rank_lists["sa_qkv"] = lrd_rank_lists["sa"]
-                self.lrd_rank_lists["sa_out"] = lrd_rank_lists["sa"]
-            if lrd_rank_lists.get("mlp") is not None:
-                self.lrd_rank_lists["mlp_up"] = lrd_rank_lists["mlp"]
-                self.lrd_rank_lists["mlp_down"] = lrd_rank_lists["mlp"]
-
-            # Substitute the keys for each layer type if they are defined
-            self.lrd_rank_lists.update(lrd_rank_lists)
-
-        if self.pruning_ratio_skip_connections is not None:
-            # Check value of the pruning ratio for skip connections
-            if not (0.0 <= self.pruning_ratio_skip_connections <= 1.0):
-                raise ValueError(
-                    f"pruning_ratio_skip_connections must be between 0.0 and 1.0, but got {self.pruning_ratio_skip_connections}."
-                )
-            # Calculate the pruned embed dimension based on the pruning ratio for skip connections
-            self.pruned_embed_dim = int(self.embed_dim * (1 - self.pruning_ratio_skip_connections))
-        else:
-            # If no pruning ratio is defined, use the original embed dimension
-            self.pruned_embed_dim = self.embed_dim
-
+        
+        # Define layer type mappings for vision model - separate for pruning and LRD
+        pruning_key_mappings = {
+            "all": ["sa_qkv", "mlp_up"],
+            "sa":  ["sa_qkv"],
+            "mlp": ["mlp_up"]
+        }
+        
+        lrd_key_mappings = {
+            "all": ["sa_qkv", "sa_out", "mlp_up", "mlp_down"],
+            "sa":  ["sa_qkv", "sa_out"],
+            "mlp": ["mlp_up", "mlp_down"]
+        }
+        
+        init_compression_config(
+            config_instance=self,
+            total_blocks=self.depth,
+            base_dim=self.embed_dim,
+            pruning_ratio_lists=pruning_ratio_lists,
+            pruning_ratio_skip_connections=pruning_ratio_skip_connections,
+            lrd_rank_lists=lrd_rank_lists,
+            default_pruning_keys=["sa_qkv", "mlp_up"],
+            default_lrd_keys=["sa_qkv", "sa_out", "mlp_up", "mlp_down"],
+            pruning_key_mappings=pruning_key_mappings,
+            lrd_key_mappings=lrd_key_mappings,
+            mlp_ratio=self.mlp_ratio,
+            num_heads=self.num_heads
+        )
 
 class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
+    """Text configuration with compression support."""
+    
     def __init__(
         self,
         pruning_ratio_lists=None,
@@ -138,117 +81,50 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        # Assign pruning ratio for the skip connections - must be equal for all the layers connecting to skip connections
-        self.pruning_ratio_skip_connections = pruning_ratio_skip_connections
-
-        self.pruning_ratio_lists = {}
-
-        if pruning_ratio_lists is not None:
-            # Use general-type keys to substitute the keys for each layer type
-            if pruning_ratio_lists.get("all") is not None:
-                self.pruning_ratio_lists["sa_qkv"] = pruning_ratio_lists["all"]
-                self.pruning_ratio_lists["mlp_gate"] = pruning_ratio_lists["all"]
-                self.pruning_ratio_lists["mlp_up"] = pruning_ratio_lists["all"]
-            if pruning_ratio_lists.get("sa") is not None:
-                self.pruning_ratio_lists["sa_q"] = pruning_ratio_lists["sa"]
-                self.pruning_ratio_lists["sa_k"] = pruning_ratio_lists["sa"]
-                self.pruning_ratio_lists["sa_v"] = pruning_ratio_lists["sa"]
-            if pruning_ratio_lists.get("mlp") is not None:
-                self.pruning_ratio_lists["mlp_gate"] = pruning_ratio_lists["mlp"]
-                self.pruning_ratio_lists["mlp_up"] = pruning_ratio_lists["mlp"]
-
-            # Substitute the keys for each layer type if they are defined
-            self.pruning_list.update(pruning_ratio_lists)
-
-        self.lrd_rank_lists = {}
-
-        if lrd_rank_lists is not None:
-            # Use general-type keys to substitute the keys for each layer type
-            if lrd_rank_lists.get("all") is not None:
-                self.lrd_rank_lists["sa_q"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["sa_k"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["sa_v"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["sa_out"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["mlp_gate"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["mlp_up"] = lrd_rank_lists["all"]
-                self.lrd_rank_lists["mlp_down"] = lrd_rank_lists["all"]
-            if lrd_rank_lists.get("sa") is not None:
-                self.lrd_rank_lists["sa_q"] = lrd_rank_lists["sa"]
-                self.lrd_rank_lists["sa_k"] = lrd_rank_lists["sa"]
-                self.lrd_rank_lists["sa_v"] = lrd_rank_lists["sa"]
-                self.lrd_rank_lists["sa_out"] = lrd_rank_lists["sa"]
-            if lrd_rank_lists.get("sa_qkv") is not None:
-                self.lrd_rank_lists["sa_q"] = lrd_rank_lists["sa_qkv"]
-                self.lrd_rank_lists["sa_k"] = lrd_rank_lists["sa_qkv"]
-                self.lrd_rank_lists["sa_v"] = lrd_rank_lists["sa_qkv"]
-            if lrd_rank_lists.get("mlp") is not None:
-                self.lrd_rank_lists["mlp_gate"] = lrd_rank_lists["mlp"]
-                self.lrd_rank_lists["mlp_up"] = lrd_rank_lists["mlp"]
-                self.lrd_rank_lists["mlp_down"] = lrd_rank_lists["mlp"]
-
-            # Substitute the keys for each layer type if they are defined
-            self.lrd_rank_lists.update(lrd_rank_lists)       
-
-        if self.pruning_ratio_skip_connections is not None:
-            # Check value of the pruning ratio for skip connections
-            if not (0.0 <= self.pruning_ratio_skip_connections <= 1.0):
-                raise ValueError(
-                    f"pruning_ratio_skip_connections must be between 0.0 and 1.0, but got {self.pruning_ratio_skip_connections}."
-                )
-            # Calculate the pruned embed dimension based on the pruning ratio for skip connections
-            self.pruned_hidden_size = int(self.embed_dim * (1 - self.pruning_ratio_skip_connections))
-        else:
-            # If no pruning ratio is defined, use the original embed dimension
-            self.pruned_hidden_size = self.hidden_size
-
-### -----------------------------------
-
+        
+        # Define layer type mappings for text model - separate for pruning and LRD
+        pruning_key_mappings = {
+            "all":    ["sa_q", "sa_k", "sa_v", "mlp_gate", "mlp_up"],
+            "sa":     ["sa_q", "sa_k", "sa_v"],
+            "sa_qkv": ["sa_q", "sa_k", "sa_v"],
+            "mlp":    ["mlp_gate", "mlp_up"]
+        }
+        
+        lrd_key_mappings = {
+            "all":    ["sa_q", "sa_k", "sa_v", "sa_out", "mlp_gate", "mlp_up", "mlp_down"],
+            "sa":     ["sa_q", "sa_k", "sa_v", "sa_out"],
+            "sa_qkv": ["sa_q", "sa_k", "sa_v"],
+            "mlp":    ["mlp_gate", "mlp_up", "mlp_down"]
+        }
+        
+        init_compression_config(
+            config_instance=self,
+            total_blocks=self.num_hidden_layers,
+            base_dim=self.hidden_size,
+            pruning_ratio_lists=pruning_ratio_lists,
+            pruning_ratio_skip_connections=pruning_ratio_skip_connections,
+            lrd_rank_lists=lrd_rank_lists,
+            default_pruning_keys=["sa_q", "sa_k", "sa_v", "mlp_gate", "mlp_up"],
+            default_lrd_keys=["sa_q", "sa_k", "sa_v", "sa_out", "mlp_gate", "mlp_up", "mlp_down"],
+            pruning_key_mappings=pruning_key_mappings,
+            lrd_key_mappings=lrd_key_mappings,
+            num_heads=self.num_attention_heads,
+            intermediate_size=self.intermediate_size
+        )
 
 class Qwen2VLConfigCompress(Qwen2VLConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`Qwen2VLModel`]. It is used to instantiate a
-    Qwen2-VL model according to the specified arguments, defining the model architecture. Instantiating a configuration
-    with the defaults will yield a similar configuration to that of
-    Qwen2-VL-7B-Instruct [Qwen/Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct).
-
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
-
-
-    Args:
-        text_config (`Union[PreTrainedConfig, dict]`, *optional*, defaults to `Qwen2_5_VLTextConfig`):
-            The config object or dictionary of the text backbone.
-        vision_config (`Union[PreTrainedConfig, dict]`,  *optional*, defaults to `Qwen2_5_VLVisionConfig`):
-            The config object or dictionary of the vision backbone.
-        image_token_id (`int`, *optional*, defaults to 151655):
-            The image token index to encode the image prompt.
-        video_token_id (`int`, *optional*, defaults to 151656):
-            The video token index to encode the image prompt.
-
-    ```python
-    >>> from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLConfig
-
-    >>> # Initializing a Qwen2_5_VL style configuration
-    >>> configuration = Qwen2_5_VLConfig()
-
-    >>> # Initializing a model from the Qwen2-VL-7B style configuration
-    >>> model = Qwen2_5_VLForConditionalGeneration(configuration)
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```"""
-
+    """
+    Main configuration class for Qwen2VL with compression support.
+    
+    This configuration extends the original Qwen2VLConfig with compression capabilities
+    including structured pruning and low-rank decomposition (LRD).
+    """
+    
     model_type = "qwen2_vl"
-
-    ### -----------------------------------
-    # CESOIA PATCH: substitute the original vision and text config classes with the compressed versions
-    ### -----------------------------------
-
-    sub_configs = {"vision_config": Qwen2VLVisionConfigCompress, "text_config": Qwen2VLTextConfigCompress}
-
-    ### -----------------------------------
-
+    sub_configs = {
+        "vision_config": Qwen2VLVisionConfigCompress, 
+        "text_config": Qwen2VLTextConfigCompress
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -259,21 +135,31 @@ class Qwen2VLConfigCompress(Qwen2VLConfig):
         video_token_id=151656,
         **kwargs,
     ):
+        # Handle vision config
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            self.vision_config = vision_config
 
+        # Handle text config
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
-            # For BC use all kwargs to init `TextConfig`
-            self.text_config = self.sub_configs["text_config"](**kwargs)
+            filtered_kwargs = {k: v for k, v in kwargs.items() 
+                             if k not in ['pruning_ratio_lists', 'pruning_ratio_skip_connections', 'lrd_rank_lists']}
+            self.text_config = self.sub_configs["text_config"](**filtered_kwargs)
+        else:
+            self.text_config = text_config
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
 
-        super(Qwen2VLConfig, self).__init__(**kwargs)
+        parent_kwargs = {k: v for k, v in kwargs.items() 
+                        if k not in ['pruning_ratio_lists', 'pruning_ratio_skip_connections', 'lrd_rank_lists',
+                                   'text_config', 'vision_config']}
+        
+        super(Qwen2VLConfig, self).__init__(**parent_kwargs)
 
-
-__all__ = ["Qwen2VLConfigCompress", "Qwen2VLTextConfigCompress"]
+__all__ = ["Qwen2VLConfigCompress", "Qwen2VLVisionConfigCompress", "Qwen2VLTextConfigCompress"]

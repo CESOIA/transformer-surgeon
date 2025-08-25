@@ -6,6 +6,8 @@ def get_validated_value(value, default, min_value=None, max_value=None):
     """
     if value is None:
         return default
+    if type(value) is str:
+        return value  # Strings are always valid
     if min_value is not None and value < min_value:
         raise ValueError(f"Value ({value}) is less than minimum allowed ({min_value}).")
     if max_value is not None and value > max_value:

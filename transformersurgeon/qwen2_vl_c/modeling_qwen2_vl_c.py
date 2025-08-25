@@ -114,10 +114,7 @@ class VisionAttentionCompress(nn.Module):
         ### -----------------------------------
 
         # Retrieve inner dimension from pruning ratio
-
-        inner_pruning_ratio = get_validated_dict_value(config.pruning_ratio_lists, "sa_qkv", index=layer_idx, default=0.0, min_value=0.0, max_value=1.0)
-        self.inner_dim = int(self.dim * (1 - inner_pruning_ratio))
-
+        self.inner_dim = get_validated_dict_value(config.pruned_dim_lists, "sa_qkv", index=layer_idx, default=self.dim)
         self.qkv_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_qkv", index=layer_idx, default="full", min_value=1)
         self.proj_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_proj", index=layer_idx, default="full", min_value=1)
 
@@ -220,8 +217,7 @@ class Qwen2VLVisionBlockCompress(GradientCheckpointingLayer):
         ### CESOIA PATCH
         ### -----------------------------------
 
-        mlp_hidden_pruning_ratio = get_validated_dict_value(config.pruning_ratio_lists, "mlp_down", layer_idx, default=0.0, min_value=0.0, max_value=1.0)
-        mlp_hidden_dim = int(int(config.embed_dim * config.mlp_ratio) * (1 - mlp_hidden_pruning_ratio))
+        mlp_hidden_dim = get_validated_dict_value(config.pruned_dim_lists, "mlp_down", index=layer_idx, default=config.embed_dim*config.mlp_ratio)
 
         lrd_rank_i = get_validated_dict_value(config.lrd_rank_lists, "mlp_down", index=layer_idx, default="full", min_value=1)
         lrd_rank_o = get_validated_dict_value(config.lrd_rank_lists, "mlp_up", index=layer_idx, default="full", min_value=1)
@@ -264,9 +260,7 @@ class Qwen2MLPCompress(nn.Module):
         ### -----------------------------------
 
         self.hidden_size = config.pruned_hidden_size
-
-        intermediate_pruning_ratio = get_validated_dict_value(config.pruning_ratio_lists, "mlp_down", index=layer_idx, default=0.0, min_value=0.0, max_value=1.0)
-        self.intermediate_size = int(config.intermediate_size * (1 - intermediate_pruning_ratio))
+        self.intermediate_size = get_validated_dict_value(config.pruned_dim_lists, "mlp_down", index=layer_idx, default=config.intermediate_size)
 
         lrd_rank_gate = get_validated_dict_value(config.lrd_rank_lists, "mlp_gate", index=layer_idx, default="full", min_value=1)
         lrd_rank_up = get_validated_dict_value(config.lrd_rank_lists, "mlp_up", index=layer_idx, default="full", min_value=1)
@@ -308,8 +302,7 @@ class Qwen2VLAttentionCompress(nn.Module):
         ### CESOIA PATCH
         ### -----------------------------------
 
-        inner_pruning_ratio = get_validated_dict_value(config.pruning_ratio_lists, "sa_qkv", index=layer_idx, default=0.0, min_value=0.0, max_value=1.0)
-        self.inner_dim = (int(self.hidden_size * (1 - inner_pruning_ratio))//self.num_heads)*self.num_heads
+        self.inner_dim = get_validated_dict_value(config.pruned_dim_lists, "sa_qkv", index=layer_idx, default=config.hidden_size)
         self.head_dim = self.inner_dim // self.num_heads
 
         ### -----------------------------------
