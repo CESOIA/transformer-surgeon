@@ -9,44 +9,122 @@ It supports structured pruning, low-rank decomposition, and flexible configurati
 
 ## Features
 
-- Modular transformer blocks for vision and text
-- Structured pruning (layer or block-wise)
-- Low-rank decomposition for linear layers
-- Custom configuration classes for compression
-- Support for multi-modal models (images, videos, text)
-- Easy integration with HuggingFace Transformers
+- **Modular transformer blocks** for vision and text
+- **Structured pruning** (layer or block-wise) with magnitude-based neuron removal
+- **Low-rank decomposition (LRD)** for linear layers with configurable ranks
+- **Generic compression manager** that works across different model architectures
+- **Custom configuration classes** for compression with automatic dimension calculation
+- **Support for multi-modal models** (images, videos, text)
+- **LinearLRD layers** with integrated pruning mask support
+- **Reversible compression** (soft application) or permanent compression (hard application)
+- **QKV concatenated layer support** for attention mechanisms
+- **Easy integration** with HuggingFace Transformers
+
+## New in this Version
+
+### 🔧 **Generic Compression Manager**
+- `CompressionSchemesManager`: Universal compression manager that works with any transformer architecture
+- Model-specific configurations through simple config dictionaries
+- Support for multiple block types (vision, text) in the same model
+
+### 🧮 **LinearLRD Layer**
+- Drop-in replacement for `nn.Linear` with built-in low-rank decomposition
+- Configurable rank: integer values or "full" for no decomposition
+- Integrated pruning mask support
+- Maintains same interface as standard linear layers
+
+### ⚙️ **Advanced Configuration**
+- Automatic dimension calculation based on pruning ratios
+- Support for skip connection management
+- Flexible key mapping system for different layer types
+- Validation and error checking for configuration parameters
+
+### 🔄 **Reversible Operations**
+- **Soft application**: Compression can be reversed (restores original weights)
+- **Hard application**: Permanent compression (reduces model size)
+- `restore_all()` method to undo all compression operations
 
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/transformer-surgeon.git
+git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
 pip install -e .
 ```
 
-## Usage
+
+## Quick Start
+
+### Basic Usage
 
 ```python
-from transformer_surgeon.qwen2_vl_c import Qwen2VLModel, Qwen2VLConfigCompress
-
-config = Qwen2VLConfigCompress(
-    pruning_ratio_lists={...},
-    lrd_rank_lists={...},
-    pruning_ratio_skip_connections=0.2,
+from transformersurgeon.qwen2_vl_c import (
+    Qwen2VLConfigCompress, 
+    Qwen2VLForConditionalGenerationCompress,
+    Qwen2VLCompressionSchemesManager
 )
-model = Qwen2VLModel(config)
+
+# Create compressed model configuration
+config = Qwen2VLConfigCompress(
+    # Pruning ratios for different layer types
+    pruning_ratio_lists={
+        "sa_qkv": [0.2, 0.3, 0.4],  # Attention layers
+        "mlp_up": [0.1, 0.2, 0.3],  # MLP layers
+    },
+    # Low-rank decomposition ranks
+    lrd_rank_lists={
+        "sa_out": [64, 32, 16],     # Output projection ranks
+        "mlp_down": ["full", 128, 64], # "full" means no decomposition
+    },
+    # Skip connection pruning
+    pruning_ratio_skip_connections=0.1,
+)
+
+# Load model with compression
+model = Qwen2VLForConditionalGenerationCompress(config)
+
+# Create compression manager
+manager = Qwen2VLCompressionSchemesManager(config, model)
+
+# Apply compression (soft - reversible)
+manager.apply_all(hard=False)
+
+# View compression schemes
+print(manager)
 ```
 
 ## Compression Options
 
-- **Pruning:** Remove neurons, attention heads, or blocks based on configurable ratios.
-- **Low-Rank Decomposition:** Replace linear layers with low-rank approximations for efficiency.
-- **Skip Connection Management:** Ensure compatibility when pruning layers connected by skip connections.
+### **Low-Rank Decomposition (LRD)**
+- **Configurable ranks**: Integer values or "full" for no decomposition
+- **SVD-based**: Uses singular value decomposition for optimal approximation
+- **Layer-wise control**: Different ranks for different layers
+- **Integrated with LinearLRD**: Seamless integration with custom linear layers
 
-## Documentation
+### **Advanced Features**
+- **QKV concatenated support**: Special handling for attention layer concatenated projections
+- **Multi-block architectures**: Support for vision + text models
 
-- See [docs/](docs/) for API details and examples.
-- Example configs and scripts are provided in the `examples/` folder.
+## Architecture Support
+
+Currently supported models:
+- **Qwen2-VL**: Vision-language model with compression support
+
+**Adding new models**: The generic `CompressionSchemesManager` can be easily extended to support new architectures by providing a model-specific configuration dictionary.
+
+## Roadmap
+
+### ✅ **Completed**
+- Generic compression manager architecture
+- Low Rank Decomposition integration
+- Qwen2-VL model compression support
+- Reversible compression operations
+
+### 🚧 **In progress/planned**
+- Support for more transformer models (Qwen3-VL, BLIP)
+- Structured pruning integration
+- Vanishing contribution model compression integration
+- Quantization integration
 
 ## License
 
@@ -54,10 +132,6 @@ MIT License
 
 ---
 
-**Maintainer:** Luciano Prono
-**Contact:** [luciano.prono@polito.it](mailto:luciano.prono@polito.it)
-
-## What to do next
-
-- Tools to convert full-size model to compressed model
-- Debug and test compressed models
+**Maintainer:** Luciano Prono  
+**Contact:** [luciano.prono@polito.it](mailto:luciano.prono@polito.it)  
+**Institution:** Politecnico di Torino & King Abdullah University of Science and Technology (KAUST)
