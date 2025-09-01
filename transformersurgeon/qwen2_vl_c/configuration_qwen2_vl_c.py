@@ -22,7 +22,7 @@ from transformers.models.qwen2_vl.configuration_qwen2_vl import (
 )
 from transformers.utils import logging
 
-from ..utils.config import init_compression_config
+from ..utils.configuration import init_compression_config
 
 logger = logging.get_logger(__name__)
 
@@ -41,11 +41,15 @@ class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # Define default pruning and lrd keys
+        default_pruning_keys = ["mlp_up"]
+        default_lrd_keys = ["sa_qkv", "sa_out", "mlp_up", "mlp_down"]
         
         # Define layer type mappings for vision model - separate for pruning and LRD
         pruning_key_mappings = {
-            "all": ["sa_qkv", "mlp_up"],
-            "sa":  ["sa_qkv"],
+            "all": ["mlp_up"],
+            # "sa":  ["sa_qkv"],
             "mlp": ["mlp_up"]
         }
         
@@ -62,8 +66,8 @@ class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
             pruning_ratio_lists=pruning_ratio_lists,
             pruning_ratio_skip_connections=pruning_ratio_skip_connections,
             lrd_rank_lists=lrd_rank_lists,
-            default_pruning_keys=["sa_qkv", "mlp_up"],
-            default_lrd_keys=["sa_qkv", "sa_out", "mlp_up", "mlp_down"],
+            default_pruning_keys=default_pruning_keys,
+            default_lrd_keys=default_lrd_keys,
             pruning_key_mappings=pruning_key_mappings,
             lrd_key_mappings=lrd_key_mappings,
             mlp_ratio=self.mlp_ratio,
@@ -81,13 +85,18 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # Define default pruning and lrd keys
+        # default_pruning_keys = ["mlp_gate", "mlp_up"]
+        default_pruning_keys = []
+        default_lrd_keys = ["sa_q", "sa_k", "sa_v", "sa_out", "mlp_gate", "mlp_up", "mlp_down"]
         
         # Define layer type mappings for text model - separate for pruning and LRD
         pruning_key_mappings = {
-            "all":    ["sa_q", "sa_k", "sa_v", "mlp_gate", "mlp_up"],
-            "sa":     ["sa_q", "sa_k", "sa_v"],
-            "sa_qkv": ["sa_q", "sa_k", "sa_v"],
-            "mlp":    ["mlp_gate", "mlp_up"]
+            # "all":    ["mlp_gate", "mlp_up"],
+            # "sa":     ["sa_q", "sa_k", "sa_v"],
+            # "sa_qkv": ["sa_q", "sa_k", "sa_v"],
+            # "mlp":    ["mlp_gate", "mlp_up"]
         }
         
         lrd_key_mappings = {
@@ -104,8 +113,8 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
             pruning_ratio_lists=pruning_ratio_lists,
             pruning_ratio_skip_connections=pruning_ratio_skip_connections,
             lrd_rank_lists=lrd_rank_lists,
-            default_pruning_keys=["sa_q", "sa_k", "sa_v", "mlp_gate", "mlp_up"],
-            default_lrd_keys=["sa_q", "sa_k", "sa_v", "sa_out", "mlp_gate", "mlp_up", "mlp_down"],
+            default_pruning_keys=default_pruning_keys,
+            default_lrd_keys=default_lrd_keys,
             pruning_key_mappings=pruning_key_mappings,
             lrd_key_mappings=lrd_key_mappings,
             num_heads=self.num_attention_heads,

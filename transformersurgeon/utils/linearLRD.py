@@ -15,17 +15,12 @@ class LinearLRD(nn.Linear):
                  bias=False,
                  lrd_rank: Union[int, str] = "full"):
         
-        self.lrd_rank = lrd_rank
-        if isinstance(lrd_rank, int):
-            if lrd_rank < 1:
-                raise ValueError("Low-rank decomposition rank must be at least 1.")
-            # use "weight" tensor to pack both the two decomposed matrices
-            # weightA = weight[:in_features, :]; weightB = weight[in_features:, :]
-            in_features = in_features + out_features
-            out_features = lrd_rank
-        
+        self.prune_mask = None  # To be set externally if needed
+
+        self.lrd_rank = self._check_rank(lrd_rank)
+                
         if out_features <= 0:
-            # If out_features is 0, skip the layer
+            # If out_features is 0, skip the layer (the block has been fully pruned)
             self.skip = True
         else:
             self.skip = False
@@ -64,12 +59,30 @@ class LinearLRD(nn.Linear):
         else:
             raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")
         
+    def set_lrd_rank(self, rank: Union[int, str]):
+        self.lrd_rank = self._check_rank(rank)
+        
     def set_prune_mask(self, mask: torch.Tensor):
         if mask.rank != 1 or mask.size(0) != self.out_features:
             raise ValueError("Prune mask must be a 1D tensor with the same size as out_features.")
         self.prune_mask = mask
+
+    def reset_prune_mask(self):
+        self.prune_mask = None
+
+    def _check_rank(self, rank: Union[int, str]):
+        if isinstance(rank, int):
+            if rank < 1:
+                raise ValueError("Low-rank decomposition rank must be at least 1.")
+        elif rank != "full":
+            raise ValueError("Low-rank decomposition rank must be a positive integer or 'full'.")
         
+        return rank
+        
+    def __repr__(self):
+        return super().__repr__() + f"(lrd_rank={self.lrd_rank})"
+
     def __str__(self):
-        return super().__str__() + f"(lrd_rank={self.lrd_rank})"
+        return self.__repr__()
     
 __all__ = ["LinearLRD"]

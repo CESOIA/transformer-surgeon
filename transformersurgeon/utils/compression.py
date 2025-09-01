@@ -18,6 +18,7 @@ class CompressionScheme:
         self.lrd_rank = lrd_rank
         self.is_qkv_concatenated = is_qkv_concatenated
         self.module = module
+        self.hard_applied = False
 
     def get_module(self):
         # Check if model has been provided
@@ -31,20 +32,18 @@ class CompressionScheme:
             tmp_module = getattr(tmp_module, path_piece, None)
         return tmp_module
     
-    def apply(self, hard=False): # WIP
+    def apply(self, hard=False):
         """       
         Applies pruning and LRD to the module specified by the path.
         """
+
         module = self.get_module()
-        if module is None:
-            raise ValueError(f"Module at path '{self.path}' not found in the model.")
-
-        print(f"Applying pruning with ratio {self.pruning_ratio} and LRD rank {self.lrd_rank} to module {self.path}.")
-
+        
         # Apply magnitude-based structured pruning
         if self.pruning_ratio > 0:
+            print(f"Applying {"HARD (non-reversible) "*hard}pruning with ratio {self.pruning_ratio} to module {self.path}.")
             # Prune module
-            prune_mask, kept = self._structured_pruning(module, norm=2, pruning_ratio=self.pruning_ratio)
+            prune_mask, kept = self._structured_pruning(norm=2, pruning_ratio=self.pruning_ratio)
             if hard:
                 # Apply hard pruning by removing the pruned rows
                 module.weight.data = module.weight.data[prune_mask]
@@ -54,20 +53,50 @@ class CompressionScheme:
                 # Apply soft pruning by setting the prune mask
                 module.set_prune_mask(prune_mask)
 
+            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted
 
-    def restore(self): # WIP
+        # Apply Low Rank Decomposition (LRD)
+        if self.lrd_rank and self.lrd_rank != "full":
+            print(f"Applying {"HARD (non-reversible) "*hard}LRD with rank {self.lrd_rank} to module {self.path}.")
+            W1, W2 = self._low_rank_decomposition(self.lrd_rank)
+            module.set_lrd_rank(self.lrd_rank)
+            if not hard:
+                # Store original weight matrix to allow restoring/vanishing contributions
+                module.weight_original = torch.nn.Parameter(module.weight.data.clone())
+            # Replace the original weight with the decomposed weights
+            newW = torch.concat((W1, W2.t()), dim=0)
+            module.weight.data = newW
+
+            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted        
+
+    def restore(self):
         """
         Restores the original module by removing pruning and LRD.
         """
-        # WIP
-        print(f"Restoring module {self.path} to its original state.")
+        if self.hard_applied:
+            raise ValueError("Cannot restore a module that has been hard applied (non-reversible changes).")
+        
+        module = self.get_module()
+        if module is None:
+            raise ValueError(f"Module at path '{self.path}' not found in the model.")
+        
+        if hasattr(module, 'weight_original') or module.prune_mask is not None:
+            print(f"Restoring module {self.path} to its original state.")
+        
+        # Restore original weights if LRD was applied
+        if hasattr(module, 'weight_original'):
+            module.weight = torch.nn.Parameter(module.weight_original.data.clone())
+            del module.weight_original
+        
+        # Remove pruning by deleting the prune mask
+        module.reset_prune_mask()
 
     def __repr__(self):
         return (f"CompressionScheme(path={self.path}, pruning_ratio={self.pruning_ratio}, "
                 f"lrd_rank={self.lrd_rank}, is_qkv_concatenated={self.is_qkv_concatenated}, "
                 f"module={self.module.__class__.__name__ if self.module else None})")
 
-    def _structured_pruning(module, norm=2, pruning_ratio=0.0) -> torch.Tensor:
+    def _structured_pruning(self, norm=2, pruning_ratio=0.0) -> torch.Tensor:
         """
         Returns a mask for structured pruning based on the specified norm.
         This function generates a binary mask that can be applied to the weight tensor
@@ -80,7 +109,9 @@ class CompressionScheme:
             torch.Tensor: A binary mask vector with the same number of elements as the rows of the weight tensor.
             kept (int): Number of rows kept after pruning.
         """
+        module = self.get_module()
         weight = module.weight.data
+
         if pruning_ratio <= 0.0:
             # No pruning, return a mask of all ones
             return torch.ones(weight.size(0), dtype=torch.bool, device=weight.device)
@@ -112,7 +143,7 @@ class CompressionScheme:
         
         return mask, kept
 
-    def _low_rank_decomposition(weight: torch.Tensor, rank: int) -> torch.Tensor:
+    def _low_rank_decomposition(self, rank: int) -> torch.Tensor:
         """
         Performs low-rank decomposition on the given weight matrix using SVD.
         Args:
@@ -122,6 +153,8 @@ class CompressionScheme:
             torch.Tensor: The first matrix of the low-rank decomposition.
             torch.Tensor: The second matrix of the low-rank decomposition.
         """
+        weight = self.get_module().weight.data
+
         if rank >= min(weight.size()):
             # No decomposition possible, launch error
             raise ValueError("Rank must be less than the minimum dimension of the weight matrix.")
