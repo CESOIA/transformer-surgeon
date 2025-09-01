@@ -28,19 +28,19 @@ class CompressionSchemesManager:
         self.model_config = model_config
         self.schemes = self._generate_schemes()
 
-    def apply_all(self, hard=False):
+    def apply_all(self, hard=False, verbose=False):
         """
         Applies all compression schemes to their respective modules in the model.
         """
         for scheme in self:
-            scheme.apply(hard=hard)
+            scheme.apply(hard=hard, verbose=verbose)
 
-    def restore_all(self):
+    def restore_all(self, verbose=False):
         """
         Restores all modules to their original state by removing pruning and LRD.
         """
         for scheme in self:
-            scheme.restore()
+            scheme.restore(verbose=verbose)
 
     def _generate_schemes(self):
         """

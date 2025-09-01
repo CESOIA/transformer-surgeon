@@ -3,10 +3,15 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
-    # Qwen2VLForConditionalGeneration
 )
 from qwen_vl_utils import process_vision_info
-from transformersurgeon import Qwen2VLForConditionalGenerationCompress
+from transformersurgeon import (
+    Qwen2VLForConditionalGenerationCompress,
+    Qwen2VLConfigCompress,
+    Qwen2VLCompressionSchemesManager,
+)
+
+from .test_messages import messages
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,66 +26,26 @@ processor = AutoProcessor.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = Qwen2VLForConditionalGenerationCompress.from_pretrained(model_name).to(device)
 
-print(processor)
-print(tokenizer)
-print(model)
-print(model.config)
+# Example usage of CompressionSchemesManager
+config_dict = model.config.to_dict()
+config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = 512
+# config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = [512, 256] * 16 # you can define lrd rank for each block
+config_dict["text_config"]["lrd_rank_lists"]["mlp_up"] = "full"
 
-# Message
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "What kind of apples are these?"
-            },
-        ],
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "What kind of oranges are these?"
-            },
-        ],
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "Describe the picture in a sentence."
-            },
-        ],
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "How many apples are there in the image?"
-            },
-        ],
-    }
-]
+# Apply updated configuration to the model
+model.config = Qwen2VLConfigCompress.from_dict(config_dict)
+
+# Initialize the CompressionSchemesManager with the model and configuration
+manager = Qwen2VLCompressionSchemesManager(model.config, model)
+
+print(model) # print the model architecture
+print(manager) # print the full compression configuration
+
+# Apply all compression schemes to the model (hard mode)
+manager.apply_all(hard=True, verbose=True)
+
+# Apply configuration to the model - needed for hard mode
+model.config = Qwen2VLConfigCompress.from_dict(config_dict)
 
 # Process each message separately
 print("Generating text...")

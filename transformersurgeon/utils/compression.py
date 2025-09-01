@@ -18,7 +18,8 @@ class CompressionScheme:
         self.lrd_rank = lrd_rank
         self.is_qkv_concatenated = is_qkv_concatenated
         self.module = module
-        self.hard_applied = False
+        self.hard_applied = False # this flags the compression as non-reversible
+        self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize
 
     def get_module(self):
         # Check if model has been provided
@@ -32,7 +33,7 @@ class CompressionScheme:
             tmp_module = getattr(tmp_module, path_piece, None)
         return tmp_module
     
-    def apply(self, hard=False):
+    def apply(self, hard=False, verbose=False):
         """       
         Applies pruning and LRD to the module specified by the path.
         """
@@ -41,9 +42,20 @@ class CompressionScheme:
         
         # Apply magnitude-based structured pruning
         if self.pruning_ratio > 0:
-            print(f"Applying {"HARD (non-reversible) "*hard}pruning with ratio {self.pruning_ratio} to module {self.path}.")
+            if verbose:
+                if self.soft_applied:
+                    if hard:
+                        print(f"Pruning already hard applied to module {self.path}, making the changes permanent (HARD mode)")
+                    else:
+                        print(f"Pruning already applied to module {self.path}, skipping re-application.")
+                else:
+                    print(f"Applying {"HARD (non-reversible) "*hard}pruning with pruning ratio {self.pruning_ratio} to module {self.path}.")
+
             # Prune module
-            prune_mask, kept = self._structured_pruning(norm=2, pruning_ratio=self.pruning_ratio)
+            if self.soft_applied:
+                prune_mask = self.module.prune_mask
+            else:
+                prune_mask, kept = self._structured_pruning(norm=2, pruning_ratio=self.pruning_ratio)
             if hard:
                 # Apply hard pruning by removing the pruned rows
                 module.weight.data = module.weight.data[prune_mask]
@@ -53,23 +65,38 @@ class CompressionScheme:
                 # Apply soft pruning by setting the prune mask
                 module.set_prune_mask(prune_mask)
 
+            self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
             self.hard_applied = hard # Flag the application as hard; changes cannot be reverted
 
         # Apply Low Rank Decomposition (LRD)
         if self.lrd_rank and self.lrd_rank != "full":
-            print(f"Applying {"HARD (non-reversible) "*hard}LRD with rank {self.lrd_rank} to module {self.path}.")
-            W1, W2 = self._low_rank_decomposition(self.lrd_rank)
-            module.set_lrd_rank(self.lrd_rank)
+            if verbose:
+                if self.soft_applied:
+                    if hard:
+                        print(f"LRD already hard applied to module {self.path}, making the changes permanent (HARD mode)")
+                    else:
+                        print(f"LRD already applied to module {self.path}, skipping re-application.")
+                else:
+                    print(f"Applying {"HARD (non-reversible) "*hard}LRD with rank {self.lrd_rank} to module {self.path}.")
+
             if not hard:
                 # Store original weight matrix to allow restoring/vanishing contributions
                 module.weight_original = torch.nn.Parameter(module.weight.data.clone())
-            # Replace the original weight with the decomposed weights
-            newW = torch.concat((W1, W2.t()), dim=0)
-            module.weight.data = newW
+            else:
+                if hasattr(module, 'weight_original'):
+                    del module.weight_original
+            
+            if not self.soft_applied:
+                # Replace the original weight with the decomposed weights
+                W1, W2 = self._low_rank_decomposition(self.lrd_rank)
+                newW = torch.concat((W1, W2.t()), dim=0)
+                module.weight.data = newW
+                module.set_lrd_rank(self.lrd_rank)
 
+            self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
             self.hard_applied = hard # Flag the application as hard; changes cannot be reverted        
 
-    def restore(self):
+    def restore(self, verbose=False):
         """
         Restores the original module by removing pruning and LRD.
         """
@@ -81,15 +108,19 @@ class CompressionScheme:
             raise ValueError(f"Module at path '{self.path}' not found in the model.")
         
         if hasattr(module, 'weight_original') or module.prune_mask is not None:
-            print(f"Restoring module {self.path} to its original state.")
+            if verbose:
+                print(f"Restoring module {self.path} to its original state.")
         
         # Restore original weights if LRD was applied
         if hasattr(module, 'weight_original'):
             module.weight = torch.nn.Parameter(module.weight_original.data.clone())
             del module.weight_original
+            module.set_lrd_rank("full")
         
         # Remove pruning by deleting the prune mask
         module.reset_prune_mask()
+
+        self.soft_applied = False # Reset the soft application flag
 
     def __repr__(self):
         return (f"CompressionScheme(path={self.path}, pruning_ratio={self.pruning_ratio}, "
@@ -157,7 +188,7 @@ class CompressionScheme:
 
         if rank >= min(weight.size()):
             # No decomposition possible, launch error
-            raise ValueError("Rank must be less than the minimum dimension of the weight matrix.")
+            raise ValueError(f"Rank {rank} must be less than the minimum dimension of the weight matrix ({weight.size(0), weight.size(1)}).")
         
         if rank == "full":
             # No decomposition needed, return original weight and identity
