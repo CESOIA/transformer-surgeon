@@ -1,0 +1,13 @@
+NOTICE
+
+This product includes software developed by:
+- The Qwen team, Alibaba Group and the HuggingFace Inc. team.
+- The CESOIA project team, Politecnico di Torino and King Abdullah University of Science and Technology.
+
+Modifications made by The CESOIA project team (2025):
+- Added new configuration options for compression approaches.
+- Refactored initialization logic for compatibility with custom pruning.
+- Updated documentation and comments to reflect new features.
+
+Original code licensed under the Apache License, Version 2.0.
+See LICENSE file for details.
