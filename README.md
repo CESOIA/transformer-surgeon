@@ -102,6 +102,7 @@ print(manager)
 - **Integrated with LinearLRD**: Seamless integration with custom linear layers
 
 ### **Advanced Features**
+- **Flexible compression configuration**: You can customize the compression of each layer and block independently
 - **QKV concatenated support**: Special handling for attention layer concatenated projections
 - **Multi-block architectures**: Support for vision + text models
 
@@ -111,6 +112,22 @@ Currently supported models:
 - **Qwen2-VL**: Vision-language model with compression support
 
 **Adding new models**: The generic `CompressionSchemesManager` can be easily extended to support new architectures by providing a model-specific configuration dictionary.
+
+## Hard and soft application
+
+When using `manager.apply_all()` function from the class `CompressionSchemesManager`, one can choose to perform a **soft** application (default behavior) or to perform a **hard** application (`manager.apply_all(hard=True)`).
+- Soft application: the performed compression is reversible and does not influence the structure of the model. Use this option when fine-tuning the model with STE or iterative approaches.
+    - When performing pruning, a mask is applied, leaving the original weights unaltered.
+    - When performing LRD, the original weight matrix is stored to allow retrieval.
+- Hard application: the performed compression is not reversible and influences the structure of the model. Use this option for the final release of the compressed model.
+    - When performing pruning, rows of the matrix are removed permanently.
+    - When performing LRD, the original matrix is not stored to save memory.
+
+When using `manager.apply_all()` a second time:
+- If hard=False, nothing is done. This way, if weights have been fine-tuned, they won't be initialized.
+- If hard=True, soft compression is converted in a hard one. Pruning mask are used to permanently remove weights and the stored original matrix is deleted.
+
+To reinitialize compression, first restore the model with `manager.restore_all()`, then use `apply_all()` again.
 
 ## Roadmap
 
