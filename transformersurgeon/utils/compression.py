@@ -18,8 +18,10 @@ class CompressionScheme:
         self.lrd_rank = lrd_rank
         self.is_qkv_concatenated = is_qkv_concatenated
         self.module = module
+
         self.hard_applied = False # this flags the compression as non-reversible
         self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize
+
 
     def get_module(self):
         # Check if model has been provided
@@ -37,7 +39,6 @@ class CompressionScheme:
         """       
         Applies pruning and LRD to the module specified by the path.
         """
-
         module = self.get_module()
         
         # Apply magnitude-based structured pruning
@@ -56,6 +57,7 @@ class CompressionScheme:
                 prune_mask = self.module.prune_mask
             else:
                 prune_mask, kept = self._structured_pruning(norm=2, pruning_ratio=self.pruning_ratio)
+            
             if hard:
                 # Apply hard pruning by removing the pruned rows
                 module.weight.data = module.weight.data[prune_mask]
@@ -66,7 +68,6 @@ class CompressionScheme:
                 module.set_prune_mask(prune_mask)
 
             self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
-            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted
 
         # Apply Low Rank Decomposition (LRD)
         if self.lrd_rank and self.lrd_rank != "full":
