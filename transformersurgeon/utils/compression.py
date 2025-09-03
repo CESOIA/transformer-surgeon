@@ -11,13 +11,13 @@ class CompressionScheme:
                  pruning_ratio, #output_paths, 
                  lrd_rank,
                  is_qkv_concatenated=False,
-                 module=None):
+                 model=None):
         self.path = path
         self.pruning_ratio = pruning_ratio
         # self.output_paths = output_paths # blocks after this layer, input should be pruned accordingly
         self.lrd_rank = lrd_rank
         self.is_qkv_concatenated = is_qkv_concatenated
-        self.module = module
+        self.model = model
 
         self.hard_applied = False # this flags the compression as non-reversible
         self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize
@@ -25,14 +25,18 @@ class CompressionScheme:
 
     def get_module(self):
         # Check if model has been provided
-        if not hasattr(self, 'module'):
+        if not hasattr(self, 'model'):
             raise ValueError("Model is not set. Please set the model before getting the module.")
 
         split_path = self.path.split('.')
         # Traverse the model iteratively to find the module
-        tmp_module = self.module
+        tmp_module = self.model
         for path_piece in split_path:
             tmp_module = getattr(tmp_module, path_piece, None)
+
+            if tmp_module is None:
+                raise ValueError(f"Module at path '{self.path}' not found in the model.")
+
         return tmp_module
     
     def apply(self, hard=False, verbose=False):
