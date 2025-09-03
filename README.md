@@ -109,7 +109,7 @@ print(manager)
 ## Architecture Support
 
 Currently supported models:
-- **Qwen2-VL**: Vision-language model with compression support
+- **Qwen2.5-VL**: Vision-language model with compression support
 
 **Adding new models**: The generic `CompressionSchemesManager` can be easily extended to support new architectures by providing a model-specific configuration dictionary.
 
@@ -134,11 +134,11 @@ To reinitialize compression, first restore the model with `manager.restore_all()
 ### ✅ **Completed**
 - Generic compression manager architecture
 - Low Rank Decomposition integration
-- Qwen2-VL model compression support
+- Qwen2.5-VL model compression support
 - Reversible compression operations
 
 ### 🚧 **In progress/planned**
-- Support for more transformer models (Qwen3-VL, BLIP)
+- Support for more transformer models (e.g., BLIP)
 - Structured pruning integration
 - Vanishing contribution model compression integration
 - Quantization integration
