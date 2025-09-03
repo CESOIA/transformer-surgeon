@@ -4,17 +4,17 @@ from .compression import CompressionScheme
 class CompressionSchemesManager:
     """
     Generic compression schemes manager that can be used across different models.
-    Model-specific configurations should be provided through model_config parameter.
+    Model-specific configurations should be provided through indexing parameter.
     """
     
-    def __init__(self, config, model, model_config):
+    def __init__(self, config, model, indexing):
         """
         Initialize the compression manager.
         
         Args:
             config: The main configuration object
             model: The model to apply compression to
-            model_config: Model-specific configuration containing:
+            indexing: Model-specific indexing containing:
                 - block_configs: List of block configurations, each containing:
                     - name: Name of the block type (e.g., 'vision', 'text')
                     - num_blocks: Number of blocks
@@ -25,7 +25,7 @@ class CompressionSchemesManager:
         """
         self.config = config
         self.model = model
-        self.model_config = model_config
+        self.indexing = indexing
         self.schemes = self._generate_schemes()
 
     def apply_all(self, hard=False, verbose=False):
@@ -48,7 +48,7 @@ class CompressionSchemesManager:
         """
         all_schemes = {}
         
-        for block_config in self.model_config['block_configs']:
+        for block_config in self.indexing.values():
             block_name = block_config['name']
             num_blocks = block_config['num_blocks']
             key_list = block_config['key_list']
@@ -86,7 +86,7 @@ class CompressionSchemesManager:
                         pruning_ratio=pruning_ratio,
                         lrd_rank=lrd_rank,
                         is_qkv_concatenated=is_qkv,
-                        module=self.model,
+                        model=self.model,
                     )
                 block_schemes.append(tmp_dict)
             
