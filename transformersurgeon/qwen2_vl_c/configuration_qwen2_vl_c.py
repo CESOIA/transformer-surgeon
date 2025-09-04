@@ -13,22 +13,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen2VL model configuration - patched for compression algorithms."""
 
 from transformers.models.qwen2_vl.configuration_qwen2_vl import (
     Qwen2VLVisionConfig,
     Qwen2VLTextConfig,
     Qwen2VLConfig,
 )
+
 from transformers.utils import logging
 
 from ..utils.configuration import init_compression_config
 
 logger = logging.get_logger(__name__)
 
-### -----------------------------------
-### COMPRESSION CONFIG CLASSES
-### -----------------------------------
+from .indexing_qwen2_vl_c import QWEN2_VL_C_INDEXING as INDEXING
 
 class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
     """Vision configuration with compression support."""
@@ -41,37 +39,14 @@ class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        # Define default pruning and lrd keys
-        default_pruning_keys = ["mlp_up"]
-        default_lrd_keys = ["sa_qkv", "sa_out", "mlp_up", "mlp_down"]
-        
-        # Define layer type mappings for vision model - separate for pruning and LRD
-        pruning_key_mappings = {
-            "all": ["mlp_up"],
-            # "sa":  ["sa_qkv"],
-            "mlp": ["mlp_up"]
-        }
-        
-        lrd_key_mappings = {
-            "all": ["sa_qkv", "sa_out", "mlp_up", "mlp_down"],
-            "sa":  ["sa_qkv", "sa_out"],
-            "mlp": ["mlp_up", "mlp_down"]
-        }
         
         init_compression_config(
             config_instance=self,
             total_blocks=self.depth,
-            base_dim=self.embed_dim,
+            indexing=INDEXING["vision"],
             pruning_ratio_lists=pruning_ratio_lists,
             pruning_ratio_skip_connections=pruning_ratio_skip_connections,
             lrd_rank_lists=lrd_rank_lists,
-            default_pruning_keys=default_pruning_keys,
-            default_lrd_keys=default_lrd_keys,
-            pruning_key_mappings=pruning_key_mappings,
-            lrd_key_mappings=lrd_key_mappings,
-            mlp_ratio=self.mlp_ratio,
-            num_heads=self.num_heads
         )
 
 class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
@@ -85,40 +60,14 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        # Define default pruning and lrd keys
-        # default_pruning_keys = ["mlp_gate", "mlp_up"]
-        default_pruning_keys = []
-        default_lrd_keys = ["sa_q", "sa_k", "sa_v", "sa_out", "mlp_gate", "mlp_up", "mlp_down"]
-        
-        # Define layer type mappings for text model - separate for pruning and LRD
-        pruning_key_mappings = {
-            # "all":    ["mlp_gate", "mlp_up"],
-            # "sa":     ["sa_q", "sa_k", "sa_v"],
-            # "sa_qkv": ["sa_q", "sa_k", "sa_v"],
-            # "mlp":    ["mlp_gate", "mlp_up"]
-        }
-        
-        lrd_key_mappings = {
-            "all":    ["sa_q", "sa_k", "sa_v", "sa_out", "mlp_gate", "mlp_up", "mlp_down"],
-            "sa":     ["sa_q", "sa_k", "sa_v", "sa_out"],
-            "sa_qkv": ["sa_q", "sa_k", "sa_v"],
-            "mlp":    ["mlp_gate", "mlp_up", "mlp_down"]
-        }
         
         init_compression_config(
             config_instance=self,
             total_blocks=self.num_hidden_layers,
-            base_dim=self.hidden_size,
+            indexing=INDEXING["text"],
             pruning_ratio_lists=pruning_ratio_lists,
             pruning_ratio_skip_connections=pruning_ratio_skip_connections,
             lrd_rank_lists=lrd_rank_lists,
-            default_pruning_keys=default_pruning_keys,
-            default_lrd_keys=default_lrd_keys,
-            pruning_key_mappings=pruning_key_mappings,
-            lrd_key_mappings=lrd_key_mappings,
-            num_heads=self.num_attention_heads,
-            intermediate_size=self.intermediate_size
         )
 
 class Qwen2VLConfigCompress(Qwen2VLConfig):
@@ -129,46 +78,9 @@ class Qwen2VLConfigCompress(Qwen2VLConfig):
     including structured pruning and low-rank decomposition (LRD).
     """
     
-    model_type = "qwen2_vl"
     sub_configs = {
         "vision_config": Qwen2VLVisionConfigCompress, 
         "text_config": Qwen2VLTextConfigCompress
     }
-    keys_to_ignore_at_inference = ["past_key_values"]
-
-    def __init__(
-        self,
-        text_config=None,
-        vision_config=None,
-        image_token_id=151655,
-        video_token_id=151656,
-        **kwargs,
-    ):
-        # Handle vision config
-        if isinstance(vision_config, dict):
-            self.vision_config = self.sub_configs["vision_config"](**vision_config)
-        elif vision_config is None:
-            self.vision_config = self.sub_configs["vision_config"]()
-        else:
-            self.vision_config = vision_config
-
-        # Handle text config
-        if isinstance(text_config, dict):
-            self.text_config = self.sub_configs["text_config"](**text_config)
-        elif text_config is None:
-            filtered_kwargs = {k: v for k, v in kwargs.items() 
-                             if k not in ['pruning_ratio_lists', 'pruning_ratio_skip_connections', 'lrd_rank_lists']}
-            self.text_config = self.sub_configs["text_config"](**filtered_kwargs)
-        else:
-            self.text_config = text_config
-
-        self.image_token_id = image_token_id
-        self.video_token_id = video_token_id
-
-        parent_kwargs = {k: v for k, v in kwargs.items() 
-                        if k not in ['pruning_ratio_lists', 'pruning_ratio_skip_connections', 'lrd_rank_lists',
-                                   'text_config', 'vision_config']}
-        
-        super(Qwen2VLConfig, self).__init__(**parent_kwargs)
 
 __all__ = ["Qwen2VLConfigCompress", "Qwen2VLVisionConfigCompress", "Qwen2VLTextConfigCompress"]

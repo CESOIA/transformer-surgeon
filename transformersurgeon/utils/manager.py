@@ -1,4 +1,5 @@
 import torch
+from typing import Dict, List, Any
 from .compression import CompressionScheme
 
 class CompressionSchemesManager:
@@ -7,7 +8,10 @@ class CompressionSchemesManager:
     Model-specific configurations should be provided through indexing parameter.
     """
     
-    def __init__(self, config, model, indexing):
+    def __init__(self,
+                 config:Dict[str, Any],
+                 model:torch.nn.Module,
+                 indexing:List[Dict[str, Any]]):
         """
         Initialize the compression manager.
         
@@ -44,33 +48,41 @@ class CompressionSchemesManager:
 
     def _generate_schemes(self):
         """
-        Generate compression schemes based on model configuration.
+        Generate compression schemes based on model configuration and indexing.
         """
         all_schemes = {}
         
-        for block_config in self.indexing.values():
-            block_name = block_config['name']
-            num_blocks = block_config['num_blocks']
-            key_list = block_config['key_list']
-            path_list = block_config['path_list']
-            path_template = block_config['path_template']
-            config_attr = block_config['config_attr']
-            
+        for block_name, block_indexing in self.indexing.items():
+            config_attr = block_indexing.get('config_attr', None)
+            num_blocks_attr = block_indexing['num_blocks_attr']
+            key_list = block_indexing['key_list']
+            path_list = block_indexing['path_list']
+            path_template = block_indexing['path_template']
+            config_attr = block_indexing['config_attr']
+
             # Get the specific config for this block type
-            block_specific_config = getattr(self.config, config_attr)
-            
+            if config_attr is None:
+                block_specific_config = self.config
+            else:
+                block_specific_config = self.config[config_attr]
+
+            # Get blocks number
+            num_blocks = block_specific_config[num_blocks_attr]
+
             block_schemes = []
             for i in range(num_blocks):
                 tmp_dict = {}
                 for key, path in zip(key_list, path_list):
                     # Check the existence of the keys
-                    if hasattr(block_specific_config, 'pruning_ratio_lists') and key in block_specific_config.pruning_ratio_lists:
-                        pruning_ratio = block_specific_config.pruning_ratio_lists[key][i]
+                    pruning_ratio_lists = block_specific_config.get('pruning_ratio_lists', {})
+                    if key in pruning_ratio_lists:
+                        pruning_ratio = pruning_ratio_lists[key][i]
                     else:
                         pruning_ratio = 0.0
                         
-                    if hasattr(block_specific_config, 'lrd_rank_lists') and key in block_specific_config.lrd_rank_lists:
-                        lrd_rank = block_specific_config.lrd_rank_lists[key][i]
+                    lrd_rank_lists = block_specific_config.get('lrd_rank_lists', {})
+                    if key in lrd_rank_lists:
+                        lrd_rank = lrd_rank_lists[key][i]
                     else:
                         lrd_rank = "full"
 
@@ -78,7 +90,7 @@ class CompressionSchemesManager:
                     full_path = path_template.format(block_index=i, path=path)
                     
                     # Check if this is a QKV concatenated layer
-                    is_qkv_concatenated = block_config.get('qkv_keys', [])
+                    is_qkv_concatenated = block_indexing.get('qkv_keys', [])
                     is_qkv = key in is_qkv_concatenated if is_qkv_concatenated else False
                     
                     tmp_dict[key] = CompressionScheme(
