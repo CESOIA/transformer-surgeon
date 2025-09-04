@@ -1,6 +1,11 @@
 # coding=utf-8
-# Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 # Copyright 2025 The CESOIA project team, Politecnico di Torino and King Abdullah University of Science and Technology. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,21 +19,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from transformers.models.qwen2_vl.configuration_qwen2_vl import (
-    Qwen2VLVisionConfig,
-    Qwen2VLTextConfig,
-    Qwen2VLConfig,
+from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
+    Qwen2_5_VLVisionConfig,
+    Qwen2_5_VLTextConfig,
+    Qwen2_5_VLConfig,
 )
-
-from transformers.utils import logging
 
 from ..utils.configuration import init_compression_config
 
-logger = logging.get_logger(__name__)
+from .indexing_qwen2_5_vl_c import QWEN2_5_VL_C_INDEXING as INDEXING
 
-from .indexing_qwen2_vl_c import QWEN2_VL_C_INDEXING as INDEXING
-
-class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
+class Qwen2_5_VLVisionConfigCompress(Qwen2_5_VLVisionConfig):
     """Vision configuration with compression support."""
     
     def __init__(
@@ -49,7 +50,7 @@ class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
             lrd_rank_lists=lrd_rank_lists,
         )
 
-class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
+class Qwen2_5_VLTextConfigCompress(Qwen2_5_VLTextConfig):
     """Text configuration with compression support."""
     
     def __init__(
@@ -70,17 +71,18 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
             lrd_rank_lists=lrd_rank_lists,
         )
 
-class Qwen2VLConfigCompress(Qwen2VLConfig):
+class Qwen2_5_VLConfigCompress(Qwen2_5_VLConfig):
     """
-    Main configuration class for Qwen2VL with compression support.
-    
-    This configuration extends the original Qwen2VLConfig with compression capabilities
-    including structured pruning and low-rank decomposition (LRD).
+    Main configuration class for Qwen2.5VL with compression support.
     """
     
     sub_configs = {
-        "vision_config": Qwen2VLVisionConfigCompress, 
-        "text_config": Qwen2VLTextConfigCompress
+        "vision_config": Qwen2_5_VLVisionConfigCompress, 
+        "text_config": Qwen2_5_VLTextConfigCompress
     }
 
-__all__ = ["Qwen2VLConfigCompress", "Qwen2VLVisionConfigCompress", "Qwen2VLTextConfigCompress"]
+__all__ = [
+    "Qwen2_5_VLVisionConfigCompress", 
+    "Qwen2_5_VLTextConfigCompress", 
+    "Qwen2_5_VLConfigCompress"
+]

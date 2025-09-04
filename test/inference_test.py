@@ -3,84 +3,106 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
-    # Qwen2VLForConditionalGeneration
 )
+from test_messages import messages
 from qwen_vl_utils import process_vision_info
-from transformersurgeon import Qwen2VLForConditionalGenerationCompress
+
+### TEST CONFIGURATION ###
+<<<<<<< HEAD
+model_type = "qwen2_5_vl_c" 
+=======
+model_type = "qwen2_vl_c" 
+>>>>>>> draft-prolucio
+hard_mode = False
+##########################
+
+if model_type == "qwen2_vl_c":
+<<<<<<< HEAD
+    # from transformersurgeon import (
+    #     Qwen2VLForConditionalGenerationCompress,
+    #     Qwen2VLConfigCompress,
+    #     Qwen2VLCompressionSchemesManager,
+    # )
+
+    # modelClass = Qwen2VLForConditionalGenerationCompress
+    # configClass = Qwen2VLConfigCompress
+    # managerClass = Qwen2VLCompressionSchemesManager
+
+    # # Model name
+    # model_name = "Qwen/Qwen2-VL-7B-Instruct"
+    raise NotImplementedError("Qwen2-VL-C support is currently deprecated.")
+=======
+    from transformersurgeon import (
+        Qwen2VLForConditionalGenerationCompress,
+        Qwen2VLConfigCompress,
+        Qwen2VLCompressionSchemesManager,
+    )
+
+    modelClass = Qwen2VLForConditionalGenerationCompress
+    configClass = Qwen2VLConfigCompress
+    managerClass = Qwen2VLCompressionSchemesManager
+
+    # Model name
+    model_name = "Qwen/Qwen2-VL-7B-Instruct"
+>>>>>>> draft-prolucio
+elif model_type == "qwen2_5_vl_c":
+    from transformersurgeon import (
+        Qwen2_5_VLForConditionalGenerationCompress,
+        Qwen2_5_VLConfigCompress,
+        Qwen2_5_VLCompressionSchemesManager,
+    )
+
+    modelClass = Qwen2_5_VLForConditionalGenerationCompress
+    configClass = Qwen2_5_VLConfigCompress
+    managerClass = Qwen2_5_VLCompressionSchemesManager
+
+    # Model name
+    model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Model name
-model_name = "Qwen/Qwen2-VL-7B-Instruct"
-
-print(Qwen2VLForConditionalGenerationCompress)
-
 # Load processor, model and tokenizer
 processor = AutoProcessor.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = Qwen2VLForConditionalGenerationCompress.from_pretrained(model_name).to(device)
+model = modelClass.from_pretrained(model_name).to(device)
 
-print(processor)
-print(tokenizer)
-print(model)
-print(model.config)
+# Example usage of CompressionSchemesManager
+config_dict = model.config.to_dict()
+config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = 512
+# config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = [512, 256] * 16 # you can define lrd rank for each block
+config_dict["text_config"]["lrd_rank_lists"]["mlp_up"] = "full"
 
-# Message
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "What kind of apples are these?"
-            },
-        ],
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "What kind of oranges are these?"
-            },
-        ],
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "Describe the picture in a sentence."
-            },
-        ],
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "How many apples are there in the image?"
-            },
-        ],
-    }
-]
+<<<<<<< HEAD
+# Apply updated configuration to the model
+model.config = configClass.from_dict(config_dict)
+
+# Initialize the CompressionSchemesManager with the model and configuration
+manager = managerClass(model.config, model)
+=======
+# Apply updated configuration to the model and update dict
+compress_config = configClass.from_dict(config_dict)
+
+# Initialize the CompressionSchemesManager with the model and configuration
+manager = managerClass(compress_config.to_dict(), model)
+>>>>>>> draft-prolucio
+
+print(model) # print the model architecture
+print(manager) # print the full compression configuration
+
+# Apply all compression schemes to the model (soft mode)
+manager.apply_all(hard=hard_mode, verbose=True)
+
+if hard_mode:
+    # Apply configuration to the model - needed for hard mode
+<<<<<<< HEAD
+    model.config = Qwen2VLConfigCompress.from_dict(config_dict)
+=======
+    model.config = compress_config
+>>>>>>> draft-prolucio
+
+# After applying compression with soft mode, you can revert the model to its original state if needed
+# manager.restore_all()  # Uncomment this line if you want to restore the model to its original state
 
 # Process each message separately
 print("Generating text...")
