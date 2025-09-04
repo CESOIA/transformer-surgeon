@@ -1,8 +1,8 @@
 """
-Model-specific configuration for Qwen2-VL-C model compression.
+Model-specific configuration for Qwen2.5-VL-C model compression.
 """
 
-# Configuration for Qwen2-VL-C model compression schemes
+# Configuration for Qwen2.5-VL-C model compression schemes
 QWEN2_5_VL_C_INDEXING = {
     'vision':
     {
