@@ -8,11 +8,16 @@ from test_messages import messages
 from qwen_vl_utils import process_vision_info
 
 ### TEST CONFIGURATION ###
+<<<<<<< HEAD
 model_type = "qwen2_5_vl_c" 
+=======
+model_type = "qwen2_vl_c" 
+>>>>>>> draft-prolucio
 hard_mode = False
 ##########################
 
 if model_type == "qwen2_vl_c":
+<<<<<<< HEAD
     # from transformersurgeon import (
     #     Qwen2VLForConditionalGenerationCompress,
     #     Qwen2VLConfigCompress,
@@ -26,6 +31,20 @@ if model_type == "qwen2_vl_c":
     # # Model name
     # model_name = "Qwen/Qwen2-VL-7B-Instruct"
     raise NotImplementedError("Qwen2-VL-C support is currently deprecated.")
+=======
+    from transformersurgeon import (
+        Qwen2VLForConditionalGenerationCompress,
+        Qwen2VLConfigCompress,
+        Qwen2VLCompressionSchemesManager,
+    )
+
+    modelClass = Qwen2VLForConditionalGenerationCompress
+    configClass = Qwen2VLConfigCompress
+    managerClass = Qwen2VLCompressionSchemesManager
+
+    # Model name
+    model_name = "Qwen/Qwen2-VL-7B-Instruct"
+>>>>>>> draft-prolucio
 elif model_type == "qwen2_5_vl_c":
     from transformersurgeon import (
         Qwen2_5_VLForConditionalGenerationCompress,
@@ -54,11 +73,19 @@ config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = 512
 # config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = [512, 256] * 16 # you can define lrd rank for each block
 config_dict["text_config"]["lrd_rank_lists"]["mlp_up"] = "full"
 
+<<<<<<< HEAD
 # Apply updated configuration to the model
 model.config = configClass.from_dict(config_dict)
 
 # Initialize the CompressionSchemesManager with the model and configuration
 manager = managerClass(model.config, model)
+=======
+# Apply updated configuration to the model and update dict
+compress_config = configClass.from_dict(config_dict)
+
+# Initialize the CompressionSchemesManager with the model and configuration
+manager = managerClass(compress_config.to_dict(), model)
+>>>>>>> draft-prolucio
 
 print(model) # print the model architecture
 print(manager) # print the full compression configuration
@@ -68,7 +95,11 @@ manager.apply_all(hard=hard_mode, verbose=True)
 
 if hard_mode:
     # Apply configuration to the model - needed for hard mode
+<<<<<<< HEAD
     model.config = Qwen2VLConfigCompress.from_dict(config_dict)
+=======
+    model.config = compress_config
+>>>>>>> draft-prolucio
 
 # After applying compression with soft mode, you can revert the model to its original state if needed
 # manager.restore_all()  # Uncomment this line if you want to restore the model to its original state

@@ -65,10 +65,10 @@ class Qwen2_5_VLTextConfigCompress(Qwen2_5_VLTextConfig):
         init_compression_config(
             config_instance=self,
             total_blocks=self.num_hidden_layers,
+            indexing=INDEXING["text"],
             pruning_ratio_lists=pruning_ratio_lists,
             pruning_ratio_skip_connections=pruning_ratio_skip_connections,
             lrd_rank_lists=lrd_rank_lists,
-            indexing=INDEXING["text"],
         )
 
 class Qwen2_5_VLConfigCompress(Qwen2_5_VLConfig):

@@ -1,20 +1,20 @@
 """
-Model-specific configuration for Qwen2.5-VL-C model compression.
+Model-specific configuration for Qwen2-VL-C model compression.
 """
 
-# Configuration for Qwen2.5-VL-C model compression schemes
-QWEN2_5_VL_C_INDEXING = {
+# Configuration for Qwen2-VL-C model compression schemes
+QWEN2_VL_C_INDEXING = {
     'vision':
     {
         'config_attr': 'vision_config',
         'num_blocks_attr': 'depth',
-        'key_list': ["sa_qkv", "sa_out", "mlp_gate", "mlp_up", "mlp_down"],
-        'path_list': ["attn.qkv", "attn.proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"],
+        'key_list': ["sa_qkv", "sa_out", "mlp_up", "mlp_down"],
+        'path_list': ["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"],
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'key_mappings': {
             "sa_all": ["sa_qkv", "sa_out"],
-            "mlp_all": ["mlp_gate", "mlp_up", "mlp_down"],
-            "all": ["sa_qkv", "sa_out", "mlp_gate", "mlp_up", "mlp_down"]
+            "mlp_all": ["mlp_up", "mlp_down"],
+            "all": ["sa_qkv", "sa_out", "mlp_up", "mlp_down"]
         },
         'qkv_keys': ["sa_qkv"],  # Keys that represent QKV concatenated layers
         'lrd_supported': [1, 1, 1, 1, 1],
@@ -38,3 +38,4 @@ QWEN2_5_VL_C_INDEXING = {
         'pruning_supported': [0, 0, 0, 0, 0],
     }
 }
+
