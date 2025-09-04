@@ -54,11 +54,11 @@ config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = 512
 # config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = [512, 256] * 16 # you can define lrd rank for each block
 config_dict["text_config"]["lrd_rank_lists"]["mlp_up"] = "full"
 
-# Apply updated configuration to the model
-model.config = configClass.from_dict(config_dict)
+# Apply updated configuration to the model and update dict
+compress_config = configClass.from_dict(config_dict)
 
 # Initialize the CompressionSchemesManager with the model and configuration
-manager = managerClass(model.config, model)
+manager = managerClass(compress_config.to_dict(), model)
 
 print(model) # print the model architecture
 print(manager) # print the full compression configuration
@@ -68,7 +68,7 @@ manager.apply_all(hard=hard_mode, verbose=True)
 
 if hard_mode:
     # Apply configuration to the model - needed for hard mode
-    model.config = Qwen2VLConfigCompress.from_dict(config_dict)
+    model.config = compress_config
 
 # After applying compression with soft mode, you can revert the model to its original state if needed
 # manager.restore_all()  # Uncomment this line if you want to restore the model to its original state
