@@ -19,7 +19,6 @@ class CompressionSchemesManager:
             config: The main configuration object
             model: The model to apply compression to
             indexing: Model-specific indexing containing:
-            indexing: Model-specific indexing containing:
                 - block_configs: List of block configurations, each containing:
                     - name: Name of the block type (e.g., 'vision', 'text')
                     - num_blocks: Number of blocks
@@ -30,7 +29,6 @@ class CompressionSchemesManager:
         """
         self.config = config
         self.model = model
-        self.indexing = indexing
         self.indexing = indexing
         self.schemes = self._generate_schemes()
 
