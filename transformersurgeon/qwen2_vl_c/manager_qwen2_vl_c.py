@@ -1,5 +1,5 @@
 from ..utils import CompressionSchemesManager
-from .manager_config import QWEN2_VL_C_CONFIG
+from .indexing_qwen2_vl_c import QWEN2_VL_C_INDEXING
 
 class Qwen2VLCompressionSchemesManager(CompressionSchemesManager):
     """
@@ -8,6 +8,6 @@ class Qwen2VLCompressionSchemesManager(CompressionSchemesManager):
     """
     
     def __init__(self, config, model):
-        super().__init__(config, model, QWEN2_VL_C_CONFIG)
+        super().__init__(config, model, QWEN2_VL_C_INDEXING)
 
 __all__ = ["Qwen2VLCompressionSchemesManager"]

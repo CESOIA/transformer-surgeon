@@ -8,24 +8,23 @@ from test_messages import messages
 from qwen_vl_utils import process_vision_info
 
 ### TEST CONFIGURATION ###
-model_type = "qwen2_5_vl_c" 
+model_type = "qwen2_vl_c" 
 hard_mode = False
 ##########################
 
 if model_type == "qwen2_vl_c":
-    # from transformersurgeon import (
-    #     Qwen2VLForConditionalGenerationCompress,
-    #     Qwen2VLConfigCompress,
-    #     Qwen2VLCompressionSchemesManager,
-    # )
+    from transformersurgeon import (
+        Qwen2VLForConditionalGenerationCompress,
+        Qwen2VLConfigCompress,
+        Qwen2VLCompressionSchemesManager,
+    )
 
-    # modelClass = Qwen2VLForConditionalGenerationCompress
-    # configClass = Qwen2VLConfigCompress
-    # managerClass = Qwen2VLCompressionSchemesManager
+    modelClass = Qwen2VLForConditionalGenerationCompress
+    configClass = Qwen2VLConfigCompress
+    managerClass = Qwen2VLCompressionSchemesManager
 
-    # # Model name
-    # model_name = "Qwen/Qwen2-VL-7B-Instruct"
-    raise NotImplementedError("Qwen2-VL-C support is currently deprecated.")
+    # Model name
+    model_name = "Qwen/Qwen2-VL-7B-Instruct"
 elif model_type == "qwen2_5_vl_c":
     from transformersurgeon import (
         Qwen2_5_VLForConditionalGenerationCompress,
