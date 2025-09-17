@@ -6,10 +6,13 @@ from transformers import (
 )
 from test_messages import messages
 from qwen_vl_utils import process_vision_info
+import sys
 
 ### TEST CONFIGURATION ###
 model_type = "qwen2_vl_c" 
 hard_mode = False
+use_vcon = True  # Whether to use VCON blocks
+vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
 ##########################
 
 if model_type == "qwen2_vl_c":
@@ -40,7 +43,15 @@ elif model_type == "qwen2_5_vl_c":
     model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # Device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Get GPU number from command line arguments
+gpu_num = 0  # Default GPU
+if len(sys.argv) > 1:
+    try:
+        gpu_num = int(sys.argv[1])
+    except ValueError:
+        print(f"Invalid GPU number '{sys.argv[1]}', using default GPU 0.")
+
+device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 
 # Load processor, model and tokenizer
 processor = AutoProcessor.from_pretrained(model_name)
@@ -59,8 +70,14 @@ compress_config = configClass.from_dict(config_dict)
 # Initialize the CompressionSchemesManager with the model and configuration
 manager = managerClass(compress_config.to_dict(), model)
 
-print(model) # print the model architecture
 print(manager) # print the full compression configuration
+
+if use_vcon:
+    # Initialize VCON blocks for all modules
+    manager.init_vcon_all(verbose=True)
+
+    # Set the beta value for all VCON blocks
+    manager.set_vcon_beta_all(vcon_beta)
 
 # Apply all compression schemes to the model (soft mode)
 manager.apply_all(hard=hard_mode, verbose=True)
@@ -68,6 +85,8 @@ manager.apply_all(hard=hard_mode, verbose=True)
 if hard_mode:
     # Apply configuration to the model - needed for hard mode
     model.config = compress_config
+
+print(model) # print the model architecture
 
 # After applying compression with soft mode, you can revert the model to its original state if needed
 # manager.restore_all()  # Uncomment this line if you want to restore the model to its original state
