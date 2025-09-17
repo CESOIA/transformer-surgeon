@@ -1,5 +1,8 @@
+import copy
+import inspect
 import torch
 import torch.nn.utils.prune as prune
+from .VCONBlock import VCONBlock
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
 # but this is not easy for skip connections, e.g., residual connections in transformers
@@ -21,7 +24,7 @@ class CompressionScheme:
 
         self.hard_applied = False # this flags the compression as non-reversible
         self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize
-
+        self.vcon_initialized = False # this flags if the VCONBlock has been initialized
 
     def get_module(self):
         # Check if model has been provided
@@ -39,11 +42,119 @@ class CompressionScheme:
 
         return tmp_module
     
+    def set_module(self, new_module):
+        # Check if model has been provided
+        if not hasattr(self, 'model'):
+            raise ValueError("Model is not set. Please set the model before setting the module.")
+        
+        # Check if init_vcon has been called
+        if self.vcon_initialized:
+            raise ValueError("Cannot set module when VCONBlock is initialized. Please cancel VCON first.")
+
+        split_path = self.path.split('.')
+        # Traverse the model iteratively to find the parent module
+        tmp_module = self.model
+        for path_piece in split_path[:-1]:
+            tmp_module = getattr(tmp_module, path_piece, None)
+
+            if tmp_module is None:
+                raise ValueError(f"Module at path '{self.path}' not found in the model.")
+        
+        # Set the new module at the specified path
+        setattr(tmp_module, split_path[-1], new_module)
+    
+    def _is_to_compress(self):
+        return (self.pruning_ratio > 0) or (self.lrd_rank and self.lrd_rank != "full")
+    
+    def _module_copy(self, module):
+        # Get the __init__ signature
+        sig = inspect.signature(type(module).__init__)
+        # Build kwargs from module attributes
+        kwargs = {}
+        for name, param in sig.parameters.items():
+            if name == 'self':
+                continue
+            if hasattr(module, name):
+                kwargs[name] = getattr(module, name)
+        # Create a new instance of the same class
+        module_copy = type(module)(**kwargs)
+        for name, param in module.named_parameters(recurse=False):
+            setattr(module_copy, name, torch.nn.Parameter(param.data.clone()))
+        for name, buf in module.named_buffers(recurse=False):
+            setattr(module_copy, name, buf.clone())
+        # Copy other attributes except parameters, buffers, and methods
+        for attr, value in module.__dict__.items():
+            if (
+                not attr.startswith('_')
+                and not isinstance(value, torch.nn.Parameter)
+                and not isinstance(value, torch.Tensor)
+                and not callable(value)
+            ):
+                try:
+                    setattr(module_copy, attr, copy.deepcopy(value))
+                except Exception:
+                    pass
+        return module_copy
+
+    def init_vcon(self, verbose=False):
+        """
+        Duplicate module and instantiate a VCONBlock
+        """   
+        # check if there is compression to be applied
+        if self._is_to_compress():
+            # check if compression is yet to be applied
+            if self.soft_applied or self.hard_applied:
+                raise ValueError("Cannot initialize VCONBlock after compression has been applied.")
+
+            module = self.get_module()
+            module_copy = self._module_copy(module)
+            vcon_block = VCONBlock(block_a=module, block_b=module_copy)
+            self.set_module(vcon_block)
+            if verbose:
+                print(f"Initialized VCONBlock at {self.path}")  
+            self.vcon_initialized = True
+
+    def cancel_vcon(self, keep_block_b=True, verbose=False):
+        """
+        Removes the VCONBlock and keeps either block_a or block_b.
+        """   
+        if not self.vcon_initialized:
+            raise ValueError("VCONBlock is not initialized, cannot cancel.")
+        
+        module = self.get_module()
+        if keep_block_b:
+            module = module.block_b
+        else:
+            module = module.block_a
+        
+        self.set_module(module)
+
+        if verbose:
+            kept = "block_b" if keep_block_b else "block_a"
+            print(f"Cancelled VCONBlock at {self.path}, kept {kept}.")  
+        self.vcon_initialized = False
+
+    def set_vcon_beta(self, beta: float):
+        """
+        Sets the beta value of the VCONBlock to control the contribution of each block.
+        """   
+        if not self.vcon_initialized:
+            raise ValueError("VCONBlock is not initialized, cannot set beta.")
+        
+        module = self.get_module() # get the VCONBlock
+        module.set_beta(beta)
+        
     def apply(self, hard=False, verbose=False):
         """       
         Applies pruning and LRD to the module specified by the path.
+        If the module is wrapped in a VCONBlock, this is applied only to the second block (block_b).
         """
+        if not self._is_to_compress():
+            return # nothing to apply
+        
         module = self.get_module()
+        if self.vcon_initialized:
+            module = module.block_b # apply to block_b only
         
         # Apply magnitude-based structured pruning
         if self.pruning_ratio > 0:
@@ -60,7 +171,7 @@ class CompressionScheme:
             if self.soft_applied:
                 prune_mask = self.module.prune_mask
             else:
-                prune_mask, kept = self._structured_pruning(norm=2, pruning_ratio=self.pruning_ratio)
+                prune_mask, kept = self._structured_pruning(module, norm=2, pruning_ratio=self.pruning_ratio)
             
             if hard:
                 # Apply hard pruning by removing the pruned rows
@@ -93,24 +204,25 @@ class CompressionScheme:
             
             if not self.soft_applied:
                 # Replace the original weight with the decomposed weights
-                W1, W2 = self._low_rank_decomposition(self.lrd_rank)
+                W1, W2 = self._low_rank_decomposition(module, self.lrd_rank)
                 newW = torch.concat((W1, W2.t()), dim=0)
                 module.weight.data = newW
                 module.set_lrd_rank(self.lrd_rank)
 
             self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
-            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted        
+            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted    
 
     def restore(self, verbose=False):
         """
         Restores the original module by removing pruning and LRD.
+        If the module is wrapped in a VCONBlock, this is applied only to the second block (block_b).
         """
         if self.hard_applied:
             raise ValueError("Cannot restore a module that has been hard applied (non-reversible changes).")
         
         module = self.get_module()
-        if module is None:
-            raise ValueError(f"Module at path '{self.path}' not found in the model.")
+        if self.vcon_initialized:
+            module = module.block_b # apply to block_b only
         
         if hasattr(module, 'weight_original') or module.prune_mask is not None:
             if verbose:
@@ -132,7 +244,7 @@ class CompressionScheme:
                 f"lrd_rank={self.lrd_rank}, is_qkv_concatenated={self.is_qkv_concatenated}, "
                 f"module={self.module.__class__.__name__ if self.module else None})")
 
-    def _structured_pruning(self, norm=2, pruning_ratio=0.0) -> torch.Tensor:
+    def _structured_pruning(self, module, norm=2, pruning_ratio=0.0) -> torch.Tensor:
         """
         Returns a mask for structured pruning based on the specified norm.
         This function generates a binary mask that can be applied to the weight tensor
@@ -145,7 +257,6 @@ class CompressionScheme:
             torch.Tensor: A binary mask vector with the same number of elements as the rows of the weight tensor.
             kept (int): Number of rows kept after pruning.
         """
-        module = self.get_module()
         weight = module.weight.data
 
         if pruning_ratio <= 0.0:
@@ -179,7 +290,7 @@ class CompressionScheme:
         
         return mask, kept
 
-    def _low_rank_decomposition(self, rank: int) -> torch.Tensor:
+    def _low_rank_decomposition(self, module, rank: int) -> torch.Tensor:
         """
         Performs low-rank decomposition on the given weight matrix using SVD.
         Args:
@@ -189,7 +300,7 @@ class CompressionScheme:
             torch.Tensor: The first matrix of the low-rank decomposition.
             torch.Tensor: The second matrix of the low-rank decomposition.
         """
-        weight = self.get_module().weight.data
+        weight = module.weight.data
 
         if rank >= min(weight.size()):
             # No decomposition possible, launch error

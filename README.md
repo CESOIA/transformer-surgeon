@@ -1,6 +1,6 @@
 # transformer-surgeon
 
-Transformer models library with compression options
+Transformer models library with compression options 🪡
 
 ## Overview
 
@@ -20,24 +20,21 @@ It supports structured pruning, low-rank decomposition, and flexible configurati
 - **QKV concatenated layer support** for attention mechanisms
 - **Easy integration** with HuggingFace Transformers
 
-## New in this Version
-
 ### 🔧 **Generic Compression Manager**
 - `CompressionSchemesManager`: Universal compression manager that works with any transformer architecture
 - Model-specific configurations through simple config dictionaries
 - Support for multiple block types (vision, text) in the same model
 
-### 🧮 **LinearLRD Layer**
+### 🧮 **LinearCompression Layer**
 - Drop-in replacement for `nn.Linear` with built-in low-rank decomposition
 - Configurable rank: integer values or "full" for no decomposition
-- Integrated pruning mask support
+- Integrated pruning mask support (WIP)
 - Maintains same interface as standard linear layers
 
-### ⚙️ **Advanced Configuration**
-- Automatic dimension calculation based on pruning ratios
-- Support for skip connection management
-- Flexible key mapping system for different layer types
-- Validation and error checking for configuration parameters
+### 🌗 **Vanishing Contributions (VCON)**
+- Drop-in replacement of layers with VCONBlock
+- Perform affine combination of original full size block and compressed block
+- Revert VCONBlock placement with the original full layer or with the compressed (and fine-tuned) layer
 
 ### 🔄 **Reversible Operations**
 - **Soft application**: Compression can be reversed (restores original weights)
@@ -51,7 +48,6 @@ git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
 pip install -e .
 ```
-
 
 ## Quick Start
 
@@ -105,6 +101,32 @@ print(manager)
 - **Flexible compression configuration**: You can customize the compression of each layer and block independently
 - **QKV concatenated support**: Special handling for attention layer concatenated projections
 - **Multi-block architectures**: Support for vision + text models
+
+## Vanishing Contribution (VCON) Blocks
+
+**Vanishing Contribution (VCON)** is a mechanism for smoothly transitioning a model from its original (uncompressed) state to a compressed version.  
+A `VCONBlock` wraps both the original and compressed modules, and combines their outputs using an affine combination controlled by a parameter `beta`. By gradually adjusting `beta` from `1` (full contribution from the original block) to `0` (full contribution from the compressed block), you can interpolate between the two representations during training.
+
+### Example Usage
+
+See [`test/qwen_tests/inference_test.py`](test/qwen_tests/inference_test.py) for a complete example.
+
+```python
+# Initialize VCON blocks for all modules: modules are duplicated (only where needed) and put in parallel
+manager.init_vcon_all(verbose=True)
+
+# Apply all compression schemes to the model (soft mode, reversible)
+# This is applied only to one of the two parallelized blocks
+manager.apply_all(hard=False, verbose=True)
+
+# Set the beta value for all VCON blocks (e.g., 0.5 for equal contribution of the two parallel blocks)
+manager.set_vcon_beta_all(0.5)
+```
+
+During training, you can gradually decrease `beta` from `1` to `0` to smoothly shift the model from the original to the compressed architecture.
+
+---
+
 
 ## Architecture Support
 

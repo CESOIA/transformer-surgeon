@@ -32,6 +32,28 @@ class CompressionSchemesManager:
         self.indexing = indexing
         self.schemes = self._generate_schemes()
 
+    def init_vcon_all(self, verbose=False):
+        """
+        Initializes VCON blocks for all modules
+        """
+        for scheme in self:
+            scheme.init_vcon(verbose=verbose)
+
+    def set_vcon_beta_all(self, beta: float):
+        """
+        Sets the beta value for all VCON-initialized blocks
+        """
+        for scheme in self:
+            if scheme.vcon_initialized:
+                scheme.set_vcon_beta(beta)
+        
+    def cancel_vcon_all(self, keep_block_b=True, verbose=False):
+        """
+        Cancels VCON blocks for all modules, keeping either block_a or block_b
+        """
+        for scheme in self:
+            scheme.cancel_vcon(keep_block_b=keep_block_b, verbose=verbose)
+
     def apply_all(self, hard=False, verbose=False):
         """
         Applies all compression schemes to their respective modules in the model.
