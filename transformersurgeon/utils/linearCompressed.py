@@ -8,7 +8,7 @@ from typing import Union
 #   when using low-rank decomposition, concatenate the two decomposed matrices into a single weight tensor.
 #   weight = torch.cat((weightA, weightB.T), dim=0)
 
-class LinearLRD(nn.Linear):
+class LinearCompressed(nn.Linear):
     def __init__(self, 
                  in_features, 
                  out_features,
@@ -16,6 +16,7 @@ class LinearLRD(nn.Linear):
                  lrd_rank: Union[int, str] = "full"):
         
         self.prune_mask = None  # To be set externally if needed
+        self.beta_vcon = None  # To be set externally if needed
 
         self.lrd_rank = self._check_rank(lrd_rank)
                 
@@ -57,7 +58,7 @@ class LinearLRD(nn.Linear):
             return output
         # Manage value errors
         else:
-            raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")
+            raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")    
         
     def set_lrd_rank(self, rank: Union[int, str]):
         self.lrd_rank = self._check_rank(rank)
@@ -85,4 +86,4 @@ class LinearLRD(nn.Linear):
     def __str__(self):
         return self.__repr__()
     
-__all__ = ["LinearLRD"]
+__all__ = ["LinearCompressed"]
