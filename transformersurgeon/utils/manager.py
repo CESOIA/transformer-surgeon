@@ -231,6 +231,7 @@ class CompressionSchemesManager:
     def iter_filtered(self, criteria:list=None):
         """
         Yields CompressionScheme objects filtered by name and/or block_id.
+
         Args:
             criteria (list): List of criteria to filter schemes. If even one of the criteria is not met, the scheme is skipped. Can include:
                 - int: Block ID to match

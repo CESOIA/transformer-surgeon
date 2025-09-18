@@ -166,8 +166,10 @@ class CompressionScheme:
         replaced with the VCONBlock. If `verbose` is True, a message indicating
         successful initialization is printed. The method sets the `vcon_initialized`
         flag to True upon completion.
+
         Raises:
             ValueError: If compression has already been applied (either soft or hard).
+            
         Args:
             verbose (bool, optional): If True, prints a message upon successful initialization.
         """   
@@ -191,13 +193,16 @@ class CompressionScheme:
         This method replaces the current module containing a VCONBlock with either its `block_a` or `block_b` submodule,
         depending on the value of `keep_block_b`. It also updates the internal state to reflect that the VCONBlock
         is no longer initialized.
+
         Args:
             keep_block_b (bool, optional): If True, retains `block_b` after cancellation; otherwise, retains `block_a`.
                 Defaults to True.
             verbose (bool, optional): If True, prints a message indicating which block was kept and the path of the module.
                 Defaults to False.
+
         Raises:
             ValueError: If the VCONBlock is not initialized and cancellation is attempted.
+
         Side Effects:
             - Replaces the current module with the selected block.
             - Updates `self.vcon_initialized` to False.
@@ -225,12 +230,14 @@ class CompressionScheme:
         Set the beta value for the VCONBlock module.
         This method updates the beta parameter of the VCONBlock, which controls the contribution
         of each block in the model. The VCONBlock must be initialized before calling this method.
+
         Args:
             beta (float): The new beta value to set for the VCONBlock.
-            verbose (bool, optional): If True, prints a message indicating the beta value has been set.
-                Defaults to False.
+            verbose (bool, optional): If True, prints a message indicating the beta value has been set. Defaults to False.
+
         Raises:
             ValueError: If the VCONBlock is not initialized.
+
         Example:
             >>> obj.set_vcon_beta(0.5, verbose=True)
             Set VCONBlock beta to 0.5 at <path>.
@@ -249,8 +256,10 @@ class CompressionScheme:
         Freezes the parameters of the `block_a` submodule within a VCONBlock to prevent them from being updated during training.
         This method sets `requires_grad` to `False` for all parameters in `block_a`, effectively freezing them.
         It is typically used when you want to exclude the uncompressed part of the VCONBlock from optimization.
+
         Args:
             verbose (bool, optional): If True, prints a message indicating that the parameters have been frozen. Default is False.
+
         Raises:
             ValueError: If the VCONBlock has not been initialized (`self.vcon_initialized` is False).
         """
@@ -266,21 +275,26 @@ class CompressionScheme:
     def apply(self, hard=False, verbose=False):
         """
         Applies magnitude-based structured pruning and Low Rank Decomposition (LRD) to the target module.
+
         Pruning:
             - If `pruning_ratio` > 0, performs structured pruning on the module's weights.
             - If `hard` is True, pruned rows are permanently removed from the module's weights and biases.
             - If `hard` is False, a prune mask is set for soft pruning (reversible).
             - Pruning is only applied once unless `hard` is specified after a soft application.
+
         Low Rank Decomposition (LRD):
             - If `lrd_rank` is set and not "full", applies LRD to the module's weights.
             - If `hard` is False, stores the original weight matrix for possible restoration.
             - If `hard` is True, removes the stored original weight matrix.
             - LRD is only applied once unless `hard` is specified after a soft application.
+
         VCONBlock Handling:
             - If the module is wrapped in a VCONBlock, compression is applied only to the second block (`block_b`).
+
         Parameters:
             hard (bool): If True, applies irreversible (hard) changes to the module. If False, applies reversible (soft) changes.
             verbose (bool): If True, prints detailed information about the application process.
+
         Returns:
             None
         """       
@@ -353,8 +367,13 @@ class CompressionScheme:
         Restores the original state of the module by removing pruning and Low-Rank Decomposition (LRD) modifications.
         If the module is wrapped in a VCONBlock, restoration is applied only to the second block (`block_b`).
         The function reverses any soft-applied changes, such as pruning masks and LRD, but raises an error if hard-applied (non-reversible) changes have been made.
+
         Args:
             verbose (bool, optional): If True, prints information about the restoration process. Defaults to False.
+
+        Args:
+            verbose (bool, optional): If True, prints information about the restoration process. Defaults to False.
+
         Raises:
             ValueError: If the module has been hard applied and cannot be restored.
         """
@@ -391,10 +410,12 @@ class CompressionScheme:
         Returns a mask for structured pruning based on the specified norm.
         This function generates a binary mask that can be applied to the weight tensor
         to zero out entire rows (structured pruning) based on their L2 norm.
+
         Args:
             module (torch.nn.Module): The module containing the weight tensor to be pruned.
             norm (int): The norm to use for calculating the importance of rows. Default is 2 (L2 norm).
             pruning_ratio (float): The ratio of rows to prune (between 0 and 1). Default is 0.0 (no pruning).
+
         Returns:
             torch.Tensor: A binary mask vector with the same number of elements as the rows of the weight tensor.
             kept (int): Number of rows kept after pruning.
@@ -435,9 +456,11 @@ class CompressionScheme:
     def _low_rank_decomposition(self, module, rank: int) -> torch.Tensor:
         """
         Performs low-rank decomposition on the given weight matrix using SVD.
+
         Args:
             weight (torch.Tensor): The weight matrix to be decomposed.
             rank (int): The target rank for the decomposition.
+
         Returns:
             torch.Tensor: The first matrix of the low-rank decomposition.
             torch.Tensor: The second matrix of the low-rank decomposition.
