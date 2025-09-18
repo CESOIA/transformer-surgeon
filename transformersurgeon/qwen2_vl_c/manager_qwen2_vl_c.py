@@ -3,8 +3,8 @@ from .indexing_qwen2_vl_c import QWEN2_VL_C_INDEXING
 
 class Qwen2VLCompressionSchemesManager(CompressionSchemesManager):
     """
-    Backward compatible CompressionSchemesManager for Qwen2-VL-C.
-    This class is deprecated. Use create_compression_manager() instead.
+    Manager for compression schemes specific to Qwen2-VL models.
+    Refer to the base class `CompressionSchemesManager` for method details.
     """
     
     def __init__(self, config, model):
