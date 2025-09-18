@@ -9,6 +9,20 @@ from typing import Union
 #   weight = torch.cat((weightA, weightB.T), dim=0)
 
 class LinearCompressed(nn.Linear):
+    """
+    Linear layer with low-rank decomposition and optional structured pruning.
+    Args:
+        in_features (int): Size of each input sample.
+        out_features (int): Size of each output sample.
+        bias (bool): If set to False, the layer will not learn an additive bias. Default: False.
+        lrd_rank (int or str): Rank for low-rank decomposition. Use a positive integer for the rank or "full" for no decomposition. Default: "full".
+
+    Note: when low-rank decomposition is used, the weight matrix is split into two parts.
+        When using low-rank decomposition, concatenate the two decomposed matrices into a single weight tensor.
+            weight = torch.cat((weightA, weightB.T), dim=0)
+        where weightA has shape (lrd_rank, in_features) and weightB has shape (out_features, lrd_rank).
+        
+    """
     def __init__(self, 
                  in_features, 
                  out_features,
@@ -16,7 +30,6 @@ class LinearCompressed(nn.Linear):
                  lrd_rank: Union[int, str] = "full"):
         
         self.prune_mask = None  # To be set externally if needed
-        self.beta_vcon = None  # To be set externally if needed
 
         self.lrd_rank = self._check_rank(lrd_rank)
                 

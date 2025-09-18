@@ -5,13 +5,24 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-def _validate_pruning_ratio(ratio: float, name: str = "pruning_ratio") -> None:
-    """Validate that pruning ratio is between 0.0 and 1.0."""
+def _validate_pruning_ratio(ratio: float) -> None:
+    """
+    Validate that pruning ratio is between 0.0 and 1.0.
+    Args:
+        ratio (float): The pruning ratio to validate.
+    """
     if ratio is not None and not (0.0 <= ratio <= 1.0):
-        raise ValueError(f"{name} must be between 0.0 and 1.0, but got {ratio}.")
+        raise ValueError(f"Pruning ratio must be between 0.0 and 1.0, but got {ratio}.")
 
 def _expand_scalar_to_list(config_dict: Dict[str, Any], total_blocks: int) -> Dict[str, List]:
-    """Convert scalar values in config dict to lists with equal values."""
+    """
+    Convert scalar values in config dict to lists with equal values.
+    Args:
+        config_dict (Dict[str, Any]): The configuration dictionary.
+        total_blocks (int): The total number of transformer blocks.
+    Returns:
+        Dict[str, List]: The updated configuration dictionary with lists.
+    """
     if config_dict is not None:
         for key, value in config_dict.items():
             if isinstance(value, (int, bool, float, str)):
@@ -19,7 +30,13 @@ def _expand_scalar_to_list(config_dict: Dict[str, Any], total_blocks: int) -> Di
     return config_dict
 
 def _apply_general_keys(config_dict: Dict[str, Any], target_dict: Dict[str, List], key_mappings: Dict[str, List[str]]) -> None:
-    """Apply general-type keys to substitute specific layer types."""
+    """
+    Apply general-type keys to substitute specific layer types.
+    Args:
+        config_dict (Dict[str, Any]): The input configuration dictionary with potential general keys.
+        target_dict (Dict[str, List]): The target configuration dictionary to update.
+        key_mappings (Dict[str, List[str]]): Mapping from general keys to specific layer types.
+    """
     if config_dict is not None:
         # Apply individual keys
         target_dict.update({k: v for k, v in config_dict.items() 

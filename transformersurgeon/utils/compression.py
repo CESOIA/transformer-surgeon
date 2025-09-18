@@ -2,6 +2,12 @@ import copy
 import inspect
 import torch
 import torch.nn.utils.prune as prune
+"""
+compression.py
+
+Provides the CompressionScheme class for managing structured pruning and low-rank decomposition of transformer blocks.
+"""
+
 from .VCONBlock import VCONBlock
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
@@ -9,12 +15,43 @@ from .VCONBlock import VCONBlock
 # Maybe it is possible to do so by storing the masks of the previouse layers and use torch.scatter (that might be supported in executorch) to insert zeros where needed
 
 class CompressionScheme:
+    """
+    Represents a compression scheme for a transformer block.
+
+    Args:
+        name (str): Name of the layer inside the block.
+        block_id (int): Block identifier.
+        path (str): Path to the block in the model.
+        pruning_ratio (float): Ratio for structured pruning.
+        lrd_rank (Union[int, str]): Rank for low-rank decomposition. Use "full" for no decomposition.
+        is_qkv_concatenated (bool, optional): Whether QKV layers are concatenated in the model definition.
+        model (torch.nn.Module, optional): Reference to the model.
+
+    Methods:
+        get_module: Returns the module at the specified path.
+        set_module: Sets a new module at the specified path.
+        _is_to_compress: Checks if compression should be applied.
+        _module_copy: Returns a copy of the module.
+        init_vcon: Initializes VCON block.
+        cancel_vcon: Cancels VCON block.
+        set_vcon_beta: Sets beta for VCON block.
+        freeze_uncompressed_vcon: Freezes uncompressed VCON block.
+        apply: Applies compression.
+        restore: Restores original module.
+        _structured_pruning: Performs structured pruning.
+        _low_rank_decomposition: Performs low-rank decomposition.
+    """
+
     def __init__(self,
+                 name,
+                 block_id,
                  path,
                  pruning_ratio, #output_paths, 
                  lrd_rank,
                  is_qkv_concatenated=False,
                  model=None):
+        self.name = name
+        self.block_id = block_id
         self.path = path
         self.pruning_ratio = pruning_ratio
         # self.output_paths = output_paths # blocks after this layer, input should be pruned accordingly
@@ -27,6 +64,9 @@ class CompressionScheme:
         self.vcon_initialized = False # this flags if the VCONBlock has been initialized
 
     def get_module(self):
+        """
+        Returns the module connected to the compression scheme.
+        """
         # Check if model has been provided
         if not hasattr(self, 'model'):
             raise ValueError("Model is not set. Please set the model before getting the module.")
@@ -43,6 +83,12 @@ class CompressionScheme:
         return tmp_module
     
     def set_module(self, new_module):
+        """
+        Sets a new module at the position specified by the compression scheme.
+
+        Args:
+            new_module (torch.nn.Module): The new module to set.
+        """
         # Check if model has been provided
         if not hasattr(self, 'model'):
             raise ValueError("Model is not set. Please set the model before setting the module.")
@@ -64,9 +110,24 @@ class CompressionScheme:
         setattr(tmp_module, split_path[-1], new_module)
     
     def _is_to_compress(self):
+        """
+        Checks if compression has been set for the module.
+
+        Returns:
+            bool: True if compression should be applied, False otherwise.
+        """
         return (self.pruning_ratio > 0) or (self.lrd_rank and self.lrd_rank != "full")
     
     def _module_copy(self, module):
+        """
+        Returns a hard copy of the module.
+
+        Args:
+            module (torch.nn.Module): Module to copy.
+
+        Returns:
+            torch.nn.Module: Copied module.
+        """
         # Get the __init__ signature
         sig = inspect.signature(type(module).__init__)
         # Build kwargs from module attributes
@@ -98,7 +159,17 @@ class CompressionScheme:
 
     def init_vcon(self, verbose=False):
         """
-        Duplicate module and instantiate a VCONBlock
+        Initializes a VCONBlock for the current module by duplicating it.
+        This method checks if compression is required and has not yet been applied.
+        If so, it creates a copy of the current module and instantiates a VCONBlock
+        with the original and copied modules as its components. The module is then
+        replaced with the VCONBlock. If `verbose` is True, a message indicating
+        successful initialization is printed. The method sets the `vcon_initialized`
+        flag to True upon completion.
+        Raises:
+            ValueError: If compression has already been applied (either soft or hard).
+        Args:
+            verbose (bool, optional): If True, prints a message upon successful initialization.
         """   
         # check if there is compression to be applied
         if self._is_to_compress():
@@ -116,8 +187,23 @@ class CompressionScheme:
 
     def cancel_vcon(self, keep_block_b=True, verbose=False):
         """
-        Removes the VCONBlock and keeps either block_a or block_b.
-        """   
+        Cancels and removes the VCONBlock from the module, retaining either `block_a` or `block_b`.
+        This method replaces the current module containing a VCONBlock with either its `block_a` or `block_b` submodule,
+        depending on the value of `keep_block_b`. It also updates the internal state to reflect that the VCONBlock
+        is no longer initialized.
+        Args:
+            keep_block_b (bool, optional): If True, retains `block_b` after cancellation; otherwise, retains `block_a`.
+                Defaults to True.
+            verbose (bool, optional): If True, prints a message indicating which block was kept and the path of the module.
+                Defaults to False.
+        Raises:
+            ValueError: If the VCONBlock is not initialized and cancellation is attempted.
+        Side Effects:
+            - Replaces the current module with the selected block.
+            - Updates `self.vcon_initialized` to False.
+            - Optionally prints a message if `verbose` is True.
+        """
+ 
         if not self.vcon_initialized:
             raise ValueError("VCONBlock is not initialized, cannot cancel.")
         
@@ -134,21 +220,71 @@ class CompressionScheme:
             print(f"Cancelled VCONBlock at {self.path}, kept {kept}.")  
         self.vcon_initialized = False
 
-    def set_vcon_beta(self, beta: float):
+    def set_vcon_beta(self, beta: float, verbose=False):
         """
-        Sets the beta value of the VCONBlock to control the contribution of each block.
-        """   
+        Set the beta value for the VCONBlock module.
+        This method updates the beta parameter of the VCONBlock, which controls the contribution
+        of each block in the model. The VCONBlock must be initialized before calling this method.
+        Args:
+            beta (float): The new beta value to set for the VCONBlock.
+            verbose (bool, optional): If True, prints a message indicating the beta value has been set.
+                Defaults to False.
+        Raises:
+            ValueError: If the VCONBlock is not initialized.
+        Example:
+            >>> obj.set_vcon_beta(0.5, verbose=True)
+            Set VCONBlock beta to 0.5 at <path>.
+        """
+
         if not self.vcon_initialized:
             raise ValueError("VCONBlock is not initialized, cannot set beta.")
         
         module = self.get_module() # get the VCONBlock
         module.set_beta(beta)
+        if verbose:
+            print(f"Set VCONBlock beta to {beta} at {self.path}.")
+
+    def freeze_uncompressed_vcon(self, verbose=False):
+        """
+        Freezes the parameters of the `block_a` submodule within a VCONBlock to prevent them from being updated during training.
+        This method sets `requires_grad` to `False` for all parameters in `block_a`, effectively freezing them.
+        It is typically used when you want to exclude the uncompressed part of the VCONBlock from optimization.
+        Args:
+            verbose (bool, optional): If True, prints a message indicating that the parameters have been frozen. Default is False.
+        Raises:
+            ValueError: If the VCONBlock has not been initialized (`self.vcon_initialized` is False).
+        """
+        if not self.vcon_initialized:
+            raise ValueError("VCONBlock is not initialized, cannot freeze uncompressed block.")
+        
+        module = self.get_module() # get the VCONBlock
+        for param in module.block_a.parameters():
+            param.requires_grad = False
+        if verbose:
+            print(f"Froze parameters of block_a in VCONBlock at {self.path}.")
         
     def apply(self, hard=False, verbose=False):
-        """       
-        Applies pruning and LRD to the module specified by the path.
-        If the module is wrapped in a VCONBlock, this is applied only to the second block (block_b).
         """
+        Applies magnitude-based structured pruning and Low Rank Decomposition (LRD) to the target module.
+        Pruning:
+            - If `pruning_ratio` > 0, performs structured pruning on the module's weights.
+            - If `hard` is True, pruned rows are permanently removed from the module's weights and biases.
+            - If `hard` is False, a prune mask is set for soft pruning (reversible).
+            - Pruning is only applied once unless `hard` is specified after a soft application.
+        Low Rank Decomposition (LRD):
+            - If `lrd_rank` is set and not "full", applies LRD to the module's weights.
+            - If `hard` is False, stores the original weight matrix for possible restoration.
+            - If `hard` is True, removes the stored original weight matrix.
+            - LRD is only applied once unless `hard` is specified after a soft application.
+        VCONBlock Handling:
+            - If the module is wrapped in a VCONBlock, compression is applied only to the second block (`block_b`).
+        Parameters:
+            hard (bool): If True, applies irreversible (hard) changes to the module. If False, applies reversible (soft) changes.
+            verbose (bool): If True, prints detailed information about the application process.
+        Returns:
+            None
+        """       
+
         if not self._is_to_compress():
             return # nothing to apply
         
@@ -214,8 +350,13 @@ class CompressionScheme:
 
     def restore(self, verbose=False):
         """
-        Restores the original module by removing pruning and LRD.
-        If the module is wrapped in a VCONBlock, this is applied only to the second block (block_b).
+        Restores the original state of the module by removing pruning and Low-Rank Decomposition (LRD) modifications.
+        If the module is wrapped in a VCONBlock, restoration is applied only to the second block (`block_b`).
+        The function reverses any soft-applied changes, such as pruning masks and LRD, but raises an error if hard-applied (non-reversible) changes have been made.
+        Args:
+            verbose (bool, optional): If True, prints information about the restoration process. Defaults to False.
+        Raises:
+            ValueError: If the module has been hard applied and cannot be restored.
         """
         if self.hard_applied:
             raise ValueError("Cannot restore a module that has been hard applied (non-reversible changes).")
@@ -240,7 +381,8 @@ class CompressionScheme:
         self.soft_applied = False # Reset the soft application flag
 
     def __repr__(self):
-        return (f"CompressionScheme(path={self.path}, pruning_ratio={self.pruning_ratio}, "
+        return (f"CompressionScheme(name={self.name}, block_id={self.block_id}, "
+                f"path={self.path}, pruning_ratio={self.pruning_ratio}, "
                 f"lrd_rank={self.lrd_rank}, is_qkv_concatenated={self.is_qkv_concatenated}, "
                 f"module={self.module.__class__.__name__ if self.module else None})")
 

@@ -1,11 +1,35 @@
+"""
+manager.py
+
+Provides the CompressionSchemesManager class for managing multiple compression schemes in transformer models.
+"""
+
 import torch
 from typing import Dict, List, Any
 from .compression import CompressionScheme
 
 class CompressionSchemesManager:
     """
-    Generic compression schemes manager that can be used across different models.
-    Model-specific configurations should be provided through indexing parameter.
+    Manages multiple compression schemes for transformer models.
+
+    Args:
+        config (Dict[str, Any]): Configuration dictionary for compression. You can use model.config.to_dict() to get this.
+        model (torch.nn.Module): The model to be compressed.
+        indexing (List[Dict[str, Any]]): List of block-specific configuration dictionaries.
+
+    Methods:
+        init_vcon: Initialize VCON blocks for selected modules.
+        cancel_vcon: Remove VCON blocks and restore original modules.
+        set_vcon_beta: Set the beta parameter for VCON blocks.
+        freeze_uncompressed_vcon: Freeze original blocks in VCON.
+        apply: Apply compression schemes to the model.
+        restore: Restore the model to its original state.
+        init_vcon_all: Initialize VCON for all modules.
+        cancel_vcon_all: Cancel VCON for all modules.
+        set_vcon_beta_all: Set beta for all VCON blocks.
+        freeze_uncompressed_vcon_all: Freeze all uncompressed VCON blocks.
+        apply_all: Apply all compression schemes.
+        restore_all: Restore all modules.
     """
     
     def __init__(self,
@@ -32,45 +56,119 @@ class CompressionSchemesManager:
         self.indexing = indexing
         self.schemes = self._generate_schemes()
 
-    def init_vcon_all(self, verbose=False):
+    def init_vcon(self, criteria=None, verbose=False):
         """
-        Initializes VCON blocks for all modules
+        Initializes VCON blocks for filtered modules
+
+        Args:
+            criteria: List of criteria to filter modules (by name or block_id)
+            verbose: If True, prints information about the initialization process
         """
-        for scheme in self:
+        for scheme in self.iter_filtered(criteria=criteria):
             scheme.init_vcon(verbose=verbose)
 
-    def set_vcon_beta_all(self, beta: float):
+    def cancel_vcon(self, criteria=None, keep_block_b=True, verbose=False):
         """
-        Sets the beta value for all VCON-initialized blocks
+        Cancels VCON blocks for filtered modules, keeping either block_a or block_b
+
+        Args:
+            criteria: List of criteria to filter modules (by name or block_id)
+            keep_block_b: If True, keeps the compressed block (block_b); otherwise keeps the original block (block_a)
+            verbose: If True, prints information about the cancellation process
         """
-        for scheme in self:
+        for scheme in self.iter_filtered(criteria=criteria):
+            scheme.cancel_vcon(keep_block_b=keep_block_b, verbose=verbose)
+
+    def set_vcon_beta(self, beta: float, criteria=None, verbose=False):
+        """
+        Sets the beta value for filtered VCON-initialized blocks
+
+        Args:
+            beta: The beta value to set (0 <= beta <= 1)
+            criteria: List of criteria to filter modules (by name or block_id)
+            verbose: If True, prints information about the beta setting process
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
             if scheme.vcon_initialized:
-                scheme.set_vcon_beta(beta)
-        
+                scheme.set_vcon_beta(beta, verbose=verbose)
+
+    def freeze_uncompressed_vcon(self, criteria=None, verbose=False):
+        """
+        Freezes uncompressed blocks in filtered VCON-initialized modules
+
+        Args:
+            criteria: List of criteria to filter modules (by name or block_id)
+            verbose: If True, prints information about the freezing process
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            if scheme.vcon_initialized:
+                scheme.freeze_uncompressed_block(verbose=verbose)
+
+    def apply(self, criteria=None, hard=False, verbose=False):
+        """
+        Applies filtered compression schemes to their respective modules in the model.
+
+        Args:
+            criteria: List of criteria to filter modules (by name or block_id)
+            hard: If True, applies hard compression (non-reversible); if False, applies soft compression (reversible)
+            verbose: If True, prints information about the application process
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            scheme.apply(hard=hard, verbose=verbose)
+
+    def restore(self, criteria=None, verbose=False):
+        """
+        Restores filtered modules to their original state by removing pruning and LRD.
+
+        Args:
+            criteria: List of criteria to filter modules (by name or block_id)
+            verbose: If True, prints information about the restoration process
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            scheme.restore(verbose=verbose)
+
+    # aliases for "all" criteria
+    def init_vcon_all(self, verbose=False):
+        """
+        Alias for init_vcon with criteria set to "all"
+        """
+        self.init_vcon(criteria=["all"], verbose=verbose)
+
     def cancel_vcon_all(self, keep_block_b=True, verbose=False):
         """
-        Cancels VCON blocks for all modules, keeping either block_a or block_b
+        Alias for cancel_vcon with criteria set to "all"
         """
-        for scheme in self:
-            scheme.cancel_vcon(keep_block_b=keep_block_b, verbose=verbose)
+        self.cancel_vcon(criteria=["all"], keep_block_b=keep_block_b, verbose=verbose)
+
+    def set_vcon_beta_all(self, beta: float, verbose=False):
+        """
+        Alias for set_vcon_beta with criteria set to "all"
+        """
+        self.set_vcon_beta(beta, criteria=["all"], verbose=verbose)
+
+    def freeze_uncompressed_vcon_all(self, verbose=False):
+        """
+        Alias for freeze_uncompressed_vcon with criteria set to "all"
+        """
+        self.freeze_uncompressed_vcon(criteria=["all"], verbose=verbose)
 
     def apply_all(self, hard=False, verbose=False):
         """
-        Applies all compression schemes to their respective modules in the model.
+        Alias for apply with criteria set to "all"
         """
-        for scheme in self:
-            scheme.apply(hard=hard, verbose=verbose)
-
+        self.apply(criteria=["all"], hard=hard, verbose=verbose)
+        
     def restore_all(self, verbose=False):
         """
-        Restores all modules to their original state by removing pruning and LRD.
+        Alias for restore with criteria set to "all"
         """
-        for scheme in self:
-            scheme.restore(verbose=verbose)
+        self.restore(criteria=["all"], verbose=verbose)
 
     def _generate_schemes(self):
         """
         Generate compression schemes based on model configuration and indexing.
+        Returns:
+            Dict[str, List[Dict[str, CompressionScheme]]]: Nested dictionary of compression schemes organized by block type and block index.
         """
         all_schemes = {}
         
@@ -116,6 +214,8 @@ class CompressionSchemesManager:
                     is_qkv = key in is_qkv_concatenated if is_qkv_concatenated else False
                     
                     tmp_dict[key] = CompressionScheme(
+                        name=key,
+                        block_id=i,
                         path=full_path,
                         pruning_ratio=pruning_ratio,
                         lrd_rank=lrd_rank,
@@ -127,6 +227,36 @@ class CompressionSchemesManager:
             all_schemes[block_name] = block_schemes
         
         return all_schemes
+    
+    def iter_filtered(self, criteria:list=None):
+        """
+        Yields CompressionScheme objects filtered by name and/or block_id.
+        Args:
+            criteria (list): List of criteria to filter schemes. If even one of the criteria is not met, the scheme is skipped. Can include:
+                - int: Block ID to match
+                - str: Substring to match in the scheme name or path
+                - "all": Matches all schemes
+        """
+        if type(criteria) != list:
+            criteria = [criteria]
+        for scheme in self:
+            select = True
+            # Verify if all criteria are met
+            for crit in criteria:
+                if crit is None:
+                    continue
+                elif crit in ["all", "ALL"]:
+                    continue
+                elif isinstance(crit, int):
+                    if scheme.block_id != crit:
+                        select = False
+                        break
+                elif isinstance(crit, str):
+                    if crit not in scheme.name and crit not in scheme.path:
+                        select = False
+                        break
+            if select:
+                yield scheme
 
     def __iter__(self):
         """
@@ -143,18 +273,20 @@ class CompressionSchemesManager:
                     
     def __repr__(self):
         string = ""
-        string += "  Pruning Ratio   LRD Rank   QKV Concatenated   Path\n"
-        string += "|"+"-"*80 + "\n"
+        string += "  Name      Block id  Pruning Ratio   LRD Rank   QKV Concatenated   Path\n"
+        string += "|"+"-"*100 + "\n"
         for i, scheme in enumerate(self):
             if i % 2 == 1:
-                string += f"| {scheme.pruning_ratio:<14}| {scheme.lrd_rank:<9}| {str(scheme.is_qkv_concatenated):<17}| {scheme.path}\n"
+                string += f"| {scheme.name:<9}| {scheme.block_id:<10}| {scheme.pruning_ratio:<14}| {scheme.lrd_rank:<9}| {str(scheme.is_qkv_concatenated):<17}| {scheme.path:<50}|\n"
             else:
-                string += f"  {scheme.pruning_ratio:<15} {scheme.lrd_rank:<10} {str(scheme.is_qkv_concatenated):<18} {scheme.path}\n"
+                string += f"  {scheme.name:<9}  {scheme.block_id:<10}  {scheme.pruning_ratio:<14}  {scheme.lrd_rank:<9}  {str(scheme.is_qkv_concatenated):<17}  {scheme.path:<50} \n"
         return string
                     
     def _set_model(self, model):
         """
         Sets the model for each CompressionScheme in the manager.
+        Args:
+            model (torch.nn.Module): The model to set for each compression scheme.
         """       
         # Set the model for each compression scheme
         for scheme in self:

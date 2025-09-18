@@ -73,9 +73,6 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
 class Qwen2VLConfigCompress(Qwen2VLConfig):
     """
     Main configuration class for Qwen2VL with compression support.
-    
-    This configuration extends the original Qwen2VLConfig with compression capabilities
-    including structured pruning and low-rank decomposition (LRD).
     """
     
     sub_configs = {
