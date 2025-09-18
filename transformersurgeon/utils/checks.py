@@ -37,7 +37,7 @@ def get_validated_dict_value(dictionary, key, index, default, min_value=None, ma
         default: The default value to return if the key is missing or value is None.
         min_value: Minimum allowed value (inclusive).
         max_value: Maximum allowed value (inclusive).
-        
+
     Returns:
         The validated value or the default.
     """

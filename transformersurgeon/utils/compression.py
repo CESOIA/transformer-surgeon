@@ -169,7 +169,7 @@ class CompressionScheme:
 
         Raises:
             ValueError: If compression has already been applied (either soft or hard).
-
+            
         Args:
             verbose (bool, optional): If True, prints a message upon successful initialization.
         """   
@@ -367,6 +367,9 @@ class CompressionScheme:
         Restores the original state of the module by removing pruning and Low-Rank Decomposition (LRD) modifications.
         If the module is wrapped in a VCONBlock, restoration is applied only to the second block (`block_b`).
         The function reverses any soft-applied changes, such as pruning masks and LRD, but raises an error if hard-applied (non-reversible) changes have been made.
+
+        Args:
+            verbose (bool, optional): If True, prints information about the restoration process. Defaults to False.
 
         Args:
             verbose (bool, optional): If True, prints information about the restoration process. Defaults to False.

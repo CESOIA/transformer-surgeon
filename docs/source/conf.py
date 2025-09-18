@@ -18,6 +18,7 @@ author = 'Luciano Prono'
 
 extensions = ['sphinx.ext.autodoc', 'sphinx_autodoc_typehints']
 
+
 templates_path = ['_templates']
 exclude_patterns = []
 
