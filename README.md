@@ -7,6 +7,10 @@ Transformer models library with compression options 🪡
 **transformer-surgeon** is a PyTorch-based library for building, compressing, and experimenting with transformer models.  
 It supports structured pruning, low-rank decomposition, and flexible configuration for both vision and text transformer architectures.
 
+## Documentation
+
+- [API Reference](docs/build/html/index.html)
+
 ## Features
 
 - **Modular transformer blocks** for vision and text
