@@ -75,7 +75,9 @@ print(manager) # print the full compression configuration
 if use_vcon:
     # Initialize VCON blocks for all modules
     # manager.init_vcon_all(verbose=True)
-    manager.init_vcon(criteria=[3, "mlp"], verbose=True)  # Initialize VCON for specific layers
+    # manager.init_vcon(criteria=[3, "mlp"], verbose=True)  # Initialize VCON for specific layers
+    # manager.init_vcon(criteria="all", verbose=True)  # Initialize VCON for all (set to be compressed) layers
+    manager.init_vcon_all(verbose=True) # Initialize VCON for all (set to be compressed) layers
 
     # Set the beta value for all VCON blocks
     manager.set_vcon_beta_all(vcon_beta)
