@@ -17,7 +17,7 @@ The easiest way to install transformer-surgeon is using pip:
 
 .. code-block:: bash
 
-   pip install transformer-surgeon
+   pip install git+https://github.com/CESOIA/transformer-surgeon
 
 Installing from Source
 --------------------

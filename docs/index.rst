@@ -26,15 +26,12 @@ You can install transformer-surgeon using pip:
 
 .. code-block:: bash
 
-   pip install transformer-surgeon
+   pip install git+https://github.com/CESOIA/transformer-surgeon
 
 Quick Start
 ----------
 
-.. code-block:: python
-
-   import transformersurgeon
-   # Your code here
+WIP
 
 Indices and tables
 ==================
