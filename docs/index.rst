@@ -1,5 +1,5 @@
 Welcome to transformer-surgeon's documentation!
-=============================================
+===============================================
 
 **transformer-surgeon** is a Python package for transformer model compression and optimization tools.
 
@@ -20,7 +20,7 @@ Features
 * Optimization tools
 
 Installation
------------
+------------
 
 You can install transformer-surgeon using pip:
 
@@ -29,7 +29,7 @@ You can install transformer-surgeon using pip:
    pip install git+https://github.com/CESOIA/transformer-surgeon
 
 Quick Start
-----------
+-----------
 
 WIP
 

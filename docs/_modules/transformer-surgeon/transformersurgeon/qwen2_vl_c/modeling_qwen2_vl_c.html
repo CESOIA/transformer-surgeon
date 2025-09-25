@@ -5,7 +5,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>transformer-surgeon.transformersurgeon.qwen2_vl_c.modeling_qwen2_vl_c &mdash; transformer-surgeon 0.2.0 documentation</title>
+  <title>transformer-surgeon.transformersurgeon.qwen2_vl_c.modeling_qwen2_vl_c &mdash; transformer-surgeon 0.2.1 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/graphviz.css?v=4ae1632d" />
@@ -14,7 +14,7 @@
     <link rel="canonical" href="https://CESOIA.github.io/transformer-surgeon/_modules/transformer-surgeon/transformersurgeon/qwen2_vl_c/modeling_qwen2_vl_c.html" />
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../../../../_static/documentation_options.js?v=938c9ccc"></script>
+      <script src="../../../../_static/documentation_options.js?v=37f418d5"></script>
       <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../../_static/js/theme.js"></script>
@@ -554,10 +554,7 @@
 <a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/qwen2_vl_c/modeling_qwen2_vl_c/index.html#transformer-surgeon.transformersurgeon.Qwen2VLPreTrainedModelCompress.config">[docs]</a>
     <span class="n">config</span><span class="p">:</span> <span class="n">Qwen2VLConfigCompress</span></div>
 
-<div class="viewcode-block" id="Qwen2VLPreTrainedModelCompress._no_split_modules">
-<a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/qwen2_vl_c/modeling_qwen2_vl_c/index.html#transformer-surgeon.transformersurgeon.Qwen2VLPreTrainedModelCompress._no_split_modules">[docs]</a>
     <span class="n">_no_split_modules</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;Qwen2VLDecoderLayerCompress&quot;</span><span class="p">,</span> <span class="s2">&quot;Qwen2VLVisionBlockCompress&quot;</span><span class="p">]</span></div>
-</div>
 
 <span class="c1"># &lt;--- CESOIA modifications</span>
 
@@ -665,10 +662,7 @@
         <span class="p">)</span></div>
 
 <span class="c1"># &lt;--- CESOIA modifications</span>
-<div class="viewcode-block" id="Qwen2VLTextModelCompress._attn_implementation">
-<a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/qwen2_vl_c/modeling_qwen2_vl_c/index.html#transformer-surgeon.transformersurgeon.Qwen2VLTextModelCompress._attn_implementation">[docs]</a>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_attn_implementation</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">_attn_implementation</span></div>
-
+        <span class="bp">self</span><span class="o">.</span><span class="n">_attn_implementation</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">_attn_implementation</span>
 <div class="viewcode-block" id="Qwen2VLTextModelCompress.norm">
 <a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/qwen2_vl_c/modeling_qwen2_vl_c/index.html#transformer-surgeon.transformersurgeon.Qwen2VLTextModelCompress.norm">[docs]</a>
         <span class="bp">self</span><span class="o">.</span><span class="n">norm</span> <span class="o">=</span> <span class="n">Qwen2RMSNorm</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">rms_norm_eps</span><span class="p">)</span></div>

@@ -11,7 +11,7 @@ Requirements
 * qwen-vl-utils
 
 Installing from PyPI
--------------------
+--------------------
 
 The easiest way to install transformer-surgeon is using pip:
 
@@ -20,7 +20,7 @@ The easiest way to install transformer-surgeon is using pip:
    pip install git+https://github.com/CESOIA/transformer-surgeon
 
 Installing from Source
---------------------
+----------------------
 
 To install from source:
 
@@ -31,7 +31,7 @@ To install from source:
    pip install -e .
 
 Dependencies
------------
+------------
 
 The package automatically installs the following dependencies:
 

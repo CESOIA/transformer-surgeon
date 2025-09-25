@@ -5,7 +5,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>transformer-surgeon.transformersurgeon.utils.manager &mdash; transformer-surgeon 0.2.0 documentation</title>
+  <title>transformer-surgeon.transformersurgeon.utils.manager &mdash; transformer-surgeon 0.2.1 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/graphviz.css?v=4ae1632d" />
@@ -14,7 +14,7 @@
     <link rel="canonical" href="https://CESOIA.github.io/transformer-surgeon/_modules/transformer-surgeon/transformersurgeon/utils/manager.html" />
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../../../../_static/documentation_options.js?v=938c9ccc"></script>
+      <script src="../../../../_static/documentation_options.js?v=37f418d5"></script>
       <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../../_static/js/theme.js"></script>
@@ -289,8 +289,6 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">restore</span><span class="p">(</span><span class="n">criteria</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;all&quot;</span><span class="p">],</span> <span class="n">verbose</span><span class="o">=</span><span class="n">verbose</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="CompressionSchemesManager._generate_schemes">
-<a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/utils/manager/index.html#transformer-surgeon.transformersurgeon.utils.CompressionSchemesManager._generate_schemes">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">_generate_schemes</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Generate compression schemes based on model configuration and indexing.</span>
@@ -353,8 +351,7 @@
             
             <span class="n">all_schemes</span><span class="p">[</span><span class="n">block_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">block_schemes</span>
         
-        <span class="k">return</span> <span class="n">all_schemes</span></div>
-
+        <span class="k">return</span> <span class="n">all_schemes</span>
     
 <div class="viewcode-block" id="CompressionSchemesManager.iter_filtered">
 <a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/utils/manager/index.html#transformer-surgeon.transformersurgeon.utils.CompressionSchemesManager.iter_filtered">[docs]</a>
@@ -390,8 +387,6 @@
                 <span class="k">yield</span> <span class="n">scheme</span></div>
 
 
-<div class="viewcode-block" id="CompressionSchemesManager.__iter__">
-<a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/utils/manager/index.html#transformer-surgeon.transformersurgeon.utils.CompressionSchemesManager.__iter__">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Yields all CompressionScheme objects from the nested dictionaries.</span>
@@ -403,11 +398,8 @@
                     <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">scheme</span><span class="p">,</span> <span class="n">CompressionScheme</span><span class="p">):</span>
                         <span class="k">yield</span> <span class="n">scheme</span>
                     <span class="k">else</span><span class="p">:</span>
-                        <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Expected CompressionScheme, got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">scheme</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span></div>
-
+                        <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Expected CompressionScheme, got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">scheme</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
                     
-<div class="viewcode-block" id="CompressionSchemesManager.__repr__">
-<a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/utils/manager/index.html#transformer-surgeon.transformersurgeon.utils.CompressionSchemesManager.__repr__">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">string</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
         <span class="n">string</span> <span class="o">+=</span> <span class="s2">&quot;  Name      Block id  Pruning Ratio   LRD Rank   QKV Concatenated   Path</span><span class="se">\n</span><span class="s2">&quot;</span>
@@ -417,11 +409,8 @@
                 <span class="n">string</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;| </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;9</span><span class="si">}</span><span class="s2">| </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">block_id</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2">| </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">pruning_ratio</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2">| </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">lrd_rank</span><span class="si">:</span><span class="s2">&lt;9</span><span class="si">}</span><span class="s2">| </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">scheme</span><span class="o">.</span><span class="n">is_qkv_concatenated</span><span class="p">)</span><span class="si">:</span><span class="s2">&lt;17</span><span class="si">}</span><span class="s2">| </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">path</span><span class="si">:</span><span class="s2">&lt;50</span><span class="si">}</span><span class="s2">|</span><span class="se">\n</span><span class="s2">&quot;</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">string</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;  </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;9</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">block_id</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">pruning_ratio</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">lrd_rank</span><span class="si">:</span><span class="s2">&lt;9</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">scheme</span><span class="o">.</span><span class="n">is_qkv_concatenated</span><span class="p">)</span><span class="si">:</span><span class="s2">&lt;17</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">scheme</span><span class="o">.</span><span class="n">path</span><span class="si">:</span><span class="s2">&lt;50</span><span class="si">}</span><span class="s2"> </span><span class="se">\n</span><span class="s2">&quot;</span>
-        <span class="k">return</span> <span class="n">string</span></div>
-
+        <span class="k">return</span> <span class="n">string</span>
                     
-<div class="viewcode-block" id="CompressionSchemesManager._set_model">
-<a class="viewcode-back" href="../../../../api/transformer-surgeon/transformersurgeon/utils/manager/index.html#transformer-surgeon.transformersurgeon.utils.CompressionSchemesManager._set_model">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">_set_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Sets the model for each CompressionScheme in the manager.</span>
@@ -431,7 +420,6 @@
         <span class="c1"># Set the model for each compression scheme</span>
         <span class="k">for</span> <span class="n">scheme</span> <span class="ow">in</span> <span class="bp">self</span><span class="p">:</span>
             <span class="n">scheme</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">model</span></div>
-</div>
 
 
 <span class="n">__all__</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;CompressionSchemesManager&quot;</span><span class="p">]</span>

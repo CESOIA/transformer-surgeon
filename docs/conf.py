@@ -5,15 +5,27 @@
 
 import os
 import sys
+import re
 
 # Add the parent directory to the path so we can import the package
 sys.path.insert(0, os.path.abspath('..'))
+
+# Function to extract version from setup.py
+def get_version():
+    """Extract version from setup.py file."""
+    setup_py_path = os.path.join(os.path.dirname(__file__), '..', 'setup.py')
+    with open(setup_py_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+        version_match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', content)
+        if version_match:
+            return version_match.group(1)
+    return '0.0.0'  # fallback version
 
 # -- Project information -----------------------------------------------------
 project = 'transformer-surgeon'
 copyright = '2024, CESOIA'
 author = 'CESOIA'
-release = '0.2.0'
+release = get_version()
 
 # -- General configuration ---------------------------------------------------
 extensions = [
@@ -29,6 +41,8 @@ autoapi_dirs = ['../transformersurgeon']
 autoapi_root = 'api'
 autoapi_add_toctree_entry = True
 autoapi_generate_api_docs = True
+autoapi_template_dir = '_templates/autoapi'
+autoapi_options = ['members', 'undoc-members', 'show-inheritance', 'show-module-summary', 'imported-members']
 
 # Napoleon settings for Google/NumPy docstring styles
 napoleon_google_docstring = True
