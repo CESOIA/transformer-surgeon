@@ -9,7 +9,7 @@ It supports structured pruning, low-rank decomposition, and flexible configurati
 
 ## Documentation
 
-- [API Reference](docs/build/html/index.html)
+- [API Reference](https://cesoia.github.io/transformer-surgeon)
 
 ## Features
 
