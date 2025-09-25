@@ -12,7 +12,6 @@
       <link rel="stylesheet" type="text/css" href="../../../../../_static/graphviz.css?v=4ae1632d" />
 
   
-    <link rel="canonical" href="https://CESOIA.github.io/transformer-surgeon/api/transformer-surgeon/transformersurgeon/utils/compression/index.html" />
       <script src="../../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../../_static/documentation_options.js?v=938c9ccc"></script>
@@ -409,7 +408,10 @@ If the module is wrapped in a VCONBlock, restoration is applied only to the seco
 The function reverses any soft-applied changes, such as pruning masks and LRD, but raises an error if hard-applied (non-reversible) changes have been made.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>verbose</strong> (<em>bool</em><em>, </em><em>optional</em>) – If True, prints information about the restoration process. Defaults to False.</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>verbose</strong> (<em>bool</em><em>, </em><em>optional</em>) – If True, prints information about the restoration process. Defaults to False.</p></li>
+<li><p><strong>verbose</strong> – If True, prints information about the restoration process. Defaults to False.</p></li>
+</ul>
 </dd>
 <dt class="field-even">Raises<span class="colon">:</span></dt>
 <dd class="field-even"><p><strong>ValueError</strong> – If the module has been hard applied and cannot be restored.</p>

@@ -11,7 +11,6 @@
       <link rel="stylesheet" type="text/css" href="../../../../_static/graphviz.css?v=4ae1632d" />
 
   
-    <link rel="canonical" href="https://CESOIA.github.io/transformer-surgeon/_modules/transformer-surgeon/transformersurgeon/utils/compression.html" />
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=938c9ccc"></script>
@@ -290,7 +289,7 @@
 
 <span class="sd">        Raises:</span>
 <span class="sd">            ValueError: If compression has already been applied (either soft or hard).</span>
-
+<span class="sd">            </span>
 <span class="sd">        Args:</span>
 <span class="sd">            verbose (bool, optional): If True, prints a message upon successful initialization.</span>
 <span class="sd">        &quot;&quot;&quot;</span>   
@@ -503,6 +502,9 @@
 <span class="sd">        Restores the original state of the module by removing pruning and Low-Rank Decomposition (LRD) modifications.</span>
 <span class="sd">        If the module is wrapped in a VCONBlock, restoration is applied only to the second block (`block_b`).</span>
 <span class="sd">        The function reverses any soft-applied changes, such as pruning masks and LRD, but raises an error if hard-applied (non-reversible) changes have been made.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            verbose (bool, optional): If True, prints information about the restoration process. Defaults to False.</span>
 
 <span class="sd">        Args:</span>
 <span class="sd">            verbose (bool, optional): If True, prints information about the restoration process. Defaults to False.</span>

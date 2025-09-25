@@ -39,6 +39,7 @@ jobs:
         sphinx-build -b html . _build
         cp -r _build/* .
         rm -rf _build .doctrees .buildinfo
+        touch .nojekyll
 
     - name: Setup Pages
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
