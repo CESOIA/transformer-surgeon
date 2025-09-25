@@ -14,13 +14,8 @@ sphinx-build -b html . _build
 if [ -d "_build" ]; then
     cp -r _build/* .
     rm -rf _build .doctrees .buildinfo
-    
-    # Create .nojekyll file to prevent Jekyll processing
-    touch .nojekyll
-    
     echo "✅ Documentation rebuilt successfully!"
     echo "📂 Files are ready in docs/ directory for GitHub Pages"
-    echo "🚫 .nojekyll file created to prevent Jekyll interference"
 else
     echo "❌ Build failed!"
     exit 1
