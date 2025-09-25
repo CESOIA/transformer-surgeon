@@ -1,0 +1,196 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../../../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>transformer-surgeon.transformersurgeon.utils.VCONBlock &mdash; transformer-surgeon 0.2.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/graphviz.css?v=4ae1632d" />
+
+  
+    <link rel="canonical" href="https://CESOIA.github.io/transformer-surgeon/api/transformer-surgeon/transformersurgeon/utils/VCONBlock/index.html" />
+      <script src="../../../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../../../_static/documentation_options.js?v=938c9ccc"></script>
+      <script src="../../../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../../index.html" class="icon icon-home">
+            transformer-surgeon
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../quickstart.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../index.html">API Reference</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../../index.html">transformer-surgeon</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">transformer-surgeon.transformersurgeon.utils.VCONBlock</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../../../../_sources/api/transformer-surgeon/transformersurgeon/utils/VCONBlock/index.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="module-transformer-surgeon.transformersurgeon.utils.VCONBlock">
+<span id="transformer-surgeon-transformersurgeon-utils-vconblock"></span><h1>transformer-surgeon.transformersurgeon.utils.VCONBlock<a class="headerlink" href="#module-transformer-surgeon.transformersurgeon.utils.VCONBlock" title="Link to this heading"></a></h1>
+<p>VCONBlock.py</p>
+<p>Defines the VCONBlock class for vanishing contribution blocks, enabling smooth transitions between original and compressed modules.</p>
+<section id="classes">
+<h2>Classes<a class="headerlink" href="#classes" title="Link to this heading"></a></h2>
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock" title="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock"><code class="xref py py-obj docutils literal notranslate"><span class="pre">VCONBlock</span></code></a></p></td>
+<td><p>Vanishing Contribution Block (VCONBlock).</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="module-contents">
+<h2>Module Contents<a class="headerlink" href="#module-contents" title="Link to this heading"></a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock">
+<em class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">transformer-surgeon.transformersurgeon.utils.VCONBlock.</span></span><span class="sig-name descname"><span class="pre">VCONBlock</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block_a</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">torch.nn.Module</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">block_b</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">torch.nn.Module</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock" title="Link to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-obj docutils literal notranslate"><span class="pre">torch.nn.Module</span></code></p>
+<p>Vanishing Contribution Block (VCONBlock).</p>
+<p>Combines the outputs of the original and compressed modules using an affine combination controlled by beta.
+When beta=1, the output is from the original module (block_a); when beta=0, the output is from the compressed module (block_b).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>original_module</strong> (<em>nn.Module</em>) – The original (uncompressed) module.</p></li>
+<li><p><strong>compressed_module</strong> (<em>nn.Module</em>) – The compressed module.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.forward">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.forward" title="Link to this definition"></a></dt>
+<dd><p>Computes the affine combination of original and compressed outputs.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.set_beta">
+<span class="sig-name descname"><span class="pre">set_beta</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.set_beta"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.set_beta" title="Link to this definition"></a></dt>
+<dd><p>Sets the beta parameter.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.block_a">
+<span class="sig-name descname"><span class="pre">block_a</span></span><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.block_a"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.block_a" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.block_b">
+<span class="sig-name descname"><span class="pre">block_b</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.block_b"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.block_b" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.beta">
+<span class="sig-name descname"><span class="pre">beta</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.beta"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.beta" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="id0">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">torch.Tensor</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">torch.Tensor</span></span></span><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#id0" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="id1">
+<span class="sig-name descname"><span class="pre">set_beta</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">beta</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.set_beta"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#id1" title="Link to this definition"></a></dt>
+<dd><dl class="simple">
+<dt>Sets the beta parameter for the VCON block.</dt><dd><dl class="simple">
+<dt>Args:</dt><dd><p>beta (float): The beta value to set (0 &lt;= beta &lt;= 1).</p>
+</dd>
+<dt>Raises:</dt><dd><p>ValueError: If beta is not in the range [0, 1].</p>
+</dd>
+</dl>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.__repr__">
+<span class="sig-name descname"><span class="pre">__repr__</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.__repr__"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.__repr__" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.__str__">
+<span class="sig-name descname"><span class="pre">__str__</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../../../../../_modules/transformer-surgeon/transformersurgeon/utils/VCONBlock.html#VCONBlock.__str__"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#transformer-surgeon.transformersurgeon.utils.VCONBlock.VCONBlock.__str__" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2024, CESOIA.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
