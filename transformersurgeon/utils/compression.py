@@ -136,7 +136,11 @@ class CompressionScheme:
             if name == 'self':
                 continue
             if hasattr(module, name):
-                kwargs[name] = getattr(module, name)
+                # check on bias, must be bool
+                if name == 'bias':
+                    kwargs["bias"] = True if module.bias is not None else False
+                else:
+                    kwargs[name] = getattr(module, name)
         # Create a new instance of the same class
         module_copy = type(module)(**kwargs)
         for name, param in module.named_parameters(recurse=False):
