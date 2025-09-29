@@ -51,7 +51,11 @@ import torch.nn.functional as F
 # from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig, Qwen2_5_VLVisionConfig
 # -------------
 from transformers.activations import ACT2FN
-from transformers.utils import auto_docstring, logging
+# original --->
+# from transformers.utils import auto_docstring, logging
+# -------------
+from transformers.utils import logging
+# <--- CESOIA modifications
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from .configuration_qwen2_5_vl_c import (
     Qwen2_5_VLConfigCompress,
