@@ -51,63 +51,33 @@ def _apply_general_keys(config_dict: Dict[str, Any], target_dict: Dict[str, List
 
 def init_compression_config(
     config_instance,
-    total_blocks: int,
     indexing: Dict[str, Any],
-    pruning_ratio_lists: Optional[Dict[str, Any]] = None,
-    pruning_ratio_skip_connections: Optional[float] = None,
-    lrd_rank_lists: Optional[Dict[str, Any]] = None,
+    pruning_ratios: Optional[Dict[str, Any]] = None,
+    lrd_ranks: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Initialize compression configuration for any transformer model.
     
     Args:
-        config_instance: The config instance to modify
-        total_blocks: Number of transformer blocks
-        base_dim: Base embedding/hidden dimension
-        pruning_ratio_lists: Dict of pruning ratios per layer type
-        pruning_ratio_skip_connections: Pruning ratio for skip connections
-        lrd_rank_lists: Dict of LRD ranks per layer type
-        default_pruning_keys: List of default keys for pruning
-        default_lrd_keys: List of default keys for LRD
-        pruning_key_mappings: Dict mapping general keys to specific layer types for pruning
-        lrd_key_mappings: Dict mapping general keys to specific layer types for LRD
-        mlp_ratio: MLP expansion ratio (for vision models)
-        num_heads: Number of attention heads
-        intermediate_size: Intermediate size for MLP (for text models)
+        config_instance: The configuration instance to initialize (e.g., model.config).
+        indexing (Dict[str, Any]): Model-specific indexing dictionary.
+        pruning_ratio_dict (Optional[Dict[str, Any]]): Dictionary specifying pruning ratios.
+        lrd_rank_dict (Optional[Dict[str, Any]]): Dictionary specifying LRD ranks
     """
 
-    # Generate keys
-    # Define layer type mappings for vision model - separate for pruning and LRD
-    default_pruning_keys = [v for v, m in zip(indexing['key_list'], indexing['pruning_supported']) if m]
-    default_lrd_keys = [v for v, m in zip(indexing['key_list'], indexing['lrd_supported']) if m]
-
-    # Define key mappings - separate for pruning and LRD
-    pruning_key_mappings = {k: [v for v in vals if v in default_pruning_keys] for k, vals in indexing['key_mappings'].items()}
-    lrd_key_mappings = {k: [v for v in vals if v in default_lrd_keys] for k, vals in indexing['key_mappings'].items()}
+    path_template = indexing["path_template"]
+    depth = getattr(config_instance, indexing["num_blocks_attr"])
+    # Generate default config values by building all the paths in a dictionary
+    config_instance.pruning_ratios = {path_template.format(block_index=id, path=path): 0.0 for id in range(depth) for path in indexing["path_list"]}
+    config_instance.lrd_ranks = {path_template.format(block_index=id, path=path): "full" for id in range(depth) for path in indexing["path_list"]}
     
-    # Validate and set skip connection pruning ratio
-    config_instance.pruning_ratio_skip_connections = pruning_ratio_skip_connections
-    if pruning_ratio_skip_connections is not None:
-        _validate_pruning_ratio(pruning_ratio_skip_connections, "pruning_ratio_skip_connections")
+    # Get values from arguments
+    if pruning_ratios is not None:
+        for key, value in pruning_ratios.items():
+            _validate_pruning_ratio(value)
+            config_instance.pruning_ratios[key] = value
+    if lrd_ranks is not None:
+        for key, value in lrd_ranks.items():
+            config_instance.lrd_ranks[key] = value
     
-    # Initialize default pruning ratio lists
-    config_instance.pruning_ratio_lists = {
-        key: [0.0] * total_blocks for key in (default_pruning_keys or [])
-    }
-    
-    # Process pruning ratio lists
-    pruning_ratio_lists = _expand_scalar_to_list(pruning_ratio_lists, total_blocks)
-    if pruning_ratio_lists is not None:
-        _apply_general_keys(pruning_ratio_lists, config_instance.pruning_ratio_lists, pruning_key_mappings or {})
-    
-    # Initialize default LRD rank lists
-    config_instance.lrd_rank_lists = {
-        key: ["full"] * total_blocks for key in (default_lrd_keys or [])
-    }
-    
-    # Process LRD rank lists
-    lrd_rank_lists = _expand_scalar_to_list(lrd_rank_lists, total_blocks)
-    if lrd_rank_lists is not None:
-        _apply_general_keys(lrd_rank_lists, config_instance.lrd_rank_lists, lrd_key_mappings or {})
-
 __all__ = ["init_compression_config"]
