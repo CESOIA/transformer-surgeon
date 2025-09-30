@@ -27,6 +27,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# original --->
+# -------------
+FORCE_ORIGINAL_LAYERS = False  # for debugging purposes
+# <--- CESOIA modifications
+
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
@@ -111,9 +116,14 @@ class Qwen2_5_VLMLPCompress(nn.Module):
         self.gate_rank = get_validated_dict_value(config.lrd_rank_lists, "mlp_gate", index=layer_idx, default="full", min_value=1)
         self.up_rank = get_validated_dict_value(config.lrd_rank_lists, "mlp_up", index=layer_idx, default="full", min_value=1)
         self.down_rank = get_validated_dict_value(config.lrd_rank_lists, "mlp_down", index=layer_idx, default="full", min_value=1)
-        self.gate_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=bias, lrd_rank=self.gate_rank)
-        self.up_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=bias, lrd_rank=self.up_rank)
-        self.down_proj = LinearCompressed(self.intermediate_size, self.hidden_size, bias=bias, lrd_rank=self.down_rank)
+        if FORCE_ORIGINAL_LAYERS:
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
+        else:
+            self.gate_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=bias, lrd_rank=self.gate_rank)
+            self.up_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=bias, lrd_rank=self.up_rank)
+            self.down_proj = LinearCompressed(self.intermediate_size, self.hidden_size, bias=bias, lrd_rank=self.down_rank)
 # <--- CESOIA modifications
         self.act_fn = ACT2FN[config.hidden_act]
 
@@ -210,8 +220,12 @@ class Qwen2_5_VLVisionAttentionCompress(Qwen2_5_VLVisionAttention):
         self.num_key_value_groups = 1  # needed for eager attention
         self.qkv_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_qkv", index=layer_idx, default="full", min_value=1)
         self.proj_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_proj", index=layer_idx, default="full", min_value=1)
-        self.qkv = LinearCompressed(self.dim, self.dim * 3, bias=True, lrd_rank=self.qkv_rank)
-        self.proj = LinearCompressed(self.dim, self.dim, lrd_rank=self.proj_rank)
+        if FORCE_ORIGINAL_LAYERS:
+            self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
+            self.proj = nn.Linear(self.dim, self.dim)
+        else:
+            self.qkv = LinearCompressed(self.dim, self.dim * 3, bias=True, lrd_rank=self.qkv_rank)
+            self.proj = LinearCompressed(self.dim, self.dim, lrd_rank=self.proj_rank)
         self.scaling = self.head_dim**-0.5
         self.config = config
         self.attention_dropout = 0.0
@@ -377,9 +391,14 @@ class Qwen2MLPCompress(nn.Module):
         self.gate_rank = get_validated_dict_value(config.lrd_rank_lists, "mlp_gate", index=layer_idx, default="full", min_value=1)
         self.up_rank = get_validated_dict_value(config.lrd_rank_lists, "mlp_up", index=layer_idx, default="full", min_value=1)
         self.down_rank = get_validated_dict_value(config.lrd_rank_lists, "mlp_down", index=layer_idx, default="full", min_value=1)
-        self.gate_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=False, lrd_rank=self.gate_rank)
-        self.up_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=False, lrd_rank=self.up_rank)
-        self.down_proj = LinearCompressed(self.intermediate_size, self.hidden_size, bias=False, lrd_rank=self.down_rank)
+        if FORCE_ORIGINAL_LAYERS:
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        else:
+            self.gate_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=False, lrd_rank=self.gate_rank)
+            self.up_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=False, lrd_rank=self.up_rank)
+            self.down_proj = LinearCompressed(self.intermediate_size, self.hidden_size, bias=False, lrd_rank=self.down_rank)
 # <--- CESOIA modifications
         self.act_fn = ACT2FN[config.hidden_act]
 
@@ -441,10 +460,16 @@ class Qwen2_5_VLAttentionCompress(Qwen2_5_VLAttention):
         self.k_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_k", index=layer_idx, default="full", min_value=1)
         self.v_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_v", index=layer_idx, default="full", min_value=1)
         self.o_rank = get_validated_dict_value(config.lrd_rank_lists, "sa_out", index=layer_idx, default="full", min_value=1)
-        self.q_proj = LinearCompressed(self.hidden_size, self.num_heads * self.head_dim, bias=True, lrd_rank=self.q_rank)
-        self.k_proj = LinearCompressed(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lrd_rank=self.k_rank)
-        self.v_proj = LinearCompressed(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lrd_rank=self.v_rank)
-        self.o_proj = LinearCompressed(self.num_heads * self.head_dim, self.hidden_size, bias=False, lrd_rank=self.o_rank)
+        if FORCE_ORIGINAL_LAYERS:
+            self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+            self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+            self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+            self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        else:
+            self.q_proj = LinearCompressed(self.hidden_size, self.num_heads * self.head_dim, bias=True, lrd_rank=self.q_rank)
+            self.k_proj = LinearCompressed(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lrd_rank=self.k_rank)
+            self.v_proj = LinearCompressed(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lrd_rank=self.v_rank)
+            self.o_proj = LinearCompressed(self.num_heads * self.head_dim, self.hidden_size, bias=False, lrd_rank=self.o_rank)
 # <--- CESOIA modifications
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
 
