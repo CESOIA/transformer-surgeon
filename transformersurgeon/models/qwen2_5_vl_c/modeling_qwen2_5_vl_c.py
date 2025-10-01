@@ -90,10 +90,9 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
-from ..utils import (
-    LinearCompressed,
-    get_validated_dict_value
-)
+from ...utils import get_validated_dict_value
+from ...layers import LinearCompressed
+
 # <--- CESOIA modifications
 
 logger = logging.get_logger(__name__)
