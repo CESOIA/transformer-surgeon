@@ -1,9 +1,9 @@
-from ..utils import CompressionSchemesManager
-from .indexing_qwen2_5_vl_c import QWEN2_5_VL_C_INDEXING as INDEXING
+from ...utils import CompressionSchemesManager
+from .indexing_qwen2_vl_c import QWEN2_VL_C_INDEXING as INDEXING
 
-class Qwen2_5_VLCompressionSchemesManager(CompressionSchemesManager):
+class Qwen2VLCompressionSchemesManager(CompressionSchemesManager):
     """
-    Manager for compression schemes specific to Qwen2.5-VL models.
+    Manager for compression schemes specific to Qwen2-VL models.
     Refer to the base class `CompressionSchemesManager` for method details.
     """
     
@@ -14,4 +14,4 @@ class Qwen2_5_VLCompressionSchemesManager(CompressionSchemesManager):
             
         super().__init__(model, INDEXING)
 
-__all__ = ["Qwen2_5_VLCompressionSchemesManager"]
+__all__ = ["Qwen2VLCompressionSchemesManager"]
