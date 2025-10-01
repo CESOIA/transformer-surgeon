@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from typing import Union
 
 # Custom linear layer for low-rank decomposition
@@ -23,12 +24,14 @@ class LinearCompressed(nn.Linear):
         
             weight = torch.cat((weightA, weightB.T), dim=0)
 
-        where weightA has shape (lrd_rank, in_features) and weightB has shape (out_features, lrd_rank). 
+        where weightA has shape (out_features, lrd_rank) and weightB.T has shape (in_features, lrd_rank). 
     """
     def __init__(self, 
-                 in_features, 
-                 out_features,
-                 bias=False,
+                 in_features: int, 
+                 out_features: int,
+                 bias: bool = True,
+                 device=None,
+                 dtype=None,
                  lrd_rank: Union[int, str] = "full"):
         
         self.prune_mask = None  # To be set externally if needed
@@ -40,7 +43,11 @@ class LinearCompressed(nn.Linear):
             self.skip = True
         else:
             self.skip = False
-            super().__init__(in_features, out_features, bias)
+            super().__init__(in_features=in_features,
+                             out_features=out_features,
+                             bias=bias,
+                             device=device,
+                             dtype=dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # Skip the layer if out_features is 0
@@ -48,29 +55,21 @@ class LinearCompressed(nn.Linear):
             return input
         # Perform with low-rank decomposition
         if isinstance(self.lrd_rank, int):
-            weight1 = self.weight[:self.out_features, :]
-            weight2 = self.weight[self.out_features:, :]
+            # In this case, weight.shape = (in_features + out_features, lrd_rank)
+            weightA = self.weight[:self.out_features, :] # shape: (out_features, lrd_rank)
+            weightBT = self.weight[self.out_features:, :] # shape: (in_features, lrd_rank)
 
             if self.prune_mask is not None: # Apply soft structured pruning if mask is available
-                weight1 = weight1 * self.prune_mask
+                weightA = weightA * self.prune_mask
 
-            # Compute: x @ weight1 @ weight2.T + bias which is the same as: x @ weight.T + bias
-            output = input @ weight2 @ weight1.t()
-            if self.bias is not None:
-                output += self.bias
-            return output
+            # Compute: x @ (weightA @ weightB).T + bias which is the same as: x @ weight.T + bias
+            return F.linear(input @ weightBT, weightA, self.bias)
         elif self.lrd_rank == "full": # Perform normally if rank is full
-            weight = self.weight
-
             # Apply soft structured pruning if mask is available
             if self.prune_mask is not None:
                 weight = weight * self.prune_mask
 
-            # Compute: x @ weight.T + bias
-            output = input @ self.weight.t()
-            if self.bias is not None:
-                output += self.bias
-            return output
+            return F.linear(input, self.weight, self.bias)
         # Manage value errors
         else:
             raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")    

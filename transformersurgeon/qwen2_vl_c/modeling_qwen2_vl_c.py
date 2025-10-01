@@ -194,10 +194,10 @@ logger = logging.get_logger(__name__)
 #         self.fc2 = nn.Linear(hidden_dim, dim)
 # -------------
 class VisionMlpCompress(nn.Module):
-    def __init__(self, config, dim: int, hidden_dim: int, hidden_act: str, layer_idx: int) -> None:
+    def __init__(self, config, dim: int, hidden_dim: int, hidden_act: str, path: str) -> None:
         super().__init__()
-        self.rank_fc1 = get_validated_dict_value(config.lrd_rank_lists, "mlp_up", layer_idx, default="full", min_value=1)
-        self.rank_fc2 = get_validated_dict_value(config.lrd_rank_lists, "mlp_down", layer_idx, default="full", min_value=1)
+        self.rank_fc1 = get_validated_dict_value(config.lrd_ranks, path+"fc1", default="full", min_value=1)
+        self.rank_fc2 = get_validated_dict_value(config.lrd_ranks, path+"fc2", default="full", min_value=1)
         self.fc1 = LinearCompressed(dim, hidden_dim, lrd_rank=self.rank_fc1)
         self.act = ACT2FN[hidden_act]
         self.fc2 = LinearCompressed(hidden_dim, dim, lrd_rank=self.rank_fc2)
@@ -234,7 +234,7 @@ class VisionMlpCompress(nn.Module):
 #         super().__init__()
 # -------------
 class VisionAttentionCompress(VisionAttention):
-    def __init__(self, config: Qwen2VLVisionConfigCompress, layer_idx: int) -> None:
+    def __init__(self, config: Qwen2VLVisionConfigCompress, path: str) -> None:
         super(VisionAttention, self).__init__()
 # <--- CESOIA modifications
         self.dim = config.embed_dim
@@ -245,8 +245,8 @@ class VisionAttentionCompress(VisionAttention):
         self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
         self.proj = nn.Linear(self.dim, self.dim)
 # -------------
-        rank_qkv = get_validated_dict_value(config.lrd_rank_lists, "sa_qkv", index=layer_idx, default="full", min_value=1)
-        rank_proj = get_validated_dict_value(config.lrd_rank_lists, "sa_out", index=layer_idx, default="full", min_value=1)
+        rank_qkv = get_validated_dict_value(config.lrd_ranks, path+".qkv", default="full", min_value=1)
+        rank_proj = get_validated_dict_value(config.lrd_ranks, path+".proj", default="full", min_value=1)
         self.qkv = LinearCompressed(self.dim, self.dim * 3, bias=True, lrd_rank=rank_qkv)
         self.proj = LinearCompressed(self.dim, self.dim, bias=True, lrd_rank=rank_proj)
 # <--- CESOIA modifications
@@ -274,7 +274,7 @@ class VisionAttentionCompress(VisionAttention):
 #         super().__init__()
 # -------------
 class Qwen2VLVisionBlockCompress(Qwen2VLVisionBlock):
-    def __init__(self, config, attn_implementation: str = "sdpa", layer_idx: int = 0) -> None:
+    def __init__(self, config, attn_implementation: str = "sdpa", path: str = None) -> None:
         super(Qwen2VLVisionBlock, self).__init__()
 # <--- CESOIA modifications
 
@@ -282,11 +282,11 @@ class Qwen2VLVisionBlockCompress(Qwen2VLVisionBlock):
         self.norm2 = LayerNorm(config.embed_dim, eps=1e-6)
         mlp_hidden_dim = int(config.embed_dim * config.mlp_ratio)
 
-        self.attn = VisionAttentionCompress(config=config, layer_idx=layer_idx)
+        self.attn = VisionAttentionCompress(config=config, path=path+".attn")
 # original --->
         # self.mlp = VisionMlp(dim=config.embed_dim, hidden_dim=mlp_hidden_dim, hidden_act=config.hidden_act)
 # -------------
-        self.mlp = VisionMlpCompress(config, dim=config.embed_dim, hidden_dim=mlp_hidden_dim, hidden_act=config.hidden_act, layer_idx=layer_idx)
+        self.mlp = VisionMlpCompress(config, dim=config.embed_dim, hidden_dim=mlp_hidden_dim, hidden_act=config.hidden_act, path=path+".mlp")
 
 # original --->
     # def forward(
@@ -308,7 +308,7 @@ class Qwen2VLVisionBlockCompress(Qwen2VLVisionBlock):
 #         super().__init__()
 # -------------
 class Qwen2MLPCompress(Qwen2MLP):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, path: str):
         super(Qwen2MLP, self).__init__()
 # <--- CESOIA modifications
         self.config = config
@@ -319,9 +319,9 @@ class Qwen2MLPCompress(Qwen2MLP):
         # self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         # self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 # -------------
-        self.rank_gate = get_validated_dict_value(config.lrd_rank_lists, "mlp_gate", layer_idx, default="full", min_value=1)
-        self.rank_up = get_validated_dict_value(config.lrd_rank_lists, "mlp_up", layer_idx, default="full", min_value=1)
-        self.rank_down = get_validated_dict_value(config.lrd_rank_lists, "mlp_down", layer_idx, default="full", min_value=1)
+        self.rank_gate = get_validated_dict_value(config.lrd_ranks, path+".gate_proj", default="full", min_value=1)
+        self.rank_up = get_validated_dict_value(config.lrd_ranks, path+".up_proj", default="full", min_value=1)
+        self.rank_down = get_validated_dict_value(config.lrd_ranks, path+".down_proj", default="full", min_value=1)
         self.gate_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=False, lrd_rank=self.rank_gate)
         self.up_proj = LinearCompressed(self.hidden_size, self.intermediate_size, bias=False, lrd_rank=self.rank_up)
         self.down_proj = LinearCompressed(self.intermediate_size, self.hidden_size, bias=False, lrd_rank=self.rank_down)
@@ -346,7 +346,7 @@ class Qwen2MLPCompress(Qwen2MLP):
 #         super().__init__()
 # -------------
 class Qwen2VLAttentionCompress(Qwen2VLAttention):
-    def __init__(self, config: Qwen2VLTextConfigCompress, layer_idx: int = 0):
+    def __init__(self, config: Qwen2VLTextConfigCompress, layer_idx: int = None, path: str = None):
         super(Qwen2VLAttention, self).__init__()
 # <--- CESOIA modifications
 
@@ -380,10 +380,10 @@ class Qwen2VLAttentionCompress(Qwen2VLAttention):
         # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         # self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 # -------------
-        self.rank_q = get_validated_dict_value(config.lrd_rank_lists, "sa_q", layer_idx, default="full", min_value=1)
-        self.rank_k = get_validated_dict_value(config.lrd_rank_lists, "sa_k", layer_idx, default="full", min_value=1)
-        self.rank_v = get_validated_dict_value(config.lrd_rank_lists, "sa_v", layer_idx, default="full", min_value=1)
-        self.rank_o = get_validated_dict_value(config.lrd_rank_lists, "sa_out", layer_idx, default="full", min_value=1)
+        self.rank_q = get_validated_dict_value(config.lrd_ranks, path+".q_proj", default="full", min_value=1)
+        self.rank_k = get_validated_dict_value(config.lrd_ranks, path+".k_proj", default="full", min_value=1)
+        self.rank_v = get_validated_dict_value(config.lrd_ranks, path+".v_proj", default="full", min_value=1)
+        self.rank_o = get_validated_dict_value(config.lrd_ranks, path+".o_proj", default="full", min_value=1)
         self.q_proj = LinearCompressed(self.hidden_size, self.num_heads * self.head_dim, bias=True, lrd_rank=self.rank_q)
         self.k_proj = LinearCompressed(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lrd_rank=self.rank_k)
         self.v_proj = LinearCompressed(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, lrd_rank=self.rank_v)
@@ -417,7 +417,7 @@ class Qwen2VLAttentionCompress(Qwen2VLAttention):
 #         super().__init__()
 # -------------
 class Qwen2VLDecoderLayerCompress(Qwen2VLDecoderLayer):
-    def __init__(self, config: Qwen2VLTextConfigCompress, layer_idx: int):
+    def __init__(self, config: Qwen2VLTextConfigCompress, layer_idx: int, path: str = None):
         super(Qwen2VLDecoderLayer, self).__init__()
 # <--- CESOIA modifications
         self.hidden_size = config.hidden_size
@@ -432,9 +432,9 @@ class Qwen2VLDecoderLayerCompress(Qwen2VLDecoderLayer):
 
         # self.mlp = Qwen2MLP(config)
 # -------------
-        self.self_attn = Qwen2VLAttentionCompress(config, layer_idx)
+        self.self_attn = Qwen2VLAttentionCompress(config, layer_idx, path=path+".self_attn")
 
-        self.mlp = Qwen2MLPCompress(config, layer_idx)
+        self.mlp = Qwen2MLPCompress(config, path=path+".mlp")
 # <--- CESOIA modifications
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -490,7 +490,7 @@ class Qwen2VisionTransformerPretrainedModelCompress(Qwen2VisionTransformerPretra
     config: Qwen2VLVisionConfigCompress
     _no_split_modules = ["Qwen2VLVisionBlockCompress"]
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, path: str) -> None:
         super(Qwen2VLPreTrainedModelCompress, self).__init__(config)
 # <--- CESOIA modifications
         self.spatial_merge_size = config.spatial_merge_size
@@ -508,7 +508,7 @@ class Qwen2VisionTransformerPretrainedModelCompress(Qwen2VisionTransformerPretra
 # original --->
         # self.blocks = nn.ModuleList([Qwen2VLVisionBlock(config) for _ in range(config.depth)])
 # -------------
-        self.blocks = nn.ModuleList([Qwen2VLVisionBlockCompress(config, layer_idx) for layer_idx in range(config.depth)])
+        self.blocks = nn.ModuleList([Qwen2VLVisionBlockCompress(config, path=path+f".blocks.{layer_idx}") for layer_idx in range(config.depth)])
 # <--- CESOIA modifications
         self.norm = LayerNorm(config.embed_dim, eps=1e-6)
         self.merger = PatchMerger(
@@ -548,7 +548,7 @@ class Qwen2VisionTransformerPretrainedModelCompress(Qwen2VisionTransformerPretra
 class Qwen2VLTextModelCompress(Qwen2VLTextModel, Qwen2VLPreTrainedModelCompress):
     config: Qwen2VLTextConfigCompress
 
-    def __init__(self, config: Qwen2VLTextConfigCompress):
+    def __init__(self, config: Qwen2VLTextConfigCompress, path: str):
         super(Qwen2VLTextModel, self).__init__(config)
 # <--- CESOIA modifications
         self.padding_idx = config.pad_token_id
@@ -561,7 +561,7 @@ class Qwen2VLTextModelCompress(Qwen2VLTextModel, Qwen2VLPreTrainedModelCompress)
         # )
 # -------------
         self.layers = nn.ModuleList(
-            [Qwen2VLDecoderLayerCompress(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen2VLDecoderLayerCompress(config, layer_idx, path=path+f".layers.{layer_idx}") for layer_idx in range(config.num_hidden_layers)]
         )
 # <--- CESOIA modifications
         self._attn_implementation = config._attn_implementation
@@ -609,8 +609,8 @@ class Qwen2VLTextModelCompress(Qwen2VLTextModel, Qwen2VLPreTrainedModelCompress)
 class Qwen2VLModelCompress(Qwen2VLModel, Qwen2VLPreTrainedModelCompress):
     def __init__(self, config: Qwen2VLConfigCompress):
         super(Qwen2VLPreTrainedModelCompress, self).__init__(config)
-        self.visual = Qwen2VisionTransformerPretrainedModelCompress._from_config(config.vision_config)
-        self.language_model = Qwen2VLTextModelCompress._from_config(config.text_config)
+        self.visual = Qwen2VisionTransformerPretrainedModelCompress._from_config(config.vision_config, path="visual")
+        self.language_model = Qwen2VLTextModelCompress._from_config(config.text_config, path="language_model")
 # <--- CESOIA modifications
         self.rope_deltas = None  # cache rope_deltas here
 

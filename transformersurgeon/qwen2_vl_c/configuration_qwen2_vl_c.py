@@ -33,20 +33,17 @@ class Qwen2VLVisionConfigCompress(Qwen2VLVisionConfig):
     
     def __init__(
         self,
-        pruning_ratio_lists=None,
-        pruning_ratio_skip_connections=None,
-        lrd_rank_lists=None,
+        pruning_ratios=None,
+        lrd_ranks=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         
         init_compression_config(
             config_instance=self,
-            total_blocks=self.depth,
             indexing=INDEXING["vision"],
-            pruning_ratio_lists=pruning_ratio_lists,
-            pruning_ratio_skip_connections=pruning_ratio_skip_connections,
-            lrd_rank_lists=lrd_rank_lists,
+            pruning_ratios=pruning_ratios,
+            lrd_ranks=lrd_ranks,
         )
 
 class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
@@ -54,20 +51,17 @@ class Qwen2VLTextConfigCompress(Qwen2VLTextConfig):
     
     def __init__(
         self,
-        pruning_ratio_lists=None,
-        pruning_ratio_skip_connections=None,
-        lrd_rank_lists=None,
+        pruning_ratios=None,
+        lrd_ranks=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         
         init_compression_config(
             config_instance=self,
-            total_blocks=self.num_hidden_layers,
             indexing=INDEXING["text"],
-            pruning_ratio_lists=pruning_ratio_lists,
-            pruning_ratio_skip_connections=pruning_ratio_skip_connections,
-            lrd_rank_lists=lrd_rank_lists,
+            pruning_ratios=pruning_ratios,
+            lrd_ranks=lrd_ranks,
         )
 
 class Qwen2VLConfigCompress(Qwen2VLConfig):
