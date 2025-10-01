@@ -5,7 +5,9 @@ Provides the CompressionSchemesManager class for managing multiple compression s
 """
 
 import torch
-from typing import Dict, List, Any
+from transformers import PretrainedConfig
+from typing import Dict, List, Any, Union
+import warnings
 from .compression import CompressionScheme
 
 class CompressionSchemesManager:
@@ -33,9 +35,9 @@ class CompressionSchemesManager:
     """
     
     def __init__(self,
-                 config:Dict[str, Any],
-                 model:torch.nn.Module,
-                 indexing:List[Dict[str, Any]]):
+                 model: torch.nn.Module,
+                 indexing: List[Dict[str, Any]]
+                 ):
         """
         Initialize the compression manager.
         
@@ -51,10 +53,26 @@ class CompressionSchemesManager:
                     - path_template: Template for generating full paths
                     - config_attr: Attribute name in main config for this block type
         """
-        self.config = config
         self.model = model
+        try:
+            self.config = model.config
+        except AttributeError:
+            raise ValueError("The provided model does not have a 'config' attribute. Please provide a model with a valid configuration.")
         self.indexing = indexing
         self.schemes = self._generate_schemes()
+
+    def set_lrd_rank(self, rank: Union[int, str], criteria=None, verbose=False):
+        """
+        Sets the LRD rank for filtered modules.
+
+        Args:
+            rank: The LRD rank to set (int or "full")
+            criteria: List of criteria to filter modules (by name or block_id)
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            scheme.lrd_rank = rank
+            if verbose:
+                print(f"Set LRD rank of {rank} for {scheme.path}")
 
     def init_vcon(self, criteria=None, verbose=False):
         """
@@ -128,6 +146,12 @@ class CompressionSchemesManager:
             scheme.restore(verbose=verbose)
 
     # aliases for "all" criteria
+    def set_lrd_rank_all(self, rank: Union[int, str], verbose=False):
+        """
+        Alias for set_lrd_rank with criteria set to "all"
+        """
+        self.set_lrd_rank(rank, criteria=["all"], verbose=verbose)
+
     def init_vcon_all(self, verbose=False):
         """
         Alias for init_vcon with criteria set to "all"
@@ -171,50 +195,38 @@ class CompressionSchemesManager:
             Dict[str, List[Dict[str, CompressionScheme]]]: Nested dictionary of compression schemes organized by block type and block index.
         """
         all_schemes = {}
+
+        config = self.config.to_dict() if isinstance(self.config, PretrainedConfig) else self.config
         
         for block_name, block_indexing in self.indexing.items():
             config_attr = block_indexing.get('config_attr', None)
             num_blocks_attr = block_indexing['num_blocks_attr']
-            key_list = block_indexing['key_list']
             path_list = block_indexing['path_list']
             path_template = block_indexing['path_template']
             config_attr = block_indexing['config_attr']
 
             # Get the specific config for this block type
-            if config_attr is None:
-                block_specific_config = self.config
-            else:
-                block_specific_config = self.config[config_attr]
+            block_specific_config = config[config_attr]
 
             # Get blocks number
             num_blocks = block_specific_config[num_blocks_attr]
 
-            block_schemes = []
+            tmp_dict = {}
             for i in range(num_blocks):
-                tmp_dict = {}
-                for key, path in zip(key_list, path_list):
-                    # Check the existence of the keys
-                    pruning_ratio_lists = block_specific_config.get('pruning_ratio_lists', {})
-                    if key in pruning_ratio_lists:
-                        pruning_ratio = pruning_ratio_lists[key][i]
-                    else:
-                        pruning_ratio = 0.0
-                        
-                    lrd_rank_lists = block_specific_config.get('lrd_rank_lists', {})
-                    if key in lrd_rank_lists:
-                        lrd_rank = lrd_rank_lists[key][i]
-                    else:
-                        lrd_rank = "full"
-
+                for path in path_list:
                     # Create CompressionScheme instance
                     full_path = path_template.format(block_index=i, path=path)
                     
                     # Check if this is a QKV concatenated layer
-                    is_qkv_concatenated = block_indexing.get('qkv_keys', [])
-                    is_qkv = key in is_qkv_concatenated if is_qkv_concatenated else False
+                    is_qkv_concatenated = block_indexing.get('qkv_paths', [])
+                    is_qkv = path in is_qkv_concatenated if is_qkv_concatenated else False
+
+                    # Get pruning ratio and LRD rank from config
+                    pruning_ratio = block_specific_config.get('pruning_ratios', {}).get(full_path, 0.0)
+                    lrd_rank = block_specific_config.get('lrd_ranks', {}).get(full_path, "full")
                     
-                    tmp_dict[key] = CompressionScheme(
-                        name=key,
+                    tmp_dict[full_path] = CompressionScheme(
+                        name=path,
                         block_id=i,
                         path=full_path,
                         pruning_ratio=pruning_ratio,
@@ -222,65 +234,112 @@ class CompressionSchemesManager:
                         is_qkv_concatenated=is_qkv,
                         model=self.model,
                     )
-                block_schemes.append(tmp_dict)
             
-            all_schemes[block_name] = block_schemes
+            all_schemes[block_name] = tmp_dict
         
         return all_schemes
     
-    def iter_filtered(self, criteria:list=None):
+    def print_filtered(self, criteria:list=None):
+        """
+        Prints CompressionScheme objects filtered by name and/or block_id.
+
+        Args:
+            criteria (list): List of criteria to filter schemes. If even one of the criteria is not met, the scheme is skipped.
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            print(scheme)
+    
+    def iter_filtered(self, criteria:Union[list, int, str]=None):
         """
         Yields CompressionScheme objects filtered by name and/or block_id.
 
         Args:
-            criteria (list): List of criteria to filter schemes. If even one of the criteria is not met, the scheme is skipped. Can include:
+            criteria (list): List of criteria to filter schemes. If even one of the criteria is met, the scheme is kept. Can include:
                 - int: Block ID to match
                 - str: Substring to match in the scheme name or path
                 - "all": Matches all schemes
+                - list: A list of criteria, where all of them must be met (AND logic within the list)
         """
         if type(criteria) != list:
             criteria = [criteria]
         for scheme in self:
-            select = True
+            select = False
             # Verify if all criteria are met
-            for crit in criteria:
-                if crit is None:
-                    continue
-                elif crit in ["all", "ALL"]:
-                    continue
-                elif isinstance(crit, int):
-                    if scheme.block_id != crit:
-                        select = False
+            for or_crit in criteria: # Use AND logic for criteria
+                if or_crit in ["all", "ALL", "All"]:
+                    select = True
+                    break
+                elif isinstance(or_crit, int):
+                    if scheme.block_id == or_crit:
+                        select = True
                         break
-                elif isinstance(crit, str):
-                    if crit not in scheme.name and crit not in scheme.path:
-                        select = False
+                elif isinstance(or_crit, str):
+                    if or_crit in scheme.name or or_crit in scheme.path:
+                        select = True
                         break
+                elif isinstance(or_crit, list): # If a list is provided, use AND logic within the list
+                    tmp_select = True
+                    for and_crit in or_crit:
+                        if and_crit is None:
+                            tmp_select = False
+                            break
+                        elif and_crit in ["all", "ALL", "All"]:
+                            continue
+                        elif isinstance(and_crit, int):
+                            if scheme.block_id != and_crit:
+                                tmp_select = False
+                                break
+                        elif isinstance(and_crit, str):
+                            if and_crit not in scheme.name and and_crit not in scheme.path:
+                                tmp_select = False
+                                break
+                    if tmp_select:
+                        select = True
+                        break
+            
             if select:
                 yield scheme
+
+    def update_config(self, verbose=False):
+        """
+        Updates the model's configuration object with the current pruning ratios and LRD ranks from all CompressionScheme objects.
+        Modifications are made in-place.
+        
+        Returns:
+            The updated configuration object.
+        """
+        config_names = [block['config_attr'] for block in self.indexing.values()]
+
+        for cname, block_dicts in zip(config_names, self.schemes.values()):    
+            for scheme in block_dicts.values():
+                getattr(self.config, cname).pruning_ratios[scheme.path] = scheme.pruning_ratio
+                getattr(self.config, cname).lrd_ranks[scheme.path] = scheme.lrd_rank
+                if verbose:
+                    print(f"Updated config for {scheme.path}: pruning_ratio={scheme.pruning_ratio}, lrd_rank={scheme.lrd_rank}")
+
+        return self.config
 
     def __iter__(self):
         """
         Yields all CompressionScheme objects from the nested dictionaries.
         """
         for block_dicts in self.schemes.values():
-            for block in block_dicts:
-                for scheme in block.values():
-                    # Ensure the scheme is an instance of CompressionScheme
-                    if isinstance(scheme, CompressionScheme):
-                        yield scheme
-                    else:
-                        raise TypeError(f"Expected CompressionScheme, got {type(scheme)}")
+            for scheme in block_dicts.values():
+                # Ensure the scheme is an instance of CompressionScheme
+                if isinstance(scheme, CompressionScheme):
+                    yield scheme
+                else:
+                    raise TypeError(f"Expected CompressionScheme, got {type(scheme)}")
                     
     def __repr__(self):
         string = ""
-        string += "  Name      Block id  Pruning Ratio   LRD Rank   QKV Concatenated   Path\n"
+        string += "  Prune Rat.   LRD Rank   Path\n"
         string += "|"+"-"*100 + "\n"
         for i, scheme in enumerate(self):
             if i % 2 == 1:
-                string += f"| {scheme.name:<9}| {scheme.block_id:<10}| {scheme.pruning_ratio:<14}| {scheme.lrd_rank:<9}| {str(scheme.is_qkv_concatenated):<17}| {scheme.path:<50}|\n"
+                string += f"| {scheme.pruning_ratio:<10} | {scheme.lrd_rank:<10} | {scheme.path:<60}|\n"
             else:
-                string += f"  {scheme.name:<9}  {scheme.block_id:<10}  {scheme.pruning_ratio:<14}  {scheme.lrd_rank:<9}  {str(scheme.is_qkv_concatenated):<17}  {scheme.path:<50} \n"
+                string += f"  {scheme.pruning_ratio:<10}   {scheme.lrd_rank:<10}   {scheme.path:<60} \n"
         return string
                     
     def _set_model(self, model):

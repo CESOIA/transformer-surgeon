@@ -407,7 +407,7 @@ class CompressionScheme:
         return (f"CompressionScheme(name={self.name}, block_id={self.block_id}, "
                 f"path={self.path}, pruning_ratio={self.pruning_ratio}, "
                 f"lrd_rank={self.lrd_rank}, is_qkv_concatenated={self.is_qkv_concatenated}, "
-                f"module={self.module.__class__.__name__ if self.module else None})")
+                f"module={self.get_module().__class__.__name__})")
 
     def _structured_pruning(self, module, norm=2, pruning_ratio=0.0) -> torch.Tensor:
         """

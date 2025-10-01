@@ -9,8 +9,8 @@ from qwen_vl_utils import process_vision_info
 import sys
 
 ### TEST CONFIGURATION ###
-model_type = "qwen2_vl_c" 
-hard_mode = False
+model_type = "qwen2_5_vl_c" 
+hard_mode = True
 use_vcon = True  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
 ##########################
@@ -58,43 +58,51 @@ processor = AutoProcessor.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = modelClass.from_pretrained(model_name).to(device)
 
+
+### COMPRESSION CONFIGURATION AND APPLICATION ###
+
 # Example usage of CompressionSchemesManager
-config_dict = model.config.to_dict()
-config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = 512
-# config_dict["vision_config"]["lrd_rank_lists"]["mlp_up"] = [512, 256] * 16 # you can define lrd rank for each block
-config_dict["text_config"]["lrd_rank_lists"]["mlp_up"] = "full"
+"""
+    SchemesManager supports filtering layers using criteria such as:
+    - Block ID (int)
+    - Layer name or path (str, supports partial matching)
+    - Lists of the above (OR logic within the list)
+    - List inside the criteria list (AND logic between criteria)
 
-# Apply updated configuration to the model and update dict
-compress_config = configClass.from_dict(config_dict)
-
-# Initialize the CompressionSchemesManager with the model and configuration
-manager = managerClass(compress_config.to_dict(), model)
-
-print(manager) # print the full compression configuration
+    Examples of criteria:
+    criteria = [3, ["mlp", "vision"]]  apply to all blocks with ID 3 OR containing "mlp" AND "vision" in their name/path
+"""
+manager = managerClass(model)
+manager.set_lrd_rank(512,
+    [
+        ["visual", "mlp.up_proj"],                # Apply to all "mlp.up_proj" layers in vision_config
+        ["visual", "mlp.down_proj", 0],           # Apply to the first "mlp.down_proj" layer in vision_config
+        ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
+        ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
+    ], verbose=True)
 
 if use_vcon:
-    # Initialize VCON blocks for all modules
-    # manager.init_vcon_all(verbose=True)
-    # manager.init_vcon(criteria=[3, "mlp"], verbose=True)  # Initialize VCON for specific layers
-    # manager.init_vcon(criteria="all", verbose=True)  # Initialize VCON for all (set to be compressed) layers
-    manager.init_vcon_all(verbose=True) # Initialize VCON for all (set to be compressed) layers
-
-    # Set the beta value for all VCON blocks
+    manager.init_vcon_all(verbose=True)
+    # manager.init_vcon(criteria=[3, "mlp"], verbose=True)  # Initialize VCON for only specific layers
     manager.set_vcon_beta_all(vcon_beta)
+    # manager.set_vcon_beta(vcon_beta, criteria=[3, "mlp"])  # Set beta for only specific layers
 
-# Apply all compression schemes to the model (soft mode)
+# Update in-place the compressed model configuration from the manager
+compress_config = manager.update_config()
+
+# Print the full compression configuration as a table
+print(manager)  
+
+# Apply all compression schemes to the model
 manager.apply_all(hard=hard_mode, verbose=True)
 
-if hard_mode:
-    # Apply configuration to the model - needed for hard mode
-    model.config = compress_config
-
-print(model) # print the model architecture
+# print the model architecture
+print(model)
 
 # After applying compression with soft mode, you can revert the model to its original state if needed
 # manager.restore_all()  # Uncomment this line if you want to restore the model to its original state
 
-# Process each message separately
+### INFERENCE AND TESTING ###
 print("Generating text...")
 
 for i, message in enumerate(messages):

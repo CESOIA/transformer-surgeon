@@ -7,7 +7,11 @@ class Qwen2_5_VLCompressionSchemesManager(CompressionSchemesManager):
     Refer to the base class `CompressionSchemesManager` for method details.
     """
     
-    def __init__(self, config, model):
-        super().__init__(config, model, INDEXING)
+    def __init__(self, model, model_bis=None): # model_bis is for compatibility, not used
+        if model_bis is not None: # for compatibility
+            model_bis.config = model 
+            model = model_bis
+            
+        super().__init__(model, INDEXING)
 
 __all__ = ["Qwen2_5_VLCompressionSchemesManager"]

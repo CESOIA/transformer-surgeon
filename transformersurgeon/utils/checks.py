@@ -24,7 +24,7 @@ def get_validated_value(value, default, min_value=None, max_value=None):
         raise ValueError(f"Value ({value}) is greater than maximum allowed ({max_value}).")
     return value
 
-def get_validated_dict_value(dictionary, key, index, default, min_value=None, max_value=None):
+def get_validated_dict_value(dictionary, key, default, min_value=None, max_value=None):
     """
     Returns the value for `key` in `dictionary` if present and valid.
     If the key is missing or the value is None, returns `default`.
@@ -33,7 +33,6 @@ def get_validated_dict_value(dictionary, key, index, default, min_value=None, ma
     Args:
         dictionary (Dict): The dictionary to get the value from.
         key (str): The key to look for in the dictionary.
-        index (int): The index to use if the value is a list.
         default: The default value to return if the key is missing or value is None.
         min_value: Minimum allowed value (inclusive).
         max_value: Maximum allowed value (inclusive).
@@ -42,8 +41,6 @@ def get_validated_dict_value(dictionary, key, index, default, min_value=None, ma
         The validated value or the default.
     """
     value = dictionary.get(key, None)
-    if value is not None:
-        value = value[index] if isinstance(value, list) else value
     value = get_validated_value(value, default, min_value, max_value)
     return value
 
