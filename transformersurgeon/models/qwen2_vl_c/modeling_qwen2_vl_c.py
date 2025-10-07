@@ -608,8 +608,8 @@ class Qwen2VLTextModelCompress(Qwen2VLTextModel, Qwen2VLPreTrainedModelCompress)
 class Qwen2VLModelCompress(Qwen2VLModel, Qwen2VLPreTrainedModelCompress):
     def __init__(self, config: Qwen2VLConfigCompress):
         super(Qwen2VLPreTrainedModelCompress, self).__init__(config)
-        self.visual = Qwen2VisionTransformerPretrainedModelCompress._from_config(config.vision_config, path="visual")
-        self.language_model = Qwen2VLTextModelCompress._from_config(config.text_config, path="language_model")
+        self.visual = Qwen2VisionTransformerPretrainedModelCompress._from_config(config.vision_config, path="model.visual")
+        self.language_model = Qwen2VLTextModelCompress._from_config(config.text_config, path="model.language_model")
 # <--- CESOIA modifications
         self.rope_deltas = None  # cache rope_deltas here
 
