@@ -81,14 +81,14 @@ print("Number of parameters before compression:", sum(p.numel() for p in model.p
 
 if DO_COMPRESSION:
     manager = managerClass(model)
-    # manager.set_lrd_rank(512,
-    #     [
-    #         ["visual", "mlp.up_proj"],                # Apply to all "mlp.up_proj" layers in vision_config
-    #         ["visual", "mlp.down_proj", 0],           # Apply to the first "mlp.down_proj" layer in vision_config
-    #         ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
-    #         ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
-    #     ], verbose=VERBOSE)
-    manager.set_lrd_rank_all(32)
+    manager.set_lrd_rank(512,
+        [
+            ["visual", "mlp.up_proj"],                # Apply to all "mlp.up_proj" layers in vision_config
+            ["visual", "mlp.down_proj", 0],           # Apply to the first "mlp.down_proj" layer in vision_config
+            ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
+            ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
+        ], verbose=VERBOSE)
+    # manager.set_lrd_rank_all(32)
 
     if use_vcon:
         manager.init_vcon_all(verbose=VERBOSE)
