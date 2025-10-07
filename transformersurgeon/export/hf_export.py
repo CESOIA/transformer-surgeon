@@ -32,7 +32,7 @@ def export_to_hf(
         exist_ok = False,
 ):
     # Setup output directory
-    out_dir = out_dir or f"./{repo_id.split('/')[-1]}"
+    out_dir = os.path.join(out_dir or "", f"{repo_id.split('/')[-1]}")
     os.makedirs(out_dir, exist_ok=True)
 
     # save the model on disk
