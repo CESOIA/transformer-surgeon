@@ -11,8 +11,10 @@ import sys
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
 hard_mode = True
-use_vcon = True  # Whether to use VCON blocks
+use_vcon = False  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
+VERBOSE = True  # Whether to print detailed information during compression
+DO_COMPRESSION = True  # Whether to apply compression
 ##########################
 
 if model_type == "qwen2_vl_c":
@@ -54,9 +56,11 @@ if len(sys.argv) > 1:
 device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 
 # Load processor, model and tokenizer
-processor = AutoProcessor.from_pretrained(model_name)
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = modelClass.from_pretrained(model_name).to(device)
+# N.B.: using torch_dtype="auto" to automatically use bfloat16 if supported by the GPU (e.g., A100, H100)
+# Not using it results in loading the model in float32, which requires more memory
+processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
+tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
+model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
 
 
 ### COMPRESSION CONFIGURATION AND APPLICATION ###
@@ -72,32 +76,39 @@ model = modelClass.from_pretrained(model_name).to(device)
     Examples of criteria:
     criteria = [3, ["mlp", "vision"]]  apply to all blocks with ID 3 OR containing "mlp" AND "vision" in their name/path
 """
-manager = managerClass(model)
-manager.set_lrd_rank(512,
-    [
-        ["visual", "mlp.up_proj"],                # Apply to all "mlp.up_proj" layers in vision_config
-        ["visual", "mlp.down_proj", 0],           # Apply to the first "mlp.down_proj" layer in vision_config
-        ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
-        ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
-    ], verbose=True)
 
-if use_vcon:
-    manager.init_vcon_all(verbose=True)
-    # manager.init_vcon(criteria=[3, "mlp"], verbose=True)  # Initialize VCON for only specific layers
-    manager.set_vcon_beta_all(vcon_beta)
-    # manager.set_vcon_beta(vcon_beta, criteria=[3, "mlp"])  # Set beta for only specific layers
+print("Number of parameters before compression:", sum(p.numel() for p in model.parameters()) / 1e6, "M")
 
-# Update in-place the compressed model configuration from the manager
-compress_config = manager.update_config()
+if DO_COMPRESSION:
+    manager = managerClass(model)
+    # manager.set_lrd_rank(512,
+    #     [
+    #         ["visual", "mlp.up_proj"],                # Apply to all "mlp.up_proj" layers in vision_config
+    #         ["visual", "mlp.down_proj", 0],           # Apply to the first "mlp.down_proj" layer in vision_config
+    #         ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
+    #         ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
+    #     ], verbose=VERBOSE)
+    manager.set_lrd_rank_all(32)
 
-# Print the full compression configuration as a table
-print(manager)  
+    if use_vcon:
+        manager.init_vcon_all(verbose=VERBOSE)
+        # manager.init_vcon(criteria=[3, "mlp"], verbose=VERBOSE)  # Initialize VCON for only specific layers
+        manager.set_vcon_beta_all(vcon_beta)
+        # manager.set_vcon_beta(vcon_beta, criteria=[3, "mlp"])  # Set beta for only specific layers
 
-# Apply all compression schemes to the model
-manager.apply_all(hard=hard_mode, verbose=True)
+    # Update in-place the compressed model configuration from the manager
+    compress_config = manager.update_config()
 
-# print the model architecture
-print(model)
+    # Optionally print the full compression configuration as a table
+    # print(manager)  
+
+    # Apply all compression schemes to the model
+    manager.apply_all(hard=hard_mode, verbose=VERBOSE)
+
+    # Optionally print the model architecture
+    # print(model)
+
+print("Number of parameters after compression:", sum(p.numel() for p in model.parameters()) / 1e6, "M")
 
 # After applying compression with soft mode, you can revert the model to its original state if needed
 # manager.restore_all()  # Uncomment this line if you want to restore the model to its original state
