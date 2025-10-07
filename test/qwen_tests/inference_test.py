@@ -11,7 +11,7 @@ import sys
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
 hard_mode = True
-use_vcon = False  # Whether to use VCON blocks
+use_vcon = True  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
 VERBOSE = True  # Whether to print detailed information during compression
 DO_COMPRESSION = True  # Whether to apply compression
@@ -61,6 +61,9 @@ device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
 model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
+
+
+### COMPRESSION CONFIGURATION AND APPLICATION ###
 
 
 ### COMPRESSION CONFIGURATION AND APPLICATION ###
