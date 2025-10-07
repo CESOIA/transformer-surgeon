@@ -224,7 +224,6 @@ class CompressionSchemesManager:
                     # Get pruning ratio and LRD rank from config
                     pruning_ratio = block_specific_config.get('pruning_ratios', {}).get(full_path, 0.0)
                     lrd_rank = block_specific_config.get('lrd_ranks', {}).get(full_path, "full")
-
                     tmp_dict[full_path] = CompressionScheme(
                         name=path,
                         block_id=i,
