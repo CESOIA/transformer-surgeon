@@ -2,12 +2,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import Union
+import math
 
 # Custom linear layer for low-rank decomposition
-
-# Note on low-rank decomposition:
-#   when using low-rank decomposition, concatenate the two decomposed matrices into a single weight tensor.
-#   weight = torch.cat((weightA, weightB.T), dim=0)
 
 class LinearCompressed(nn.Linear):
     """
@@ -19,12 +16,7 @@ class LinearCompressed(nn.Linear):
         bias (bool): If set to False, the layer will not learn an additive bias. Default: False.
         lrd_rank (int or str): Rank for low-rank decomposition. Use a positive integer for the rank or "full" for no decomposition. Default: "full".
 
-    Note: when low-rank decomposition is used, the weight matrix is split into two parts.
-        When using low-rank decomposition, concatenate the two decomposed matrices into a single weight tensor
-        
-            weight = torch.cat((weightA, weightB.T), dim=0)
-
-        where weightA has shape (out_features, lrd_rank) and weightB.T has shape (in_features, lrd_rank). 
+    Note: when low-rank decomposition is used, an additional weight matrix is created internally.
     """
     def __init__(self, 
                  in_features: int, 
@@ -43,11 +35,17 @@ class LinearCompressed(nn.Linear):
             self.skip = True
         else:
             self.skip = False
-            super().__init__(in_features=in_features,
+            in_features_eff = self.lrd_rank if isinstance(self.lrd_rank, int) else in_features
+            super().__init__(in_features=in_features_eff,
                              out_features=out_features,
                              bias=bias,
                              device=device,
                              dtype=dtype)
+            
+            # When using low-rank decomposition, create weight_2
+            if isinstance(self.lrd_rank, int):
+                self.weight_2 = nn.Parameter(torch.empty((in_features, self.lrd_rank), device=device, dtype=dtype))
+                nn.init.kaiming_uniform_(self.weight_2, a=math.sqrt(5))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # Skip the layer if out_features is 0
@@ -55,14 +53,13 @@ class LinearCompressed(nn.Linear):
             return input
         # Perform with low-rank decomposition
         if isinstance(self.lrd_rank, int):
-            # In this case, weight.shape = (in_features + out_features, lrd_rank)
-            weightA = self.weight[:self.out_features, :] # shape: (out_features, lrd_rank)
-            weightBT = self.weight[self.out_features:, :] # shape: (in_features, lrd_rank)
+            weightA = self.weight # shape: (out_features, lrd_rank)
+            weightBT = self.weight_2 # shape: (in_features, lrd_rank)
 
             if self.prune_mask is not None: # Apply soft structured pruning if mask is available
                 weightA = weightA * self.prune_mask
 
-            # Compute: x @ (weightA @ weightB).T + bias which is the same as: x @ weight.T + bias
+            # Compute: x @ (weightA @ weightB).T + bias which is the same as x @ weightB.T @ weightA.T + bias
             return F.linear(input @ weightBT, weightA, self.bias)
         elif self.lrd_rank == "full": # Perform normally if rank is full
             # Apply soft structured pruning if mask is available
