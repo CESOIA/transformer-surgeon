@@ -49,7 +49,8 @@ class CompressionScheme:
                  pruning_ratio, #output_paths, 
                  lrd_rank,
                  is_qkv_concatenated=False,
-                 model=None):
+                 model=None,
+                 ):
         self.name = name
         self.block_id = block_id
         self.path = path
@@ -59,9 +60,16 @@ class CompressionScheme:
         self.is_qkv_concatenated = is_qkv_concatenated
         self.model = model
 
-        self.hard_applied = False # this flags the compression as non-reversible
-        self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize
+        self.hard_applied = False # this flags the compression as non-reversible when True
+        self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize with hard application
         self.vcon_initialized = False # this flags if the VCONBlock has been initialized
+
+        if model is not None:
+            # Check if the module exists in the model
+            module = self.get_module()
+            # Check if the module has already been hard-compressed (low-rank only)
+            if hasattr(module, 'lrd_rank') and module.lrd_rank != "full":
+                self.hard_applied = True
 
     def get_module(self):
         """
@@ -359,8 +367,8 @@ class CompressionScheme:
             if not self.soft_applied:
                 # Replace the original weight with the decomposed weights
                 W1, W2 = self._low_rank_decomposition(module, self.lrd_rank)
-                newW = torch.concat((W1, W2.t()), dim=0)
-                module.weight.data = newW
+                module.weight = torch.nn.Parameter(W1)
+                module.weight_2 = torch.nn.Parameter(W2.t())
                 module.set_lrd_rank(self.lrd_rank)
 
             self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
@@ -480,7 +488,13 @@ class CompressionScheme:
             return weight, torch.eye(weight.size(1), device=weight.device)
         
         # Perform SVD
-        U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
+        if weight.dtype != torch.float32: # Convert to float32 for SVD computation
+            weight_f32 = weight.float()
+        U, S, Vh = torch.linalg.svd(weight_f32, full_matrices=False)
+        if weight.dtype != torch.float32: # Convert back to original dtype
+            U = U.to(weight.dtype)
+            S = S.to(weight.dtype)
+            Vh = Vh.to(weight.dtype)
         # Keep only the top 'rank' components
         U_r = U[:, :rank]
         S_r = torch.diag(S[:rank])

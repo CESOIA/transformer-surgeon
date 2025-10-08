@@ -3,6 +3,7 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
+    AutoModel,
 )
 from test_messages import messages
 from qwen_vl_utils import process_vision_info
@@ -11,10 +12,9 @@ import sys
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
 hard_mode = True
-use_vcon = True  # Whether to use VCON blocks
+use_vcon = False  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
 VERBOSE = True  # Whether to print detailed information during compression
-DO_COMPRESSION = True  # Whether to apply compression
 ##########################
 
 if model_type == "qwen2_vl_c":
@@ -28,8 +28,6 @@ if model_type == "qwen2_vl_c":
     configClass = Qwen2VLConfigCompress
     managerClass = Qwen2VLCompressionSchemesManager
 
-    # Model name
-    model_name = "Qwen/Qwen2-VL-7B-Instruct"
 elif model_type == "qwen2_5_vl_c":
     from transformersurgeon import (
         Qwen2_5_VLForConditionalGenerationCompress,
@@ -41,8 +39,9 @@ elif model_type == "qwen2_5_vl_c":
     configClass = Qwen2_5_VLConfigCompress
     managerClass = Qwen2_5_VLCompressionSchemesManager
 
-    # Model name
-    model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+# Model name
+# model_name = "./models/Qwen2.5-VL-compress-custom"  # Local path to the exported compressed model
+model_name = "prolucio/Qwen2.5-VL-compress-custom"  # Hugging Face Hub repo with the exported compressed model
 
 # Device
 # Get GPU number from command line arguments
@@ -62,55 +61,32 @@ processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
 model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
 
-### COMPRESSION CONFIGURATION AND APPLICATION ###
 
-# Example usage of CompressionSchemesManager
-"""
-    SchemesManager supports filtering layers using criteria such as:
-    - Block ID (int)
-    - Layer name or path (str, supports partial matching)
-    - Lists of the above (OR logic within the list)
-    - List inside the criteria list (AND logic between criteria)
+### COMPRESSION AND HUGGING FACE EXPORT TEST ###
 
-    Examples of criteria:
-    criteria = [3, ["mlp", "vision"]]  apply to all blocks with ID 3 OR containing "mlp" AND "vision" in their name/path
-"""
+def sizeof_dtype(dtype):
+    if dtype == torch.float32:
+        return 4
+    elif dtype == torch.float16:
+        return 2
+    elif dtype == torch.bfloat16:
+        return 2
+    elif dtype == torch.int8:
+        return 1
+    elif dtype == torch.int4:
+        return 0.5
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
 
-print("Number of parameters before compression:", sum(p.numel() for p in model.parameters()) / 1e6, "M")
+print("Number of parameters:", sum(p.numel() for p in model.parameters()) / 1e6, "M")
+print("Estimated size on disk", sum(p.numel()*sizeof_dtype(p.dtype) for p in model.parameters()) / 2**30, "GB")
+print("Number of parameters of the vision tower:", sum(p.numel() for n, p in model.named_parameters() if "visual" in n) / 1e6, "M")
+print("Number of parameters of the text tower:", sum(p.numel() for n, p in model.named_parameters() if "language_model" in n) / 1e6, "M")
+print("Number of parameters of the output layers:", sum(p.numel() for n, p in model.named_parameters() if "lm_head" in n) / 1e6, "M")
 
-if DO_COMPRESSION:
-    manager = managerClass(model)
-    manager.set_lrd_rank(512,
-        [
-            ["visual", "mlp.up_proj"],                # Apply to all "mlp.up_proj" layers in vision_config
-            ["visual", "mlp.down_proj", 0],           # Apply to the first "mlp.down_proj" layer in vision_config
-            ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
-            ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
-        ], verbose=VERBOSE)
-    # manager.set_lrd_rank_all(32)
-
-    if use_vcon:
-        manager.init_vcon_all(verbose=VERBOSE)
-        # manager.init_vcon(criteria=[3, "mlp"], verbose=VERBOSE)  # Initialize VCON for only specific layers
-        manager.set_vcon_beta_all(vcon_beta)
-        # manager.set_vcon_beta(vcon_beta, criteria=[3, "mlp"])  # Set beta for only specific layers
-
-    # Update in-place the compressed model configuration from the manager
-    compress_config = manager.update_config()
-
-    # Optionally print the full compression configuration as a table
-    # print(manager)  
-
-    # Apply all compression schemes to the model
-    manager.apply_all(hard=hard_mode, verbose=VERBOSE)
-
-    # Optionally print the model architecture
-    # print(model)
-
-print("Number of parameters after compression:", sum(p.numel() for p in model.parameters()) / 1e6, "M")
-
-# After applying compression with soft mode, you can revert the model to its original state if needed
-# manager.restore_all()  # Uncomment this line if you want to restore the model to its original state
+# Check model compression configuration
+manager = managerClass(model)
+print(manager)
 
 ### INFERENCE AND TESTING ###
 print("Generating text...")

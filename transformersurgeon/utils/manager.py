@@ -224,7 +224,6 @@ class CompressionSchemesManager:
                     # Get pruning ratio and LRD rank from config
                     pruning_ratio = block_specific_config.get('pruning_ratios', {}).get(full_path, 0.0)
                     lrd_rank = block_specific_config.get('lrd_ranks', {}).get(full_path, "full")
-                    
                     tmp_dict[full_path] = CompressionScheme(
                         name=path,
                         block_id=i,
@@ -310,12 +309,17 @@ class CompressionSchemesManager:
         """
         config_names = [block['config_attr'] for block in self.indexing.values()]
 
-        for cname, block_dicts in zip(config_names, self.schemes.values()):    
+        total_updates = 0
+        for cname, block_dicts in zip(config_names, self.schemes.values()):
             for scheme in block_dicts.values():
-                getattr(self.config, cname).pruning_ratios[scheme.path] = scheme.pruning_ratio
-                getattr(self.config, cname).lrd_ranks[scheme.path] = scheme.lrd_rank
-                if verbose:
-                    print(f"Updated config for {scheme.path}: pruning_ratio={scheme.pruning_ratio}, lrd_rank={scheme.lrd_rank}")
+                if scheme.hard_applied:
+                    getattr(self.config, cname).pruning_ratios[scheme.path] = scheme.pruning_ratio
+                    getattr(self.config, cname).lrd_ranks[scheme.path] = scheme.lrd_rank
+                    if verbose:
+                        print(f"Updated config for {scheme.path}: pruning_ratio={scheme.pruning_ratio}, lrd_rank={scheme.lrd_rank}")
+                    total_updates += 1
+        if total_updates == 0:
+            warnings.warn("No compression has been applied to configuration. Check if compression was applied in hard mode.")
 
         return self.config
 
@@ -333,13 +337,13 @@ class CompressionSchemesManager:
                     
     def __repr__(self):
         string = ""
-        string += "  Prune Rat.   LRD Rank   Path\n"
+        string += "  Prune Rat.   LRD Rank   Soft       Hard       Path\n"
         string += "|"+"-"*100 + "\n"
         for i, scheme in enumerate(self):
             if i % 2 == 1:
-                string += f"| {scheme.pruning_ratio:<10} | {scheme.lrd_rank:<10} | {scheme.path:<60}|\n"
+                string += f"| {scheme.pruning_ratio:<10} | {scheme.lrd_rank:<10} | {scheme.soft_applied:<10} | {scheme.hard_applied:<10} | {scheme.path:<60}|\n"
             else:
-                string += f"  {scheme.pruning_ratio:<10}   {scheme.lrd_rank:<10}   {scheme.path:<60} \n"
+                string += f"  {scheme.pruning_ratio:<10}   {scheme.lrd_rank:<10}   {scheme.soft_applied:<10}   {scheme.hard_applied:<10}   {scheme.path:<60} \n"
         return string
                     
     def _set_model(self, model):
