@@ -40,7 +40,7 @@ def get_validated_dict_value(dictionary, key, default, min_value=None, max_value
     Returns:
         The validated value or the default.
     """
-    value = dictionary.get(key, None)
+    value = dictionary[key] # if key is missing, this raises a KeyError
     value = get_validated_value(value, default, min_value, max_value)
     return value
 

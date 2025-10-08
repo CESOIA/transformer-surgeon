@@ -196,6 +196,7 @@ Thumbs.db
 *.safetensors
 checkpoints/
 models/
+!transformersurgeon/models/
 *.bin
 
 # Data files
