@@ -62,10 +62,6 @@ processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
 model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
 
-
-### COMPRESSION CONFIGURATION AND APPLICATION ###
-
-
 ### COMPRESSION CONFIGURATION AND APPLICATION ###
 
 # Example usage of CompressionSchemesManager
@@ -99,14 +95,14 @@ if DO_COMPRESSION:
         manager.set_vcon_beta_all(vcon_beta)
         # manager.set_vcon_beta(vcon_beta, criteria=[3, "mlp"])  # Set beta for only specific layers
 
-    # Update in-place the compressed model configuration from the manager
-    compress_config = manager.update_config()
-
     # Optionally print the full compression configuration as a table
-    # print(manager)  
+    # print(manager)
 
     # Apply all compression schemes to the model
     manager.apply_all(hard=hard_mode, verbose=VERBOSE)
+
+    # Update in-place the compressed model configuration from the manager
+    compress_config = manager.update_config()
 
     # Optionally print the model architecture
     # print(model)

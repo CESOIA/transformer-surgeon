@@ -114,11 +114,8 @@ class Qwen2_5_VLMLPCompress(nn.Module):
 # -------------
         self.gate_rank = get_validated_dict_value(config.lrd_ranks, path+".gate_proj", default="full", min_value=1)
         self.up_rank = get_validated_dict_value(config.lrd_ranks, path+".up_proj", default="full", min_value=1)
-<<<<<<< HEAD:transformersurgeon/models/qwen2_5_vl_c/modeling_qwen2_5_vl_c.py
         self.down_rank = get_validated_dict_value(config.lrd_ranks, path+".down_proj", default="full", min_value=1)
-=======
-        self.down_rank = get_validated_dict_value(config.lrd_ranks, path+"down_proj", default="full", min_value=1)
->>>>>>> main:transformersurgeon/qwen2_5_vl_c/modeling_qwen2_5_vl_c.py
+
         if FORCE_ORIGINAL_LAYERS:
             self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
             self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
@@ -331,11 +328,7 @@ class Qwen2_5_VisionTransformerPretrainedModelCompress(Qwen2_5_VisionTransformer
         # original --->
         # self.blocks = nn.ModuleList([Qwen2_5_VLVisionBlock(config) for _ in range(config.depth)])
         # -------------
-<<<<<<< HEAD:transformersurgeon/models/qwen2_5_vl_c/modeling_qwen2_5_vl_c.py
         self.blocks = nn.ModuleList([Qwen2_5_VLVisionBlockCompress(config, path=path+f".blocks.{i}") for i in range(config.depth)])
-=======
-        self.blocks = nn.ModuleList([Qwen2_5_VLVisionBlockCompress(config, path=path+f"blocks.{i}") for i in range(config.depth)])
->>>>>>> main:transformersurgeon/qwen2_5_vl_c/modeling_qwen2_5_vl_c.py
         # <--- CESOIA modifications
 
         self.merger = Qwen2_5_VLPatchMerger(
@@ -636,13 +629,8 @@ class Qwen2_5_VLModelCompress(Qwen2_5_VLModel, Qwen2_5_VLPreTrainedModelCompress
         # self.language_model = Qwen2_5_VLTextModel._from_config(config.text_config)
 # -------------
         super(Qwen2_5_VLModel, self).__init__(config)
-<<<<<<< HEAD:transformersurgeon/models/qwen2_5_vl_c/modeling_qwen2_5_vl_c.py
         self.visual = Qwen2_5_VisionTransformerPretrainedModelCompress._from_config(config.vision_config, path="model.visual")
         self.language_model = Qwen2_5_VLTextModelCompress._from_config(config.text_config, path="model.language_model")
-=======
-        self.visual = Qwen2_5_VisionTransformerPretrainedModelCompress._from_config(config.vision_config, path="visual")
-        self.language_model = Qwen2_5_VLTextModelCompress._from_config(config.text_config, path="language_model")
->>>>>>> main:transformersurgeon/qwen2_5_vl_c/modeling_qwen2_5_vl_c.py
 # <--- CESOIA modifications
         self.rope_deltas = None  # cache rope_deltas here
 
