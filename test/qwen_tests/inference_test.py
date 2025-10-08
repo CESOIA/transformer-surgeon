@@ -64,6 +64,9 @@ model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
 
 ### COMPRESSION CONFIGURATION AND APPLICATION ###
 
+
+### COMPRESSION CONFIGURATION AND APPLICATION ###
+
 # Example usage of CompressionSchemesManager
 """
     SchemesManager supports filtering layers using criteria such as:
