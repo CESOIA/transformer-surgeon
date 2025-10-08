@@ -115,6 +115,7 @@ class Qwen2_5_VLMLPCompress(nn.Module):
         self.gate_rank = get_validated_dict_value(config.lrd_ranks, path+".gate_proj", default="full", min_value=1)
         self.up_rank = get_validated_dict_value(config.lrd_ranks, path+".up_proj", default="full", min_value=1)
         self.down_rank = get_validated_dict_value(config.lrd_ranks, path+".down_proj", default="full", min_value=1)
+
         if FORCE_ORIGINAL_LAYERS:
             self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
             self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)

@@ -11,7 +11,7 @@ import sys
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
 hard_mode = True
-use_vcon = False  # Whether to use VCON blocks
+use_vcon = True  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
 VERBOSE = True  # Whether to print detailed information during compression
 DO_COMPRESSION = True  # Whether to apply compression
@@ -62,6 +62,8 @@ processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
 model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
 
+### COMPRESSION CONFIGURATION AND APPLICATION ###
+
 
 ### COMPRESSION CONFIGURATION AND APPLICATION ###
 
@@ -96,14 +98,14 @@ if DO_COMPRESSION:
         manager.set_vcon_beta_all(vcon_beta)
         # manager.set_vcon_beta(vcon_beta, criteria=[3, "mlp"])  # Set beta for only specific layers
 
-    # Update in-place the compressed model configuration from the manager
-    compress_config = manager.update_config()
-
     # Optionally print the full compression configuration as a table
-    # print(manager)  
+    # print(manager)
 
     # Apply all compression schemes to the model
     manager.apply_all(hard=hard_mode, verbose=VERBOSE)
+
+    # Update in-place the compressed model configuration from the manager
+    compress_config = manager.update_config()
 
     # Optionally print the model architecture
     # print(model)
