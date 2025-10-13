@@ -125,7 +125,7 @@ if DO_EXPORT:
         base_model=model_name,
         out_dir="models",
         readme="This is a compressed version of Qwen2.5-VL-7B-Instruct using custom compression schemes.",
-        embed_code=False,
+        embed_code=True,
         token=token,
         private=True,
         exist_ok=True,

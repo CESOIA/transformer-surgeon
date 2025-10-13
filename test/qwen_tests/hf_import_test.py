@@ -3,7 +3,7 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
-    AutoModel,
+    AutoModel,  # Added to test AutoModel loading (with trust_remote_code=True)
 )
 from test_messages import messages
 from qwen_vl_utils import process_vision_info
@@ -15,6 +15,8 @@ hard_mode = True
 use_vcon = False  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
 VERBOSE = True  # Whether to print detailed information during compression
+USE_AUTOMODEL = True  # Whether to load the model with AutoModel (trust_remote_code=True) or with the custom class directly
+LOAD_REMOTE = False  # Whether to load the model from the Hugging Face Hub (True) or from a local path (False)
 ##########################
 
 if model_type == "qwen2_vl_c":
@@ -40,8 +42,10 @@ elif model_type == "qwen2_5_vl_c":
     managerClass = Qwen2_5_VLCompressionSchemesManager
 
 # Model name
-# model_name = "./models/Qwen2.5-VL-compress-custom"  # Local path to the exported compressed model
-model_name = "prolucio/Qwen2.5-VL-compress-custom"  # Hugging Face Hub repo with the exported compressed model
+if LOAD_REMOTE:
+    model_name = "prolucio/Qwen2.5-VL-compress-custom"  # Hugging Face Hub repo with the exported compressed model
+else:
+    model_name = "./models/Qwen2.5-VL-compress-custom"  # Local path with the exported compressed model
 
 # Device
 # Get GPU number from command line arguments
@@ -59,8 +63,10 @@ device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 # Not using it results in loading the model in float32, which requires more memory
 processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
-model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
-
+if not USE_AUTOMODEL:
+    model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
+else:
+    model = AutoModel.from_pretrained(model_name, trust_remote_code=True, torch_dtype="auto").to(device)
 
 ### COMPRESSION AND HUGGING FACE EXPORT TEST ###
 
