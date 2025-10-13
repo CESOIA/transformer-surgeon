@@ -8,7 +8,7 @@ compression.py
 Provides the CompressionScheme class for managing structured pruning and low-rank decomposition of transformer blocks.
 """
 
-from .VCONBlock import VCONBlock
+from ..layers.VCONBlock import VCONBlock
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
 # but this is not easy for skip connections, e.g., residual connections in transformers
