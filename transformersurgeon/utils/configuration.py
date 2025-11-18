@@ -13,46 +13,38 @@ def _validate_pruning_ratio(ratio: float) -> None:
     """
     if ratio is not None and not (0.0 <= ratio <= 1.0):
         raise ValueError(f"Pruning ratio must be between 0.0 and 1.0, but got {ratio}.")
-
-def _expand_scalar_to_list(config_dict: Dict[str, Any], total_blocks: int) -> Dict[str, List]:
+    
+def _validate_pruning_mode(mode: str) -> None:
     """
-    Convert scalar values in config dict to lists with equal values.
+    Validate that pruning mode is either 'structured' or 'unstructured'.
     Args:
-        config_dict (Dict[str, Any]): The configuration dictionary.
-        total_blocks (int): The total number of transformer blocks.
-    Returns:
-        Dict[str, List]: The updated configuration dictionary with lists.
+        mode (str): The pruning mode to validate.
     """
-    if config_dict is not None:
-        for key, value in config_dict.items():
-            if isinstance(value, (int, bool, float, str)):
-                config_dict[key] = [value] * total_blocks
-    return config_dict
-
-def _apply_general_keys(config_dict: Dict[str, Any], target_dict: Dict[str, List], key_mappings: Dict[str, List[str]]) -> None:
+    valid_modes = ["structured", "unstructured"]
+    if mode is not None and mode not in valid_modes:
+        raise ValueError(f"Pruning mode must be one of {valid_modes}, but got '{mode}'.")
+    
+def _validate_lrd_rank(rank: Union[int, str]) -> None:
     """
-    Apply general-type keys to substitute specific layer types.
+    Validate that LRD rank is either 'full' or a positive integer.
     Args:
-        config_dict (Dict[str, Any]): The input configuration dictionary with potential general keys.
-        target_dict (Dict[str, List]): The target configuration dictionary to update.
-        key_mappings (Dict[str, List[str]]): Mapping from general keys to specific layer types.
+        rank (Union[int, str]): The LRD rank to validate.
     """
-    if config_dict is not None:
-        # Apply individual keys
-        target_dict.update({k: v for k, v in config_dict.items() 
-                           if k not in key_mappings.keys()})
-        
-        # Apply group keys (including "all")
-        for group_key, target_keys in key_mappings.items():
-            if config_dict.get(group_key) is not None:
-                for target_key in target_keys:
-                    print(f"Info: overwriting config '{target_key}' with general config '{group_key}'")
-                    target_dict[target_key] = config_dict[group_key]
+    if rank is not None:
+        if isinstance(rank, str):
+            if rank != "full":
+                raise ValueError(f"LRD rank must be 'full' or a positive integer, but got '{rank}'.")
+        elif isinstance(rank, int):
+            if rank <= 0:
+                raise ValueError(f"LRD rank must be a positive integer, but got {rank}.")
+        else:
+            raise ValueError(f"LRD rank must be 'full' or a positive integer, but got type {type(rank)}.")
 
 def init_compression_config(
     config_instance,
     indexing: Dict[str, Any],
     pruning_ratios: Optional[Dict[str, Any]] = None,
+    pruning_mode: Optional[Dict[str, Any]] = None,
     lrd_ranks: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
@@ -69,6 +61,7 @@ def init_compression_config(
     depth = getattr(config_instance, indexing["num_blocks_attr"])
     # Generate default config values by building all the paths in a dictionary
     config_instance.pruning_ratios = {path_template.format(block_index=id, path=path): 0.0 for id in range(depth) for path in indexing["path_list"]}
+    config_instance.pruning_mode = {path_template.format(block_index=id, path=path): "structured" for id in range(depth) for path in indexing["path_list"]}
     config_instance.lrd_ranks = {path_template.format(block_index=id, path=path): "full" for id in range(depth) for path in indexing["path_list"]}
     
     # Get values from arguments
@@ -76,8 +69,13 @@ def init_compression_config(
         for key, value in pruning_ratios.items():
             _validate_pruning_ratio(value)
             config_instance.pruning_ratios[key] = value
+    if pruning_mode is not None:
+        for key, value in pruning_mode.items():
+            _validate_pruning_mode(value)
+            config_instance.pruning_mode[key] = value
     if lrd_ranks is not None:
         for key, value in lrd_ranks.items():
+            _validate_lrd_rank(value)
             config_instance.lrd_ranks[key] = value
     
 __all__ = ["init_compression_config"]

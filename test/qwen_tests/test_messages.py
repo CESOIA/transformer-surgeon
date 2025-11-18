@@ -31,7 +31,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image.jpg",
+                "image": "example_image2.png",
             },
             {
                 "type": "text",
@@ -44,7 +44,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image.jpg",
+                "image": "example_image2.png",
             },
             {
                 "type": "text",

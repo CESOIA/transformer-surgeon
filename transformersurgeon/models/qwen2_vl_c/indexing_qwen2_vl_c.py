@@ -11,7 +11,6 @@ QWEN2_VL_C_INDEXING = {
         'path_list': ["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"],
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'qkv_paths': ["attn.qkv"],  # Paths that represent QKV concatenated layers
-        'path_list': ["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"],
         'pruning_supported': [],
     },
     'text':

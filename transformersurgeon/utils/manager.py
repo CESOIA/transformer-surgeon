@@ -1,3 +1,4 @@
+# Copyright 2025 The CESOIA project team, Politecnico di Torino and King Abdullah University of Science and Technology. All rights reserved.
 """
 manager.py
 
@@ -206,7 +207,10 @@ class CompressionSchemesManager:
             config_attr = block_indexing['config_attr']
 
             # Get the specific config for this block type
-            block_specific_config = config[config_attr]
+            if config_attr == '':
+                block_specific_config = config
+            else:
+                block_specific_config = config[config_attr]
 
             # Get blocks number
             num_blocks = block_specific_config[num_blocks_attr]
@@ -313,8 +317,12 @@ class CompressionSchemesManager:
         for cname, block_dicts in zip(config_names, self.schemes.values()):
             for scheme in block_dicts.values():
                 if scheme.hard_applied:
-                    getattr(self.config, cname).pruning_ratios[scheme.path] = scheme.pruning_ratio
-                    getattr(self.config, cname).lrd_ranks[scheme.path] = scheme.lrd_rank
+                    if cname == '':
+                        self.config.pruning_ratios[scheme.path] = scheme.pruning_ratio
+                        self.config.lrd_ranks[scheme.path] = scheme.lrd_rank
+                    else:
+                        getattr(self.config, cname).pruning_ratios[scheme.path] = scheme.pruning_ratio
+                        getattr(self.config, cname).lrd_ranks[scheme.path] = scheme.lrd_rank
                     if verbose:
                         print(f"Updated config for {scheme.path}: pruning_ratio={scheme.pruning_ratio}, lrd_rank={scheme.lrd_rank}")
                     total_updates += 1
