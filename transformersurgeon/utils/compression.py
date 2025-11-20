@@ -23,9 +23,15 @@ class CompressionScheme:
         block_id (int): Block identifier.
         path (str): Path to the block in the model.
         pruning_ratio (float): Ratio for structured pruning.
+        pruning_mode (str): Mode for pruning ('structured' or 'unstructured').
         lrd_rank (Union[int, str]): Rank for low-rank decomposition. Use "full" for no decomposition.
         is_qkv_concatenated (bool, optional): Whether QKV layers are concatenated in the model definition.
         model (torch.nn.Module, optional): Reference to the model.
+
+    Attributes:
+        hard_applied (bool): Flags if compression is non-reversible.
+        soft_applied (bool): Flags if compression has been performed.
+        vcon_initialized (bool): Flags if VCONBlock has been initialized.
 
     Methods:
         get_module: Returns the module at the specified path.
@@ -36,8 +42,9 @@ class CompressionScheme:
         cancel_vcon: Cancels VCON block.
         set_vcon_beta: Sets beta for VCON block.
         freeze_uncompressed_vcon: Freezes uncompressed VCON block.
-        apply: Applies compression.
+        apply: Applies compression (pruning and/or LRD).
         restore: Restores original module.
+        _unstructured_pruning: Performs unstructured pruning.
         _structured_pruning: Performs structured pruning.
         _low_rank_decomposition: Performs low-rank decomposition.
     """
@@ -46,8 +53,10 @@ class CompressionScheme:
                  name,
                  block_id,
                  path,
-                 pruning_ratio, #output_paths, 
-                 lrd_rank,
+                 # output_paths,
+                 pruning_ratio=0.0,
+                 pruning_mode='structured',
+                 lrd_rank="full",
                  is_qkv_concatenated=False,
                  model=None,
                  ):
@@ -55,6 +64,7 @@ class CompressionScheme:
         self.block_id = block_id
         self.path = path
         self.pruning_ratio = pruning_ratio
+        self.pruning_mode = pruning_mode
         # self.output_paths = output_paths # blocks after this layer, input should be pruned accordingly
         self.lrd_rank = lrd_rank
         self.is_qkv_concatenated = is_qkv_concatenated
@@ -103,7 +113,7 @@ class CompressionScheme:
         
         # Check if init_vcon has been called
         if self.vcon_initialized:
-            raise ValueError("Cannot set module when VCONBlock is initialized. Please cancel VCON first.")
+            self.vcon_initialized = False
 
         split_path = self.path.split('.')
         # Traverse the model iteratively to find the parent module
@@ -318,7 +328,7 @@ class CompressionScheme:
         if self.vcon_initialized:
             module = module.block_b # apply to block_b only
         
-        # Apply magnitude-based structured pruning
+        # Apply pruning
         if self.pruning_ratio > 0:
             if verbose:
                 if self.soft_applied:
@@ -331,11 +341,19 @@ class CompressionScheme:
 
             # Prune module
             if self.soft_applied:
-                prune_mask = self.module.prune_mask
+                prune_mask = module.prune_mask
             else:
-                prune_mask, kept = self._structured_pruning(module, norm=2, pruning_ratio=self.pruning_ratio)
+                if self.pruning_mode == 'structured':
+                    prune_mask, kept = self._structured_pruning(module, norm=2, pruning_ratio=self.pruning_ratio)
+                elif self.pruning_mode == 'unstructured':
+                    prune_mask = self._unstructured_pruning(module, criterion="magnitude", pruning_ratio=self.pruning_ratio)
+                else:
+                    raise ValueError(f"Unsupported pruning mode '{self.pruning_mode}' for module {self.path}.")
             
             if hard:
+                if self.pruning_mode == 'unstructured':
+                    raise ValueError("Hard pruning is not supported for unstructured pruning.")
+                
                 # Apply hard pruning by removing the pruned rows
                 module.weight.data = module.weight.data[prune_mask]
                 module.bias.data = module.bias.data[prune_mask] if module.bias is not None else None
@@ -416,6 +434,51 @@ class CompressionScheme:
                 f"path={self.path}, pruning_ratio={self.pruning_ratio}, "
                 f"lrd_rank={self.lrd_rank}, is_qkv_concatenated={self.is_qkv_concatenated}, "
                 f"module={self.get_module().__class__.__name__})")
+    
+    def _unstructured_pruning(self, module, criterion="magnitude", pruning_ratio=0.0) -> torch.Tensor:
+        """
+        Returns a mask for unstructured pruning based on the specified criterion.
+        This function generates a binary mask that can be applied to the weight tensor
+        to zero out individual weights (unstructured pruning) based on their magnitude.
+
+        Args:
+            module (torch.nn.Module): The module containing the weight tensor to be pruned.
+            criterion (str): The criterion to use for calculating the importance of weights. Default is "magnitude".
+            pruning_ratio (float): The ratio of weights to prune (between 0 and 1). Default is 0.0 (no pruning).
+
+        Returns:
+            torch.Tensor: A binary mask with the same shape as the weight tensor.
+        """
+        weight = module.weight.data.flatten()
+
+        if pruning_ratio <= 0.0:
+            # No pruning, return a mask of all ones
+            return torch.ones_like(weight, dtype=torch.bool, device=weight.device)
+        
+        if pruning_ratio >= 1.0:
+            # Full pruning, return a mask of all zeros
+            return torch.zeros_like(weight, dtype=torch.bool, device=weight.device)
+        
+        # Calculate importance scores based on the criterion
+        if criterion == "magnitude":
+            scores = torch.abs(weight)
+        else:
+            raise ValueError(f"Unsupported criterion '{criterion}' for unstructured pruning.")
+        
+        # Determine the number of weights to prune
+        num_weights_to_prune = int(pruning_ratio * weight.numel())
+        
+        if num_weights_to_prune == 0:
+            return torch.ones_like(weight, dtype=torch.bool, device=weight.device)
+        
+        # Get the indices of the weights with the smallest scores
+        _, prune_indices = torch.topk(scores, num_weights_to_prune, largest=False)
+        
+        # Create a mask with ones and set the prune indices to zero
+        mask = torch.ones_like(weight, dtype=torch.bool, device=weight.device)
+        mask[prune_indices] = False
+        
+        return mask.view_as(module.weight)
 
     def _structured_pruning(self, module, norm=2, pruning_ratio=0.0) -> torch.Tensor:
         """

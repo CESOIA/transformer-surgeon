@@ -61,7 +61,7 @@ def init_compression_config(
     depth = getattr(config_instance, indexing["num_blocks_attr"])
     # Generate default config values by building all the paths in a dictionary
     config_instance.pruning_ratios = {path_template.format(block_index=id, path=path): 0.0 for id in range(depth) for path in indexing["path_list"]}
-    config_instance.pruning_mode = {path_template.format(block_index=id, path=path): "structured" for id in range(depth) for path in indexing["path_list"]}
+    config_instance.pruning_modes = {path_template.format(block_index=id, path=path): "structured" for id in range(depth) for path in indexing["path_list"]}
     config_instance.lrd_ranks = {path_template.format(block_index=id, path=path): "full" for id in range(depth) for path in indexing["path_list"]}
     
     # Get values from arguments
@@ -72,7 +72,7 @@ def init_compression_config(
     if pruning_mode is not None:
         for key, value in pruning_mode.items():
             _validate_pruning_mode(value)
-            config_instance.pruning_mode[key] = value
+            config_instance.pruning_modes[key] = value
     if lrd_ranks is not None:
         for key, value in lrd_ranks.items():
             _validate_lrd_rank(value)

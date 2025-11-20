@@ -11,12 +11,13 @@ class ViTForImageClassificationCompress(ViTForImageClassification):
 
     def __init__(self, config: ViTConfigCompress):
         super().__init__(config)
-        print(self)
 
         replace_layers_upon_init(
             self,
             INDEXING["vit"],
             config,
         )
+
+        print(self)
 
 __all__ = ["ViTForImageClassificationCompress"]

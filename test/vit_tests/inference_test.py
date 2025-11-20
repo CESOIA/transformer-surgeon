@@ -7,7 +7,7 @@ import os
 from transformers import ViTForImageClassification
 from transformersurgeon import ViTForImageClassificationCompress, ViTCompressionSchemesManager
 
-DO_COMPRESSION = False
+DO_COMPRESSION = True
 VERBOSE = True
 USE_GPU = True
 BATCH_SIZE = 512
@@ -40,14 +40,11 @@ if DO_COMPRESSION:
     manager = ViTCompressionSchemesManager(model)
     
     # Apply compression schemes
-    manager.set_lrd_rank(
-        64,
-        [
-            ["intermediate.dense"], # Apply to all "intermediate.dense" layers in vision_config
-        ], verbose=VERBOSE)
+    manager.set_pruning_ratio_all(0.9, verbose=VERBOSE)
+    manager.set_pruning_mode_all("unstructured", verbose=VERBOSE)
     
     # Apply all compression schemes to the model
-    manager.apply_all(hard=True, verbose=VERBOSE)
+    manager.apply_all(hard=False, verbose=VERBOSE)
 
     # Update in-place the compressed model configuration from the manager
     manager.update_config()
