@@ -243,3 +243,6 @@ secrets.env
 # Conda environment
 .conda/
 _build/
+
+# Experiments folder
+experiments/
