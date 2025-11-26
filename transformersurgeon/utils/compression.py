@@ -113,7 +113,7 @@ class CompressionScheme:
         
         # Check if init_vcon has been called
         if self.vcon_initialized:
-            self.vcon_initialized = False
+            raise ValueError("Cannot set module when VCONBlock is initialized. Please cancel VCON first.")
 
         split_path = self.path.split('.')
         # Traverse the model iteratively to find the parent module
@@ -233,7 +233,8 @@ class CompressionScheme:
  
         if not self.vcon_initialized:
             raise ValueError("VCONBlock is not initialized, cannot cancel.")
-        
+        self.vcon_initialized = False
+
         module = self.get_module()
         if keep_block_b:
             module = module.block_b
@@ -245,7 +246,6 @@ class CompressionScheme:
         if verbose:
             kept = "block_b" if keep_block_b else "block_a"
             print(f"Cancelled VCONBlock at {self.path}, kept {kept}.")  
-        self.vcon_initialized = False
 
     def set_vcon_beta(self, beta: float, verbose=False):
         """

@@ -20,7 +20,10 @@ def replace_layers_upon_init(
     Returns:
         None: The model is modified in place.
     """
-    config_dict = config.to_dict()
+    if indexing["config_attr"] != "":
+        config_dict = getattr(config, indexing["config_attr"]).to_dict()
+    else:
+        config_dict = config.to_dict()
     path_template = indexing['path_template']
     path_list = indexing['path_list']
     blocks_num = config_dict.get(indexing['num_blocks_attr'], None)
