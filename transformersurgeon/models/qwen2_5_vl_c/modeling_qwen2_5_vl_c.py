@@ -1,5 +1,5 @@
 """
-Model definitions for ViT model compression.
+Model definitions for Qwen2.5-VL model compression.
 """
 
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration

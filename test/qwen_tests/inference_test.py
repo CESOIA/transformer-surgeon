@@ -9,7 +9,7 @@ from qwen_vl_utils import process_vision_info
 import sys
 
 ### TEST CONFIGURATION ###
-model_type = "qwen2_5_vl_c" 
+model_type = "qwen2_vl_c" 
 hard_mode = True
 use_vcon = True  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
@@ -43,6 +43,8 @@ elif model_type == "qwen2_5_vl_c":
 
     # Model name
     model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+else:
+    raise ValueError(f"Unsupported model_type '{model_type}'")
 
 # Device
 # Get GPU number from command line arguments
