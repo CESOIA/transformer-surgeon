@@ -1,14 +1,13 @@
-import copy
-import inspect
-import torch
-import torch.nn.utils.prune as prune
 """
 compression.py
 
 Provides the CompressionScheme class for managing structured pruning and low-rank decomposition of transformer blocks.
 """
-
-from ..layers.VCONBlock import VCONBlock
+import copy
+import inspect
+import torch
+from ..layers import LinearCompressed
+from ..layers import VCONBlock
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
 # but this is not easy for skip connections, e.g., residual connections in transformers
@@ -129,12 +128,21 @@ class CompressionScheme:
     
     def _is_to_compress(self):
         """
-        Checks if compression has been set for the module.
+        Checks if compression has been set for the module, or if the module is compatible with compression.
+        Compatible modules:
+            - LinearCompressed
 
         Returns:
             bool: True if compression should be applied, False otherwise.
         """
-        return (self.pruning_ratio > 0) or (self.lrd_rank and self.lrd_rank != "full")
+        compression_set = False
+        compression_set = compression_set or self.pruning_ratio > 0
+        compression_set = compression_set or (self.lrd_rank and self.lrd_rank != "full")
+
+        compatible = False
+        compatible = compatible or (type(self.get_module()) is LinearCompressed)
+
+        return compression_set and compatible
     
     def _module_copy(self, module):
         """
