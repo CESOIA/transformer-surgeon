@@ -61,6 +61,7 @@ class CompressionSchemesManager:
         self.indexing = indexing
         self.schemes = self._generate_schemes()
 
+    
     def set_lrd_rank(self, rank: Union[int, str], criteria=None, verbose=False):
         """
         Sets the LRD rank for filtered modules.
@@ -203,7 +204,7 @@ class CompressionSchemesManager:
             num_blocks_attr = block_indexing['num_blocks_attr']
             path_list = block_indexing['path_list']
             path_template = block_indexing['path_template']
-            config_attr = block_indexing['config_attr']
+            config_attr = block_indexing['config_attr'] # added by babisant88: it's done twice.
 
             # Get the specific config for this block type
             block_specific_config = config[config_attr]

@@ -327,7 +327,7 @@ class CompressionScheme:
                     else:
                         print(f"Pruning already applied to module {self.path}, skipping re-application.")
                 else:
-                    print(f"Applying {"HARD (non-reversible) "*hard}pruning with pruning ratio {self.pruning_ratio} to module {self.path}.")
+                    print(f"Applying {'HARD (non-reversible) '*hard}pruning with pruning ratio {self.pruning_ratio} to module {self.path}.")
 
             # Prune module
             if self.soft_applied:
@@ -355,7 +355,7 @@ class CompressionScheme:
                     else:
                         print(f"LRD already applied to module {self.path}, skipping re-application.")
                 else:
-                    print(f"Applying {"HARD (non-reversible) "*hard}LRD with rank {self.lrd_rank} to module {self.path}.")
+                    print(f"Applying {'HARD (non-reversible) '*hard}LRD with rank {self.lrd_rank} to module {self.path}.")
 
             if not hard:
                 # Store original weight matrix to allow restoring/vanishing contributions
@@ -488,6 +488,7 @@ class CompressionScheme:
             return weight, torch.eye(weight.size(1), device=weight.device)
         
         # Perform SVD
+        weight_f32 = weight
         if weight.dtype != torch.float32: # Convert to float32 for SVD computation
             weight_f32 = weight.float()
         U, S, Vh = torch.linalg.svd(weight_f32, full_matrices=False)
