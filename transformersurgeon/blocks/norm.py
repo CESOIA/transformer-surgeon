@@ -1,6 +1,6 @@
 import torch
 
-def RMSNorm(torch.nn.Module):
+class RMSNorm(torch.nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(hidden_size))

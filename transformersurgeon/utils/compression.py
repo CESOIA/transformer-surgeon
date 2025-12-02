@@ -8,6 +8,7 @@ import inspect
 import torch
 from ..layers import LinearCompressed
 from ..layers import VCONBlock
+from .utils import get_submodule
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
 # but this is not easy for skip connections, e.g., residual connections in transformers
@@ -88,16 +89,7 @@ class CompressionScheme:
         if not hasattr(self, 'model'):
             raise ValueError("Model is not set. Please set the model before getting the module.")
 
-        split_path = self.path.split('.')
-        # Traverse the model iteratively to find the module
-        tmp_module = self.model
-        for path_piece in split_path:
-            tmp_module = getattr(tmp_module, path_piece, None)
-
-            if tmp_module is None:
-                raise ValueError(f"Module at path '{self.path}' not found in the model.")
-
-        return tmp_module
+        return get_submodule(self.model, self.path)
     
     def set_module(self, new_module):
         """

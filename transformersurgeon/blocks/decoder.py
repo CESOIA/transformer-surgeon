@@ -2,39 +2,75 @@ import torch
 from . import MHACausal
 from . import MLP
 from . import MLPGated
-from . import RMSnorm
-from . import precompute_rope_cos_sin_half
+from . import RMSNorm
+from . import precompute_mrope_cos_sin_half
 
 class TransformerDecoderBlock(torch.nn.Module):
 
-    def __init__(
-            self,
-            embed_dim,
-            num_heads,
-            mlp_hidden_dim,
-            gated_mlp=False,
-            q_num_heads=None):
+    def __init__(self, config : dict):
         super().__init__()
         """
         Generic Transformer Decoder Block.
         
         Args:
-            embed_dim (int): Embedding dimension.
-            num_heads (int): Number of attention heads (or KV heads if q_num_heads is given).
-            mlp_hidden_dim (int): Hidden dimension of the MLP.
-            gated_mlp (bool): Whether to use gated MLP.
-            q_num_heads (int, optional): Number of Q heads (enables GQA). If None, set to num_heads.
+            config (dict): Configuration dictionary with the following keys:
+                - embed_dim (int): Embedding dimension.
+                - num_heads (int): Number of attention heads.
+                - mlp_hidden_dim (int): Hidden dimension of the MLP.
+                - mlp_activation (str): Activation function for the MLP.
+                - kv_num_heads (int, optional): Number of key/value heads for GQA.
+                - gated_mlp (bool, optional): Whether to use gated MLP (Qwen-style).
+                - compression_config (dict, optional): Compression configuration for MHA and MLP layers
         """
 
-        self.num_heads = num_heads
+        # Extract configuration (mandatory)
+        self.embed_dim = config["embed_dim"]
+        self.num_heads = config["num_heads"]
+        self.mlp_hidden_dim = config["mlp_hidden_dim"]
+        self.mlp_activation = config["mlp_activation"]
+        self.mha_type = config["mha_type"]
+        self.mlp_type = config["mlp_type"]
+        self.norm_type = config["norm_type"]
 
-        self.norm_in = RMSnorm(embed_dim)
-        self.attn = MHACausal(embed_dim, num_heads)
-        self.norm_out = RMSnorm(embed_dim)
-        if gated_mlp:
-            self.mlp = MLPGated(embed_dim, mlp_hidden_dim)
+        # Extract configuration (optional)
+        self.kv_num_heads = None if "kv_num_heads" not in config else config["kv_num_heads"]
+        self.compression_config = {
+            "attn": None,
+            "mlp": None,
+        } if "compression_config" not in config else config["compression_config"]
+
+        # Instantiate normalization modules
+        if self.norm_type == "rmsnorm":
+            self.norm_in = RMSNorm(self.embed_dim)
+            self.norm_out = RMSNorm(self.embed_dim)
         else:
-            self.mlp = MLP(embed_dim, mlp_hidden_dim)
+            raise ValueError(f"Unsupported norm type: {self.norm_type}")
+
+        # Instantiate attention module
+        if self.mha_type == "mha_causal":
+            self.attn = MHACausal(
+                self.embed_dim,
+                self.num_heads,
+                kv_num_heads=self.kv_num_heads,
+                compression_config=self.compression_config["attn"])
+        else:
+            raise ValueError(f"Unsupported MHA type: {self.mha_type}")      
+        
+        # Instantiate multi-layer perceptron module
+        if self.mlp_type == "mlp_gated":
+            self.mlp = MLPGated(
+                self.embed_dim,
+                self.mlp_hidden_dim,
+                self.mlp_activation, 
+                compression_config=self.compression_config["mlp"])
+        elif self.mlp_type == "mlp":
+            self.mlp = MLP(
+                self.embed_dim,
+                self.mlp_hidden_dim,
+                self.mlp_activation,
+                compression_config=self.compression_config["mlp"])
+        else:
+            raise ValueError(f"Unsupported MLP type: {self.mlp_type}")
 
     def forward(
             self,
@@ -60,13 +96,13 @@ class TransformerDecoderBlock(torch.nn.Module):
         """
         residual = x            # start skip connection
         x = self.norm_in(x)     # norm layer
-        x, k, v = self.attn(          # multihead self attention
-                x, 
-                key_cache=key_cache,
-                value_cache=value_cache,
-                rope=rope,
-                prefill=prefill
-                )
+        x, k, v = self.attn(    # multihead self attention
+            x, 
+            key_cache=key_cache,
+            value_cache=value_cache,
+            rope=rope,
+            prefill=prefill
+            )
         x = x + residual        # join skip connection
         residual = x            # start skip connection
         x = self.norm_out(x)    # norm layer
@@ -88,7 +124,9 @@ class TransformerDecoder(torch.nn.Module):
         """
         super().__init__()
 
-        self.blocks = torch.nn.ModuleList([TransformerDecoderBlock(**blocks_config[i]) for i in range(len(blocks_config))])
+        self.blocks = torch.nn.ModuleList(
+            [TransformerDecoderBlock(block_config) for block_config in blocks_config]
+            )
 
     def forward(
             self,
@@ -115,7 +153,7 @@ class TransformerDecoder(torch.nn.Module):
 
         # Evaluate RoPE cos and sin once
         if inv_freq is not None:
-            rope = precompute_rope_cos_sin_half(inv_freq, seq_len, position) # (1, 1, seq_len, head_dim//2)
+            rope = precompute_mrope_cos_sin_half(inv_freq, seq_len, position) # (1, 1, seq_len, head_dim//2)
         else:
             rope = None
         
@@ -130,7 +168,7 @@ class TransformerDecoder(torch.nn.Module):
             num_heads = block.num_heads
             head_dim = embed_dim // num_heads
 
-            if position is not None: # Decode
+            if position is not None: # Prepare for Decode
                 # Get cache slice
                 cache_len = int(cache_lengths[i].item())
                 k = key_cache[:, :, cache_cumlen:cache_cumlen+cache_len] # (batch_size, seq_len, length)
@@ -144,11 +182,11 @@ class TransformerDecoder(torch.nn.Module):
                 k = None
                 v = None
 
-            # Prefill/Decode
+            # Inference (prefill or decode)
             x, k, v = block(
                 x,                  # (batch_size, seq_len, embed_dim)
-                key_cache=k,        # (batch_size, num_heads, total_seq_len, head_dim)
-                value_cache=v,      # (batch_size, num_heads, total_seq_len, head_dim)
+                key_cache=k,        # (batch_size, num_heads, total_seq_len, head_dim) or None
+                value_cache=v,      # (batch_size, num_heads, total_seq_len, head_dim) or None
                 rope=rope,          # (1, 1, seq_len, head_dim//2)
                 prefill=prefill,
             )
@@ -166,3 +204,5 @@ class TransformerDecoder(torch.nn.Module):
         wb_value_cache = torch.cat(wb_value_cache, dim=-1) # (batch_size, total_seq_len+1, cumsum(cache_lengths))
 
         return x, wb_key_cache, wb_value_cache, wb_cache_lengths
+
+__all__ = ["TransformerDecoder",]

@@ -4,64 +4,109 @@ import math
 import torch
 import torch.nn.functional as F
 from . import apply_rope_multihead
+from ..layers import LinearCompressed
 
 def attention(query, key, value, is_causal=False):
     """
     Explicit implementation of scaled dot-product attention.
     This is needed for cases where torch's built-in SDPA is not suited for model export (e.g., ONNX).
+    It supports GQA automatically by handling different head dimensions for query and key/value.
 
     Args:
-        query: Tensor of shape (batch_size, num_heads, seq_length, head_dim)
-        key:   Tensor of shape (batch_size, num_heads, seq_length, head_dim)
-        value: Tensor of shape (batch_size, num_heads, seq_length, head_dim)
+        query: Tensor of shape (batch_size, num_heads, seq_length, q_head_dim)
+        key:   Tensor of shape (batch_size, num_heads, seq_length, kv_head_dim)
+        value: Tensor of shape (batch_size, num_heads, seq_length, kv_head_dim)
         is_causal: Whether to apply causal masking (for decoder use)
     """
-    _, _, seq_length, head_dim = query.size()
+    batch_size, q_head_num,  seq_length, head_dim  = query.size()
+    _,          kv_head_num, _,          _         = key.size()
+    group_size = q_head_num // kv_head_num
+
+    # reshape query, key, value for possible GQA
+    query = query.view(batch_size, kv_head_num, group_size, seq_length, head_dim) # (batch_size, kv_head_num, group_size, seq_length, head_dim)
+    key   = key.unsqueeze(2)    # (batch_size, kv_head_num, 1, seq_length, head_dim)
+    value = value.unsqueeze(2)  # (batch_size, kv_head_num, 1, seq_length, head_dim)
+
     device = query.device
     dtype = query.dtype
         
     # Scaled QK^T
     scale = 1.0 / math.sqrt(head_dim)
-    scores = torch.matmul(query, key.permute(0, 1, 3, 2))*scale
+    scores = torch.matmul(query, key.permute(0, 1, 2, 4, 3))*scale
+
     # Cast to float32 for numerical stability
     scores = scores.to(torch.float32)
+
+    # Generate negative causal mask
     if is_causal:
-        # Generate negative causal mask
         i = torch.arange(seq_length, device=device).view(1,1,seq_length,1)
         j = torch.arange(seq_length, device=device).view(1,1,1,seq_length)
         mask = i < j
         # Mask the future positions
         scores = scores.masked_fill(mask, torch.finfo(torch.float32).min)
+
     # Stabilize softmax by subtracting max
     scores = scores - scores.max(dim=-1, keepdim=True).values
+
     # Softmax and back to original dtype
     scores = torch.nn.functional.softmax(scores, dim=-1).to(dtype)
+
     # Attention output
-    attn_output = torch.matmul(scores, value)
+    attn_output = torch.matmul(scores, value)  # (batch_size, kv_head_num, group_size, seq_length, head_dim)
+    attn_output = attn_output.view(batch_size, q_head_num, seq_length, head_dim) # (batch_size, num_heads, seq_length, head_dim)
 
     return attn_output
 
-class MHAEncoder(torch.nn.Module): # No cache, no causal masking, for encoder-only use
-    def __init__(self, embed_dim, num_heads, bias=False, use_sdpa=False):
+class MHABase(torch.nn.Module):
+    def __init__(
+            self,
+            embed_dim,
+            num_heads,
+            bias=False,
+            kv_num_heads=None,
+            use_sdpa=False,
+            compression_config=None,
+            ):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert kv_num_heads is None or num_heads % kv_num_heads == 0, "num_heads must be divisible by kv_num_heads"
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.kv_num_heads = num_heads if kv_num_heads is None else kv_num_heads
         self.use_sdpa = use_sdpa
+        self.kv_out_dim = self.kv_num_heads * self.head_dim
+
+        # Setup compression configuration
+        if compression_config is None:
+            compression_config = {
+                "q_proj": {"lrd_rank": "full"},
+                "k_proj": {"lrd_rank": "full"},
+                "v_proj": {"lrd_rank": "full"},
+                "out_proj": {"lrd_rank": "full"}
+            }
         
-        self.q_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.k_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.out_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
+        q_lrd_rank = compression_config["q_proj"]["lrd_rank"]
+        k_lrd_rank = compression_config["k_proj"]["lrd_rank"]
+        v_lrd_rank = compression_config["v_proj"]["lrd_rank"]
+        out_lrd_rank = compression_config["out_proj"]["lrd_rank"]
         
+        self.q_proj = LinearCompressed(embed_dim, embed_dim, bias=bias, lrd_rank=q_lrd_rank)
+        self.k_proj = LinearCompressed(embed_dim, self.kv_out_dim, bias=bias, lrd_rank=k_lrd_rank)
+        self.v_proj = LinearCompressed(embed_dim, self.kv_out_dim, bias=bias, lrd_rank=v_lrd_rank)
+        self.out_proj = LinearCompressed(embed_dim, embed_dim, bias=bias, lrd_rank=out_lrd_rank)
+
+class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
     def forward(self, x, rope=None):
         batch_size, seq_length, embed_dim = x.size()
         
         # Project inputs to Q, K, V
-        q = self.q_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q = self.q_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
+        k = self.k_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
+        v = self.v_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
 
         # Apply RoPE
         if rope is not None:
@@ -70,7 +115,7 @@ class MHAEncoder(torch.nn.Module): # No cache, no causal masking, for encoder-on
         
         # Scaled dot-product attention
         if self.use_sdpa:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
         else:
             attn_output = attention(q, k, v, is_causal=False)
         
@@ -80,17 +125,35 @@ class MHAEncoder(torch.nn.Module): # No cache, no causal masking, for encoder-on
         
         return output
 
-class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA
-    def __init__(self, embed_dim, num_heads, bias=False, use_sdpa=False):
+class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (No GQA)
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        bias=False,
+        use_sdpa=False,
+        compression_config=None,
+        ):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.use_sdpa = use_sdpa
+
+        # Setup compression configuration
+        if compression_config is None:
+            compression_config = {
+                "qkv_proj": {"lrd_rank": "full"},
+                "out_proj": {"lrd_rank": "full"}
+            }
         
-        self.qkv_proj = torch.nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
-        self.out_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
+        qkv_lrd_rank = compression_config["qkv_proj"]["lrd_rank"]
+        out_lrd_rank = compression_config["out_proj"]["lrd_rank"]
+        
+        # Instantiate layers
+        self.qkv_proj = LinearCompressed(embed_dim, 3 * embed_dim, bias=bias, lrd_rank=qkv_lrd_rank)
+        self.out_proj = LinearCompressed(embed_dim, embed_dim, bias=bias, lrd_rank=out_lrd_rank)
         
     def forward(self, x, rope=None):
         batch_size, seq_length, embed_dim = x.size()
@@ -117,22 +180,21 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA
         
         return output
     
-class MHACausal(torch.nn.Module): # Causal MHA with caching for decoder use
-    def __init__(self, embed_dim, num_heads, bias=False, use_sdpa=False):
-        super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.use_sdpa = use_sdpa
-        
-        self.q_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.k_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.out_proj = torch.nn.Linear(embed_dim, embed_dim, bias=bias)
+class MHACausal(MHABase): # Causal MHA with caching for decoder use
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         
     def forward(self, x, key_cache=None, value_cache=None, prefill=True, rope=None):
+        """
+        Forward pass of the causal Multi-Head Attention with caching.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_length, embed_dim).
+            key_cache (torch.Tensor, optional): Key cache of shape (batch_size, num_heads, cache_length, head_dim). If None, no cache is used.
+            value_cache (torch.Tensor, optional): Value cache of shape (batch_size, num_heads, cache_length, head_dim). If None, no cache is used.
+            prefill (bool): If True, indicates that we are in prefill mode (processing multiple tokens). If False, we are decoding a single token.
+            rope (tuple, optional): Tuple of (cos, sin) tensors for RoPE application.
+        """
         batch_size, seq_length, embed_dim = x.size()
         
         # Project inputs to Q, K, V
