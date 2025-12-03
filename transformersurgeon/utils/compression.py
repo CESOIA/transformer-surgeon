@@ -25,7 +25,6 @@ class CompressionScheme:
         pruning_ratio (float): Ratio for structured pruning.
         pruning_mode (str): Mode for pruning ('structured' or 'unstructured').
         lrd_rank (Union[int, str]): Rank for low-rank decomposition. Use "full" for no decomposition.
-        is_qkv_concatenated (bool, optional): Whether QKV layers are concatenated in the model definition.
         model (torch.nn.Module, optional): Reference to the model.
 
     Attributes:
@@ -57,7 +56,6 @@ class CompressionScheme:
                  pruning_ratio=0.0,
                  pruning_mode='structured',
                  lrd_rank="full",
-                 is_qkv_concatenated=False,
                  model=None,
                  ):
         self.name = name
@@ -67,7 +65,6 @@ class CompressionScheme:
         self.pruning_mode = pruning_mode
         # self.output_paths = output_paths # blocks after this layer, input should be pruned accordingly
         self.lrd_rank = lrd_rank
-        self.is_qkv_concatenated = is_qkv_concatenated
         self.model = model
 
         self.hard_applied = False # this flags the compression as non-reversible when True
@@ -432,7 +429,7 @@ class CompressionScheme:
     def __repr__(self):
         return (f"CompressionScheme(name={self.name}, block_id={self.block_id}, "
                 f"path={self.path}, pruning_ratio={self.pruning_ratio}, "
-                f"lrd_rank={self.lrd_rank}, is_qkv_concatenated={self.is_qkv_concatenated}, "
+                f"lrd_rank={self.lrd_rank}, "
                 f"module={self.get_module().__class__.__name__})")
     
     def _unstructured_pruning(self, module, criterion="magnitude", pruning_ratio=0.0) -> torch.Tensor:

@@ -264,10 +264,6 @@ class CompressionSchemesManager:
                 for path in path_list:
                     # Create CompressionScheme instance
                     full_path = path_template.format(block_index=i, path=path)
-                    
-                    # Check if this is a QKV concatenated layer
-                    is_qkv_concatenated = block_indexing.get('qkv_paths', [])
-                    is_qkv = path in is_qkv_concatenated if is_qkv_concatenated else False
 
                     # Get pruning ratio and LRD rank from config
                     pruning_ratio = block_specific_config.get('pruning_ratios', {}).get(full_path, 0.0)
@@ -280,7 +276,6 @@ class CompressionSchemesManager:
                         pruning_ratio=pruning_ratio,
                         pruning_mode=pruning_mode,
                         lrd_rank=lrd_rank,
-                        is_qkv_concatenated=is_qkv,
                         model=self.model,
                     )
             

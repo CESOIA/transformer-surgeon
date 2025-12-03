@@ -4,33 +4,35 @@ import tqdm
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from transformersurgeon import Qwen2_5_VLForConditionalGenerationCompress
+from transformersurgeon.utils import convert_for_export
+from transformersurgeon import precompute_rope_inv_freqs
 from transformers import Qwen2TokenizerFast
 
 MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 tokenizer = Qwen2TokenizerFast.from_pretrained(MODEL_NAME)
 model = Qwen2_5_VLForConditionalGenerationCompress.from_pretrained(MODEL_NAME)
-model.config._attn_implementation = "eager"
 
 # Extract language backbone only
 embedding = model.get_input_embeddings()
 decoder = model.language_model
 final_layer = model.lm_head
-data_type = torch.float32
 
-with open("debug_log.txt", "w") as f:
-    f.write(model.config.__repr__())
+# Convert to export-compatible modules
+converted_models = convert_for_export(model, verbose=False)
+decoder = converted_models['text']
 
+# Set device and data type
 # device = torch.device("cpu")
 device = torch.device("cuda")
-model.to(device)
-model.eval()
+data_type = torch.float32
 
 # Put all modules on the same device
 embedding = embedding.to(device, dtype=data_type)
 decoder = decoder.to(device, dtype=data_type)
 final_layer = final_layer.to(device, dtype=data_type)
 
+# Prepare prompt
 template = (
     "<|im_start|>system\nYou are a helpful assistant.\n<|im_end|>\n"
     "<|im_start|>user\n{instruction}\n<|im_end|>\n"
@@ -59,6 +61,13 @@ def logits_to_input_id(logits, temperature=1.0):
     
     return torch.multinomial(probs, num_samples=1)
 
+# Precompute RoPE inverse frequencies
+inv_freq = precompute_rope_inv_freqs(
+    head_dim=128,
+    base=1e6,
+    device=device,
+    ).to(data_type)
+
 # Decode loop (no caching)
 max_new_tokens = 64
 
@@ -75,14 +84,23 @@ output_ids = input_ids
 with torch.no_grad():
     for i in tqdm.tqdm(range(max_new_tokens), "Generating"):
         # Decode
+        # output_embed = decoder(
+        #     attention_mask=attention_mask,
+        #     position_ids=position_ids,
+        #     inputs_embeds=inputs_embeds,
+        #     output_attentions=False,
+        #     use_cache=False,
+        #     cache_position=cache_position,
+        #     ).last_hidden_state
+
         output_embed = decoder(
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_attentions=False,
-            use_cache=False,
-            cache_position=cache_position,
-            ).last_hidden_state
+            inputs_embeds,
+            inv_freq=inv_freq,
+            key_cache=None,
+            value_cache=None,
+            cache_lengths=None,
+            position=None,
+            )[0]
         
         # Extract logits from output embed
         logits = final_layer(output_embed[:, -1, :])

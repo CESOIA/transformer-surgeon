@@ -9,7 +9,7 @@ from qwen_vl_utils import process_vision_info
 import sys
 
 ### TEST CONFIGURATION ###
-model_type = "qwen2_vl_c" 
+model_type = "qwen2_5_vl_c" 
 hard_mode = True
 use_vcon = True  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
@@ -63,6 +63,7 @@ device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
 model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
+print(model.config)
 
 ### COMPRESSION CONFIGURATION AND APPLICATION ###
 

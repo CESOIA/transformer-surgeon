@@ -1,7 +1,7 @@
 import torch
 
-def precompute_mrope_inv_freqs(
-        section_dims : list = [16, 24, 24],
+def precompute_rope_inv_freqs(
+        head_dim : int = 128,
         base : float = 1e6,
         device = "cpu",
         ):
@@ -16,15 +16,10 @@ def precompute_mrope_inv_freqs(
     Returns:
         inv_freqs: Tensor of inverse frequencies for each section
     """
-    inv_freqs = []
-    for i, dim in enumerate(section_dims):
-        base_prime = base ** ((i+1)/len(section_dims))
-        inv_freq = 1.0 / (base_prime ** (torch.arange(0, dim, 2, device=device).float() / dim))
-        inv_freqs.append(inv_freq)
-    inv_freqs = torch.cat(inv_freqs, dim=0) # (sum(section_dim)//2) -> (rotated_dim//2)
-    return inv_freqs 
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)) # (head_dim//2,)
+    return inv_freq
 
-def precompute_mrope_cos_sin_half(
+def precompute_rope_cos_sin_half(
         inv_freq : torch.Tensor,  # (rotated_dim//2,)
         seq_len : int, 
         position : int = None,
@@ -56,7 +51,7 @@ def precompute_mrope_cos_sin_half(
     sin = torch.sin(angles)  # (1, 1, 1, rotated_dim//2)
     return cos, sin
 
-def apply_mrope_multihead(
+def apply_rope_multihead(
         x : torch.Tensor,          # (batch_size, num_heads, seq_len, head_dim)
         cos : torch.Tensor,        # Precomputed half-size cosine values for RoPE (1, 1, seq_len, rotated_dim//2)
         sin : torch.Tensor,        # Precomputed half-size sine values for RoPE (1, 1, seq_len, rotated_dim//2)
@@ -73,31 +68,20 @@ def apply_mrope_multihead(
     Returns:
         out: Rotated tensor of the same shape as x
     """
-    _, _, _, half_rotated_dim = cos.shape  # (1, 1, seq_len, rotated_dim//2)
-    rotated_dim = half_rotated_dim * 2
-
-    # Generate even and odd indices (safest for export)
-    even_idx = torch.arange(0, rotated_dim, 2, device=x.device)
-    odd_idx = torch.arange(1, rotated_dim, 2, device=x.device)
-
-    # Slice even dims
-    x_even = torch.index_select(x, -1, even_idx)
-    x_odd = torch.index_select(x, -1, odd_idx)
+    # Split in 2 chunks for the "real" and "imaginary" parts
+    x_real, x_imag = torch.chunk(x, 2, dim=-1)  # Each of shape (batch_size, num_heads, seq_len, head_dim//2)
 
     # Apply rotation
-    y_even = x_even * cos - x_odd * sin
-    y_odd = x_even * sin + x_odd * cos
+    y_real = x_real * cos - x_imag * sin
+    y_imag = x_real * sin + x_imag * cos
 
     # Re-interleave even and odd dimensions
-    out = torch.zeros_like(x)
-    out[..., even_idx] = y_even
-    out[..., odd_idx] = y_odd
-    out[..., rotated_dim:] = x[..., rotated_dim:] # copy unrotated tail
+    out = torch.cat((y_real, y_imag), dim=-1)  # (batch_size, num_heads, seq_len, head_dim)
 
     return out
 
 __all__ = [
-    "precompute_mrope_inv_freqs",
-    "precompute_mrope_cos_sin_half",
-    "apply_mrope_multihead",
+    "precompute_rope_inv_freqs",
+    "precompute_rope_cos_sin_half",
+    "apply_rope_multihead",
 ]

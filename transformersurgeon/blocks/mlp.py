@@ -13,10 +13,9 @@ activation_map = {
 class MLP(torch.nn.Module):
     def __init__(
             self,
-            input_dim,
+            embed_dim,
             hidden_dim,
-            output_dim,
-            bias=False,
+            bias_required=None,
             activation='gelu',
             compression_config=None
             ):
@@ -43,18 +42,25 @@ class MLP(torch.nn.Module):
         up_proj_lrd_rank = compression_config["up_proj"]["lrd_rank"]
         down_proj_lrd_rank = compression_config["down_proj"]["lrd_rank"]
 
+        # Setup bias requirement
+        if bias_required is None:
+            bias_required = {
+                "up_proj": False,
+                "down_proj": False
+            }
+
         self.up_proj = LinearCompressed(
-            input_dim,
+            embed_dim,
             hidden_dim,
-            bias=bias,
+            bias=bias_required["up_proj"],
             lrd_rank=up_proj_lrd_rank)
         
         self.activation = activation_map[activation]()
 
         self.down_proj = LinearCompressed(
             hidden_dim,
-            output_dim,
-            bias=bias,
+            embed_dim,
+            bias=bias_required["down_proj"],
             lrd_rank=down_proj_lrd_rank)
 
     def forward(self, x):
@@ -75,11 +81,10 @@ class MLP(torch.nn.Module):
 class MLPGated(torch.nn.Module): # Qwen-style gated MLP
     def __init__(
             self,
-            input_dim,
+            embed_dim,
             hidden_dim,
-            output_dim,
-            bias=False,
-            activation=torch.nn.GELU,
+            bias_required=None,
+            activation='gelu',
             compression_config=None
             ):
         """
@@ -107,24 +112,32 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
         gate_proj_lrd_rank = compression_config["gate_proj"]["lrd_rank"]
         down_proj_lrd_rank = compression_config["down_proj"]["lrd_rank"]
 
+        # Setup bias requirement
+        if bias_required is None:
+            bias_required = {
+                "up_proj": False,
+                "gate_proj": False,
+                "down_proj": False
+            }
+
         self.up_proj = LinearCompressed(
-            input_dim,
+            embed_dim,
             hidden_dim,
-            bias=bias,
+            bias=bias_required["up_proj"],
             lrd_rank=up_proj_lrd_rank)
         
         self.gate_proj = LinearCompressed(
-            input_dim,
+            embed_dim,
             hidden_dim,
-            bias=bias,
+            bias=bias_required["gate_proj"],
             lrd_rank=gate_proj_lrd_rank)
         
-        self.activation = activation()
+        self.activation = activation_map[activation]()
 
         self.down_proj = LinearCompressed(
             hidden_dim,
-            output_dim,
-            bias=bias,
+            embed_dim,
+            bias=bias_required["down_proj"],
             lrd_rank=down_proj_lrd_rank)
 
     def forward(self, x):

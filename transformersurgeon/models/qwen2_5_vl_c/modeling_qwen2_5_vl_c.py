@@ -13,6 +13,8 @@ class Qwen2_5_VLForConditionalGenerationCompress(Qwen2_5_VLForConditionalGenerat
     def __init__(self, config: Qwen2_5_VLConfigCompress):
         super().__init__(config)
 
+        self.indexing = INDEXING
+
         replace_layers_upon_init(
             self,
             INDEXING["vision"],

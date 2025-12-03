@@ -3,7 +3,7 @@
 import math
 import torch
 import torch.nn.functional as F
-from . import apply_rope_multihead
+from .rope import apply_rope_multihead
 from ..layers import LinearCompressed
 
 def attention(query, key, value, is_causal=False):
@@ -62,7 +62,7 @@ class MHABase(torch.nn.Module):
             self,
             embed_dim,
             num_heads,
-            bias=False,
+            bias_required=None,
             kv_num_heads=None,
             use_sdpa=False,
             compression_config=None,
@@ -85,33 +85,59 @@ class MHABase(torch.nn.Module):
                 "v_proj": {"lrd_rank": "full"},
                 "out_proj": {"lrd_rank": "full"}
             }
+
+        # Setup bias requirement
+        if bias_required is None:
+            bias_required = {
+                "q_proj": False,
+                "k_proj": False,
+                "v_proj": False,
+                "out_proj": False
+            }
         
         q_lrd_rank = compression_config["q_proj"]["lrd_rank"]
         k_lrd_rank = compression_config["k_proj"]["lrd_rank"]
         v_lrd_rank = compression_config["v_proj"]["lrd_rank"]
         out_lrd_rank = compression_config["out_proj"]["lrd_rank"]
         
-        self.q_proj = LinearCompressed(embed_dim, embed_dim, bias=bias, lrd_rank=q_lrd_rank)
-        self.k_proj = LinearCompressed(embed_dim, self.kv_out_dim, bias=bias, lrd_rank=k_lrd_rank)
-        self.v_proj = LinearCompressed(embed_dim, self.kv_out_dim, bias=bias, lrd_rank=v_lrd_rank)
-        self.out_proj = LinearCompressed(embed_dim, embed_dim, bias=bias, lrd_rank=out_lrd_rank)
+        self.q_proj = LinearCompressed(
+            embed_dim,
+            embed_dim,
+            bias=bias_required["q_proj"],
+            lrd_rank=q_lrd_rank)
+        self.k_proj = LinearCompressed(
+            embed_dim,
+            self.kv_out_dim,
+            bias=bias_required["k_proj"],
+            lrd_rank=k_lrd_rank)
+        self.v_proj = LinearCompressed(
+            embed_dim,
+            self.kv_out_dim,
+            bias=bias_required["v_proj"],
+            lrd_rank=v_lrd_rank)
+        self.out_proj = LinearCompressed(
+            embed_dim,
+            embed_dim,
+            bias=bias_required["out_proj"],
+            lrd_rank=out_lrd_rank)
 
 class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
     def forward(self, x, rope=None):
         batch_size, seq_length, embed_dim = x.size()
         
         # Project inputs to Q, K, V
         q = self.q_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
-        k = self.k_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
-        v = self.v_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
+        k = self.k_proj(x).reshape(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
+        v = self.v_proj(x).reshape(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
 
         # Apply RoPE
         if rope is not None:
             cos, sin = rope
             q = apply_rope_multihead(q, cos, sin)
+            k = apply_rope_multihead(k, cos, sin)
         
         # Scaled dot-product attention
         if self.use_sdpa:
@@ -130,7 +156,7 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         self,
         embed_dim,
         num_heads,
-        bias=False,
+        bias_required=None,
         use_sdpa=False,
         compression_config=None,
         ):
@@ -147,13 +173,28 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
                 "qkv_proj": {"lrd_rank": "full"},
                 "out_proj": {"lrd_rank": "full"}
             }
+
+        # Setup bias requirement
+        if bias_required is None:
+            bias_required = {
+                "qkv_proj": False,
+                "out_proj": False
+            }
         
         qkv_lrd_rank = compression_config["qkv_proj"]["lrd_rank"]
         out_lrd_rank = compression_config["out_proj"]["lrd_rank"]
         
         # Instantiate layers
-        self.qkv_proj = LinearCompressed(embed_dim, 3 * embed_dim, bias=bias, lrd_rank=qkv_lrd_rank)
-        self.out_proj = LinearCompressed(embed_dim, embed_dim, bias=bias, lrd_rank=out_lrd_rank)
+        self.qkv_proj = LinearCompressed(
+            embed_dim, 
+            3 * embed_dim, 
+            bias=bias_required["qkv_proj"],
+            lrd_rank=qkv_lrd_rank)
+        self.out_proj = LinearCompressed(
+            embed_dim,
+            embed_dim,
+            bias=bias_required["out_proj"],
+            lrd_rank=out_lrd_rank)
         
     def forward(self, x, rope=None):
         batch_size, seq_length, embed_dim = x.size()
@@ -170,7 +211,7 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
     
         # Scaled dot-product attention
         if self.use_sdpa:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
         else:
             attn_output = attention(q, k, v, is_causal=False)
         
@@ -181,8 +222,8 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         return output
     
 class MHACausal(MHABase): # Causal MHA with caching for decoder use
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         
     def forward(self, x, key_cache=None, value_cache=None, prefill=True, rope=None):
         """
@@ -198,14 +239,15 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         batch_size, seq_length, embed_dim = x.size()
         
         # Project inputs to Q, K, V
-        q = self.q_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q = self.q_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
+        k = self.k_proj(x).reshape(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
+        v = self.v_proj(x).reshape(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
 
         # Apply RoPE
         if rope is not None:
             cos, sin = rope
             q = apply_rope_multihead(q, cos, sin)
+            k = apply_rope_multihead(k, cos, sin)
 
         # Append to cache
         if not prefill:
@@ -215,9 +257,9 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # Scaled dot-product attention
         if self.use_sdpa:
             if prefill:
-                attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
             else:
-                attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+                attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
         else:
             if prefill:
                 attn_output = attention(q, k, v, is_causal=True)
@@ -227,7 +269,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # Concatenate heads and project output
         attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_length, embed_dim).contiguous()
         output = self.out_proj(attn_output)
-        
+
         return output, k, v
     
 __all__ = [

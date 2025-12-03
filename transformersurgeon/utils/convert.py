@@ -1,4 +1,4 @@
-import torch
+import warnings
 from ..blocks import TransformerDecoder
 from .utils import get_submodule
 from collections import defaultdict
@@ -6,7 +6,7 @@ from collections import defaultdict
 def nested_dict():
     return defaultdict(nested_dict)
 
-def convert_for_export(model, indexing):
+def convert_for_export(model, verbose=False):
     """
     Convert model components to be compatible with export formats like ONNX.
 
@@ -18,28 +18,57 @@ def convert_for_export(model, indexing):
         The converted model.
     """
 
-    config = model.config.to_dict()
-    num_blocks = config[indexing['num_blocks_attr'])]
+    # Get indexing and config for the whole model (e.g., vision + text)
+    whole_indexing = model.indexing
+    whole_config = model.config.to_dict()
 
-    if indexing['structure'] == 'transformer_decoder':
-        new_model = _instantiate_decoder_block(config, indexing, num_blocks)
-        path_template = "blocks.{i}.{path}"
-    else:
-        raise NotImplementedError(f"Conversion for structure '{indexing['structure']}' is not implemented.")
-    
-    # Import parameters from the original model to the new model
+    # Convert each model component separately
+    new_models = {}
+    for name, indexing in whole_indexing.items():
+        if verbose:
+            print(f"Converting {name} component for export...")
 
-    for i in range(num_blocks):
-        for old_path, new_path in zip(indexing['path_template'], indexing['layer_matching']):
-            old_path = indexing['path_template'].format(block_index=i, path=old_path)
-            new_path = path_template.format(i=i, path=new_path)
-            if new_path.endswith('.norm_in') or new_path.endswith('.norm_out'):
-                continue  # Skip normalization layers
-            old_layer = get_submodule(model, old_path)
-            new_layer = get_submodule(new_model, new_path)
-            # WIP: copy parameters from old_layer to new_layer
+        # Check if conversion is supported
+        if indexing.get('structure', None) is None:
+            warnings.warn(f"Conversion for component '{name}' with structure '{indexing.get('structure', None)}' is not supported. Skipping conversion.")
+            new_models[name] = None
+            continue
 
-    return new_model
+        # Get configuration of the specific model component
+        config = whole_config[indexing['config_attr']]
+
+        # Instantiate new model structure based on indexing
+        num_blocks = config[indexing['num_blocks_attr']]
+
+        if indexing['structure'] == 'transformer_decoder':
+            new_model = _instantiate_decoder_block(config, indexing, num_blocks)
+            path_template = "blocks.{i}.{path}"
+        else:
+            raise NotImplementedError(f"Conversion for structure '{indexing['structure']}' is not implemented.")
+        
+        # Import parameters from the original model to the new model
+        for i in range(num_blocks):
+            for old_path, new_path in zip(indexing['path_list'], indexing['layer_matching']):
+                old_path = indexing['path_template'].format(block_index=i, path=old_path)
+                new_path = path_template.format(i=i, path=new_path)
+                if verbose:
+                    print("Transfering parameters:", old_path, "->", new_path)
+                old_layer = get_submodule(model, old_path)
+                new_layer = get_submodule(new_model, new_path)
+                new_layer.load_state_dict(old_layer.state_dict())
+
+        # Handle extra layers if any
+        if 'extra_layers' in indexing:
+            for old_path, new_path in zip(indexing['extra_layers'], indexing['extra_layers_matching']):
+                if verbose:
+                    print("Transfering extra layer parameters:", old_path, "->", new_path)
+                old_layer = get_submodule(model, old_path)
+                new_layer = get_submodule(new_model, new_path)
+                new_layer.load_state_dict(old_layer.state_dict())
+
+        new_models[name] = new_model
+
+    return new_models
         
 def _instantiate_decoder_block(config, indexing, blocks_num):
     """
@@ -57,7 +86,8 @@ def _instantiate_decoder_block(config, indexing, blocks_num):
 
         # Define compression configuration as a nested dictionary
         compression_config = nested_dict()
-        for path, matched in zip(indexing['path_list'], indexing['layer_matching']):
+        bias_required = nested_dict()
+        for j, (path, matched) in enumerate(zip(indexing['path_list'], indexing['layer_matching'])):
             full_path_old = indexing['path_template'].format(block_index=i, path=path)
 
             if matched in ['norm_in', 'norm_out']:
@@ -65,9 +95,13 @@ def _instantiate_decoder_block(config, indexing, blocks_num):
 
             matched_block, matched_layer = matched.split('.')
             
+            # Collect compression config parameters
             compression_config[matched_block][matched_layer]['lrd_rank'] = config['lrd_ranks'][full_path_old]
             compression_config[matched_block][matched_layer]['pruning_mode'] = config['pruning_modes'][full_path_old]
             compression_config[matched_block][matched_layer]['pruning_ratio'] = config['pruning_ratios'][full_path_old]
+
+            # Collect bias requirement
+            bias_required[matched_block][matched_layer] = indexing['bias_required'][j]
 
         # Define block configuration
         embed_dim = config[indexing['embed_dim_attr']]
@@ -89,10 +123,20 @@ def _instantiate_decoder_block(config, indexing, blocks_num):
             "mlp_type": mlp_type,
             "norm_type": norm_type,            
             "compression_config": compression_config,
+            "bias_required": bias_required,
         }
 
         blocks_config.append(block_config)
 
+    # Define extra layers configuration
+    extra_layers_config = {}
+    if 'extra_layers_matching' in indexing:
+        for extra_layer in indexing['extra_layers_matching']:
+            if extra_layer == "norm":
+                extra_layers_config["norm"] = {
+                    "embed_dim": config[indexing['embed_dim_attr']]
+                }
+
     # Instantiate the TransformerDecoder with the blocks configuration
-    decoder = TransformerDecoder(blocks_config)
+    decoder = TransformerDecoder(blocks_config, extra_layers_config)
     return decoder

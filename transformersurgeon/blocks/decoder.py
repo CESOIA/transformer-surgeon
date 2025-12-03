@@ -1,9 +1,9 @@
 import torch
-from . import MHACausal
-from . import MLP
-from . import MLPGated
-from . import RMSNorm
-from . import precompute_mrope_cos_sin_half
+from .mha import MHACausal
+from .mlp import MLP
+from .mlp import MLPGated
+from .norm import RMSNorm
+from .rope import precompute_rope_cos_sin_half
 
 class TransformerDecoderBlock(torch.nn.Module):
 
@@ -31,6 +31,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.mha_type = config["mha_type"]
         self.mlp_type = config["mlp_type"]
         self.norm_type = config["norm_type"]
+        self.bias_required = config["bias_required"]
 
         # Extract configuration (optional)
         self.kv_num_heads = None if "kv_num_heads" not in config else config["kv_num_heads"]
@@ -51,6 +52,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             self.attn = MHACausal(
                 self.embed_dim,
                 self.num_heads,
+                bias_required=self.bias_required["attn"],
                 kv_num_heads=self.kv_num_heads,
                 compression_config=self.compression_config["attn"])
         else:
@@ -61,13 +63,15 @@ class TransformerDecoderBlock(torch.nn.Module):
             self.mlp = MLPGated(
                 self.embed_dim,
                 self.mlp_hidden_dim,
-                self.mlp_activation, 
+                bias_required=self.bias_required["mlp"], 
+                activation=self.mlp_activation,
                 compression_config=self.compression_config["mlp"])
         elif self.mlp_type == "mlp":
             self.mlp = MLP(
                 self.embed_dim,
                 self.mlp_hidden_dim,
-                self.mlp_activation,
+                bias_required=self.bias_required["mlp"],
+                activation=self.mlp_activation,
                 compression_config=self.compression_config["mlp"])
         else:
             raise ValueError(f"Unsupported MLP type: {self.mlp_type}")
@@ -112,10 +116,14 @@ class TransformerDecoderBlock(torch.nn.Module):
         
 
 class TransformerDecoder(torch.nn.Module):
+    # BIG PROBLEM
+    # cache_lengths is NOT export safe - it forces dynamic shape slicing
+    # UNLESS it is passed as a constant tensor - wrap the forward call in a function that passes it as constant
 
     def __init__(
-            self, 
-            blocks_config,):
+            self,
+            blocks_config,
+            extra_layers_config):
         """
         Generic Transformer Decoder model.
         
@@ -127,6 +135,7 @@ class TransformerDecoder(torch.nn.Module):
         self.blocks = torch.nn.ModuleList(
             [TransformerDecoderBlock(block_config) for block_config in blocks_config]
             )
+        self.norm = RMSNorm(extra_layers_config["norm"]["embed_dim"])
 
     def forward(
             self,
@@ -142,9 +151,9 @@ class TransformerDecoder(torch.nn.Module):
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim).
             inv_freq (torch.Tensor, optional): Precomputed inverse frequencies for RoPE of shape (head_dim//2,). If None, no RoPE is applied.
-            key_cache (torch.Tensor, optional): Key cache for attention of size (batch_size, seq_len, cumsum(cache_lengths)). Can be None if prefill is True.
-            value_cache (torch.Tensor, optional): Value cache for attention of size (batch_size, seq_len, cumsum(cache_lengths)). Can be None if prefill is True.
-            cache_lengths (torch.Tensor, optional): Lengths of each layer's cache of shape (num_layers,).
+            key_cache (torch.Tensor, optional): Key cache for attention of size (batch_size, seq_len, cumsum(cache_lengths)). Can be None if position is None (prefill).
+            value_cache (torch.Tensor, optional): Value cache for attention of size (batch_size, seq_len, cumsum(cache_lengths)). Can be None if position is None (prefill).
+            cache_lengths (torch.Tensor, optional): Lengths of each layer's cache of shape (num_layers,). Can be None if position is None (prefill).
             position (int, optional): Specific position for decoding. If None, prefill mode is used.
         """
         
@@ -153,7 +162,7 @@ class TransformerDecoder(torch.nn.Module):
 
         # Evaluate RoPE cos and sin once
         if inv_freq is not None:
-            rope = precompute_mrope_cos_sin_half(inv_freq, seq_len, position) # (1, 1, seq_len, head_dim//2)
+            rope = precompute_rope_cos_sin_half(inv_freq, seq_len, position) # (1, 1, seq_len, head_dim//2)
         else:
             rope = None
         
@@ -190,18 +199,25 @@ class TransformerDecoder(torch.nn.Module):
                 rope=rope,          # (1, 1, seq_len, head_dim//2)
                 prefill=prefill,
             )
+            # x : (batch_size, seq_len, embed_dim)
+            # k : (batch_size, num_heads, total_seq_len, head_dim)
+            # v : (batch_size, num_heads, total_seq_len, head_dim)
 
             # Pack cache
             new_total_seq_len = k.size(2) # total_seq_len + 1
+            cache_len = k.size(3)*k.size(1) # head_dim * num_heads
             k = k.permute(0, 2, 1, 3).reshape(batch_size, new_total_seq_len, cache_len)
             v = v.permute(0, 2, 1, 3).reshape(batch_size, new_total_seq_len, cache_len)
             wb_cache_lengths.append(k.size(1))
             wb_key_cache.append(k)
             wb_value_cache.append(v)
         
-        wb_cache_lengths = torch.tensor(wb_cache_lengths, dtype=torch.long, dtype=device) # (num_layers,)
+        wb_cache_lengths = torch.tensor(wb_cache_lengths, dtype=torch.long, device=device) # (num_layers,)
         wb_key_cache = torch.cat(wb_key_cache, dim=-1) # (batch_size, total_seq_len+1, cumsum(cache_lengths))
         wb_value_cache = torch.cat(wb_value_cache, dim=-1) # (batch_size, total_seq_len+1, cumsum(cache_lengths))
+
+        # Final normalization
+        x = self.norm(x) # (batch_size, seq_len, embed_dim)
 
         return x, wb_key_cache, wb_value_cache, wb_cache_lengths
 
