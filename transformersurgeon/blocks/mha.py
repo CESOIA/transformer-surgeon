@@ -11,11 +11,14 @@ def attention(query, key, value, is_causal=False):
     Explicit implementation of scaled dot-product attention.
     This is needed for cases where torch's built-in SDPA is not suited for model export (e.g., ONNX).
     It supports GQA automatically by handling different head dimensions for query and key/value.
+    key_cache and value_cache are provided separately to minimize the concatenation overhead. They are used only if is_causal is False.
 
     Args:
         query: Tensor of shape (batch_size, num_heads, seq_length, q_head_dim)
         key:   Tensor of shape (batch_size, num_heads, seq_length, kv_head_dim)
         value: Tensor of shape (batch_size, num_heads, seq_length, kv_head_dim)
+        key_cache [optional]: Tensor of shape (batch_size, num_heads, cache_seq_length, kv_head_dim)
+        value_cache [optional]: Tensor of shape (batch_size, num_heads, cache_seq_length, kv_head_dim)
         is_causal: Whether to apply causal masking (for decoder use)
     """
     batch_size, q_head_num,  seq_length, head_dim  = query.size()
@@ -29,7 +32,7 @@ def attention(query, key, value, is_causal=False):
 
     device = query.device
     dtype = query.dtype
-        
+    
     # Scaled QK^T
     scale = 1.0 / math.sqrt(head_dim)
     scores = torch.matmul(query, key.permute(0, 1, 2, 4, 3))*scale
@@ -51,8 +54,10 @@ def attention(query, key, value, is_causal=False):
     # Softmax and back to original dtype
     scores = torch.nn.functional.softmax(scores, dim=-1).to(dtype)
 
-    # Attention output
+    # Project the values over the scores
     attn_output = torch.matmul(scores, value)  # (batch_size, kv_head_num, group_size, seq_length, head_dim)
+
+    # reshape back to original shape
     attn_output = attn_output.view(batch_size, q_head_num, seq_length, head_dim) # (batch_size, num_heads, seq_length, head_dim)
 
     return attn_output
@@ -129,9 +134,9 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
         batch_size, seq_length, embed_dim = x.size()
         
         # Project inputs to Q, K, V
-        q = self.q_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
-        k = self.k_proj(x).reshape(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
-        v = self.v_proj(x).reshape(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
+        q = self.q_proj(x).view(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
+        k = self.k_proj(x).view(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
+        v = self.v_proj(x).view(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
 
         # Apply RoPE
         if rope is not None:
@@ -146,7 +151,7 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
             attn_output = attention(q, k, v, is_causal=False)
         
         # Concatenate heads and project output
-        attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_length, embed_dim).contiguous()
+        attn_output = attn_output.permute(0, 2, 1, 3).view(batch_size, seq_length, embed_dim).contiguous()
         output = self.out_proj(attn_output)
         
         return output
@@ -200,7 +205,7 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         batch_size, seq_length, embed_dim = x.size()
         
         # Project inputs to Q, K, V in a single projection
-        qkv = self.qkv_proj(x).reshape(batch_size, seq_length, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv_proj(x).view(batch_size, seq_length, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         # Apply RoPE
@@ -216,7 +221,7 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
             attn_output = attention(q, k, v, is_causal=False)
         
         # Concatenate heads and project output
-        attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_length, embed_dim).contiguous()
+        attn_output = attn_output.permute(0, 2, 1, 3).view(batch_size, seq_length, embed_dim).contiguous()
         output = self.out_proj(attn_output)
         
         return output
@@ -231,7 +236,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_length, embed_dim).
-            key_cache (torch.Tensor, optional): Key cache of shape (batch_size, num_heads, cache_length, head_dim). If None, no cache is used.
+            key_cache (torch.Tensor): Key cache of shape (batch_size, num_heads, cache_length, head_dim). If None, no cache is used.
             value_cache (torch.Tensor, optional): Value cache of shape (batch_size, num_heads, cache_length, head_dim). If None, no cache is used.
             prefill (bool): If True, indicates that we are in prefill mode (processing multiple tokens). If False, we are decoding a single token.
             rope (tuple, optional): Tuple of (cos, sin) tensors for RoPE application.
@@ -239,9 +244,9 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         batch_size, seq_length, embed_dim = x.size()
         
         # Project inputs to Q, K, V
-        q = self.q_proj(x).reshape(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
-        k = self.k_proj(x).reshape(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
-        v = self.v_proj(x).reshape(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
+        q = self.q_proj(x).view(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
+        k = self.k_proj(x).view(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
+        v = self.v_proj(x).view(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
 
         # Apply RoPE
         if rope is not None:
@@ -249,11 +254,11 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             q = apply_rope_multihead(q, cos, sin)
             k = apply_rope_multihead(k, cos, sin)
 
-        # Append to cache
+        # Concatenate caches if not in prefill mode
         if not prefill:
-            k = torch.cat([key_cache, k], dim=2)
-            v = torch.cat([value_cache, v], dim=2)
-        
+            k = torch.cat([key_cache, k], dim=2)   # (batch_size, num_heads, cache_length + seq_length, head_dim)
+            v = torch.cat([value_cache, v], dim=2) # (batch_size, num_heads, cache_length + seq_length, head_dim)
+
         # Scaled dot-product attention
         if self.use_sdpa:
             if prefill:
@@ -267,9 +272,9 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                 attn_output = attention(q, k, v, is_causal=False)
         
         # Concatenate heads and project output
-        attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_length, embed_dim).contiguous()
+        attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_length, embed_dim)
         output = self.out_proj(attn_output)
-
+        
         return output, k, v
     
 __all__ = [

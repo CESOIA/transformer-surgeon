@@ -38,7 +38,10 @@ template = (
     "<|im_start|>user\n{instruction}\n<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
-prompt = "What's the capital of France?"
+prompt = """Please provide a comprehensive analysis of the impact of artificial intelligence on modern society, including its effects on employment, education, healthcare, and privacy. 
+Discuss both the potential benefits and risks, and explain how different sectors are adapting to these technological changes. 
+Additionally, consider the ethical implications of AI development and deployment, particularly in areas such as autonomous vehicles, facial recognition, and algorithmic decision-making in critical systems like criminal justice and financial services.
+Finally, suggest some policy recommendations that could help ensure AI development remains beneficial for humanity while minimizing potential harms."""
 
 # Tokenize inputs (string to input_ids)
 inputs = tokenizer(
@@ -69,38 +72,33 @@ inv_freq = precompute_rope_inv_freqs(
     ).to(data_type)
 
 # Decode loop (no caching)
-max_new_tokens = 64
+max_new_tokens = 512
 
 # Initialize embeddings sequence
 inputs_embeds = embedding(input_ids)
-prompt_length = input_ids.size(1)
-attention_mask = torch.triu(torch.full(size=(1, 1, prompt_length, prompt_length), fill_value=torch.finfo(data_type).min, device=device), diagonal=1)
-cache_position = torch.arange(0, prompt_length, device=device)
-position_ids = cache_position.unsqueeze(0)
 
-# Here insert prefill phase (if cache is used)
+# Prefill
+output_embed, key_cache, value_cache = decoder(
+    inputs_embeds,
+    inv_freq=inv_freq,
+    key_cache=None,
+    value_cache=None,
+    position=None,
+    )
+
 temperature = 0.6
 output_ids = input_ids
+position = output_ids.size(1)
 with torch.no_grad():
     for i in tqdm.tqdm(range(max_new_tokens), "Generating"):
-        # Decode
-        # output_embed = decoder(
-        #     attention_mask=attention_mask,
-        #     position_ids=position_ids,
-        #     inputs_embeds=inputs_embeds,
-        #     output_attentions=False,
-        #     use_cache=False,
-        #     cache_position=cache_position,
-        #     ).last_hidden_state
-
-        output_embed = decoder(
-            inputs_embeds,
+        output_embed, key_cache, value_cache = decoder(
+            inputs_embeds[:, -1:, :],
             inv_freq=inv_freq,
-            key_cache=None,
-            value_cache=None,
-            cache_lengths=None,
-            position=None,
-            )[0]
+            key_cache=key_cache,
+            value_cache=value_cache,
+            position=position,
+            )
+        position += 1
         
         # Extract logits from output embed
         logits = final_layer(output_embed[:, -1, :])
@@ -110,11 +108,7 @@ with torch.no_grad():
 
         # Append to sequence
         output_ids = torch.cat([output_ids, output_id], dim=1)
-        inputs_embeds = torch.cat([inputs_embeds, embedding(output_id)], dim=1)
-        prompt_length = output_ids.size(1)
-        attention_mask = torch.triu(torch.full(size=(1, 1, prompt_length, prompt_length), fill_value=torch.finfo(data_type).min, device=device), diagonal=1)
-        cache_position = torch.arange(0, prompt_length, device=device, dtype=torch.long)
-        position_ids = cache_position.unsqueeze(0)
+        inputs_embeds = embedding(output_ids)
 
         # Check for end-of-sequence token
         if output_id.item() == tokenizer.eos_token_id:

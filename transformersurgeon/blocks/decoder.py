@@ -50,7 +50,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         # Instantiate attention module
         if self.mha_type == "mha_causal":
             self.attn = MHACausal(
-                self.embed_dim,
+                self.embed_dim, # QUERY/KEY, VALUE, OUTPUT DIMENSIONS MUST BE EXPLICITED
                 self.num_heads,
                 bias_required=self.bias_required["attn"],
                 kv_num_heads=self.kv_num_heads,
@@ -116,10 +116,6 @@ class TransformerDecoderBlock(torch.nn.Module):
         
 
 class TransformerDecoder(torch.nn.Module):
-    # BIG PROBLEM
-    # cache_lengths is NOT export safe - it forces dynamic shape slicing
-    # UNLESS it is passed as a constant tensor - wrap the forward call in a function that passes it as constant
-
     def __init__(
             self,
             blocks_config,
@@ -136,6 +132,8 @@ class TransformerDecoder(torch.nn.Module):
             [TransformerDecoderBlock(block_config) for block_config in blocks_config]
             )
         self.norm = RMSNorm(extra_layers_config["norm"]["embed_dim"])
+        self.cache_lengths = self._precompute_cache_lengths()
+        self.cache_cumlengths = [0] + torch.cumsum(torch.tensor(self.cache_lengths), dim=0).tolist()
 
     def forward(
             self,
@@ -143,22 +141,26 @@ class TransformerDecoder(torch.nn.Module):
             inv_freq : torch.Tensor = None, # (head_dim//2,)
             key_cache = None,               # (batch_size, seq_len, cumsum(cache_lengths))
             value_cache = None,             # (batch_size, seq_len, cumsum(cache_lengths))
-            cache_lengths = None,           # (num_layers,)
             position = None,):
         """
-        Forward pass of the Transformer Decoder.
+        Forward pass of the Transformer Decoder. Supports:
+        - Prefill mode (position is None): processes the entire input sequence and generates key/value caches for the whole sequence.
+        - Decode mode (position is provided): processes one token at a time, using the provided key/value caches. It returns the new key/value cache elements for the current position, to be appended externally to the existing caches.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim).
             inv_freq (torch.Tensor, optional): Precomputed inverse frequencies for RoPE of shape (head_dim//2,). If None, no RoPE is applied.
-            key_cache (torch.Tensor, optional): Key cache for attention of size (batch_size, seq_len, cumsum(cache_lengths)). Can be None if position is None (prefill).
-            value_cache (torch.Tensor, optional): Value cache for attention of size (batch_size, seq_len, cumsum(cache_lengths)). Can be None if position is None (prefill).
-            cache_lengths (torch.Tensor, optional): Lengths of each layer's cache of shape (num_layers,). Can be None if position is None (prefill).
+            key_cache (torch.Tensor, optional): Key cache for attention of size (batch_size, seq_len, cumsum(self.cache_lengths)). Can be None if position is None (prefill).
+            value_cache (torch.Tensor, optional): Value cache for attention of size (batch_size, seq_len, cumsum(self.cache_lengths)). Can be None if position is None (prefill).
             position (int, optional): Specific position for decoding. If None, prefill mode is used.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, embed_dim).
+            torch.Tensor: key_cache generated after prefill or new key_cache element (batch_size, seq_len, cumsum(self.cache_lengths)).
+            torch.Tensor: value_cache generated after prefill or new value_cache element (batch_size, seq_len, cumsum(self.cache_lengths)).
         """
         
         batch_size, seq_len, embed_dim = x.shape 
-        device = x.device
 
         # Evaluate RoPE cos and sin once
         if inv_freq is not None:
@@ -167,58 +169,71 @@ class TransformerDecoder(torch.nn.Module):
             rope = None
         
         # Decode
-        prefill = position is None
-        cache_cumlen = 0
-        wb_key_cache = []
-        wb_value_cache = []
-        wb_cache_lengths = []
+        prefill = position is None # if position is not provided, we are in prefill mode
+        seq_len = x.size(1)
+        cache_seq_len = seq_len if key_cache is None else key_cache.size(1)
+        new_key_cache = [] # write-back key cache
+        new_value_cache = [] # write-back value cache
         for i, block in enumerate(self.blocks):
 
-            num_heads = block.num_heads
-            head_dim = embed_dim // num_heads
+            # Number of key and value heads
+            kv_num_heads = block.kv_num_heads if block.kv_num_heads is not None else block.num_heads
+            # Head dim (evaluated on the number of query heads)
+            head_dim = embed_dim // block.num_heads
+            # Cache lengths for this block
+            cache_len = self.cache_lengths[i]
+            cache_start, cache_stop = self.cache_cumlengths[i], self.cache_cumlengths[i+1]
 
-            if position is not None: # Prepare for Decode
-                # Get cache slice
-                cache_len = int(cache_lengths[i].item())
-                k = key_cache[:, :, cache_cumlen:cache_cumlen+cache_len] # (batch_size, seq_len, length)
-                v = value_cache[:, :, cache_cumlen:cache_cumlen+cache_len] # (batch_size, seq_len, length)
-                cache_cumlen += cache_len
+            if not prefill: # Prepare for Decode
+                # Slice cache for this block
+                k = key_cache[..., cache_start:cache_stop]
+                v = value_cache[..., cache_start:cache_stop]
                 # Unpack cache
-                total_seq_len = k.size(1)
-                k = k.reshape(batch_size, total_seq_len, num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, total_seq_len, head_dim)
-                v = v.reshape(batch_size, total_seq_len, num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, total_seq_len, head_dim)
+                k = k.view(batch_size, cache_seq_len, kv_num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, cache_seq_len, head_dim)
+                v = v.view(batch_size, cache_seq_len, kv_num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, cache_seq_len, head_dim)
             else: # Prefill
                 k = None
                 v = None
 
             # Inference (prefill or decode)
             x, k, v = block(
-                x,                  # (batch_size, seq_len, embed_dim)
-                key_cache=k,        # (batch_size, num_heads, total_seq_len, head_dim) or None
-                value_cache=v,      # (batch_size, num_heads, total_seq_len, head_dim) or None
-                rope=rope,          # (1, 1, seq_len, head_dim//2)
+                x,                       # (batch_size, seq_len, embed_dim)
+                key_cache=k,     # (batch_size, num_heads, total_seq_len, head_dim) or None
+                value_cache=v, # (batch_size, num_heads, total_seq_len, head_dim) or None
+                rope=rope,               # (1, 1, seq_len, head_dim//2)
                 prefill=prefill,
             )
-            # x : (batch_size, seq_len, embed_dim)
-            # k : (batch_size, num_heads, total_seq_len, head_dim)
-            # v : (batch_size, num_heads, total_seq_len, head_dim)
+            # x     : (batch_size, seq_len, embed_dim)
+            # new_k : (batch_size, num_heads, seq_len, head_dim)
+            # new_v : (batch_size, num_heads, seq_len, head_dim)
 
-            # Pack cache
-            new_total_seq_len = k.size(2) # total_seq_len + 1
-            cache_len = k.size(3)*k.size(1) # head_dim * num_heads
-            k = k.permute(0, 2, 1, 3).reshape(batch_size, new_total_seq_len, cache_len)
-            v = v.permute(0, 2, 1, 3).reshape(batch_size, new_total_seq_len, cache_len)
-            wb_cache_lengths.append(k.size(1))
-            wb_key_cache.append(k)
-            wb_value_cache.append(v)
+            # Pack new cache
+            k = k.permute(0, 2, 1, 3).reshape(batch_size, -1, cache_len)
+            v = v.permute(0, 2, 1, 3).reshape(batch_size, -1, cache_len)
+            new_key_cache.append(k)
+            new_value_cache.append(v)
         
-        wb_cache_lengths = torch.tensor(wb_cache_lengths, dtype=torch.long, device=device) # (num_layers,)
-        wb_key_cache = torch.cat(wb_key_cache, dim=-1) # (batch_size, total_seq_len+1, cumsum(cache_lengths))
-        wb_value_cache = torch.cat(wb_value_cache, dim=-1) # (batch_size, total_seq_len+1, cumsum(cache_lengths))
+        new_key_cache = torch.cat(new_key_cache, dim=-1) # (batch_size, cache_seq_len, cumsum(cache_lengths))
+        new_value_cache = torch.cat(new_value_cache, dim=-1) # (batch_size, cache_seq_len, cumsum(cache_lengths))
 
         # Final normalization
         x = self.norm(x) # (batch_size, seq_len, embed_dim)
 
-        return x, wb_key_cache, wb_value_cache, wb_cache_lengths
+        return x, new_key_cache, new_value_cache
+    
+    def _precompute_cache_lengths(self):
+        """
+        Calculate the cache lengths for each layer based on their configuration.
 
+        Returns:
+            list : Cache lengths for each layer.
+        """
+        cache_lengths = []
+        for block in self.blocks:
+            kv_num_heads = block.kv_num_heads if block.kv_num_heads is not None else block.num_heads
+            head_dim = block.embed_dim // block.num_heads
+            cache_len = kv_num_heads * head_dim
+            cache_lengths.append(cache_len)
+        return cache_lengths
+    
 __all__ = ["TransformerDecoder",]

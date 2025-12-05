@@ -36,7 +36,10 @@ template = (
     "<|im_start|>user\n{instruction}\n<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
-prompt = "What's the capital of France?"
+prompt = """Please provide a comprehensive analysis of the impact of artificial intelligence on modern society, including its effects on employment, education, healthcare, and privacy. 
+Discuss both the potential benefits and risks, and explain how different sectors are adapting to these technological changes. 
+Additionally, consider the ethical implications of AI development and deployment, particularly in areas such as autonomous vehicles, facial recognition, and algorithmic decision-making in critical systems like criminal justice and financial services.
+Finally, suggest some policy recommendations that could help ensure AI development remains beneficial for humanity while minimizing potential harms."""
 
 # Tokenize inputs (string to input_ids)
 inputs = tokenizer(
@@ -60,7 +63,7 @@ def logits_to_input_id(logits, temperature=1.0):
     return torch.multinomial(probs, num_samples=1)
 
 # Decode loop (no caching)
-max_new_tokens = 64
+max_new_tokens = 512
 
 # Initialize embeddings sequence
 inputs_embeds = embedding(input_ids)

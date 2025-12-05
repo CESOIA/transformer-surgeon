@@ -29,8 +29,8 @@ def convert_for_export(model, verbose=False):
             print(f"Converting {name} component for export...")
 
         # Check if conversion is supported
-        if indexing.get('structure', None) is None:
-            warnings.warn(f"Conversion for component '{name}' with structure '{indexing.get('structure', None)}' is not supported. Skipping conversion.")
+        if 'structure' not in indexing:
+            warnings.warn(f"Structure not specified for model with name '{name}'. Skipping conversion.")
             new_models[name] = None
             continue
 
