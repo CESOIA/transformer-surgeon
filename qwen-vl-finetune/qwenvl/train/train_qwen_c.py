@@ -163,6 +163,7 @@ def train(attn_implementation="flash_attention_2"):
     data_args.image_processor = processor.image_processor
     data_args.model_type = model_type
     
+    
     if data_args.data_flatten:
         replace_qwen2_vl_attention_class()
     model.config.use_cache = False
@@ -178,8 +179,7 @@ def train(attn_implementation="flash_attention_2"):
 
     set_model(model_args, model)
 
-    if torch.distributed.get_rank() == 0:
-        model.visual.print_trainable_parameters()
+    # if torch.distributed.get_rank() == 0:
         # model.model.print_trainable_parameters()
 
     if data_args.data_packing:

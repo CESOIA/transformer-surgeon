@@ -18,7 +18,7 @@ CACHE_DIR="./cache"                          # [TrainingArguments] Cache directo
 # ======================
 # Model Configuration
 # ======================
-DATASETS="coco_indoor%10"                  # [DataArguments] Dataset with sampling rate
+DATASETS="coco_qa_cats_chair"                  # [DataArguments] Dataset with sampling rate
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # ======================
 # Training Hyperparameters
