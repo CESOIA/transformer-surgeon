@@ -8,12 +8,12 @@ from transformersurgeon import (
     Qwen2_5_VLForConditionalGenerationCompress,
 )
 
-from data.dataset_qwen import QwenVLCalibDataset, collate_fn_qwen
+from data.QwenVL_calibDataset import QwenVLCalibDataset, collate_fn_qwen
 from importance_eval_methods.BI import eval_bi
 from utils.utils import sort_bi_scores
 
-json_path = "/ibex/user/antonic/CESOIA/datasets/COCO/annotations/indoor.jsonl"
-image_root = "/ibex/user/antonic/CESOIA/datasets/COCO/"
+json_path = "/ibex/user/antonic/CESOIA/datasets/COCO/annotations/train2017_qa_cats_chair2.jsonl"
+image_root = "/ibex/user/antonic/CESOIA/datasets/COCO/train2017/"
 
 # Device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
