@@ -28,6 +28,7 @@ class LinearCompressed(nn.Linear):
                  lrd_rank: Union[int, str] = "full"):
         
         self.prune_mask = None  # To be set externally if needed
+        self.pruning_ratio = 0.0  # To track the pruning ratio
 
         self.lrd_rank = self._check_rank(lrd_rank)
                 
@@ -92,7 +93,9 @@ class LinearCompressed(nn.Linear):
                              f"{mask.device} and {self.weight.device}!")
         if mask.dim() == 1:
             mask = mask.unsqueeze(1)  # Convert to 2D for broadcasting
+
         self.prune_mask = Parameter(mask, requires_grad=False)
+        self.pruning_ratio = 1.0 - (mask.sum().item() / mask.numel())
 
     def reset_prune_mask(self):
         self.prune_mask = None
@@ -107,7 +110,7 @@ class LinearCompressed(nn.Linear):
         return rank
         
     def __repr__(self):
-        return super().__repr__() + f"(lrd_rank={self.lrd_rank})"
+        return super().__repr__() + f"(lrd_rank={self.lrd_rank}, pruning_ratio={self.pruning_ratio})"
 
     def __str__(self):
         return self.__repr__()

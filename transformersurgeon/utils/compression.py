@@ -7,7 +7,7 @@ import copy
 import inspect
 import torch
 from ..layers import LinearCompressed
-from ..layers import VCONBlock
+from ..layers import VCONBlock, VCONBlockVariant
 from .utils import get_submodule
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
@@ -128,10 +128,22 @@ class CompressionScheme:
         compression_set = compression_set or self.pruning_ratio > 0
         compression_set = compression_set or (self.lrd_rank and self.lrd_rank != "full")
 
-        compatible = False
-        compatible = compatible or (type(self.get_module()) is LinearCompressed)
+        return compression_set and self._is_compatible()
+    
+    def _is_compatible(self):
+        """
+        Checks if the module is compatible with compression.
+        Compatible modules:
+            - LinearCompressed
 
-        return compression_set and compatible
+        Returns:
+            bool: True if the module is compatible, False otherwise.
+        """
+        compatible = False
+        compatible = compatible or self.vcon_initialized # if VCON is initialized, compatible by definition
+        compatible = compatible or (type(self.get_module()) is LinearCompressed)
+        
+        return compatible
     
     def _module_copy(self, module):
         """
@@ -176,7 +188,7 @@ class CompressionScheme:
                     pass
         return module_copy
 
-    def init_vcon(self, verbose=False):
+    def init_vcon(self, verbose=False, variant=False):
         """
         Initializes a VCONBlock for the current module by duplicating it.
         This method checks if compression is required and has not yet been applied.
@@ -191,20 +203,26 @@ class CompressionScheme:
             
         Args:
             verbose (bool, optional): If True, prints a message upon successful initialization.
+            variant (bool, optional): If True, uses VCONBlockVariant instead of VCONBlock. Defaults to False.
         """   
-        # check if there is compression to be applied
-        if self._is_to_compress():
-            # check if compression is yet to be applied
-            if self.soft_applied or self.hard_applied:
-                raise ValueError("Cannot initialize VCONBlock after compression has been applied.")
+        # check if the model is compatible with compression
+        if not self._is_compatible():
+            return # nothing to do
+        
+        # check if compression has already been applied
+        if self.soft_applied or self.hard_applied:
+            raise ValueError("Cannot initialize VCONBlock after compression has been applied.")
 
-            module = self.get_module()
-            module_copy = self._module_copy(module)
+        module = self.get_module()
+        module_copy = self._module_copy(module)
+        if variant:
+            vcon_block = VCONBlockVariant(block_a=module, block_b=module_copy)
+        else:
             vcon_block = VCONBlock(block_a=module, block_b=module_copy)
-            self.set_module(vcon_block)
-            if verbose:
-                print(f"Initialized VCONBlock at {self.path}")  
-            self.vcon_initialized = True
+        self.set_module(vcon_block)
+        if verbose:
+            print(f"Initialized VCONBlock at {self.path}")
+        self.vcon_initialized = True
 
     def cancel_vcon(self, keep_block_b=True, verbose=False):
         """

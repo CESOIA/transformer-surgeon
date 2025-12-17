@@ -107,7 +107,7 @@ class CompressionSchemesManager:
             if verbose:
                 print(f"Set LRD rank of {rank} for {scheme.path}")
 
-    def init_vcon(self, criteria=None, verbose=False):
+    def init_vcon(self, criteria=None, verbose=False, variant=False):
         """
         Initializes VCON blocks for filtered modules
 
@@ -116,7 +116,7 @@ class CompressionSchemesManager:
             verbose: If True, prints information about the initialization process
         """
         for scheme in self.iter_filtered(criteria=criteria):
-            scheme.init_vcon(verbose=verbose)
+            scheme.init_vcon(verbose=verbose, variant=variant)
 
     def cancel_vcon(self, criteria=None, keep_block_b=True, verbose=False):
         """
@@ -197,11 +197,11 @@ class CompressionSchemesManager:
         """
         self.set_lrd_rank(rank, criteria=["all"], verbose=verbose)
 
-    def init_vcon_all(self, verbose=False):
+    def init_vcon_all(self, verbose=False, variant=False):
         """
         Alias for init_vcon with criteria set to "all"
         """
-        self.init_vcon(criteria=["all"], verbose=verbose)
+        self.init_vcon(criteria=["all"], verbose=verbose, variant=variant)
 
     def cancel_vcon_all(self, keep_block_b=True, verbose=False):
         """
