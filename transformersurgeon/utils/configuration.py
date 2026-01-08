@@ -54,6 +54,7 @@ def init_compression_config(
     indexing: Dict[str, Any],
     pruning_ratios: Optional[Dict[str, Any]] = None,
     lrd_ranks: Optional[Dict[str, Any]] = None,
+    quantization_bits: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Initialize compression configuration for any transformer model.
@@ -63,6 +64,7 @@ def init_compression_config(
         indexing (Dict[str, Any]): Model-specific indexing dictionary.
         pruning_ratio_dict (Optional[Dict[str, Any]]): Dictionary specifying pruning ratios.
         lrd_rank_dict (Optional[Dict[str, Any]]): Dictionary specifying LRD ranks
+        quantization_bits_dict (Optional[Dict[str, Any]]): Dictionary specifying quantization bits.
     """
 
     path_template = indexing["path_template"]
@@ -70,7 +72,7 @@ def init_compression_config(
     # Generate default config values by building all the paths in a dictionary
     config_instance.pruning_ratios = {path_template.format(block_index=id, path=path): 0.0 for id in range(depth) for path in indexing["path_list"]}
     config_instance.lrd_ranks = {path_template.format(block_index=id, path=path): "full" for id in range(depth) for path in indexing["path_list"]}
-    
+    config_instance.quantization_bits = {path_template.format(block_index=id, path=path): 32 for id in range(depth) for path in indexing["path_list"]}
     # Get values from arguments
     if pruning_ratios is not None:
         for key, value in pruning_ratios.items():
@@ -79,5 +81,8 @@ def init_compression_config(
     if lrd_ranks is not None:
         for key, value in lrd_ranks.items():
             config_instance.lrd_ranks[key] = value
+    if quantization_bits is not None:
+        for key, value in quantization_bits.items():
+            config_instance.quantization_bits[key] = value
     
 __all__ = ["init_compression_config"]

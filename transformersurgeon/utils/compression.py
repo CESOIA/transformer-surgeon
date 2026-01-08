@@ -48,6 +48,7 @@ class CompressionScheme:
                  path,
                  pruning_ratio, #output_paths, 
                  lrd_rank,
+                 bits,
                  is_qkv_concatenated=False,
                  model=None,
                  ):
@@ -57,6 +58,7 @@ class CompressionScheme:
         self.pruning_ratio = pruning_ratio
         # self.output_paths = output_paths # blocks after this layer, input should be pruned accordingly
         self.lrd_rank = lrd_rank
+        self.bits=bits
         self.is_qkv_concatenated = is_qkv_concatenated
         self.model = model
 
@@ -124,7 +126,7 @@ class CompressionScheme:
         Returns:
             bool: True if compression should be applied, False otherwise.
         """
-        return (self.pruning_ratio > 0) or (self.lrd_rank and self.lrd_rank != "full")
+        return (self.pruning_ratio > 0) or (self.lrd_rank and self.lrd_rank != "full") or (self.bits < 32)
     
     def _module_copy(self, module):
         """
@@ -372,7 +374,33 @@ class CompressionScheme:
                 module.set_lrd_rank(self.lrd_rank)
 
             self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
-            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted    
+            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted 
+
+        # Apply Low Rank Decomposition (LRD)
+        if self.bits and self.bits < 32:
+            if verbose:
+                if self.soft_applied:
+                    if hard:
+                        print(f"Quantization already hard applied to module {self.path}, making the changes permanent (HARD mode)")
+                    else:
+                        print(f"Quantization already applied to module {self.path}, skipping re-application.")
+                else:
+                    print(f"Applying {"HARD (non-reversible) "*hard}Quantization with bits {self.bits} to module {self.path}.")
+
+            if not hard:
+                # Store original weight matrix to allow restoring/vanishing contributions
+                module.weight_original = torch.nn.Parameter(module.weight.data.clone())
+            else:
+                if hasattr(module, 'weight_original'):
+                    del module.weight_original
+            
+            if not self.soft_applied:
+                # Replace the original weight with the decomposed weights
+                W1= self._quantization(module)
+                module.weight.data = torch.nn.Parameter(W1)
+
+            self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
+            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted     
 
     def restore(self, verbose=False):
         """
@@ -503,5 +531,26 @@ class CompressionScheme:
         W1 = U_r @ S_r
         W2 = Vh_r
         return W1, W2
+    
+    def _quantization(self, module, qbits) -> torch.Tensor:
+        """
+        Performs Quntization on the given weight matrix using uniform quantization.
+
+        Args:
+            weight (torch.Tensor): The weight matrix to be quantized.
+            qbits (int): The number of bits for quantization.
+
+        Returns:
+            torch.Tensor: The quantized weight matrix.
+        """
+        weight = module.weight.data
+        
+        q_levels = 2 ** qbits
+        w_min, w_max = weight.min(), weight.max()
+        w_norm = (weight - w_min) / (w_max - w_min + 1e-8)
+        w_q = torch.round(w_norm * (q_levels - 1)) / (q_levels - 1)
+        w_q = w_q * (w_max - w_min) + w_min
+
+        return w_q
 
 __all__ = ["CompressionScheme"]
