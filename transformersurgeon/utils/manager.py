@@ -273,6 +273,7 @@ class CompressionSchemesManager:
                     pruning_ratio = block_specific_config.get('pruning_ratios', {}).get(full_path, 0.0)
                     pruning_mode = block_specific_config.get('pruning_modes', {}).get(full_path, "structured")
                     lrd_rank = block_specific_config.get('lrd_ranks', {}).get(full_path, "full")
+                    bits=block_specific_config.get('quantization_bits', {}).get(full_path, 32)
                     tmp_dict[full_path] = CompressionScheme(
                         name=path,
                         block_id=i,
@@ -280,6 +281,7 @@ class CompressionSchemesManager:
                         pruning_ratio=pruning_ratio,
                         pruning_mode=pruning_mode,
                         lrd_rank=lrd_rank,
+                        bits=bits,
                         is_qkv_concatenated=is_qkv,
                         model=self.model,
                     )
