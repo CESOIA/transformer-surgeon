@@ -21,11 +21,12 @@ final_layer = model.lm_head
 # Convert to export-compatible modules
 converted_models = convert_for_export(model, verbose=False)
 decoder = converted_models['text']
+print("Total cache length:", decoder.total_cache_length)
 
 # Set device and data type
 # device = torch.device("cpu")
 device = torch.device("cuda")
-data_type = torch.float32
+data_type = torch.float16
 
 # Put all modules on the same device
 embedding = embedding.to(device, dtype=data_type)
@@ -38,10 +39,7 @@ template = (
     "<|im_start|>user\n{instruction}\n<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
-prompt = """Please provide a comprehensive analysis of the impact of artificial intelligence on modern society, including its effects on employment, education, healthcare, and privacy. 
-Discuss both the potential benefits and risks, and explain how different sectors are adapting to these technological changes. 
-Additionally, consider the ethical implications of AI development and deployment, particularly in areas such as autonomous vehicles, facial recognition, and algorithmic decision-making in critical systems like criminal justice and financial services.
-Finally, suggest some policy recommendations that could help ensure AI development remains beneficial for humanity while minimizing potential harms."""
+prompt = """What is the capital of France?"""
 
 # Tokenize inputs (string to input_ids)
 inputs = tokenizer(
@@ -71,24 +69,31 @@ inv_freq = precompute_rope_inv_freqs(
     device=device,
     ).to(data_type)
 
-# Decode loop (no caching)
+# Decode loop
 max_new_tokens = 512
+temperature = 0.0
 
 # Initialize embeddings sequence
 inputs_embeds = embedding(input_ids)
 
-# Prefill
+# Prefill phase
+key_cache = torch.zeros((inputs_embeds.size(0), 1, decoder.total_cache_length), device=device, dtype=data_type)
+value_cache = torch.zeros_like(key_cache)
 output_embed, key_cache, value_cache = decoder(
     inputs_embeds,
     inv_freq=inv_freq,
-    key_cache=None,
-    value_cache=None,
-    position=None,
+    key_cache=key_cache,
+    value_cache=value_cache,
     )
+# Extract logits from output embed
+logits = final_layer(output_embed[:, -1, :])
+# Sample next token from logits
+output_id = logits_to_input_id(logits, temperature=temperature)
+# Concatenate to the sequence
+output_ids = torch.cat([input_ids, output_id], dim=1)
+# Get next input embeddings
+inputs_embeds = embedding(output_id)
 
-temperature = 0.6
-output_ids = input_ids
-position = output_ids.size(1)
 with torch.no_grad():
     for i in tqdm.tqdm(range(max_new_tokens), "Generating"):
         output_embed, key_cache, value_cache = decoder(
@@ -96,9 +101,7 @@ with torch.no_grad():
             inv_freq=inv_freq,
             key_cache=key_cache,
             value_cache=value_cache,
-            position=position,
             )
-        position += 1
         
         # Extract logits from output embed
         logits = final_layer(output_embed[:, -1, :])
@@ -108,7 +111,9 @@ with torch.no_grad():
 
         # Append to sequence
         output_ids = torch.cat([output_ids, output_id], dim=1)
-        inputs_embeds = embedding(output_ids)
+
+        # Get next input embeddings
+        inputs_embeds = embedding(output_id)
 
         # Check for end-of-sequence token
         if output_id.item() == tokenizer.eos_token_id:
