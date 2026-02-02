@@ -27,7 +27,8 @@ class LinearCompressed(nn.Linear):
                  dtype=None,
                  lrd_rank: Union[int, str] = "full"):
         
-        self.prune_mask = None  # To be set externally if needed
+        # self.prune_mask = None  # To be set externally if needed
+        # self.pruning_ratio = 0.0  # To track the pruning ratio
 
         self.lrd_rank = self._check_rank(lrd_rank)
                 
@@ -57,17 +58,16 @@ class LinearCompressed(nn.Linear):
             weightA = self.weight # shape: (out_features, lrd_rank)
             weightBT = self.weight_2 # shape: (in_features, lrd_rank)
 
-            if self.prune_mask is not None: # Apply soft structured pruning if mask is available
-                weightA = self.prune_mask * weightA
+            # if self.prune_mask is not None: # Apply soft structured pruning if mask is available
+            #     weightA = self.prune_mask * weightA
 
             # Compute: x @ (weightA @ weightB).T + bias which is the same as x @ weightB.T @ weightA.T + bias
             return F.linear(input @ weightBT, weightA, self.bias)
         elif self.lrd_rank == "full": # Perform normally if rank is full
-            # Apply soft structured pruning if mask is available
-            if self.prune_mask is not None:
-                weight =  self.prune_mask * self.weight
-            else:
-                weight = self.weight
+            # if self.prune_mask is not None: # Apply soft structured pruning if mask is available
+            #     weight =  self.prune_mask * self.weight
+            # else:
+            weight = self.weight
 
             return F.linear(input, weight, self.bias)
         # Manage value errors
@@ -77,25 +77,27 @@ class LinearCompressed(nn.Linear):
     def set_lrd_rank(self, rank: Union[int, str]):
         self.lrd_rank = self._check_rank(rank)
         
-    def set_prune_mask(self, mask: torch.Tensor):
-        mask = mask.squeeze()
-        if mask.dim() == 1 and mask.size(0) != self.out_features:
-            raise ValueError("1D pruning mask must have the same size as out_features.")
-        if mask.dim() == 2 and self.lrd_rank != "full":
-            raise ValueError("2D pruning mask is only supported when lrd_rank is 'full'.")
-        if mask.dim() == 2 and mask.size(0) != self.out_features and mask.size(1) != self.in_features:
-            raise ValueError("2D pruning mask must have the same size as (out_features, in_features).")
-        if mask.dim() > 2:
-            raise ValueError("Pruning mask must be either 1D or 2D tensor.")
-        if mask.device != self.weight.device:
-            raise ValueError("Expected pruning mask to be on the same device as the layer weights, but found two devices, "
-                             f"{mask.device} and {self.weight.device}!")
-        if mask.dim() == 1:
-            mask = mask.unsqueeze(1)  # Convert to 2D for broadcasting
-        self.prune_mask = Parameter(mask, requires_grad=False)
+    # def set_prune_mask(self, mask: torch.Tensor):
+    #     mask = mask.squeeze()
+    #     if mask.dim() == 1 and mask.size(0) != self.out_features:
+    #         raise ValueError("1D pruning mask must have the same size as out_features.")
+    #     if mask.dim() == 2 and self.lrd_rank != "full":
+    #         raise ValueError("2D pruning mask is only supported when lrd_rank is 'full'.")
+    #     if mask.dim() == 2 and mask.size(0) != self.out_features and mask.size(1) != self.in_features:
+    #         raise ValueError("2D pruning mask must have the same size as (out_features, in_features).")
+    #     if mask.dim() > 2:
+    #         raise ValueError("Pruning mask must be either 1D or 2D tensor.")
+    #     if mask.device != self.weight.device:
+    #         raise ValueError("Expected pruning mask to be on the same device as the layer weights, but found two devices, "
+    #                          f"{mask.device} and {self.weight.device}!")
+    #     if mask.dim() == 1:
+    #         mask = mask.unsqueeze(1)  # Convert to 2D for broadcasting
 
-    def reset_prune_mask(self):
-        self.prune_mask = None
+    #     self.prune_mask = Parameter(mask, requires_grad=False)
+    #     self.pruning_ratio = 1.0 - (mask.sum().item() / mask.numel())
+
+    # def reset_prune_mask(self):
+    #     self.prune_mask = None
 
     def _check_rank(self, rank: Union[int, str]):
         if isinstance(rank, int):

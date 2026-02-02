@@ -1,5 +1,6 @@
 """
-Model definitions for ViT model compression."""
+Model definitions for ViT model compression.
+"""
 
 from transformers.models.vit.modeling_vit import ViTForImageClassification
 from .configuration_vit_c import ViTConfigCompress
@@ -17,7 +18,5 @@ class ViTForImageClassificationCompress(ViTForImageClassification):
             INDEXING["vit"],
             config,
         )
-
-        print(self)
 
 __all__ = ["ViTForImageClassificationCompress"]
