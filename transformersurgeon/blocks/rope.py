@@ -22,7 +22,7 @@ def precompute_rope_inv_freqs(
 def precompute_rope_cos_sin_half(
         inv_freq : torch.Tensor,  # (rotated_dim//2,)
         seq_len : int, 
-        position : int = None,
+        position : int,
         ):
     """
     Precompute the cosine and sine values for RoPE.
@@ -31,7 +31,7 @@ def precompute_rope_cos_sin_half(
     Args:
         inv_freq: Precomputed inverse frequencies (from precompute_rope_inv_freqs)
         seq_len: Length of the input sequence
-        position: Specific position for decoding (None for encoding/prefill)
+        position: Specific starting position for the rope sequence
 
     Returns:
         cos: Cosine values for RoPE (half-size)
@@ -39,13 +39,9 @@ def precompute_rope_cos_sin_half(
     """
     device = inv_freq.device
     # Broadcast cos and sin to match x's shape
-    if position is None: # prefill or encode - use all positions from 0 to seq_len-1
-        t = torch.arange(seq_len, device=device).float()
-        angles = t.unsqueeze(-1) * inv_freq.unsqueeze(0)  # (seq_len, rotated_dim//2)
-        angles = angles.unsqueeze(0).unsqueeze(0)         # (1, 1, seq_len, rotated_dim//2)
-    else: # decode - use only the specified position
-        angles = position * inv_freq # (sections_num, rotated_dim//2)
-        angles = angles.view(1, 1, 1, -1)  # (1, 1, 1, rotated_dim//2)
+    t = torch.arange(position, position+seq_len, device=device).float()
+    angles = t.unsqueeze(-1) * inv_freq.unsqueeze(0)  # (seq_len, rotated_dim//2)
+    angles = angles.unsqueeze(0).unsqueeze(0)         # (1, 1, seq_len, rotated_dim//2)
 
     cos = torch.cos(angles)  # (1, 1, 1, rotated_dim//2)
     sin = torch.sin(angles)  # (1, 1, 1, rotated_dim//2)
@@ -68,6 +64,12 @@ def apply_rope_multihead(
     Returns:
         out: Rotated tensor of the same shape as x
     """
+    # Convert to float32 for numerical stability during rotation
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    cos = cos.to(torch.float32)
+    sin = sin.to(torch.float32)
+
     # Split in 2 chunks for the "real" and "imaginary" parts
     x_real, x_imag = torch.chunk(x, 2, dim=-1)  # Each of shape (batch_size, num_heads, seq_len, head_dim//2)
 
@@ -78,6 +80,9 @@ def apply_rope_multihead(
     # Re-interleave even and odd dimensions
     out = torch.cat((y_real, y_imag), dim=-1)  # (batch_size, num_heads, seq_len, head_dim)
 
+    # Restore original dtype
+    out = out.to(dtype)
+    
     return out
 
 __all__ = [

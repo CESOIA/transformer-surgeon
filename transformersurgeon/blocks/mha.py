@@ -21,44 +21,47 @@ def attention(query, key, value, is_causal=False):
         value_cache [optional]: Tensor of shape (batch_size, num_heads, cache_seq_length, kv_head_dim)
         is_causal: Whether to apply causal masking (for decoder use)
     """
-    batch_size, q_head_num,  seq_length, head_dim  = query.size()
-    _,          kv_head_num, _,          _         = key.size()
+    batch_size, q_head_num,  q_seq_length,  head_dim = query.size()
+    _,          kv_head_num, kv_seq_length, _        = key.size()
     group_size = q_head_num // kv_head_num
-
+    
     # reshape query, key, value for possible GQA
-    query = query.view(batch_size, kv_head_num, group_size, seq_length, head_dim) # (batch_size, kv_head_num, group_size, seq_length, head_dim)
-    key   = key.unsqueeze(2)    # (batch_size, kv_head_num, 1, seq_length, head_dim)
-    value = value.unsqueeze(2)  # (batch_size, kv_head_num, 1, seq_length, head_dim)
+    query = query.view(batch_size, kv_head_num, group_size, q_seq_length, head_dim) # (batch_size, kv_head_num, group_size, q_seq_length, head_dim)
+    key   = key.unsqueeze(2)    # (batch_size, kv_head_num, 1, kv_seq_length, head_dim)
+    value = value.unsqueeze(2)  # (batch_size, kv_head_num, 1, kv_seq_length, head_dim)
 
     device = query.device
     dtype = query.dtype
-    
+
+    # Cast to float32 for numerical stability - avoid overflow/underflow
+    query = query.to(torch.float32)
+    key   = key.to(torch.float32)
+    value = value.to(torch.float32)
+
     # Scaled QK^T
     scale = 1.0 / math.sqrt(head_dim)
-    scores = torch.matmul(query, key.permute(0, 1, 2, 4, 3))*scale
-
-    # Cast to float32 for numerical stability
-    scores = scores.to(torch.float32)
+    scores = torch.matmul(query, key.permute(0, 1, 2, 4, 3))*scale    
 
     # Generate negative causal mask
     if is_causal:
-        i = torch.arange(seq_length, device=device).view(1,1,seq_length,1)
-        j = torch.arange(seq_length, device=device).view(1,1,1,seq_length)
+        i = torch.arange(q_seq_length, device=device).view(1, 1, q_seq_length, 1)
+        j = torch.arange(kv_seq_length, device=device).view(1, 1, 1, kv_seq_length)
+        i = i + (kv_seq_length - q_seq_length)  # Adjust query indexing to match key indexing in cache scenario
         mask = i < j
         # Mask the future positions
-        scores = scores.masked_fill(mask, torch.finfo(torch.float32).min)
+        scores = scores.masked_fill(mask, -1e4) # Use a large negative value for masking
 
     # Stabilize softmax by subtracting max
     scores = scores - scores.max(dim=-1, keepdim=True).values
 
-    # Softmax and back to original dtype
-    scores = torch.nn.functional.softmax(scores, dim=-1).to(dtype)
+    # Softmax
+    scores = torch.nn.functional.softmax(scores, dim=-1)
 
     # Project the values over the scores
     attn_output = torch.matmul(scores, value)  # (batch_size, kv_head_num, group_size, seq_length, head_dim)
 
-    # reshape back to original shape
-    attn_output = attn_output.view(batch_size, q_head_num, seq_length, head_dim) # (batch_size, num_heads, seq_length, head_dim)
+    # reshape back to original shape and dtype
+    attn_output = attn_output.view(batch_size, q_head_num, q_seq_length, head_dim).to(dtype) # (batch_size, num_heads, seq_length, head_dim)
 
     return attn_output
 
@@ -230,7 +233,8 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-    def forward(self, x, key_cache=None, value_cache=None, prefill=True, rope=None):
+    # def forward(self, x, key_cache=None, value_cache=None, prefill=True, rope=None):
+    def forward(self, x, key_cache, value_cache, rope=None):
         """
         Forward pass of the causal Multi-Head Attention with caching.
         
@@ -247,35 +251,45 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         q = self.q_proj(x).view(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, seq_length, head_dim)
         k = self.k_proj(x).view(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
         v = self.v_proj(x).view(batch_size, seq_length, self.kv_num_heads, self.head_dim).permute(0, 2, 1, 3) # (batch_size, kv_num_heads, seq_length, head_dim)
-
+        
         # Apply RoPE
         if rope is not None:
             cos, sin = rope
             q = apply_rope_multihead(q, cos, sin)
             k = apply_rope_multihead(k, cos, sin)
-
+        
         # Concatenate caches if not in prefill mode
-        if not prefill:
-            k = torch.cat([key_cache, k], dim=2)   # (batch_size, num_heads, cache_length + seq_length, head_dim)
-            v = torch.cat([value_cache, v], dim=2) # (batch_size, num_heads, cache_length + seq_length, head_dim)
+        # if not prefill:
+            # k = torch.cat([key_cache, k], dim=2)   # (batch_size, num_heads, cache_length + seq_length, head_dim)
+            # v = torch.cat([value_cache, v], dim=2) # (batch_size, num_heads, cache_length + seq_length, head_dim)
+        key_cache = torch.cat([key_cache, k], dim=2)   # (batch_size, num_heads, 1 + cache_length + seq_length, head_dim)
+        value_cache = torch.cat([value_cache, v], dim=2) # (batch_size, num_heads, 1 + cache_length + seq_length, head_dim)
+        # Remove dummy cache entry (necessary for prefill phase)
+        k = key_cache[:, :, 1:, :]
+        v = value_cache[:, :, 1:, :]
 
         # Scaled dot-product attention
-        if self.use_sdpa:
-            if prefill:
-                attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
-            else:
-                attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
-        else:
-            if prefill:
-                attn_output = attention(q, k, v, is_causal=True)
-            else:
-                attn_output = attention(q, k, v, is_causal=False)
+        # if self.use_sdpa:
+        #     if prefill:
+        #         attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        #     else:
+        #         attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
+        # else:
+        #     if prefill:
+        #         attn_output = attention(q, k, v, is_causal=True)
+        #     else:
+        #         attn_output = attention(q, k, v, is_causal=False)
+        # if self.use_sdpa:
+        #     attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        # else:
+        #     attn_output = attention(q, k, v, is_causal=True)
+        attn_output = attention(q, k, v, is_causal=True)
         
         # Concatenate heads and project output
         attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_length, embed_dim)
         output = self.out_proj(attn_output)
         
-        return output, k, v
+        return output, key_cache, value_cache
     
 __all__ = [
     "MHAEncoder",

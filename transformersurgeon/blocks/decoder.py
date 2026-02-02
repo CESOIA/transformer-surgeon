@@ -79,9 +79,9 @@ class TransformerDecoderBlock(torch.nn.Module):
     def forward(
             self,
             x,
-            prefill=True,
-            key_cache=None,
-            value_cache=None,
+            # prefill=True,
+            key_cache,
+            value_cache,
             rope=None,):
         """
         Forward pass of the Transformer Decoder Block.
@@ -105,7 +105,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             key_cache=key_cache,
             value_cache=value_cache,
             rope=rope,
-            prefill=prefill
+            # prefill=prefill
             )
         x = x + residual        # join skip connection
         residual = x            # start skip connection
@@ -134,33 +134,35 @@ class TransformerDecoder(torch.nn.Module):
         self.norm = RMSNorm(extra_layers_config["norm"]["embed_dim"])
         self.cache_lengths = self._precompute_cache_lengths()
         self.cache_cumlengths = [0] + torch.cumsum(torch.tensor(self.cache_lengths), dim=0).tolist()
+        self.total_cache_length = self.cache_cumlengths[-1]
 
     def forward(
             self,
-            x : torch.Tensor,               # (batch_size, seq_len, embed_dim)
-            inv_freq : torch.Tensor = None, # (head_dim//2,)
-            key_cache = None,               # (batch_size, seq_len, cumsum(cache_lengths))
-            value_cache = None,             # (batch_size, seq_len, cumsum(cache_lengths))
-            position = None,):
+            x : torch.Tensor,             # (batch_size, seq_len, embed_dim)
+            inv_freq : torch.Tensor,      # (head_dim//2,)
+            key_cache : torch.Tensor,     # (batch_size, seq_len, cumsum(cache_lengths))
+            value_cache : torch.Tensor,   # (batch_size, seq_len, cumsum(cache_lengths))
+    ):
         """
-        Forward pass of the Transformer Decoder. Supports:
-        - Prefill mode (position is None): processes the entire input sequence and generates key/value caches for the whole sequence.
-        - Decode mode (position is provided): processes one token at a time, using the provided key/value caches. It returns the new key/value cache elements for the current position, to be appended externally to the existing caches.
+        Forward pass of the Transformer Decoder.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim).
             inv_freq (torch.Tensor, optional): Precomputed inverse frequencies for RoPE of shape (head_dim//2,). If None, no RoPE is applied.
-            key_cache (torch.Tensor, optional): Key cache for attention of size (batch_size, seq_len, cumsum(self.cache_lengths)). Can be None if position is None (prefill).
-            value_cache (torch.Tensor, optional): Value cache for attention of size (batch_size, seq_len, cumsum(self.cache_lengths)). Can be None if position is None (prefill).
-            position (int, optional): Specific position for decoding. If None, prefill mode is used.
+            key_cache (torch.Tensor, optional): Key cache for attention of size (batch_size, total_seq_len-seq_len, self.total_cache_lengths). For prefill, a seq_len = 1 empty tensor must be provided. This dummy tensor is kept also during decode for interface consistency.
+            value_cache (torch.Tensor, optional): Value cache for attention of size (batch_size, total_seq_len-seq_len, self.total_cache_lengths). For prefill, a seq_len = 1 empty tensor must be provided. This dummy tensor is kept also during decode for interface consistency.
+            position (int, optional): Specific position for decoding. During prefill, position = 0 must be provided. 
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_len, embed_dim).
-            torch.Tensor: key_cache generated after prefill or new key_cache element (batch_size, seq_len, cumsum(self.cache_lengths)).
-            torch.Tensor: value_cache generated after prefill or new value_cache element (batch_size, seq_len, cumsum(self.cache_lengths)).
+            torch.Tensor: generated full key_cache (batch_size, total_seq_len, self.total_cache_length).
+            torch.Tensor: generated full value_cache (batch_size, total_seq_len, self.total_cache_length).
         """
-        
-        batch_size, seq_len, embed_dim = x.shape 
+        # Get dimensions
+        batch_size, seq_len, embed_dim = x.shape
+
+        # Get current position
+        position = key_cache.size(1)-1
 
         # Evaluate RoPE cos and sin once
         if inv_freq is not None:
@@ -169,9 +171,8 @@ class TransformerDecoder(torch.nn.Module):
             rope = None
         
         # Decode
-        prefill = position is None # if position is not provided, we are in prefill mode
-        seq_len = x.size(1)
-        cache_seq_len = seq_len if key_cache is None else key_cache.size(1)
+        # prefill = position is None # if position is not provided, we are in prefill mode
+        cache_seq_len = key_cache.size(1)
         new_key_cache = [] # write-back key cache
         new_value_cache = [] # write-back value cache
         for i, block in enumerate(self.blocks):
@@ -184,24 +185,32 @@ class TransformerDecoder(torch.nn.Module):
             cache_len = self.cache_lengths[i]
             cache_start, cache_stop = self.cache_cumlengths[i], self.cache_cumlengths[i+1]
 
-            if not prefill: # Prepare for Decode
-                # Slice cache for this block
-                k = key_cache[..., cache_start:cache_stop]
-                v = value_cache[..., cache_start:cache_stop]
-                # Unpack cache
-                k = k.view(batch_size, cache_seq_len, kv_num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, cache_seq_len, head_dim)
-                v = v.view(batch_size, cache_seq_len, kv_num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, cache_seq_len, head_dim)
-            else: # Prefill
-                k = None
-                v = None
+            # if not prefill: # Prepare for Decode
+            #     # Slice cache for this block
+            #     k = key_cache[..., cache_start:cache_stop]
+            #     v = value_cache[..., cache_start:cache_stop]
+            #     # Unpack cache
+            #     k = k.view(batch_size, cache_seq_len, kv_num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, cache_seq_len, head_dim)
+            #     v = v.view(batch_size, cache_seq_len, kv_num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, cache_seq_len, head_dim)
+            # else: # Prefill
+            #     k = None
+            #     v = None
+            
+            # Slice cache for this block
+            k = key_cache[..., cache_start:cache_stop]
+            v = value_cache[..., cache_start:cache_stop]
+            
+            # Unpack cache
+            k = k.view(batch_size, cache_seq_len, kv_num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, cache_seq_len, head_dim)
+            v = v.view(batch_size, cache_seq_len, kv_num_heads, head_dim).permute(0, 2, 1, 3) # (batch_size, num_heads, cache_seq_len, head_dim)
 
             # Inference (prefill or decode)
             x, k, v = block(
                 x,                       # (batch_size, seq_len, embed_dim)
                 key_cache=k,     # (batch_size, num_heads, total_seq_len, head_dim) or None
-                value_cache=v, # (batch_size, num_heads, total_seq_len, head_dim) or None
+                value_cache=v,   # (batch_size, num_heads, total_seq_len, head_dim) or None
                 rope=rope,               # (1, 1, seq_len, head_dim//2)
-                prefill=prefill,
+                # prefill=prefill,
             )
             # x     : (batch_size, seq_len, embed_dim)
             # new_k : (batch_size, num_heads, seq_len, head_dim)
@@ -213,8 +222,8 @@ class TransformerDecoder(torch.nn.Module):
             new_key_cache.append(k)
             new_value_cache.append(v)
         
-        new_key_cache = torch.cat(new_key_cache, dim=-1) # (batch_size, cache_seq_len, cumsum(cache_lengths))
-        new_value_cache = torch.cat(new_value_cache, dim=-1) # (batch_size, cache_seq_len, cumsum(cache_lengths))
+        new_key_cache = torch.cat(new_key_cache, dim=-1) # (batch_size, cache_seq_len+seq_len, cumsum(cache_lengths))
+        new_value_cache = torch.cat(new_value_cache, dim=-1) # (batch_size, cache_seq_len+seq_len, cumsum(cache_lengths))
 
         # Final normalization
         x = self.norm(x) # (batch_size, seq_len, embed_dim)
