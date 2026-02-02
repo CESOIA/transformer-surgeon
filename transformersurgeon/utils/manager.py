@@ -106,8 +106,23 @@ class CompressionSchemesManager:
             scheme.lrd_rank = rank
             if verbose:
                 print(f"Set LRD rank of {rank} for {scheme.path}")
+    
+    def set_quantization_bits(self, bits: int, criteria=None, verbose=False):
+        """
+        Sets the quantization bits for filtered modules.
 
-    def init_vcon(self, criteria=None, verbose=False):
+        Args:
+            bits: The number of bits to set (e.g., 8, 16, 32)
+            criteria: List of criteria to filter modules (by name or block_id)
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            if scheme.soft_applied or scheme.hard_applied:
+                raise RuntimeError(f"Cannot set quantization bits for {scheme.path} because compression has already been applied.")
+            scheme.bits = bits
+            if verbose:
+                print(f"Set quantization bits of {bits} for {scheme.path}")
+
+    def init_vcon(self, criteria=None, verbose=False, variant=False):
         """
         Initializes VCON blocks for filtered modules
 
@@ -116,7 +131,7 @@ class CompressionSchemesManager:
             verbose: If True, prints information about the initialization process
         """
         for scheme in self.iter_filtered(criteria=criteria):
-            scheme.init_vcon(verbose=verbose)
+            scheme.init_vcon(verbose=verbose, variant=variant)
 
     def cancel_vcon(self, criteria=None, keep_block_b=True, verbose=False):
         """
@@ -197,11 +212,17 @@ class CompressionSchemesManager:
         """
         self.set_lrd_rank(rank, criteria=["all"], verbose=verbose)
 
-    def init_vcon_all(self, verbose=False):
+    def set_quantization_bits_all(self, bits: int, verbose=False):
+        """
+        Alias for set_quantization_bits with criteria set to "all"
+        """
+        self.set_quantization_bits(bits, criteria=["all"], verbose=verbose)
+
+    def init_vcon_all(self, verbose=False, variant=False):
         """
         Alias for init_vcon with criteria set to "all"
         """
-        self.init_vcon(criteria=["all"], verbose=verbose)
+        self.init_vcon(criteria=["all"], verbose=verbose, variant=variant)
 
     def cancel_vcon_all(self, keep_block_b=True, verbose=False):
         """
@@ -264,10 +285,6 @@ class CompressionSchemesManager:
                 for path in path_list:
                     # Create CompressionScheme instance
                     full_path = path_template.format(block_index=i, path=path)
-                    
-                    # Check if this is a QKV concatenated layer
-                    is_qkv_concatenated = block_indexing.get('qkv_paths', [])
-                    is_qkv = path in is_qkv_concatenated if is_qkv_concatenated else False
 
                     # Get pruning ratio and LRD rank from config
                     pruning_ratio = block_specific_config.get('pruning_ratios', {}).get(full_path, 0.0)
@@ -282,7 +299,6 @@ class CompressionSchemesManager:
                         pruning_mode=pruning_mode,
                         lrd_rank=lrd_rank,
                         bits=bits,
-                        is_qkv_concatenated=is_qkv,
                         model=self.model,
                     )
             

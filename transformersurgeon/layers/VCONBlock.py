@@ -32,9 +32,9 @@ class VCONBlock(nn.Module):
         self.beta = None  # To be set externally if needed
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self.beta is None or self.beta == 1:
+        if self.beta is None or self.beta >= 1:
             return self.block_a(input)
-        elif self.beta == 0:
+        elif self.beta <= 0:
             if self.block_b is None:
                 raise ValueError("Block B is not defined.")
             return self.block_b(input)
@@ -68,4 +68,51 @@ class VCONBlock(nn.Module):
     def __str__(self):
         return self.__repr__()        
             
-__all__ = ["VCONBlock"]
+class VCONBlockVariant(VCONBlock):
+    """
+    Vanishing Contribution Block (VCONBlock) variant: the block outputs both the uncompressed and (beta)compressed + (1-beta)uncompressed outputs.
+
+    Combines the outputs of the original and compressed modules using an affine combination controlled by beta.
+    When beta=1, the output is from the original module (block_a); when beta=0, the output is from the compressed module (block_b).
+
+    Args:
+        original_module (nn.Module): The original (uncompressed) module.
+        compressed_module (nn.Module): The compressed module.
+
+    Methods:
+        forward: Computes the affine combination of original and compressed outputs.
+        set_beta: Sets the beta parameter.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input: input tensor; first dimension (batch) is doubled to managed
+            both the data flow through the uncompressed model and the data flow through the (beta)compressed + (1-beta)uncompressed model
+        """
+        doubled_batch_size, *rest = input.size()
+        assert doubled_batch_size % 2 == 0, "Input doubled batch size must be even."
+        batch_size = doubled_batch_size // 2
+
+        input_a = input[:batch_size]
+        input_b = input[batch_size:]
+
+        if self.beta is None or self.beta == 1:
+            output_a = self.block_a(input_a)
+            output_b = output_a
+        elif self.beta == 0:
+            if self.block_b is None:
+                raise ValueError("Block B is not defined.")
+            output_b = self.block_b(input_b)
+            output_a = torch.empty_like(output_b)
+        else:
+            if self.block_b is None:
+                raise ValueError("Block B is not defined.")
+            output_a = self.block_a(input_a)
+            output_b = self.beta * output_a + (1 - self.beta) * self.block_b(input_b)
+        
+        return torch.cat([output_a, output_b], dim=0)       
+
+__all__ = ["VCONBlock", "VCONBlockVariant"]

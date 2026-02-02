@@ -246,3 +246,6 @@ _build/
 
 # Experiments folder
 experiments/
+
+# HF transformers github repository
+transformers/

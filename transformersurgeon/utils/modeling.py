@@ -20,7 +20,12 @@ def replace_layers_upon_init(
     Returns:
         None: The model is modified in place.
     """
-    config_dict = config.to_dict()
+    if indexing["config_attr"] != "":
+        config_dict = getattr(config, indexing["config_attr"]).to_dict()
+    else:
+        config_dict = config.to_dict()
+
+    # Extract layer path information
     path_template = indexing['path_template']
     path_list = indexing['path_list']
     blocks_num = config_dict.get(indexing['num_blocks_attr'], None)
@@ -44,25 +49,26 @@ def replace_layers_upon_init(
             # Get the target module
             module_name = split_path[-1]
             old_module = getattr(parent_module, module_name, None)
-            if type(old_module) is not torch.nn.Linear:
-                raise TypeError(f"Expected torch.nn.Linear at '{full_path}', but found {type(old_module)}")
-            
-            # Get the module parameters
-            # WIP logic for determining features size from pruning config
-            in_features = old_module.in_features
-            out_features = old_module.out_features
-        
-            # Get lrd rank from config if available
-            lrd_rank = config_dict.get('lrd_ranks', {}).get(full_path, "full")
 
-            new_module = LinearCompressed(
-                in_features=in_features,
-                out_features=out_features,
-                bias=old_module.bias is not None,
-                device=old_module.weight.device,
-                dtype=old_module.weight.dtype,
-                lrd_rank=lrd_rank,
-                )
-            setattr(parent_module, module_name, new_module)
+            # Substitute Linear modules with LinearCompressed
+            if type(old_module) is torch.nn.Linear:
+                
+                # Get the module parameters
+                # WIP logic for determining features size from pruning config
+                in_features = old_module.in_features
+                out_features = old_module.out_features
+            
+                # Get lrd rank from config if available
+                lrd_rank = config_dict.get('lrd_ranks', {}).get(full_path, "full")
+
+                new_module = LinearCompressed(
+                    in_features=in_features,
+                    out_features=out_features,
+                    bias=old_module.bias is not None,
+                    device=old_module.weight.device,
+                    dtype=old_module.weight.dtype,
+                    lrd_rank=lrd_rank,
+                    )
+                setattr(parent_module, module_name, new_module)
                 
 __all__ = ["replace_layers_upon_init"]

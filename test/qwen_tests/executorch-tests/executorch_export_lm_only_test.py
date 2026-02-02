@@ -1,11 +1,22 @@
 import torch
 import os
+from copy import deepcopy
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
 from executorch.backends.apple.coreml.partition import CoreMLPartitioner
-from executorch.exir import to_edge_transform_and_lower
+from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
 from torch.export import Dim, export
+
+from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
+    get_symmetric_quantization_config,
+    XNNPACKQuantizer
+)
+
+from executorch.backends.apple.coreml.quantizer.coreml_quantizer import (
+    CoreMLQuantizer,
+)
 
 from transformers import (
     AutoModel,
@@ -20,15 +31,19 @@ import sys
 ### TEST CONFIGURATION ###
 PARTITIONER = XnnpackPartitioner()
 # PARTITIONER = CoreMLPartitioner()
+QUANTIZER = XNNPACKQuantizer
 EXPORT_TO_EXECUTORCH = True
+EXPORT_EMBEDDING = True
+EXPORT_LM_DECODER = True
+EXPORT_FINAL_LAYER = False
 
 hard_mode = True
-data_type = torch.float16  # Data type for model weights
-use_vcon = False  # Whether to use VCON blocks
-vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
+data_type = torch.float32  # Data type for model weights
 VERBOSE = True  # Whether to print detailed information during compression
-DO_COMPRESSION = True  # Whether to apply compression
+DO_COMPRESSION = False  # Whether to apply compression
 USE_STANDARD_MODEL = False  # Whether to use standard model instead of compressed version
+
+Q_GROUP_SIZE = 32  # Quantization group size for weight-only quantization
 ##########################
 
 from transformersurgeon import (
@@ -40,6 +55,20 @@ from transformersurgeon import (
 modelClass = Qwen2_5_VLForConditionalGenerationCompress
 configClass = Qwen2_5_VLConfigCompress
 managerClass = Qwen2_5_VLCompressionSchemesManager
+
+# Quantizer function
+
+def quantize(model, example_inputs):
+    # model.print_readable()
+    quantizer = QUANTIZER()
+    qparams = get_symmetric_quantization_config(is_per_channel=True)
+    quantizer.set_global(qparams)
+    m = prepare_pt2e(model, quantizer)
+    # calibration
+    m(*example_inputs)
+    m = convert_pt2e(m)
+    # m.print_readable()
+    return m
 
 # Model name
 model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -64,6 +93,10 @@ device = torch.device("cpu")
 processor = AutoProcessor.from_pretrained(model_name, torch_dtype=data_type)
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype=data_type)
 model = modelClass.from_pretrained(model_name, torch_dtype=data_type).to(device)
+
+print(processor.__class__.__name__)
+print(tokenizer.__class__.__name__)
+print(model.__class__.__name__)
 
 model.config.use_cache = False  # Disable cache for generation
 
@@ -93,12 +126,6 @@ if DO_COMPRESSION:
             ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
         ], verbose=VERBOSE)
     # manager.set_lrd_rank_all(32)
-
-    if use_vcon:
-        manager.init_vcon_all(verbose=VERBOSE)
-        # manager.init_vcon(criteria=[3, "mlp"], verbose=VERBOSE)  # Initialize VCON for only specific layers
-        manager.set_vcon_beta_all(vcon_beta)
-        # manager.set_vcon_beta(vcon_beta, criteria=[3, "mlp"])  # Set beta for only specific layers
 
     # Optionally print the full compression configuration as a table
     # print(manager)
@@ -144,7 +171,7 @@ class EmbeddingWrapper(torch.nn.Module):
         super().__init__()
         self.model = model.get_input_embeddings()
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
         return self.model(input_ids)
 
 class LMWrapper(torch.nn.Module):
@@ -154,12 +181,13 @@ class LMWrapper(torch.nn.Module):
         model.config._attn_implementation = "eager" # required for coreml export
 
     def forward(self,
+                attention_mask: torch.Tensor,
                 position_ids: torch.LongTensor,
                 inputs_embeds: torch.Tensor,
                 cache_position: torch.LongTensor,
                 ):
         outputs = self.model(
-            attention_mask={"full_attention": None},
+            attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             output_attentions=False,
@@ -184,23 +212,24 @@ wrapped_final_layer = FinalLayerWrapper(model)
 
 # Prepare example inputs for each wrapper
 batch_size = 1
-seq_len = 30
+seq_len = 20
 max_seq_len = 1217
 embed_dim = 3584
 vocab_size = 152064
 # embedding
 example_inputs_embedding = (
-    torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long),
+    torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long).to(device),
 )
 # language decoder
 example_inputs = (
+    torch.triu(torch.full(size=(batch_size, 1, seq_len, seq_len), fill_value=torch.finfo(data_type).min, device=device), diagonal=1).to(device),  # attention_mask
     torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0).to(device),
-    torch.randn(batch_size, seq_len, embed_dim, dtype=data_type),
+    torch.randn(batch_size, seq_len, embed_dim, dtype=data_type).to(device),
     torch.arange(seq_len, dtype=torch.long).to(device),
 )
 # final layer
 example_inputs_final_layer = (
-    torch.randn(batch_size, seq_len, embed_dim, dtype=data_type),
+    torch.randn(batch_size, seq_len, embed_dim, dtype=data_type).to(device),
 )
 
 # Prepare dynamic shapes for the inputs of all the blocks
@@ -211,6 +240,7 @@ dynamic_shapes_embedding = {
 }
 # language decoder
 dynamic_shapes = {
+    "attention_mask": (batch_size, 1, dyn_seq_len, dyn_seq_len),
     "position_ids": (batch_size, dyn_seq_len),
     "inputs_embeds": (batch_size, dyn_seq_len, embed_dim),
     "cache_position": (dyn_seq_len,),
@@ -226,9 +256,7 @@ wrapped_embedding.eval()
 wrapped_model.eval()
 wrapped_final_layer.eval()
 example_outputs_embedding = wrapped_embedding(*example_inputs_embedding)
-# example_outputs = wrapped_model(example_inputs[0], example_outputs_embedding, example_inputs[2])
 example_outputs = wrapped_model(*example_inputs)
-# example_outputs_final_layer = wrapped_final_layer(example_outputs)
 example_outputs_final_layer = wrapped_final_layer(*example_inputs_final_layer)
 
 if EXPORT_TO_EXECUTORCH:
@@ -241,35 +269,53 @@ if EXPORT_TO_EXECUTORCH:
                 file.flush()
                 os.fsync(file.fileno()) # Ensure data is written to disk
 
-    print("EXPORTING EMBEDDING LAYER")
-    print("Exporting to graph format...")
-    exported_program_embedding = export(wrapped_embedding, example_inputs_embedding, dynamic_shapes=dynamic_shapes_embedding)
-    print("Exporting to Executorch format...")
-    executorch_program_embedding = to_edge_transform_and_lower(
-        exported_program_embedding,
-        partitioner=[PARTITIONER],
-    ).to_executorch()
-    write_to_file("embedding.pte", executorch_program_embedding.buffer)
+    if EXPORT_EMBEDDING:
+        print("EXPORTING EMBEDDING LAYER")
+        print("Exporting to ATen graph...")
+        exported_module = export(wrapped_embedding, example_inputs_embedding).module()
+        print("Quantizing graph module...")
+        # quantized_module = quantize(exported_module, example_inputs_embedding)
+        quantized_module = exported_module
+        print("Lowering to edge model...")
+        edge_module = to_edge_transform_and_lower(
+            export(quantized_module, example_inputs_embedding),
+            compile_config=EdgeCompileConfig(_check_ir_validity=False),
+            partitioner=[PARTITIONER],
+        )
+        print("Exporting to Executorch format...")
+        executorch_module = edge_module.to_executorch()
+        print("Writing to file...")
+        write_to_file("embedding.pte", executorch_module.buffer)
 
-    print("EXPORTING LANGUAGE DECODER")
-    print("Exporting to graph format...")
-    exported_program = export(wrapped_model, example_inputs, dynamic_shapes=dynamic_shapes)
-    print("Exporting to Executorch format...")
-    executorch_program = to_edge_transform_and_lower(
-        exported_program,
-        partitioner=[PARTITIONER],
-    ).to_executorch()
-    write_to_file("lm_decoder.pte", executorch_program.buffer)
+    if EXPORT_LM_DECODER:
+        print("EXPORTING LANGUAGE DECODER")
+        print("Exporting to ATen graph...")
+        exported_module = export(wrapped_model, example_inputs).module()
+        print("Quantizing graph module...")
+        # quantized_module = quantize(exported_module, example_inputs)
+        quantized_module = exported_module
+        print("Lowering to edge model...")
+        edge_module = to_edge_transform_and_lower(
+            export(quantized_module, example_inputs),
+            compile_config=EdgeCompileConfig(_check_ir_validity=False),
+            partitioner=[PARTITIONER],
+        )
+        print("Exporting to Executorch format...")
+        executorch_module = edge_module.to_executorch()
+        print("Writing to file...")
+        write_to_file("lm_decoder.pte", executorch_module.buffer)
 
-    print("EXPORTING FINAL LAYER")
-    print("Exporting final layer to graph format...")
-    exported_program_final_layer = export(wrapped_final_layer, example_inputs_final_layer, dynamic_shapes=dynamic_shapes_final_layer)
-    print("Exporting final layer to Executorch format...")
-    executorch_program_final_layer = to_edge_transform_and_lower(
-        exported_program_final_layer,
-        partitioner=[PARTITIONER],
-    ).to_executorch()
-    write_to_file("final_layer.pte", executorch_program_final_layer.buffer)
+    if EXPORT_FINAL_LAYER:
+        print("EXPORTING FINAL LAYER")
+        print("Exporting final layer to graph format...")
+        exported_program_final_layer = export(wrapped_final_layer, example_inputs_final_layer, dynamic_shapes=dynamic_shapes_final_layer)
+        print("Exporting final layer to Executorch format...")
+        executorch_program_final_layer = to_edge_transform_and_lower(
+            exported_program_final_layer,
+            compile_config=EdgeCompileConfig(_check_ir_validity=False),
+            partitioner=[PARTITIONER],
+        ).to_executorch()
+        write_to_file("final_layer.pte", executorch_program_final_layer.buffer)
 
 print("Loading and running Executorch program...")
 from executorch.runtime import Runtime
@@ -278,54 +324,57 @@ runtime = Runtime.get()
 # load program
 program_embedding = runtime.load_program("embedding.pte")
 program_lm_decoder = runtime.load_program("lm_decoder.pte")
-program_final_layer = runtime.load_program("final_layer.pte")
+# program_final_layer = runtime.load_program("final_layer.pte")
 # extract method
 method_embedding = program_embedding.load_method("forward")
 method_lm = program_lm_decoder.load_method("forward")
-method_final_layer = program_final_layer.load_method("forward")
+# method_final_layer = program_final_layer.load_method("forward")
 # run method
 outputs_embedding = method_embedding.execute(list(example_inputs_embedding))
-# outputs = method_lm.execute([example_inputs[0], outputs_embedding[0], example_inputs[2]])
 outputs = method_lm.execute(list(example_inputs))
-# outputs_final_layer = method_final_layer.execute(list(outputs))
-outputs_final_layer = method_final_layer.execute(list(example_inputs_final_layer))
-# here the next token is evaluated as follow
-# temp = 1.0 (< 0 -> more greedy, > 1 -> more random)
-# logits = torch.softmax(outputs[0] / temp, dim=-1)
-# next_token = torch.multinomial(logits, num_samples=1)
+# outputs_final_layer = method_final_layer.execute(list(example_inputs_final_layer))
 
 if type(example_outputs_embedding) is tuple or type(example_outputs_embedding) is list:
     example_output_embedding = example_outputs_embedding[0]
 if type(example_outputs) is tuple or type(example_outputs) is list:
     example_output = example_outputs[0]
-if type(example_outputs_final_layer) is tuple or type(example_outputs_final_layer) is list:
-    example_output_final_layer = example_outputs_final_layer[0]
+# if type(example_outputs_final_layer) is tuple or type(example_outputs_final_layer) is list:
+#     example_output_final_layer = example_outputs_final_layer[0]
 
 print("Maximum error between original and executorch program (embedding):", torch.max(torch.abs(example_outputs_embedding - outputs_embedding[0])).item())
 print("Maximum error between original and executorch program (lm):", torch.max(torch.abs(example_outputs - outputs[0])).item())
-print("Maximum error between original and executorch program (final layer):", torch.max(torch.abs(example_outputs_final_layer - outputs_final_layer[0])).item())
+exit()
+# print("Maximum error between original and executorch program (final layer):", torch.max(torch.abs(example_outputs_final_layer - outputs_final_layer[0])).item())
 
 
 print("Loading and running Executorch program with a different sequence length...")
 # Test with a different sequence length
-new_seq_len = 50
-# Prepare new example inputs
+seq_len = 26
+# Prepare new example input
 # embedding
-new_example_inputs_embedding = (
-    torch.randint(0, vocab_size, (batch_size, new_seq_len), dtype=torch.long),
+example_inputs_embedding = (
+    torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long),
 )
 # language decoder
-new_example_inputs = (
-    torch.arange(0, new_seq_len, dtype=torch.long, device=device).unsqueeze(0).to(device),
-    torch.randn(1, new_seq_len, embed_dim, dtype=data_type),
-    torch.arange(new_seq_len, dtype=torch.long).to(device),
+example_inputs = (
+    torch.triu(torch.full(size=(batch_size, 1, seq_len, seq_len), fill_value=torch.finfo(data_type).min, device=device), diagonal=1),  # attention_mask
+    torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0).to(device),
+    torch.randn(batch_size, seq_len, embed_dim, dtype=data_type),
+    torch.arange(seq_len, dtype=torch.long).to(device),
 )
 # final layer
-new_example_inputs_final_layer = (
-    torch.randn(1, new_seq_len, embed_dim, dtype=data_type),
+example_inputs_final_layer = (
+    torch.randn(1, seq_len, embed_dim, dtype=data_type),
 )
-# run method
-new_outputs = method_embedding.execute(list(new_example_inputs_embedding))
-new_outputs = method_lm.execute([new_example_inputs[0], new_outputs[0], new_example_inputs[2]])
-new_outputs = method_final_layer.execute(list(new_outputs))
-print("Test with different sequence length completed successfully.")
+# run torch method for reference
+example_outputs_embedding = wrapped_embedding(*example_inputs_embedding)
+example_outputs = wrapped_model(*[example_inputs[0], example_inputs[1], example_outputs_embedding, example_inputs[3]])
+example_outputs_final_layer = wrapped_final_layer(*[example_outputs])
+# run executorch methods
+outputs_embedding = method_embedding.execute(list(example_inputs_embedding))
+outputs = method_lm.execute([example_inputs[0], example_inputs[1], outputs_embedding[0], example_inputs[3]])
+outputs_final_layer = method_final_layer.execute(list(outputs))
+
+print("Maximum error between original and executorch program (embedding):", torch.max(torch.abs(example_outputs_embedding - outputs_embedding[0])).item())
+print("Maximum error between original and executorch program (lm):", torch.max(torch.abs(example_outputs - outputs[0])).item())
+print("Maximum error between original and executorch program (final layer):", torch.max(torch.abs(example_outputs_final_layer - outputs_final_layer[0])).item())
