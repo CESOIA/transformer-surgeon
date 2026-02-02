@@ -342,70 +342,68 @@ class CompressionScheme:
         module = self.get_module()
         if self.vcon_initialized:
             module = module.block_b # apply to block_b only
+
+        if verbose:
+            print(f"Applying ({"hard" if hard else "soft"}) compression scheme {self} to module {self.path}.")
+            if self.soft_applied:
+                if hard:
+                    print(f"Compression already hard applied, making the changes permanent (HARD mode)")
+                else:
+                    print(f"Compression already soft applied, skipping re-application.")
+            else:
+                print(f"Applying {'HARD (non-reversible) ' if hard else ''}compression to module {self.path}.")
+
+        if self.hard_applied: # already hard applied, nothing to do
+            return
+        
+        if not hard: # Backup original weights if not already done
+            if not hasattr(module, '_weight_original'):
+                module._weight_original = module.weight.data.clone()
+        else: # Make changes permanent
+            if hasattr(module, '_weight_original'):
+                del module._weight_original
         
         # Apply pruning
         if self.pruning_ratio > 0:
-            if verbose:
-                if self.soft_applied:
-                    if hard:
-                        print(f"Pruning already hard applied to module {self.path}, making the changes permanent (HARD mode)")
-                    else:
-                        print(f"Pruning already applied to module {self.path}, skipping re-application")
-                else:
-                    print(f"Applying {"HARD (non-reversible) "*hard}pruning with pruning ratio {self.pruning_ratio} to module {self.path}")
-
             # Prune module
-            if self.soft_applied:
-                prune_mask = module.prune_mask
-            else:
+            if not self.soft_applied:
                 if self.pruning_mode == 'structured':
                     prune_mask, kept = self._structured_pruning(module, norm=2, pruning_ratio=self.pruning_ratio)
+                    self.prune_mask = prune_mask.to(torch.int8) # store for later use
+                    self.kept = kept # store for later use
                 elif self.pruning_mode == 'unstructured':
                     prune_mask = self._unstructured_pruning(module, criterion="magnitude", pruning_ratio=self.pruning_ratio)
                 else:
                     raise ValueError(f"Unsupported pruning mode '{self.pruning_mode}' for module {self.path}.")
+                
+                if not hard:
+                    # Apply soft pruning by zeroing out the pruned rows/weights
+                    if self.pruning_mode == 'structured':
+                        module.weight.data = module.weight.data*prune_mask.unsqueeze(1).to(torch.float32)
+                    else:
+                        module.weight.data = module.weight.data*prune_mask.to(torch.float32)
             
             if hard:
                 if self.pruning_mode == 'unstructured':
                     raise ValueError("Hard pruning is not supported for unstructured pruning.")
                 
                 # Apply hard pruning by removing the pruned rows
-                module.weight.data = module.weight.data[prune_mask]
-                module.bias.data = module.bias.data[prune_mask] if module.bias is not None else None
-                module.out_features = kept
-            else:
-                # Apply soft pruning by setting the prune mask
-                module.set_prune_mask(prune_mask)
-
-            self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
+                module.weight.data = module.weight.data[self.prune_mask]
+                module.bias.data = module.bias.data[self.prune_mask] if module.bias is not None else None
+                module.out_features = self.kept
+                del self.prune_mask                
 
         # Apply Low Rank Decomposition (LRD)
         if self.lrd_rank and self.lrd_rank != "full":
-            if verbose:
-                if self.soft_applied:
-                    if hard:
-                        print(f"LRD already hard applied to module {self.path}, making the changes permanent (HARD mode)")
-                    else:
-                        print(f"LRD already applied to module {self.path}, skipping re-application.")
-                else:
-                    print(f"Applying {"HARD (non-reversible) "*hard}LRD with rank {self.lrd_rank} to module {self.path}.")
-
-            if not hard:
-                # Store original weight matrix to allow restoring/vanishing contributions
-                module.weight_original = torch.nn.Parameter(module.weight.data.clone())
-            else:
-                if hasattr(module, 'weight_original'):
-                    del module.weight_original
-            
-            if not self.soft_applied:
-                # Replace the original weight with the decomposed weights
+            if not self.soft_applied: # Apply LRD if decomposition not yet applied
                 W1, W2 = self._low_rank_decomposition(module, self.lrd_rank)
                 module.weight = torch.nn.Parameter(W1)
                 module.weight_2 = torch.nn.Parameter(W2.t())
                 module.set_lrd_rank(self.lrd_rank)
 
-            self.soft_applied = True # Flag the application as soft, do not overwrite/reinitialize
-            self.hard_applied = hard # Flag the application as hard; changes cannot be reverted    
+        # Flag as applied
+        self.soft_applied = True
+        self.hard_applied = hard
 
     def restore(self, verbose=False):
         """
@@ -429,24 +427,21 @@ class CompressionScheme:
         if self.vcon_initialized:
             module = module.block_b # apply to block_b only
         
-        if hasattr(module, 'weight_original') or module.prune_mask is not None:
+        if hasattr(module, '_weight_original'):
             if verbose:
                 print(f"Restoring module {self.path} to its original state.")
         
-        # Restore original weights if LRD was applied
-        if hasattr(module, 'weight_original'):
-            module.weight = torch.nn.Parameter(module.weight_original.data.clone())
-            del module.weight_original
+        # Restore original weights
+        if hasattr(module, '_weight_original'):
+            module.weight.data.copy_(module._weight_original)
+            del module._weight_original
             module.set_lrd_rank("full")
-        
-        # Remove pruning by deleting the prune mask
-        module.reset_prune_mask()
 
         self.soft_applied = False # Reset the soft application flag
 
     def __repr__(self):
         return (f"CompressionScheme(name={self.name}, block_id={self.block_id}, "
-                f"path={self.path}, pruning_ratio={self.pruning_ratio}, "
+                f"path={self.path}, pruning_ratio={self.pruning_ratio}, pruning_mode={self.pruning_mode}, "
                 f"lrd_rank={self.lrd_rank}, "
                 f"module={self.get_module().__class__.__name__})")
     
@@ -465,14 +460,15 @@ class CompressionScheme:
             torch.Tensor: A binary mask with the same shape as the weight tensor.
         """
         weight = module.weight.data.flatten()
-
-        if pruning_ratio <= 0.0:
-            # No pruning, return a mask of all ones
-            return torch.ones_like(weight, dtype=torch.bool, device=weight.device)
         
-        if pruning_ratio >= 1.0:
-            # Full pruning, return a mask of all zeros
+        if pruning_ratio >= 1.0: # Prune all weights
             return torch.zeros_like(weight, dtype=torch.bool, device=weight.device)
+        
+        # Determine the number of weights to prune
+        num_weights_to_prune = int(pruning_ratio * weight.numel())
+        
+        if pruning_ratio <= 0.0 or num_weights_to_prune == 0: # No pruning, return a mask of all ones
+            return torch.ones_like(weight, dtype=torch.bool, device=weight.device)
         
         # Calculate importance scores based on the criterion
         if criterion == "magnitude":
@@ -480,18 +476,9 @@ class CompressionScheme:
         else:
             raise ValueError(f"Unsupported criterion '{criterion}' for unstructured pruning.")
         
-        # Determine the number of weights to prune
-        num_weights_to_prune = int(pruning_ratio * weight.numel())
-        
-        if num_weights_to_prune == 0:
-            return torch.ones_like(weight, dtype=torch.bool, device=weight.device)
-        
-        # Get the indices of the weights with the smallest scores
-        _, prune_indices = torch.topk(scores, num_weights_to_prune, largest=False)
-        
-        # Create a mask with ones and set the prune indices to zero
-        mask = torch.ones_like(weight, dtype=torch.bool, device=weight.device)
-        mask[prune_indices] = False
+        # Generate the pruning mask
+        threshold = torch.topk(scores, num_weights_to_prune, largest=False, sorted=False).values.max()
+        mask = scores > threshold
         
         return mask.view_as(module.weight)
 
@@ -511,35 +498,24 @@ class CompressionScheme:
             kept (int): Number of rows kept after pruning.
         """
         weight = module.weight.data
-
-        if pruning_ratio <= 0.0:
-            # No pruning, return a mask of all ones
-            return torch.ones(weight.size(0), dtype=torch.bool, device=weight.device)
+        current_rows = weight.size(0)
         
-        if pruning_ratio >= 1.0:
-            # Full pruning, return a mask of all zeros
-            return torch.zeros(weight.size(0), dtype=torch.bool, device=weight.device)
-        
-        # Calculate the norm of each row
-        if module.lrd_rank == "full":
-            row_norms = torch.norm(weight, p=norm, dim=1)
-        else:
-            # For low-rank decomposed weights, only consider the first part of the weight matrix
-            row_norms = torch.norm(weight[:module.out_features, :], p=norm, dim=1)
+        if pruning_ratio >= 1.0: # Prune all rows
+            return torch.zeros(weight.size(0), dtype=torch.bool, device=weight.device), 0
         
         # Determine the number of rows to prune
-        num_rows_to_prune = int(pruning_ratio * module.out_features)
-        kept = module.out_features - num_rows_to_prune
+        num_rows_to_prune = int(pruning_ratio * current_rows)
+        kept = current_rows - num_rows_to_prune
         
-        if num_rows_to_prune == 0:
-            return torch.ones(weight.size(0), dtype=torch.bool, device=weight.device)
+        if pruning_ratio <= 0.0 or num_rows_to_prune == 0: # Prune no rows
+            return torch.ones(weight.size(0), dtype=torch.bool, device=weight.device), weight.size(0)
         
-        # Get the indices of the rows with the smallest norms
-        _, prune_indices = torch.topk(row_norms, num_rows_to_prune, largest=False)
-        
-        # Create a mask with ones and set the prune indices to zero
-        mask = torch.ones(weight.size(0), dtype=torch.bool, device=weight.device)
-        mask[prune_indices] = False
+        # Generate scores
+        scores = torch.norm(weight, p=norm, dim=1) # Calculate the norm of each row
+
+        # Generate pruning mask
+        threshold = torch.topk(scores, num_rows_to_prune, largest=False, sorted=False).values.max()
+        mask = scores > threshold
         
         return mask, kept
 
