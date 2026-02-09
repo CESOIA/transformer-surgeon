@@ -122,7 +122,7 @@ class CompressionSchemesManager:
             if verbose:
                 print(f"Set quantization bits of {bits} for {scheme.path}")
 
-    def init_vcon(self, criteria=None, verbose=False, variant=False):
+    def init_vcon(self, criteria=None, verbose=False):
         """
         Initializes VCON blocks for filtered modules
 
@@ -131,7 +131,7 @@ class CompressionSchemesManager:
             verbose: If True, prints information about the initialization process
         """
         for scheme in self.iter_filtered(criteria=criteria):
-            scheme.init_vcon(verbose=verbose, variant=variant)
+            scheme.init_vcon(verbose=verbose)
 
     def cancel_vcon(self, criteria=None, keep_block_b=True, verbose=False):
         """
@@ -182,7 +182,7 @@ class CompressionSchemesManager:
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.apply(hard=hard, verbose=verbose)
 
-    def restore(self, criteria=None, verbose=False):
+    def restore(self, criteria=None, topology=False, verbose=False):
         """
         Restores filtered modules to their original state by removing pruning and LRD.
 
@@ -191,7 +191,7 @@ class CompressionSchemesManager:
             verbose: If True, prints information about the restoration process
         """
         for scheme in self.iter_filtered(criteria=criteria):
-            scheme.restore(verbose=verbose)
+            scheme.restore(topology=topology, verbose=verbose)
 
     # aliases for "all" criteria
     def set_pruning_ratio_all(self, ratio: float, verbose=False):
@@ -218,11 +218,11 @@ class CompressionSchemesManager:
         """
         self.set_quantization_bits(bits, criteria=["all"], verbose=verbose)
 
-    def init_vcon_all(self, verbose=False, variant=False):
+    def init_vcon_all(self, verbose=False):
         """
         Alias for init_vcon with criteria set to "all"
         """
-        self.init_vcon(criteria=["all"], verbose=verbose, variant=variant)
+        self.init_vcon(criteria=["all"], verbose=verbose)
 
     def cancel_vcon_all(self, keep_block_b=True, verbose=False):
         """
@@ -248,11 +248,11 @@ class CompressionSchemesManager:
         """
         self.apply(criteria=["all"], hard=hard, verbose=verbose)
         
-    def restore_all(self, verbose=False):
+    def restore_all(self, topology=False, verbose=False):
         """
         Alias for restore with criteria set to "all"
         """
-        self.restore(criteria=["all"], verbose=verbose)
+        self.restore(criteria=["all"], topology=topology, verbose=verbose)
 
     def _generate_schemes(self):
         """
