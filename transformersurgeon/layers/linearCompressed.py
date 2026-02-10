@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.parameter import Parameter
 from typing import Union
 import math
 
@@ -25,8 +26,6 @@ class LinearCompressed(nn.Linear):
                  device=None,
                  dtype=None,
                  lrd_rank: Union[int, str] = "full"):
-        
-        self.prune_mask = None  # To be set externally if needed
 
         self.lrd_rank = self._check_rank(lrd_rank)
                 
@@ -35,6 +34,7 @@ class LinearCompressed(nn.Linear):
             self.skip = True
         else:
             self.skip = False
+            # When using low-rank decomposition, adjust in_features accordingly for weight_1
             in_features_eff = self.lrd_rank if isinstance(self.lrd_rank, int) else in_features
             super().__init__(in_features=in_features_eff,
                              out_features=out_features,
@@ -53,34 +53,24 @@ class LinearCompressed(nn.Linear):
             return input
         # Perform with low-rank decomposition
         if isinstance(self.lrd_rank, int):
-            weightA = self.weight # shape: (out_features, lrd_rank)
-            weightBT = self.weight_2 # shape: (in_features, lrd_rank)
+            US_r = self.weight # shape: (out_features, lrd_rank)
+            V_r = self.weight_2 # shape: (lrd_rank, in_features)
 
-            if self.prune_mask is not None: # Apply soft structured pruning if mask is available
-                weightA = weightA * self.prune_mask
-
-            # Compute: x @ (weightA @ weightB).T + bias which is the same as x @ weightB.T @ weightA.T + bias
-            return F.linear(input @ weightBT, weightA, self.bias)
+            # Compute:
+            #   x @ W.t() + bias
+            # = x @ (US_r @ V_r).t() + bias
+            # = x @ V_r.t() @ US_r.t() + bias
+            return F.linear(F.linear(input, V_r), US_r, self.bias)
         elif self.lrd_rank == "full": # Perform normally if rank is full
-            # Apply soft structured pruning if mask is available
-            if self.prune_mask is not None:
-                weight = weight * self.prune_mask
+            weight = self.weight
 
-            return F.linear(input, self.weight, self.bias)
+            return F.linear(input, weight, self.bias)
         # Manage value errors
         else:
             raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")    
         
     def set_lrd_rank(self, rank: Union[int, str]):
         self.lrd_rank = self._check_rank(rank)
-        
-    def set_prune_mask(self, mask: torch.Tensor):
-        if mask.rank != 1 or mask.size(0) != self.out_features:
-            raise ValueError("Prune mask must be a 1D tensor with the same size as out_features.")
-        self.prune_mask = mask
-
-    def reset_prune_mask(self):
-        self.prune_mask = None
 
     def _check_rank(self, rank: Union[int, str]):
         if isinstance(rank, int):

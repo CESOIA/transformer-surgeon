@@ -2,19 +2,16 @@ import os, json, shutil
 from huggingface_hub import HfApi, create_repo
 from transformers import PreTrainedModel
 
-def _fqcn(cls): # fully-qualified class name
-    return f"{cls.__module__}.{cls.__name__}"
-
 def _infer_auto_map(model: PreTrainedModel):
     # always map config and generic AutoModel
     auto_map = {
-        "AutoConfig": _fqcn(model.config.__class__),
-        "AutoModel": _fqcn(model.__class__),
+        "AutoConfig": "autoload."+model.config.__class__.__name__,
+        "AutoModel": "autoload."+model.__class__.__name__,
     }
     # Heuristics for common specialized autos
     name = model.__class__.__name__
     if "ForConditionalGeneration" in name:
-        auto_map["AutoModelForConditionalGeneration"] = _fqcn(model.__class__)
+        auto_map["AutoModelForConditionalGeneration"] = "autoload."+model.__class__.__name__
     ### add more heuristics here if needed
     ### ...
 
@@ -63,6 +60,13 @@ def export_to_hf(
         cfg["trust_remote_code"] = True
         cfg["auto_map"] = _infer_auto_map(model)
         with open(cfg_path, "w") as f: json.dump(cfg, f, indent=2)
+        # embed module loading code
+        with open(os.path.join(out_dir, "autoload.py"), "w") as f:
+            f.write(
+                "''' Module autoload.py: contains reference to custom classes for loading the model. '''\n"
+                f"from transformersurgeon import {model.__class__.__name__}\n"
+                f"from transformersurgeon import {model.config.__class__.__name__}\n"
+            )
 
     if embed_code:
         try:

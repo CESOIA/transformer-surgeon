@@ -1,2 +1,3 @@
 # Compressed custom layers folder
-from .linearCompressed import LinearCompressed
+from .linearCompressed import *
+from .VCONBlock import *
