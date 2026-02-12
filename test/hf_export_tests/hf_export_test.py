@@ -4,7 +4,7 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from test_messages import messages
+from test.qwen_tests.test_messages import messages
 from qwen_vl_utils import process_vision_info
 import sys
 

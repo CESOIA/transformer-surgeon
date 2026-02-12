@@ -38,3 +38,5 @@ QWEN2_5_VL_C_INDEXING = {
         'extra_layers_matching': ["norm"],
     }
 }
+
+__all__ = ["QWEN2_5_VL_C_INDEXING"]
