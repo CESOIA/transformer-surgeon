@@ -1,7 +1,7 @@
 # Copyright 2025 The CESOIA project team, Politecnico di Torino and King Abdullah University of Science and Technology. All rights reserved.
 import torch
 from transformers import PretrainedConfig
-from ..layers import LinearCompressed
+from ..blocks import LinearCompressed
 from typing import Dict, Any
 
 def replace_layers_upon_init(

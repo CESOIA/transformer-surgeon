@@ -1,7 +1,7 @@
 # Simple blocks implementation for transformers
 # Multi Layer Perceptron (MLP) blocks
 import torch
-from ..layers import LinearCompressed
+from . import LinearCompressed
 
 # Activation function mapping
 activation_map = {

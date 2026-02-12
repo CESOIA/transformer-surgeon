@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 from .rope import apply_rope_multihead
-from ..layers import LinearCompressed
+from . import LinearCompressed
 
 def attention(query, key, value, is_causal=False):
     """

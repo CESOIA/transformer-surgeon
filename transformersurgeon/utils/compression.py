@@ -7,8 +7,8 @@ import copy
 import inspect
 import torch
 from typing import Union
-from ..layers import LinearCompressed
-from ..layers import VCONBlock
+from ..blocks import LinearCompressed
+from ..blocks import VCONBlock
 from .utils import get_submodule
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
