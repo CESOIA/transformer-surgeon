@@ -137,11 +137,10 @@ def train(attn_implementation="flash_attention_2"):
     print("Model is on:", device)
 
     mgr = managerClass(model)
-    mgr.set_lrd_rank(512, [
-        ["visual", "mlp.up_proj"],
-        ["visual", "mlp.down_proj", 0],
-        ["visual", "mlp.down_proj", 1],
-        ["language_model", "mlp.down_proj", 27],
+    mgr.set_lrd_rank(8, [
+        ["language_model", "mlp.down_proj"],
+        ["language_model", "mlp.up_proj"],
+        ["language_model", "mlp.gate_proj"]
     ], verbose=True)
 
     if use_vcon:

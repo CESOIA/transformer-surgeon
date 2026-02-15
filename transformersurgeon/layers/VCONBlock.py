@@ -32,9 +32,9 @@ class VCONBlock(nn.Module):
         self.beta = None  # To be set externally if needed
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self.beta is None or self.beta == 1:
+        if self.beta is None or self.beta >= 1:
             return self.block_a(input)
-        elif self.beta == 0:
+        elif self.beta <= 0:
             if self.block_b is None:
                 raise ValueError("Block B is not defined.")
             return self.block_b(input)
@@ -66,6 +66,6 @@ class VCONBlock(nn.Module):
         return "VCONBlock(\n" + ",\n".join(args) + "\n)"
     
     def __str__(self):
-        return self.__repr__()        
-            
+        return self.__repr__()    
+
 __all__ = ["VCONBlock"]

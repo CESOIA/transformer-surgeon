@@ -243,3 +243,9 @@ secrets.env
 # Conda environment
 .conda/
 _build/
+
+# Experiments folder
+experiments/
+
+# HF transformers github repository
+transformers/

@@ -1,3 +1,4 @@
+# Copyright 2025 The CESOIA project team, Politecnico di Torino and King Abdullah University of Science and Technology. All rights reserved.
 """
 manager.py
 
@@ -62,6 +63,36 @@ class CompressionSchemesManager:
         self.schemes = self._generate_schemes()
 
     
+    def set_pruning_ratio(self, ratio: float, criteria=None, verbose=False):
+        """
+        Sets the pruning ratio for filtered modules.
+
+        Args:
+            ratio: The pruning ratio to set (0.0 to 1.0)
+            criteria: List of criteria to filter modules (by name or block_id)
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            if scheme.soft_applied or scheme.hard_applied:
+                raise RuntimeError(f"Cannot set pruning ratio for {scheme.path} because compression has already been applied.")
+            scheme.pruning_ratio = ratio
+            if verbose:
+                print(f"Set pruning ratio of {ratio} for {scheme.path}")
+            
+    def set_pruning_mode(self, mode: str, criteria=None, verbose=False):
+        """
+        Sets the pruning mode for filtered modules.
+
+        Args:
+            mode: The pruning mode to set ('structured' or 'unstructured')
+            criteria: List of criteria to filter modules (by name or block_id)
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            if scheme.soft_applied or scheme.hard_applied:
+                raise RuntimeError(f"Cannot set pruning mode for {scheme.path} because compression has already been applied.")
+            scheme.pruning_mode = mode
+            if verbose:
+                print(f"Set pruning mode of {mode} for {scheme.path}")
+
     def set_lrd_rank(self, rank: Union[int, str], criteria=None, verbose=False):
         """
         Sets the LRD rank for filtered modules.
@@ -71,9 +102,26 @@ class CompressionSchemesManager:
             criteria: List of criteria to filter modules (by name or block_id)
         """
         for scheme in self.iter_filtered(criteria=criteria):
+            if scheme.soft_applied or scheme.hard_applied:
+                raise RuntimeError(f"Cannot set LRD rank for {scheme.path} because compression has already been applied.")
             scheme.lrd_rank = rank
             if verbose:
                 print(f"Set LRD rank of {rank} for {scheme.path}")
+    
+    def set_quantization_bits(self, bits: int, criteria=None, verbose=False):
+        """
+        Sets the quantization bits for filtered modules.
+
+        Args:
+            bits: The number of bits to set (e.g., 8, 16, 32)
+            criteria: List of criteria to filter modules (by name or block_id)
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            if scheme.soft_applied or scheme.hard_applied:
+                raise RuntimeError(f"Cannot set quantization bits for {scheme.path} because compression has already been applied.")
+            scheme.bits = bits
+            if verbose:
+                print(f"Set quantization bits of {bits} for {scheme.path}")
 
     def init_vcon(self, criteria=None, verbose=False):
         """
@@ -121,7 +169,7 @@ class CompressionSchemesManager:
         """
         for scheme in self.iter_filtered(criteria=criteria):
             if scheme.vcon_initialized:
-                scheme.freeze_uncompressed_block(verbose=verbose)
+                scheme.freeze_uncompressed_vcon(verbose=verbose)
 
     def apply(self, criteria=None, hard=False, verbose=False):
         """
@@ -135,7 +183,7 @@ class CompressionSchemesManager:
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.apply(hard=hard, verbose=verbose)
 
-    def restore(self, criteria=None, verbose=False):
+    def restore(self, criteria=None, topology=False, verbose=False):
         """
         Restores filtered modules to their original state by removing pruning and LRD.
 
@@ -144,14 +192,32 @@ class CompressionSchemesManager:
             verbose: If True, prints information about the restoration process
         """
         for scheme in self.iter_filtered(criteria=criteria):
-            scheme.restore(verbose=verbose)
+            scheme.restore(topology=topology, verbose=verbose)
 
     # aliases for "all" criteria
+    def set_pruning_ratio_all(self, ratio: float, verbose=False):
+        """
+        Alias for set_pruning_ratio with criteria set to "all"
+        """
+        self.set_pruning_ratio(ratio, criteria=["all"], verbose=verbose)
+
+    def set_pruning_mode_all(self, mode: str, verbose=False):
+        """
+        Alias for set_pruning_mode with criteria set to "all"
+        """
+        self.set_pruning_mode(mode, criteria=["all"], verbose=verbose)
+
     def set_lrd_rank_all(self, rank: Union[int, str], verbose=False):
         """
         Alias for set_lrd_rank with criteria set to "all"
         """
         self.set_lrd_rank(rank, criteria=["all"], verbose=verbose)
+
+    def set_quantization_bits_all(self, bits: int, verbose=False):
+        """
+        Alias for set_quantization_bits with criteria set to "all"
+        """
+        self.set_quantization_bits(bits, criteria=["all"], verbose=verbose)
 
     def init_vcon_all(self, verbose=False):
         """
@@ -183,11 +249,11 @@ class CompressionSchemesManager:
         """
         self.apply(criteria=["all"], hard=hard, verbose=verbose)
         
-    def restore_all(self, verbose=False):
+    def restore_all(self, topology=False, verbose=False):
         """
         Alias for restore with criteria set to "all"
         """
-        self.restore(criteria=["all"], verbose=verbose)
+        self.restore(criteria=["all"], topology=topology, verbose=verbose)
 
     def _generate_schemes(self):
         """
@@ -207,7 +273,10 @@ class CompressionSchemesManager:
             config_attr = block_indexing['config_attr'] # added by babisant88: it's done twice.
 
             # Get the specific config for this block type
-            block_specific_config = config[config_attr]
+            if config_attr == '':
+                block_specific_config = config
+            else:
+                block_specific_config = config[config_attr]
 
             # Get blocks number
             num_blocks = block_specific_config[num_blocks_attr]
@@ -217,21 +286,20 @@ class CompressionSchemesManager:
                 for path in path_list:
                     # Create CompressionScheme instance
                     full_path = path_template.format(block_index=i, path=path)
-                    
-                    # Check if this is a QKV concatenated layer
-                    is_qkv_concatenated = block_indexing.get('qkv_paths', [])
-                    is_qkv = path in is_qkv_concatenated if is_qkv_concatenated else False
 
                     # Get pruning ratio and LRD rank from config
                     pruning_ratio = block_specific_config.get('pruning_ratios', {}).get(full_path, 0.0)
+                    pruning_mode = block_specific_config.get('pruning_modes', {}).get(full_path, "structured")
                     lrd_rank = block_specific_config.get('lrd_ranks', {}).get(full_path, "full")
+                    bits=block_specific_config.get('quantization_bits', {}).get(full_path, 32)
                     tmp_dict[full_path] = CompressionScheme(
                         name=path,
                         block_id=i,
                         path=full_path,
                         pruning_ratio=pruning_ratio,
+                        pruning_mode=pruning_mode,
                         lrd_rank=lrd_rank,
-                        is_qkv_concatenated=is_qkv,
+                        bits=bits,
                         model=self.model,
                     )
             
@@ -314,10 +382,19 @@ class CompressionSchemesManager:
         for cname, block_dicts in zip(config_names, self.schemes.values()):
             for scheme in block_dicts.values():
                 if scheme.hard_applied:
-                    getattr(self.config, cname).pruning_ratios[scheme.path] = scheme.pruning_ratio
-                    getattr(self.config, cname).lrd_ranks[scheme.path] = scheme.lrd_rank
+                    if cname == '':
+                        self.config.pruning_ratios[scheme.path] = scheme.pruning_ratio
+                        self.config.pruning_modes[scheme.path] = scheme.pruning_mode
+                        self.config.lrd_ranks[scheme.path] = scheme.lrd_rank
+                    else:
+                        getattr(self.config, cname).pruning_ratios[scheme.path] = scheme.pruning_ratio
+                        getattr(self.config, cname).pruning_modes[scheme.path] = scheme.pruning_mode
+                        getattr(self.config, cname).lrd_ranks[scheme.path] = scheme.lrd_rank
                     if verbose:
-                        print(f"Updated config for {scheme.path}: pruning_ratio={scheme.pruning_ratio}, lrd_rank={scheme.lrd_rank}")
+                        print(f"Updated config for {scheme.path}:"
+                              f"pruning_ratio={scheme.pruning_ratio},"
+                              f"pruning_mode={scheme.pruning_mode},"
+                              f"lrd_rank={scheme.lrd_rank}")
                     total_updates += 1
         if total_updates == 0:
             warnings.warn("No compression has been applied to configuration. Check if compression was applied in hard mode.")

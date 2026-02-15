@@ -43,6 +43,8 @@ elif model_type == "qwen2_5_vl_c":
 
     # Model name
     model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+else:
+    raise ValueError(f"Unsupported model_type '{model_type}'")
 
 # Device
 # Get GPU number from command line arguments
@@ -61,9 +63,7 @@ device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
 model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
-
-### COMPRESSION CONFIGURATION AND APPLICATION ###
-
+print(model.config)
 
 ### COMPRESSION CONFIGURATION AND APPLICATION ###
 
