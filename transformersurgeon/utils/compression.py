@@ -44,8 +44,8 @@ class CompressionScheme:
         freeze_uncompressed_vcon: Freezes uncompressed VCON block.
         apply: Applies compression (pruning and/or LRD).
         restore: Restores original module.
-        _unstructured_pruning: Performs unstructured pruning.
-        _structured_pruning: Performs structured pruning.
+        _unstructured_maks: Generates a mask for unstructured pruning.
+        _structured_mask: Generates a mask for structured pruning.
         _low_rank_decomposition: Performs low-rank decomposition.
     """
 
@@ -367,11 +367,11 @@ class CompressionScheme:
             # Prune module
             if not self.soft_applied:
                 if self.pruning_mode == 'structured':
-                    prune_mask, kept = self._structured_pruning(module.weight.data, norm=2, pruning_ratio=self.pruning_ratio)
+                    prune_mask, kept = self._structured_mask(module.weight.data, norm=2, pruning_ratio=self.pruning_ratio)
                     self.prune_mask = prune_mask.to(torch.int8) # store for later use
                     self.kept = kept # store for later use
                 elif self.pruning_mode == 'unstructured':
-                    prune_mask = self._unstructured_pruning(module.weight.data, criterion="magnitude", pruning_ratio=self.pruning_ratio)
+                    prune_mask = self._unstructured_mask(module.weight.data, criterion="magnitude", pruning_ratio=self.pruning_ratio)
                 else:
                     raise ValueError(f"Unsupported pruning mode '{self.pruning_mode}' for module {self.path}.")
                 
@@ -469,7 +469,13 @@ class CompressionScheme:
                 f"lrd_rank={self.lrd_rank}, "
                 f"module={self.get_module().__class__.__name__})")
     
-    def _unstructured_pruning(self, weight, criterion="magnitude", pruning_ratio=0.0) -> torch.Tensor:
+    def _unstructured_mask(
+        self,
+        weight,
+        criterion="magnitude",
+        pruning_ratio=0.0,
+        reverse=False,
+        ) -> torch.Tensor:
         """
         Returns a mask for unstructured pruning based on the specified criterion.
         This function generates a binary mask that can be applied to the weight tensor
@@ -477,8 +483,9 @@ class CompressionScheme:
 
         Args:
             weight (torch.Tensor): The weight tensor to be pruned.
-            criterion (str): The criterion to use for calculating the importance of weights. Default is "magnitude".
+            criterion (str): The criterion to use for calculating the importance of weights. Default is "magnitude". Supported criteria: "magnitude", "gradient", "random".
             pruning_ratio (float): The ratio of weights to prune (between 0 and 1). Default is 0.0 (no pruning).
+            reverse (bool): If True, prunes the most important weights instead of the least important ones. Default is False.
 
         Returns:
             torch.Tensor: A binary mask with the same shape as the weight tensor.
@@ -495,16 +502,29 @@ class CompressionScheme:
         # Calculate importance scores based on the criterion
         if criterion == "magnitude":
             scores = torch.abs(weight)
+        elif criterion == "gradient":
+            if weight.grad is None:
+                raise ValueError("Gradient is required for gradient-based scoring but is not available.")
+            scores = torch.abs(weight * weight.grad) # Element-wise product of weights and their gradients
+        elif criterion == "random":
+            scores = torch.rand_like(weight)
         else:
             raise ValueError(f"Unsupported criterion '{criterion}' for unstructured pruning.")
         
-        # Generate the pruning mask
-        threshold = torch.topk(scores, num_weights_to_prune, largest=False, sorted=False).values.max()
-        mask = scores > threshold
+        # Generate the mask by selecting the top-k scores (either the smallest or largest based on the reverse flag)
+        threshold = torch.topk(scores, num_weights_to_prune, largest=reverse, sorted=False).values.max()
+        mask = scores < threshold if reverse else scores > threshold
         
         return mask.view_as(weight)
 
-    def _structured_pruning(self, weight, norm=2, pruning_ratio=0.0) -> torch.Tensor:
+    def _structured_mask(
+        self,
+        weight,
+        norm=2,
+        criterion="magnitude",
+        pruning_ratio=0.0,
+        reverse=False,
+        ) -> torch.Tensor:
         """
         Returns a mask for structured pruning based on the specified norm.
         This function generates a binary mask that can be applied to the weight tensor
@@ -513,7 +533,9 @@ class CompressionScheme:
         Args:
             weight (torch.Tensor): The weight tensor to be pruned.
             norm (int): The norm to use for calculating the importance of rows. Default is 2 (L2 norm).
+            criterion (str): The criterion to use for calculating the importance of rows. Default is "magnitude". Supported criteria: "magnitude", "gradient", "random".
             pruning_ratio (float): The ratio of rows to prune (between 0 and 1). Default is 0.0 (no pruning).
+            reverse (bool): If True, prunes the most important rows instead of the least important ones. Default is False.
 
         Returns:
             torch.Tensor: A binary mask vector with the same number of elements as the rows of the weight tensor.
@@ -532,11 +554,20 @@ class CompressionScheme:
             return torch.ones(weight.size(0), dtype=torch.bool, device=weight.device), weight.size(0)
         
         # Generate scores
-        scores = torch.norm(weight, p=norm, dim=1) # Calculate the norm of each row
+        if criterion == "magnitude":
+            scores = torch.norm(weight, p=norm, dim=1) # Calculate the norm of each row
+        elif criterion == "gradient":
+            if weight.grad is None:
+                raise ValueError("Gradient is required for gradient-based scoring but is not available.")
+            scores = torch.norm(weight*weight.grad, p=norm, dim=1) # Calculate the norm of the gradient of each row
+        elif criterion == "random":
+            scores = torch.rand(weight.size(0), device=weight.device)
+        else:
+            raise ValueError(f"Unsupported criterion '{criterion}' for structured pruning.")
 
-        # Generate pruning mask
-        threshold = torch.topk(scores, num_rows_to_prune, largest=False, sorted=False).values.max()
-        mask = scores > threshold
+        # Generate the mask by selecting the top-k scores (either the smallest or largest based on the reverse flag)
+        threshold = torch.topk(scores, num_rows_to_prune, largest=reverse, sorted=False).values.max()
+        mask = scores < threshold if reverse else scores > threshold
         
         return mask, kept
 
