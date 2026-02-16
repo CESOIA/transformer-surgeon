@@ -5,7 +5,7 @@ from transformers import (
     AutoTokenizer,
     AutoModel,  # Added to test AutoModel loading (with trust_remote_code=True)
 )
-from test_messages import messages
+from test.qwen_tests.test_messages import messages
 from qwen_vl_utils import process_vision_info
 import sys
 

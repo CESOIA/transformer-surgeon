@@ -20,3 +20,4 @@ VIT_C_INDEXING = {
     },
 }
 
+__all__ = ["VIT_C_INDEXING"]
