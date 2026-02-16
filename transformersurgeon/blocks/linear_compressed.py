@@ -48,26 +48,25 @@ class LinearCompressed(nn.Linear):
                 nn.init.kaiming_uniform_(self.weight_2, a=math.sqrt(5))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        x = input
         # Skip the layer if out_features is 0
         if self.skip:
-            return input
-        # Perform with low-rank decomposition
-        if isinstance(self.lrd_rank, int):
-            US_r = self.weight # shape: (out_features, lrd_rank)
-            V_r = self.weight_2 # shape: (lrd_rank, in_features)
+            return x
+        # If low-rank decomposition is used, compute the partial output
+        if isinstance(self.weight_2, torch.nn.Parameter):
+            # US_r = self.weight # shape: (out_features, lrd_rank)
+            # V_r = self.weight_2 # shape: (lrd_rank, in_features)
 
             # Compute:
-            #   x @ W.t() + bias
-            # = x @ (US_r @ V_r).t() + bias
-            # = x @ V_r.t() @ US_r.t() + bias
-            return F.linear(F.linear(input, V_r), US_r, self.bias)
-        elif self.lrd_rank == "full": # Perform normally if rank is full
-            weight = self.weight
-
-            return F.linear(input, weight, self.bias)
-        # Manage value errors
-        else:
-            raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")    
+            #   in @ W.t() + bias
+            # = in @ (US_r @ V_r).t() + bias
+            # = in @ V_r.t() @ US_r.t() + bias
+            #
+            # x = in @ V_r.t()
+            # y = x @ US_r.t() + bias
+            x = F.linear(x, self.weight_2) # shape: (batch_size, lrd_rank)
+        
+        return F.linear(x, self.weight, self.bias)    
         
     def set_lrd_rank(self, rank: Union[int, str]):
         self.lrd_rank = self._check_rank(rank)
