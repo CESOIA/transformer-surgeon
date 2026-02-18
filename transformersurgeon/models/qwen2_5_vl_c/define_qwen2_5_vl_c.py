@@ -44,7 +44,7 @@ class Qwen2_5_VLForConditionalGenerationCompress(Qwen2_5_VLForConditionalGenerat
         replace_layers_upon_init(self, INDEXING["text"], config)
 
 # Define compression manager
-class Qwen2_5_VL_CompressionSchemesManager(CompressionSchemesManager):
+class Qwen2_5_VLCompressionSchemesManager(CompressionSchemesManager):
     def __init__(self, model):
         super().__init__(model, INDEXING)
 
@@ -54,5 +54,5 @@ __all__ = [
     "Qwen2_5_VLVisionConfigCompress", 
     "Qwen2_5_VLTextConfigCompress", 
     "Qwen2_5_VLConfigCompress",
-    "Qwen2_5_VL_CompressionSchemesManager",
+    "Qwen2_5_VLCompressionSchemesManager",
 ]

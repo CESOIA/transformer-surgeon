@@ -3,6 +3,7 @@ import torch
 from transformers import PretrainedConfig
 from ..blocks import LinearCompressed
 from typing import Dict, Any
+import math
 
 def replace_layers_upon_init(
         model: torch.nn.Module, # model to modify (e.g., vision encoder, language decoder)
@@ -59,7 +60,13 @@ def replace_layers_upon_init(
                 out_features = old_module.out_features
             
                 # Get lrd rank from config if available
-                lrd_rank = config_dict.get('lrd_ranks', {}).get(full_path, "full")
+                compression_config = config_dict.get('compression_config', {})
+                compression_config = compression_config.get(path, {})
+                lrd_config = config_dict.get("lrd", {})
+                rank = lrd_config.get("rank", None)
+                quantization_config = config_dict.get("quantization", {})
+                precision = quantization_config.get("precision", None)
+                qsparsity = quantization_config.get("sparsity", None)
 
                 new_module = LinearCompressed(
                     in_features=in_features,
@@ -67,8 +74,11 @@ def replace_layers_upon_init(
                     bias=old_module.bias is not None,
                     device=old_module.weight.device,
                     dtype=old_module.weight.dtype,
-                    lrd_rank=lrd_rank,
+                    rank=rank,
+                    precision=precision,
+                    qsparsity=qsparsity,
                     )
+
                 setattr(parent_module, module_name, new_module)
                 
 __all__ = ["replace_layers_upon_init"]
