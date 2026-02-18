@@ -88,7 +88,6 @@ class LinearCompressed(nn.Linear):
         # Apply qmask
         if self.qsparsity > 0.0 and hasattr(self, 'qmask'):
             weight_out = weight_out * self.qmask + weight * (~self.qmask)
-        print(weight_out)
         return weight_out
         
     def weight_lrd(self, weight1, weight2) -> torch.Tensor:
