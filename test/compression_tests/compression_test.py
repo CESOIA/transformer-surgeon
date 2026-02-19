@@ -14,25 +14,30 @@ hard_mode = False
 use_vcon = False  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
 restore_topology = False  # Whether to restore the original model topology only
-VERBOSE = True  # Whether to print detailed information during compression
+VERBOSE = False  # Whether to print detailed information during compression
 DO_COMPRESSION = True  # Whether to apply compression
+USE_ORIGINAL_MODEL = False  # Whether to load the original model without compression for comparison
 ##########################
 
-if model_type == "qwen2_5_vl_c":
+if USE_ORIGINAL_MODEL:
+    from transformers import (
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2_5_VLConfig,
+    )
+    modelClass = Qwen2_5_VLForConditionalGeneration
+    configClass = Qwen2_5_VLConfig
+else:
     from transformersurgeon import (
         Qwen2_5_VLForConditionalGenerationCompress,
         Qwen2_5_VLConfigCompress,
         Qwen2_5_VLCompressionSchemesManager,
     )
-
     modelClass = Qwen2_5_VLForConditionalGenerationCompress
     configClass = Qwen2_5_VLConfigCompress
     managerClass = Qwen2_5_VLCompressionSchemesManager
 
-    # Model name
-    model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
-else:
-    raise ValueError(f"Unsupported model_type '{model_type}'")
+# Model name
+model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -65,25 +70,26 @@ filter = [
     ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config 
 ]
 
-manager = managerClass(model)
-# manager.set("pruning", "mode", "unstructured", filter, verbose=VERBOSE)
-# manager.set("pruning", "criterion", "magnitude", filter, verbose=VERBOSE)
-# manager.set("pruning", "ratio", 0.5, filter, verbose=VERBOSE)
-# manager.set("quantization", "precision", "binary", filter, verbose=VERBOSE)
-# manager.set("quantization", "sparsity", 0.5, filter, verbose=VERBOSE)
-# manager.set("quantization", "sparse_criterion", "magnitude", filter, verbose=VERBOSE)
-# manager.set("quantization", "sparse_reverse", True, filter, verbose=VERBOSE)
-manager.set("lrd", "rank", 64, filter, verbose=VERBOSE)
+if not USE_ORIGINAL_MODEL:
+    manager = managerClass(model)
+    # manager.set("pruning", "mode", "unstructured", filter, verbose=VERBOSE)
+    # manager.set("pruning", "criterion", "magnitude", filter, verbose=VERBOSE)
+    # manager.set("pruning", "ratio", 0.5, filter, verbose=VERBOSE)
+    # manager.set("quantization", "precision", "binary", filter, verbose=VERBOSE)
+    # manager.set("quantization", "sparsity", 0.5, filter, verbose=VERBOSE)
+    # manager.set("quantization", "sparse_criterion", "magnitude", filter, verbose=VERBOSE)
+    # manager.set("quantization", "sparse_reverse", True, filter, verbose=VERBOSE)
+    manager.set("lrd", "rank", 64, filter, verbose=VERBOSE)
 
-if use_vcon:
-    manager.init_vcon(filter, verbose=VERBOSE)
-    manager.set_vcon_beta(filter, vcon_beta)
+    if use_vcon:
+        manager.init_vcon(filter, verbose=VERBOSE)
+        manager.set_vcon_beta(filter, vcon_beta)
 
-# Print the compression schemes manager
-print(manager)
+    # Print the compression schemes manager
+    # print(manager)
 
-# Apply all compression schemes to the model
-manager.apply_all(hard=hard_mode, verbose=VERBOSE)
+    # Apply all compression schemes to the model
+    manager.apply(hard=hard_mode, verbose=VERBOSE)
 
 # Print the model architecture
 print(model)
@@ -123,11 +129,14 @@ for i, message in enumerate(messages):
     print("Output:", message_output[0])
     print("-" * 40)
 
+if USE_ORIGINAL_MODEL:
+    exit() # If we are only testing the original model, we can exit here without restoring
+
 # Cancel vcon
 if use_vcon:
-    manager.cancel_vcon_all()
+    manager.cancel_vcon()
 # Restore the model to its original state and test again
-manager.restore_all(topology=restore_topology)
+manager.restore(topology=restore_topology)
 
 print("Generating text with restored model...")
 

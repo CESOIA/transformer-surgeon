@@ -7,9 +7,7 @@ setup(
     packages=find_packages(),
     python_requires=">=3.12",
     install_requires=[
-        "torch",
-        "transformers",
-        "Pillow",
-        "qwen-vl-utils",
+        "torch>=2.8.0",
+        "transformers>=5.2.0",
     ],
 )
