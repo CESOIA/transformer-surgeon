@@ -5,7 +5,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image.jpg",
+                "image": "/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/example_image.jpg",
             },
             {
                 "type": "text",
@@ -18,7 +18,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image.jpg",
+                "image": "/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/example_image.jpg",
             },
             {
                 "type": "text",
@@ -31,7 +31,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image2.png",
+                "image": "/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/example_image.jpg",
             },
             {
                 "type": "text",
@@ -44,7 +44,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image2.png",
+                "image": "/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/example_image.jpg",
             },
             {
                 "type": "text",

@@ -63,8 +63,8 @@ class Quantizer(Compressor):
 
         if precision:
             if not hard and not soft_applied:
-                for param in module.parameters():
-                    if param.name not in ["weight", "weight_2"]:
+                for name, param in module.named_parameters():
+                    if name not in ["weight", "weight_2"]:
                         continue
 
                     if precision == "binary":
