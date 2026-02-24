@@ -5,12 +5,6 @@ from torch.nn.parameter import Parameter
 from typing import Union
 import math
 
-from ..compression import (
-    validate_lrd_rank,
-    validate_precision,
-    validate_pruning_ratio,
-)
-
 # Custom linear layer for low-rank decomposition
 class LinearCompressed(nn.Linear):
     """
@@ -20,14 +14,13 @@ class LinearCompressed(nn.Linear):
         in_features (int): Size of each input sample.
         out_features (int): Size of each output sample.
         bias (bool): If set to False, the layer will not learn an additive bias. Default: False.
+        rank (Union[int, str]): The target rank for low-rank decomposition. If set to "full", no decomposition is applied. Default: None (equivalent to "full").
     """
     def __init__(self, 
                  in_features: int, 
                  out_features: int,
                  bias: bool = True,
                  rank = None,
-                 precision = None,
-                 qsparsity = None,
                  device = None,
                  dtype = None,
                  ):
@@ -42,75 +35,68 @@ class LinearCompressed(nn.Linear):
                             bias=bias,
                             device=device,
                             dtype=dtype)
-        
-        self.init_soft_quantization(precision, qsparsity)
-        self.init_soft_lrd(rank)
+        self.weight_2 = None # Placeholder for the second weight matrix in low-rank decomposition
 
-    def init_soft_lrd(self, rank):
-        device, dtype = self.weight.device, self.weight.dtype
+        self.init_lrd(rank)
+
+    def init_lrd(self, rank):
         # Set rank and initialize weight_2 for low-rank decomposition if needed
         self.rank = "full" if rank is None else rank
-        validate_lrd_rank(self.rank)
-        if isinstance(rank, int) and not hasattr(self, 'weight_2'):
-            self.weight_2 = Parameter(
-                torch.zeros(
-                    (self.in_features, self.in_features),
-                    device=device,
-                    dtype=dtype),
+        if isinstance(rank, int):
+            shape_change = False
+            device = self.weight.device
+            dtype = self.weight.dtype
+            # Initialize weight_2 for low-rank decomposition
+            if self.weight_2 is None or self.weight_2.shape[0] != rank:
+                self.weight_2 = Parameter(
+                    torch.empty([self.rank, self.in_features], device=device, dtype=dtype),
+                    requires_grad=True)
+                torch.nn.init.kaiming_uniform_(self.weight_2, a=math.sqrt(5))
+                shape_change = True
+            # Adjust weight shape for low-rank decomposition if necessary
+            if self.weight.shape[1] != self.rank:
+                self.weight = Parameter(
+                    torch.empty([self.out_features, self.rank], device=device, dtype=dtype),
+                    requires_grad=True)
+                torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                shape_change = True
+            # Free cache if there was a shape change and we're on GPU
+            if shape_change and device.type == "cuda":
+                torch.cuda.empty_cache()
+            
+    def cancel_lrd(self):
+        self.rank = "full"
+        device = self.weight.device
+        dtype = self.weight.dtype
+        shape_change = False
+        # Remove weight_2 if it exists
+        if self.weight_2 is not None:
+            self.weight_2 = None
+            shape_change = True
+        # Revert weight to original shape if it was changed for low-rank decomposition
+        if self.weight.shape[1] != self.in_features:
+            self.weight = Parameter(
+                torch.empty([self.out_features, self.in_features], device=device, dtype=dtype),
                 requires_grad=True)
-            torch.nn.init.kaiming_uniform_(self.weight_2, a=math.sqrt(5))
-
-    def init_soft_quantization(self, precision=None, qsparsity=None):
-        # Set precision
-        self.precision = "full" if precision is None else precision
-        validate_precision(self.precision)
-
-        # Set sparsity and initialize qmask if needed
-        self.qsparsity = 0.0 if qsparsity is None else qsparsity
-        validate_pruning_ratio(self.qsparsity)
-        if self.qsparsity > 0.0 and not hasattr(self, 'qmask'):
-            self.register_buffer('qmask', torch.ones_like(self.weight.data, dtype=torch.bool))
-
-    def weight_quantization(self, weight) -> torch.Tensor:
-        # Apply quantization to weight
-        if self.precision == "full" or weight is None:
-            return weight
-        elif self.precision == "binary":
-            scale = weight.abs().mean()
-            weight_out = torch.sign(weight)*scale
-        elif isinstance(self.precision, int):
-            w_max = weight.max()
-            w_min = weight.min()
-            weight_out = (w_max - w_min) / (2**self.precision - 1)
-            return torch.round((weight - w_min) / scale) * scale + w_min
-        else: 
-            raise ValueError(f"Unsupported precision type: {self.precision}. Supported types are 'full', 'binary', or a positive integer for quantization bits.")
-        # Apply qmask
-        if self.qsparsity > 0.0 and hasattr(self, 'qmask'):
-            weight_out = weight_out * self.qmask + weight * (~self.qmask)
-        return weight_out
-        
-    def weight_lrd(self, weight1, weight2) -> torch.Tensor:
-        if self.rank == "full" or weight1 is None or weight2 is None:
-            return weight1
-        elif isinstance(self.rank, int):
-            return weight1[:, :self.rank] @ weight2[:self.rank, :]
-        else:
-            raise ValueError(f"Unsupported rank type: {self.rank}. Supported types are 'full' or a positive integer for low-rank decomposition.")
+            torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        # Free cache if there was a shape change and we're on GPU
+        if shape_change and device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         x = input
-        # Skip the layer if out_features is 0
+
+        # Skip logic
         if self.skip:
             return x
 
-        # Soft compression route
-        weight = self.weight
-        weight_2 = getattr(self, "weight_2", None)
-        weight = self.weight_quantization(weight)
-        weight_2 = self.weight_quantization(weight_2)
-        weight = self.weight_lrd(weight, weight_2)
-        
+        # LRD logic
+        if isinstance(self.rank, int):
+            weight = self.weight[:, :self.rank]
+            x = F.linear(x, self.weight_2[:self.rank, :])
+        else:
+            weight = self.weight
+
         return F.linear(x, weight, self.bias)    
 
     def __str__(self):

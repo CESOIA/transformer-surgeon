@@ -391,19 +391,15 @@ class CompressionScheme:
             module = module.block_b # apply to block_b only
         
         if not hard and not self.soft_applied: # Backup original weights if not already done
-            self._weight_original = module.weight.data.clone().cpu() # Store original weights on CPU to save GPU memory
+            self._weight_original = module.weight.data.clone() # Store original weights for restoration if needed
         else: # Make changes permanent
-            if hasattr(module, '_weight_original'):
-                self._weight_original = None
+            self._weight_original = None
 
         # Perform compression for each compressor in the scheme
         for cname, compressor in self.compressors.items():
             if verbose:
                 print(f"Applying compression '{cname}' for module {self.path}")
-            compressor.apply(
-                module=module,
-                hard=hard,
-                soft_applied=self.soft_applied)
+            compressor.apply(module=module, hard=hard, soft_applied=self.soft_applied)
                     
         # Flag as applied
         self.soft_applied = True
@@ -444,7 +440,8 @@ class CompressionScheme:
                 raise ValueError("Original weights not found for restoration. Cannot restore the module.")
             if verbose:
                 print(f"Restoring parameters for module {self.path}.")
-            module.weight.data = self._weight_original.to(module.weight.device)
+            with torch.no_grad():
+                module.weight.copy_(self._weight_original)
 
         # Clean up the backup of original weights
         self._weight_original = None

@@ -6,48 +6,24 @@ from .pruning import (
 )
 from typing import Union
 
-def _quantize(weight, qbits, norm=2) -> torch.Tensor:
+def _quantize_maxabs(weight, precision) -> torch.Tensor:
     """
-    Perform single scale/zero-point quantization of the weight matrix.
+    Perform single scale/zero-point fake-quantization of the weight matrix.
     This function preserves the norm of the original weight matrix.
 
     Args:
         weight (torch.Tensor): The weight matrix to be quantized.
         qbits (int): The number of bits for quantization.
-        norm (int): The norm to use for scaling the quantized weights. Default is 2 (L2 norm).
 
     Returns:
-        torch.int32: The quantized weight matrix.
-        torch.float32: The scale factor used for quantization.
-        torch.float32: The zero point used for quantization.
-        int: Quantization block rows number. In this implementation, it is set to the number of columns in the original weight matrix (input features).
-        int: Quantization block columns number. In this implementation, it is set to the number of rows in the original weight matrix (output features).
+        torch.Tensor: The fake-quantized weight matrix.
     """
-    # Evaluate number of quantization intervals
-    q_levels = 2 ** qbits
+    qmax = 2**precision - 1
+    scale = weight.abs().max() / qmax
+    q = torch.clamp(torch.round(weight / scale), -qmax, qmax)
+    return q * scale
 
-    # Evaluate norm of the original weight matrix
-    w_norm = weight.norm(p=norm)
-
-    # Quantize weights to integers in the range [0, q_levels-1]
-    w_min, w_max = weight.min(), weight.max()
-    w_centered = weight - w_min
-    w_scale = (w_max - w_min) / (q_levels - 1 + 1e-8) # Add small epsilon to avoid division by zero
-    w_q = torch.round(w_centered / w_scale).clamp(0, q_levels - 1)
-
-    # Evaluate norm of the quantized weight matrix
-    w_q_norm = (w_q * w_scale + w_min).norm(p=norm)
-
-    # Adjust scale to preserve the norm of the original weight matrix
-    w_scale = w_scale * (w_norm / (w_q_norm + 1e-8)) # Add small epsilon to avoid division by zero
-
-    # Calculate zero point to preserve the minimum value of the original weight matrix
-    w_zero_point = w_min
-
-    block_r, block_c = weight.size() # Single block quantization
-    return w_q.to(torch.int32), w_scale.to(weight.dtype), w_zero_point.to(weight.dtype), block_r, block_c
-
-def _binarize(weight):
+def _quantize_binarize(weight):
     """
     Binarize the weight matrix using the sign function.
 
@@ -57,11 +33,9 @@ def _binarize(weight):
     Returns:
         torch.int8: The binarized weight matrix.
     """
-    w_b = torch.sign(weight).to(torch.int8)
+    s = torch.sign(weight)
     scale = weight.abs().mean()
-    zero = torch.tensor([0.0])
-    block_r, block_c = weight.size() # Single block binarization
-    return w_b, scale, zero, block_r, block_c
+    return s * scale
 
 class Quantizer(Compressor):
     def __init__(
@@ -89,16 +63,28 @@ class Quantizer(Compressor):
 
         if precision:
             if not hard and not soft_applied:
-                module.init_soft_quantization(precision, sparsity)
-                # Possibly apply sparse quantizaition if configured
-                if sparsity > 0.0:
-                    mask = _unstructured_mask(
-                        module.weight,
-                        criterion=sparse_criterion,
-                        pruning_ratio=sparsity,
-                        reverse=sparse_reverse
-                        )
-                    module.qmask.copy_(mask)
+                for param in module.parameters():
+                    if param.name not in ["weight", "weight_2"]:
+                        continue
+
+                    if precision == "binary":
+                        qweight = _quantize_binarize(param.data)
+                    else:
+                        qweight = _quantize_maxabs(param.data, precision)
+                    
+                    with torch.no_grad():
+                        # Possibly apply sparse quantization if configured
+                        if sparsity > 0.0:
+                            mask = _unstructured_mask(
+                                param,
+                                criterion=sparse_criterion,
+                                pruning_ratio=sparsity,
+                                reverse=sparse_reverse
+                                )
+                            param.copy_(qweight * mask + param.data * (~mask))
+                        else:
+                            param.copy_(qweight)
+                    
             if hard:
                 # NOT IMPLEMENTED
                 raise NotImplementedError("Hard quantization is not implemented yet.")

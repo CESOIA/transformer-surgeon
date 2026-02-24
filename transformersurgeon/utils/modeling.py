@@ -64,9 +64,6 @@ def replace_layers_upon_init(
                 compression_config = compression_config.get(path, {})
                 lrd_config = config_dict.get("lrd", {})
                 rank = lrd_config.get("rank", None)
-                quantization_config = config_dict.get("quantization", {})
-                precision = quantization_config.get("precision", None)
-                qsparsity = quantization_config.get("sparsity", None)
 
                 new_module = LinearCompressed(
                     in_features=in_features,
@@ -75,8 +72,6 @@ def replace_layers_upon_init(
                     device=old_module.weight.device,
                     dtype=old_module.weight.dtype,
                     rank=rank,
-                    precision=precision,
-                    qsparsity=qsparsity,
                     )
 
                 setattr(parent_module, module_name, new_module)

@@ -2,7 +2,7 @@ import torch
 from typing import Union
 from .abstract import Compressor
 
-def _low_rank_decomposition(weight, rank: int) -> torch.Tensor:
+def _low_rank_svd(weight, rank: int) -> torch.Tensor:
     """
     Performs low-rank decomposition on the given weight matrix using SVD.
 
@@ -47,15 +47,12 @@ class LRDer(Compressor):
         rank = self.rank
     
         if rank:
-            if not hard and not soft_applied:
-                module.init_soft_lrd(rank)
-                US_r, V_r = _low_rank_decomposition(module.weight.data, rank)
-                module.weight.data[:, :rank] = US_r
-                module.weight_2.data[:rank, :] = V_r
-
-            if hard:
-                # NOT IMPLEMENTED
-                raise NotImplementedError("Hard low-rank decomposition is not implemented yet.")
+            if not soft_applied:
+                US_r, V_r = _low_rank_svd(module.weight.data, rank)
+                module.init_lrd(rank)
+                with torch.no_grad():
+                    module.weight[:, :rank].copy_(US_r)
+                    module.weight_2[:rank, :].copy_(V_r)
 
     def restore(self, module):
         if not self._to_compress():
@@ -65,8 +62,11 @@ class LRDer(Compressor):
             raise AttributeError("Module does not have 'weight_2' attribute required for LRD restoration.")
         
         # Combine the low-rank components to restore the original weight matrix
-        module.weight.data.copy_(module.weight.data[:, :module.rank] @ module.weight_2[:module.rank, :])
-        module.rank = "full" # Reset rank to full to restore original weights
+        with torch.no_grad():
+            restored_weight = module.weight @ module.weight_2
+            module.cancel_lrd()
+            with torch.no_grad():
+                module.weight.copy_(restored_weight)
         
     def _to_compress(self):
         # Check if LRD has to be applied based on the rank configuration

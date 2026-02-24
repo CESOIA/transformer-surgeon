@@ -25,9 +25,10 @@ def _unstructured_mask(
         return torch.zeros_like(weight, dtype=torch.bool, device=weight.device)
     
     # Determine the number of weights to prune
-    num_weights_to_prune = int(pruning_ratio * weight.numel())
+    num_to_prune = int(pruning_ratio * weight.numel())
+    num_to_keep = weight.numel() - num_to_prune
     
-    if pruning_ratio <= 0.0 or num_weights_to_prune == 0: # No pruning, return a mask of all ones
+    if pruning_ratio <= 0.0 or num_to_prune == 0: # No pruning, return a mask of all ones
         return torch.ones_like(weight, dtype=torch.bool, device=weight.device)
     
     # Calculate importance scores based on the criterion
@@ -43,8 +44,9 @@ def _unstructured_mask(
         raise ValueError(f"Unsupported criterion '{criterion}' for unstructured pruning.")
     
     # Generate the mask by selecting the top-k scores (either the smallest or largest based on the reverse flag)
-    threshold = torch.topk(scores.flatten(), num_weights_to_prune, largest=reverse, sorted=False).values.max()
-    mask = scores < threshold if reverse else scores > threshold
+    values = torch.topk(scores.view(-1), num_to_keep, largest=not reverse, sorted=False).values
+    threshold = values.min() if not reverse else values.max()
+    mask = torch.ge(scores, threshold) if not reverse else torch.le(scores, threshold)
     
     return mask.view_as(weight)
 
@@ -74,14 +76,14 @@ def _structured_mask(
     current_rows = weight.size(0)
     
     if pruning_ratio >= 1.0: # Prune all rows
-        return torch.zeros(weight.size(0), dtype=torch.bool, device=weight.device), 0
+        return torch.zeros(weight.size(0), dtype=torch.bool, device=weight.device)
     
     # Determine the number of rows to prune
-    num_rows_to_prune = int(pruning_ratio * current_rows)
-    kept = current_rows - num_rows_to_prune
+    num_to_prune = int(pruning_ratio * current_rows)
+    num_to_keep = current_rows - num_to_prune
     
-    if pruning_ratio <= 0.0 or num_rows_to_prune == 0: # Prune no rows
-        return torch.ones(weight.size(0), dtype=torch.bool, device=weight.device), weight.size(0)
+    if pruning_ratio <= 0.0 or num_to_prune == 0: # Prune no rows
+        return torch.ones(weight.size(0), dtype=torch.bool, device=weight.device)
     
     # Generate scores
     if criterion == "magnitude":
@@ -96,10 +98,11 @@ def _structured_mask(
         raise ValueError(f"Unsupported criterion '{criterion}' for structured pruning.")
 
     # Generate the mask by selecting the top-k scores (either the smallest or largest based on the reverse flag)
-    threshold = torch.topk(scores, num_rows_to_prune, largest=reverse, sorted=False).values.max()
-    mask = scores < threshold if reverse else scores > threshold
+    values = torch.topk(scores, num_to_keep, largest=not reverse, sorted=False).values
+    threshold = values.min() if not reverse else values.max()
+    mask = torch.ge(scores, threshold) if not reverse else torch.le(scores, threshold)
     
-    return mask, kept
+    return mask
 
 class Pruner(Compressor):
     def __init__(
@@ -112,9 +115,6 @@ class Pruner(Compressor):
         self.ratio = ratio
         self.mode = mode
         self.criterion = criterion
-        # Helper objects for applying and restoring pruning
-        self.prune_mask = None
-        self.kept = None
 
     def apply(self, module, hard=False, soft_applied=False):
         if not self._to_compress():
@@ -128,43 +128,37 @@ class Pruner(Compressor):
         if ratio > 0:
             if not soft_applied:
                 if mode == 'structured':
-                    prune_mask, kept = _structured_mask(
-                        module.weight.data,
+                    prune_mask = _structured_mask(
+                        module.weight,
                         norm=2,
                         criterion=criterion,
                         pruning_ratio=ratio)
-                    self.prune_mask = prune_mask.cpu() # store on CPU to save GPU memory
-                    self.kept = kept # store for later use
                 elif mode == 'unstructured':
                     prune_mask = _unstructured_mask(
-                        module.weight.data,
+                        module.weight,
                         criterion=criterion,
                         pruning_ratio=ratio)
-                    self.prune_mask = prune_mask.cpu() # store on CPU to save GPU memory
                 else:
                     raise ValueError(f"Unsupported pruning mode '{mode}'.")
                 
                 if not hard:
                     # Apply soft pruning by zeroing out the pruned rows/weights
-                    if mode == 'structured':
-                        module.weight.data = module.weight.data*prune_mask.unsqueeze(1).to(torch.float32)
-                    else:
-                        module.weight.data = module.weight.data*prune_mask.to(torch.float32)
+                    with torch.no_grad():
+                        dtype = module.weight.dtype
+                        if mode == 'structured':
+                            module.weight.mul_(prune_mask.unsqueeze(1).to(dtype))
+                            if module.bias is not None:
+                                module.bias.mul_(prune_mask.to(dtype))
+                        else:
+                            module.weight.mul_(prune_mask.to(dtype))
             
             if hard:
-                if mode == 'unstructured':
-                    raise ValueError("Hard pruning is not supported for unstructured pruning.")
-                
-                # Apply hard pruning by removing the pruned rows
-                module.weight.data = module.weight.data[self.prune_mask.to(module.weight.device)]
-                if module.bias is not None:
-                    module.bias.data = module.bias.data[self.prune_mask.to(module.bias.device)] 
-                module.out_features = self.kept
-                del self.prune_mask
+                raise NotImplementedError("Hard pruning is not implemented yet.")
 
     def restore(self, module):
-        self.prune_mask = None
-        self.kept = None
+        # Hard pruning is not implemented, no restoration needed
+        # Soft pruning does not change topology, so no restoration needed
+        pass
 
     def _to_compress(self):
         # Check if pruning has to be applied based on the ratio configuration
