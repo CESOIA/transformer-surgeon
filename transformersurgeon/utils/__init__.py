@@ -1,6 +1,6 @@
 # Common utilities for transformer surgeon
 from .checks import *
-from .compression import *
+from .scheme import *
 from .configuration import *
 from .manager import *
 from .modeling import *

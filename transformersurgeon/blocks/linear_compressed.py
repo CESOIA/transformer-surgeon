@@ -6,83 +6,98 @@ from typing import Union
 import math
 
 # Custom linear layer for low-rank decomposition
-
 class LinearCompressed(nn.Linear):
     """
-    Linear layer with low-rank decomposition and optional structured pruning.
+    Linear layer with support for low-rank decomposition and quantization. This layer can be used to replace standard Linear layers in a transformer model to enable compression techniques such as pruning, low-rank decomposition, and quantization.
 
     Args:
         in_features (int): Size of each input sample.
         out_features (int): Size of each output sample.
         bias (bool): If set to False, the layer will not learn an additive bias. Default: False.
-        lrd_rank (int or str): Rank for low-rank decomposition. Use a positive integer for the rank or "full" for no decomposition. Default: "full".
-
-    Note: when low-rank decomposition is used, an additional weight matrix is created internally.
+        rank (Union[int, str]): The target rank for low-rank decomposition. If set to "full", no decomposition is applied. Default: None (equivalent to "full").
     """
     def __init__(self, 
                  in_features: int, 
                  out_features: int,
                  bias: bool = True,
-                 device=None,
-                 dtype=None,
-                 lrd_rank: Union[int, str] = "full"):
+                 rank = None,
+                 device = None,
+                 dtype = None,
+                 ):
 
-        self.lrd_rank = self._check_rank(lrd_rank)
-                
         if out_features <= 0:
-            # If out_features is 0, skip the layer (the block has been fully pruned)
-            self.skip = True
-        else:
-            self.skip = False
-            # When using low-rank decomposition, adjust in_features accordingly for weight_1
-            in_features_eff = self.lrd_rank if isinstance(self.lrd_rank, int) else in_features
-            super().__init__(in_features=in_features_eff,
-                             out_features=out_features,
-                             bias=bias,
-                             device=device,
-                             dtype=dtype)
+            self.skip = True # If out_features is 0, skip the layer (the block has been fully pruned)
+            return
+        
+        self.skip = False
+        super().__init__(in_features=in_features,
+                            out_features=out_features,
+                            bias=bias,
+                            device=device,
+                            dtype=dtype)
+        self.weight_2 = None # Placeholder for the second weight matrix in low-rank decomposition
+
+        self.init_lrd(rank)
+
+    def init_lrd(self, rank):
+        # Set rank and initialize weight_2 for low-rank decomposition if needed
+        self.rank = "full" if rank is None else rank
+        if isinstance(rank, int):
+            shape_change = False
+            device = self.weight.device
+            dtype = self.weight.dtype
+            # Initialize weight_2 for low-rank decomposition
+            if self.weight_2 is None or self.weight_2.shape[0] != rank:
+                self.weight_2 = Parameter(
+                    torch.empty([self.rank, self.in_features], device=device, dtype=dtype),
+                    requires_grad=True)
+                torch.nn.init.kaiming_uniform_(self.weight_2, a=math.sqrt(5))
+                shape_change = True
+            # Adjust weight shape for low-rank decomposition if necessary
+            if self.weight.shape[1] != self.rank:
+                self.weight = Parameter(
+                    torch.empty([self.out_features, self.rank], device=device, dtype=dtype),
+                    requires_grad=True)
+                torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                shape_change = True
+            # Free cache if there was a shape change and we're on GPU
+            if shape_change and device.type == "cuda":
+                torch.cuda.empty_cache()
             
-            # When using low-rank decomposition, create weight_2
-            if isinstance(self.lrd_rank, int):
-                self.weight_2 = nn.Parameter(torch.empty((in_features, self.lrd_rank), device=device, dtype=dtype))
-                nn.init.kaiming_uniform_(self.weight_2, a=math.sqrt(5))
+    def cancel_lrd(self):
+        self.rank = "full"
+        device = self.weight.device
+        dtype = self.weight.dtype
+        shape_change = False
+        # Remove weight_2 if it exists
+        if self.weight_2 is not None:
+            self.weight_2 = None
+            shape_change = True
+        # Revert weight to original shape if it was changed for low-rank decomposition
+        if self.weight.shape[1] != self.in_features:
+            self.weight = Parameter(
+                torch.empty([self.out_features, self.in_features], device=device, dtype=dtype),
+                requires_grad=True)
+            torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        # Free cache if there was a shape change and we're on GPU
+        if shape_change and device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # Skip the layer if out_features is 0
-        if self.skip:
-            return input
-        # Perform with low-rank decomposition
-        if isinstance(self.lrd_rank, int):
-            US_r = self.weight # shape: (out_features, lrd_rank)
-            V_r = self.weight_2 # shape: (lrd_rank, in_features)
+        x = input
 
-            # Compute:
-            #   x @ W.t() + bias
-            # = x @ (US_r @ V_r).t() + bias
-            # = x @ V_r.t() @ US_r.t() + bias
-            return F.linear(F.linear(input, V_r), US_r, self.bias)
-        elif self.lrd_rank == "full": # Perform normally if rank is full
+        # Skip logic
+        if self.skip:
+            return x
+
+        # LRD logic
+        if isinstance(self.rank, int):
+            weight = self.weight[:, :self.rank]
+            x = F.linear(x, self.weight_2[:self.rank, :])
+        else:
             weight = self.weight
 
-            return F.linear(input, weight, self.bias)
-        # Manage value errors
-        else:
-            raise ValueError(f"Unsupported low-rank decomposition value: {self.lrd_rank}")    
-        
-    def set_lrd_rank(self, rank: Union[int, str]):
-        self.lrd_rank = self._check_rank(rank)
-
-    def _check_rank(self, rank: Union[int, str]):
-        if isinstance(rank, int):
-            if rank < 1:
-                raise ValueError("Low-rank decomposition rank must be at least 1.")
-        elif rank != "full":
-            raise ValueError("Low-rank decomposition rank must be a positive integer or 'full'.")
-        
-        return rank
-        
-    def __repr__(self):
-        return super().__repr__() + f"(lrd_rank={self.lrd_rank})"
+        return F.linear(x, weight, self.bias)    
 
     def __str__(self):
         return self.__repr__()

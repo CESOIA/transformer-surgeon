@@ -9,7 +9,7 @@ import torch
 from transformers import PretrainedConfig
 from typing import Dict, List, Any, Union
 import warnings
-from .compression import CompressionScheme
+from .scheme import CompressionScheme
 
 class CompressionSchemesManager:
     """
@@ -62,84 +62,38 @@ class CompressionSchemesManager:
         self.indexing = indexing
         self.schemes = self._generate_schemes()
 
-    def set_pruning_ratio(self, ratio: float, criteria=None, verbose=False):
+    def set(self, compression, property, value, criteria=None, verbose=False):
         """
-        Sets the pruning ratio for filtered modules.
+        Generic setter for compression properties based on criteria.
 
         Args:
-            ratio: The pruning ratio to set (0.0 to 1.0)
-            criteria: List of criteria to filter modules (by name or block_id)
+            compression: The type of compression to set (e.g., 'pruning', 'lrd', 'quantization')
+            property: The name of the property to set (e.g., 'ratio', 'rank')
+            value: The value to set for the specified property
+            criteria: List of criteria to filter modules (by name or block_id). No criteria = all
+            verbose: If True, prints information about the setting process
         """
         for scheme in self.iter_filtered(criteria=criteria):
-            if scheme.soft_applied or scheme.hard_applied:
-                raise RuntimeError(f"Cannot set pruning ratio for {scheme.path} because compression has already been applied.")
-            scheme.pruning_ratio = ratio
-            if verbose:
-                print(f"Set pruning ratio of {ratio} for {scheme.path}")
-            
-    def set_pruning_mode(self, mode: str, criteria=None, verbose=False):
-        """
-        Sets the pruning mode for filtered modules.
-
-        Args:
-            mode: The pruning mode to set ('structured' or 'unstructured')
-            criteria: List of criteria to filter modules (by name or block_id)
-        """
-        for scheme in self.iter_filtered(criteria=criteria):
-            if scheme.soft_applied or scheme.hard_applied:
-                raise RuntimeError(f"Cannot set pruning mode for {scheme.path} because compression has already been applied.")
-            scheme.pruning_mode = mode
-            if verbose:
-                print(f"Set pruning mode of {mode} for {scheme.path}")
-
-    def set_lrd_rank(self, rank: Union[int, str], criteria=None, verbose=False):
-        """
-        Sets the LRD rank for filtered modules.
-
-        Args:
-            rank: The LRD rank to set (int or "full")
-            criteria: List of criteria to filter modules (by name or block_id)
-        """
-        for scheme in self.iter_filtered(criteria=criteria):
-            if scheme.soft_applied or scheme.hard_applied:
-                raise RuntimeError(f"Cannot set LRD rank for {scheme.path} because compression has already been applied.")
-            scheme.lrd_rank = rank
-            if verbose:
-                print(f"Set LRD rank of {rank} for {scheme.path}")
-    
-    def set_quantization_bits(self, bits: int, criteria=None, verbose=False):
-        """
-        Sets the quantization bits for filtered modules.
-
-        Args:
-            bits: The number of bits to set (e.g., 8, 16, 32)
-            criteria: List of criteria to filter modules (by name or block_id)
-        """
-        for scheme in self.iter_filtered(criteria=criteria):
-            if scheme.soft_applied or scheme.hard_applied:
-                raise RuntimeError(f"Cannot set quantization bits for {scheme.path} because compression has already been applied.")
-            scheme.bits = bits
-            if verbose:
-                print(f"Set quantization bits of {bits} for {scheme.path}")
+            scheme.set(compression, property, value, verbose=verbose)
 
     def init_vcon(self, criteria=None, verbose=False):
         """
-        Initializes VCON blocks for filtered modules
+        Initializes VCON blocks for filtered modules.
 
         Args:
-            criteria: List of criteria to filter modules (by name or block_id)
+            criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the initialization process
         """
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.init_vcon(verbose=verbose)
 
-    def cancel_vcon(self, criteria=None, keep_block_b=True, verbose=False):
+    def cancel_vcon(self, keep_block_b=True, criteria=None, verbose=False):
         """
         Cancels VCON blocks for filtered modules, keeping either block_a or block_b
 
         Args:
-            criteria: List of criteria to filter modules (by name or block_id)
             keep_block_b: If True, keeps the compressed block (block_b); otherwise keeps the original block (block_a)
+            criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the cancellation process
         """
         for scheme in self.iter_filtered(criteria=criteria):
@@ -151,7 +105,7 @@ class CompressionSchemesManager:
 
         Args:
             beta: The beta value to set (0 <= beta <= 1)
-            criteria: List of criteria to filter modules (by name or block_id)
+            criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the beta setting process
         """
         for scheme in self.iter_filtered(criteria=criteria):
@@ -163,96 +117,36 @@ class CompressionSchemesManager:
         Freezes uncompressed blocks in filtered VCON-initialized modules
 
         Args:
-            criteria: List of criteria to filter modules (by name or block_id)
+            criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the freezing process
         """
         for scheme in self.iter_filtered(criteria=criteria):
             if scheme.vcon_initialized:
                 scheme.freeze_uncompressed_vcon(verbose=verbose)
 
-    def apply(self, criteria=None, hard=False, verbose=False):
+    def apply(self, hard=False, criteria=None, verbose=False):
         """
         Applies filtered compression schemes to their respective modules in the model.
 
         Args:
-            criteria: List of criteria to filter modules (by name or block_id)
             hard: If True, applies hard compression (non-reversible); if False, applies soft compression (reversible)
+            criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the application process
         """
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.apply(hard=hard, verbose=verbose)
 
-    def restore(self, criteria=None, topology=False, verbose=False):
+    def restore(self, topology=False, criteria=None, verbose=False):
         """
         Restores filtered modules to their original state by removing pruning and LRD.
 
         Args:
-            criteria: List of criteria to filter modules (by name or block_id)
+            topology: If True, restores only the original topology (e.g., original weight shapes); if False, restores the original weights and parameters as well.
+            criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the restoration process
         """
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.restore(topology=topology, verbose=verbose)
-
-    # aliases for "all" criteria
-    def set_pruning_ratio_all(self, ratio: float, verbose=False):
-        """
-        Alias for set_pruning_ratio with criteria set to "all"
-        """
-        self.set_pruning_ratio(ratio, criteria=["all"], verbose=verbose)
-
-    def set_pruning_mode_all(self, mode: str, verbose=False):
-        """
-        Alias for set_pruning_mode with criteria set to "all"
-        """
-        self.set_pruning_mode(mode, criteria=["all"], verbose=verbose)
-
-    def set_lrd_rank_all(self, rank: Union[int, str], verbose=False):
-        """
-        Alias for set_lrd_rank with criteria set to "all"
-        """
-        self.set_lrd_rank(rank, criteria=["all"], verbose=verbose)
-
-    def set_quantization_bits_all(self, bits: int, verbose=False):
-        """
-        Alias for set_quantization_bits with criteria set to "all"
-        """
-        self.set_quantization_bits(bits, criteria=["all"], verbose=verbose)
-
-    def init_vcon_all(self, verbose=False):
-        """
-        Alias for init_vcon with criteria set to "all"
-        """
-        self.init_vcon(criteria=["all"], verbose=verbose)
-
-    def cancel_vcon_all(self, keep_block_b=True, verbose=False):
-        """
-        Alias for cancel_vcon with criteria set to "all"
-        """
-        self.cancel_vcon(criteria=["all"], keep_block_b=keep_block_b, verbose=verbose)
-
-    def set_vcon_beta_all(self, beta: float, verbose=False):
-        """
-        Alias for set_vcon_beta with criteria set to "all"
-        """
-        self.set_vcon_beta(beta, criteria=["all"], verbose=verbose)
-
-    def freeze_uncompressed_vcon_all(self, verbose=False):
-        """
-        Alias for freeze_uncompressed_vcon with criteria set to "all"
-        """
-        self.freeze_uncompressed_vcon(criteria=["all"], verbose=verbose)
-
-    def apply_all(self, hard=False, verbose=False):
-        """
-        Alias for apply with criteria set to "all"
-        """
-        self.apply(criteria=["all"], hard=hard, verbose=verbose)
-        
-    def restore_all(self, topology=False, verbose=False):
-        """
-        Alias for restore with criteria set to "all"
-        """
-        self.restore(criteria=["all"], topology=topology, verbose=verbose)
 
     def _generate_schemes(self):
         """
@@ -287,18 +181,13 @@ class CompressionSchemesManager:
                     full_path = path_template.format(block_index=i, path=path)
 
                     # Get pruning ratio and LRD rank from config
-                    pruning_ratio = block_specific_config.get('pruning_ratios', {}).get(full_path, 0.0)
-                    pruning_mode = block_specific_config.get('pruning_modes', {}).get(full_path, "structured")
-                    lrd_rank = block_specific_config.get('lrd_ranks', {}).get(full_path, "full")
-                    bits=block_specific_config.get('quantization_bits', {}).get(full_path, 32)
+                    compression_config = block_specific_config.get('compression_config', {})
+                    compression_config = compression_config.get(full_path, None)
                     tmp_dict[full_path] = CompressionScheme(
                         name=path,
                         block_id=i,
                         path=full_path,
-                        pruning_ratio=pruning_ratio,
-                        pruning_mode=pruning_mode,
-                        lrd_rank=lrd_rank,
-                        bits=bits,
+                        compression_config=compression_config,
                         model=self.model,
                     )
             
@@ -325,8 +214,11 @@ class CompressionSchemesManager:
                 - int: Block ID to match
                 - str: Substring to match in the scheme name or path
                 - "all": Matches all schemes
+                - None: Matches all schemes
                 - list: A list of criteria, where all of them must be met (AND logic within the list)
         """
+        if criteria is None:
+            criteria = ["all"]
         if type(criteria) != list:
             criteria = [criteria]
         for scheme in self:
@@ -375,30 +267,7 @@ class CompressionSchemesManager:
         Returns:
             The updated configuration object.
         """
-        config_names = [block['config_attr'] for block in self.indexing.values()]
-
-        total_updates = 0
-        for cname, block_dicts in zip(config_names, self.schemes.values()):
-            for scheme in block_dicts.values():
-                if scheme.hard_applied:
-                    if cname == '':
-                        self.config.pruning_ratios[scheme.path] = scheme.pruning_ratio
-                        self.config.pruning_modes[scheme.path] = scheme.pruning_mode
-                        self.config.lrd_ranks[scheme.path] = scheme.lrd_rank
-                    else:
-                        getattr(self.config, cname).pruning_ratios[scheme.path] = scheme.pruning_ratio
-                        getattr(self.config, cname).pruning_modes[scheme.path] = scheme.pruning_mode
-                        getattr(self.config, cname).lrd_ranks[scheme.path] = scheme.lrd_rank
-                    if verbose:
-                        print(f"Updated config for {scheme.path}:"
-                              f"pruning_ratio={scheme.pruning_ratio},"
-                              f"pruning_mode={scheme.pruning_mode},"
-                              f"lrd_rank={scheme.lrd_rank}")
-                    total_updates += 1
-        if total_updates == 0:
-            warnings.warn("No compression has been applied to configuration. Check if compression was applied in hard mode.")
-
-        return self.config
+        
 
     def __iter__(self):
         """
@@ -411,16 +280,24 @@ class CompressionSchemesManager:
                     yield scheme
                 else:
                     raise TypeError(f"Expected CompressionScheme, got {type(scheme)}")
-                    
+                
+    def __len__(self):
+        """
+        Returns the total number of CompressionScheme objects managed.
+        """
+        return sum(len(block_dicts) for block_dicts in self.schemes.values())
+
     def __repr__(self):
-        string = ""
-        string += "  Prune Rat.   LRD Rank   Soft       Hard       Path\n"
-        string += "|"+"-"*100 + "\n"
-        for i, scheme in enumerate(self):
-            if i % 2 == 1:
-                string += f"| {scheme.pruning_ratio:<10} | {scheme.lrd_rank:<10} | {scheme.soft_applied:<10} | {scheme.hard_applied:<10} | {scheme.path:<60}|\n"
-            else:
-                string += f"  {scheme.pruning_ratio:<10}   {scheme.lrd_rank:<10}   {scheme.soft_applied:<10}   {scheme.hard_applied:<10}   {scheme.path:<60} \n"
+        """
+        Returns a string representation of the CompressionSchemesManager, including the number of schemes and their paths.
+        """
+        string = f"CompressionSchemesManager with {len(self)} schemes:\n"
+        for scheme in self:
+            string += scheme.__repr__() + "\n"
+        # Remove the last newline character for cleaner formatting
+        string = string.rstrip("\n")
+        # add intendation for better readability
+        string = string.replace("\n", "\n  ")
         return string
                     
     def _set_model(self, model):

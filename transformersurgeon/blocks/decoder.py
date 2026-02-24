@@ -128,6 +128,7 @@ class TransformerDecoder(torch.nn.Module):
         """
         super().__init__()
 
+        self.depth = len(blocks_config)
         self.blocks = torch.nn.ModuleList(
             [TransformerDecoderBlock(block_config) for block_config in blocks_config]
             )

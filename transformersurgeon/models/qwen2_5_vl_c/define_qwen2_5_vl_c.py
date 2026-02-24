@@ -30,10 +30,24 @@ class Qwen2_5_VLTextConfigCompress(Qwen2_5_VLTextConfig):
         )
 
 class Qwen2_5_VLConfigCompress(Qwen2_5_VLConfig):
-    sub_configs = {
-        "vision_config": Qwen2_5_VLVisionConfigCompress, 
-        "text_config": Qwen2_5_VLTextConfigCompress
-    }
+    def __init__(self, **kwargs):
+        # Set the sub-config classes to the standard versions before calling the parent constructor
+        self.sub_configs["vision_config"] = Qwen2_5_VLVisionConfig
+        self.sub_configs["text_config"] = Qwen2_5_VLTextConfig
+        # Call the parent constructor to initialize standard config attributes
+        super().__init__(**kwargs)
+        # Update vision and text sub-configs to their compressed versions
+        self.sub_configs["vision_config"] = Qwen2_5_VLVisionConfigCompress
+        self.sub_configs["text_config"] = Qwen2_5_VLTextConfigCompress
+        # Convert the vision and text sub-configs to their compressed versions, passing the compression kwargs
+        vision_config_dict = {} if self.vision_config is None else self.vision_config.to_dict()
+        text_config_dict = {} if self.text_config is None else self.text_config.to_dict()
+        self.vision_config = self.sub_configs["vision_config"](
+            compression=kwargs.get("vision_config", {}).get("compression_config", None),
+            **vision_config_dict)
+        self.text_config = self.sub_configs["text_config"](
+            compression=kwargs.get("text_config", {}).get("compression_config", None),
+            **text_config_dict)
 
 # Define model
 class Qwen2_5_VLForConditionalGenerationCompress(Qwen2_5_VLForConditionalGeneration):
@@ -44,7 +58,7 @@ class Qwen2_5_VLForConditionalGenerationCompress(Qwen2_5_VLForConditionalGenerat
         replace_layers_upon_init(self, INDEXING["text"], config)
 
 # Define compression manager
-class Qwen2_5_VL_CompressionSchemesManager(CompressionSchemesManager):
+class Qwen2_5_VLCompressionSchemesManager(CompressionSchemesManager):
     def __init__(self, model):
         super().__init__(model, INDEXING)
 
@@ -54,5 +68,5 @@ __all__ = [
     "Qwen2_5_VLVisionConfigCompress", 
     "Qwen2_5_VLTextConfigCompress", 
     "Qwen2_5_VLConfigCompress",
-    "Qwen2_5_VL_CompressionSchemesManager",
+    "Qwen2_5_VLCompressionSchemesManager",
 ]

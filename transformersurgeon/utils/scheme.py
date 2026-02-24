@@ -9,6 +9,10 @@ import torch
 from typing import Union
 from ..blocks import LinearCompressed
 from ..blocks import VCONBlock
+from ..compression import (
+    COMPRESSOR_DICT,
+    COMPRESSION_REGISTRY,
+) 
 from .utils import get_submodule
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
@@ -44,41 +48,45 @@ class CompressionScheme:
         freeze_uncompressed_vcon: Freezes uncompressed VCON block.
         apply: Applies compression (pruning and/or LRD).
         restore: Restores original module.
-        _unstructured_pruning: Performs unstructured pruning.
-        _structured_pruning: Performs structured pruning.
+        _unstructured_maks: Generates a mask for unstructured pruning.
+        _structured_mask: Generates a mask for structured pruning.
         _low_rank_decomposition: Performs low-rank decomposition.
     """
 
-    def __init__(self,
-                 name,
-                 block_id,
-                 path,
-                 # output_paths,
-                 pruning_ratio=0.0,
-                 pruning_mode='structured',
-                 lrd_rank="full",
-                 bits=None,
-                 model=None,
-                 ):
+    def __init__(
+            self,
+            name,
+            block_id,
+            path,
+            # output_paths,
+            compression_config=None,
+            model=None,
+            ):
         self.name = name
         self.block_id = block_id
         self.path = path
-        self.pruning_ratio = pruning_ratio
-        self.pruning_mode = pruning_mode
-        # self.output_paths = output_paths # blocks after this layer, input should be pruned accordingly
-        self.lrd_rank = lrd_rank
-        self.bits=bits
         self.model = model
         self.hard_applied = False # this flags the compression as non-reversible when True
         self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize with hard application
         self.vcon_initialized = False # this flags if the VCONBlock has been initialized
 
-        if model is not None:
-            # Check if the module exists in the model
-            module = self.get_module()
-            # Check if the module has already been hard-compressed (low-rank only)
-            if hasattr(module, 'lrd_rank') and module.lrd_rank != "full":
-                self.hard_applied = True
+        # Generate compressor list based on the provided configuration
+        self.compressors = {}
+        # Extract path-specific compression configuration, if provided
+        if compression_config is not None:
+            for comp_name, comp_config in compression_config.items():
+                # Instantiate correct compressor with the provided configuration
+                compressor = COMPRESSOR_DICT.get(comp_name, None)
+                if compressor is None:
+                    raise ValueError(f"Unsupported compression type '{comp_name}' in configuration.")
+                self.compressors[comp_name] = compressor(**comp_config)
+
+        # Check if the module exists in the model
+        if self.model is not None:
+            self.get_module()
+
+        # Backup objects
+        self._weight_original = None # This will store the original weights for restoration if needed
 
     def get_module(self):
         """
@@ -89,6 +97,44 @@ class CompressionScheme:
             raise ValueError("Model is not set. Please set the model before getting the module.")
 
         return get_submodule(self.model, self.path)
+
+    def set(self, compression_name, compression_property, value, verbose=False):
+        """
+        Sets a specific property of a compression type in the compression scheme.
+
+        Args:
+            compression_name (str): The name of the compression type (e.g., 'pruning', 'lrd').
+            compression_property (str): The name of the property to set (e.g., 'ratio' for pruning).
+            value: The new value to set for the specified property.
+        """
+        if verbose:
+            print(f"Setting {compression_property} of {compression_name} to {value} for module {self.path}.")
+
+        # Check validity of the property value using COMPRESSION_REGISTRY
+        if compression_name not in COMPRESSION_REGISTRY:
+            raise ValueError(f"Unsupported compression type '{compression_name}' in configuration.")
+        if compression_property not in COMPRESSION_REGISTRY[compression_name]:
+            raise ValueError(f"Unsupported property '{compression_property}' for compression type '{compression_name}' in configuration.")
+        validator = COMPRESSION_REGISTRY[compression_name][compression_property]['validator']
+        if validator is not None:
+            validator(value) # This will raise an error if the value is invalid
+
+        if self.soft_applied or self.hard_applied:
+            raise RuntimeError(f"Cannot set {compression_property} for {compression_name} because compression has already been applied.")
+
+        # Generate compressor if necessary
+        if compression_name not in self.compressors:
+            compressor_class = COMPRESSOR_DICT.get(compression_name, None)
+            if compressor_class is None:
+                raise ValueError(f"Unsupported compression type '{compression_name}' in configuration.")
+            self.compressors[compression_name] = compressor_class(self.get_module)
+
+        # Set the specified property of the compressor
+        compressor = self.compressors[compression_name]
+        if hasattr(compressor, compression_property):
+            setattr(compressor, compression_property, value)
+        else:
+            raise ValueError(f"Compressor '{compression_name}' does not have property '{compression_property}'.")
     
     def set_module(self, new_module):
         """
@@ -126,12 +172,12 @@ class CompressionScheme:
         Returns:
             bool: True if compression should be applied, False otherwise.
         """
-        compression_set = False
-        compression_set = compression_set or self.pruning_ratio > 0
-        compression_set = compression_set or (self.lrd_rank and self.lrd_rank != "full")
-        compression_set = compression_set or (self.bits and self.bits < 32)
+        # Navigate through the compressors to check if any compression is configured for this module
+        to_compress = False
+        for comp_name, compressor in self.compressors.items():
+            to_compress = to_compress or compressor._to_compress()
 
-        return compression_set and self._is_compatible()
+        return to_compress and self._is_compatible()
     
     def _is_compatible(self):
         """
@@ -174,7 +220,7 @@ class CompressionScheme:
         # Create a new instance of the same class
         module_copy = type(module)(**kwargs)
         for name, param in module.named_parameters(recurse=False):
-            setattr(module_copy, name, torch.nn.Parameter(param.data.clone()))
+            getattr(module_copy, name).data = param.data.clone()
         for name, buf in module.named_buffers(recurse=False):
             setattr(module_copy, name, buf.clone())
         # Copy other attributes except parameters, buffers, and methods
@@ -246,7 +292,9 @@ class CompressionScheme:
         """
  
         if not self.vcon_initialized:
-            raise ValueError("VCONBlock is not initialized, cannot cancel.")
+            # Nothing to do
+            return
+        
         self.vcon_initialized = False
 
         module = self.get_module()
@@ -312,18 +360,6 @@ class CompressionScheme:
         """
         Applies magnitude-based structured pruning and Low Rank Decomposition (LRD) to the target module.
 
-        Pruning:
-            - If `pruning_ratio` > 0, performs structured pruning on the module's weights.
-            - If `hard` is True, pruned rows are permanently removed from the module's weights and biases.
-            - If `hard` is False, a prune mask is set for soft pruning (reversible).
-            - Pruning is only applied once unless `hard` is specified after a soft application.
-
-        Low Rank Decomposition (LRD):
-            - If `lrd_rank` is set and not "full", applies LRD to the module's weights.
-            - If `hard` is False, stores the original weight matrix for possible restoration.
-            - If `hard` is True, removes the stored original weight matrix.
-            - LRD is only applied once unless `hard` is specified after a soft application.
-
         VCONBlock Handling:
             - If the module is wrapped in a VCONBlock, compression is applied only to the second block (`block_b`).
 
@@ -337,79 +373,34 @@ class CompressionScheme:
 
         if not self._is_to_compress():
             return # nothing to apply
+
+        if verbose:
+            print(f"Applying ({"HARD (non-reversible)" if hard else "soft"}) compression scheme:\n{self}.")
+            if self.soft_applied:
+                if hard:
+                    print(f"  ! Compression already hard applied, making the changes permanent (HARD mode)")
+                else:
+                    print(f"  ! Compression already soft applied, skipping re-application.")
+
+        if self.hard_applied or (self.soft_applied and not hard):
+            return # Nothing to do
         
+        # Get the module to compress
         module = self.get_module()
         if self.vcon_initialized:
             module = module.block_b # apply to block_b only
-
-        if verbose:
-            print(f"Applying ({"hard" if hard else "soft"}) compression scheme {self} to module {self.path}.")
-            if self.soft_applied:
-                if hard:
-                    print(f"Compression already hard applied, making the changes permanent (HARD mode)")
-                else:
-                    print(f"Compression already soft applied, skipping re-application.")
-            else:
-                print(f"Applying {'HARD (non-reversible) ' if hard else ''}compression to module {self.path}.")
-
-        if self.hard_applied: # already hard applied, nothing to do
-            return
         
-        if not hard: # Backup original weights if not already done
-            if not hasattr(module, '_weight_original'):
-                module._weight_original = module.weight.data.clone()
+        if not hard and not self.soft_applied: # Backup original weights if not already done
+            self._weight_original = module.weight.data.clone() # Store original weights for restoration if needed
         else: # Make changes permanent
-            if hasattr(module, '_weight_original'):
-                del module._weight_original
-        
-        # Apply pruning
-        if self.pruning_ratio > 0:
-            # Prune module
-            if not self.soft_applied:
-                if self.pruning_mode == 'structured':
-                    prune_mask, kept = self._structured_pruning(module.weight.data, norm=2, pruning_ratio=self.pruning_ratio)
-                    self.prune_mask = prune_mask.to(torch.int8) # store for later use
-                    self.kept = kept # store for later use
-                elif self.pruning_mode == 'unstructured':
-                    prune_mask = self._unstructured_pruning(module.weight.data, criterion="magnitude", pruning_ratio=self.pruning_ratio)
-                else:
-                    raise ValueError(f"Unsupported pruning mode '{self.pruning_mode}' for module {self.path}.")
-                
-                if not hard:
-                    # Apply soft pruning by zeroing out the pruned rows/weights
-                    if self.pruning_mode == 'structured':
-                        module.weight.data = module.weight.data*prune_mask.unsqueeze(1).to(torch.float32)
-                    else:
-                        module.weight.data = module.weight.data*prune_mask.to(torch.float32)
-            
-            if hard:
-                if self.pruning_mode == 'unstructured':
-                    raise ValueError("Hard pruning is not supported for unstructured pruning.")
-                
-                # Apply hard pruning by removing the pruned rows
-                module.weight.data = module.weight.data[self.prune_mask]
-                module.bias.data = module.bias.data[self.prune_mask] if module.bias is not None else None
-                module.out_features = self.kept
-                del self.prune_mask                
+            self._weight_original = None
 
-        # Apply Low Rank Decomposition (LRD)
-        if self.lrd_rank and self.lrd_rank != "full":
-            if not self.soft_applied: # Apply LRD if decomposition not yet applied
-                # module.weight.data shape: (out_features, in_features)
-                US_r, V_r = self._low_rank_decomposition(module.weight.data, self.lrd_rank)
-                module.weight = torch.nn.Parameter(US_r) # shape (out_features, lrd_rank)
-                module.weight_2 = torch.nn.Parameter(V_r) # shape (lrd_rank, in_features)
-                # module.bias.data = module.bias.data*0.0 # TEMP
-                # module.bias1 = torch.nn.Parameter(torch.zeros(self.lrd_rank, device=module.weight.device, dtype=module.weight.dtype)) # TEMP
-                module.set_lrd_rank(self.lrd_rank)
-
-        # Apply quantization
-        if self.bits and self.bits < 32:            
-            if not self.soft_applied:
-                # Replace weight with quantized version
-                W = self._quantization(module.weight.data, self.bits)
-                module.weight = torch.nn.Parameter(W)  
-
+        # Perform compression for each compressor in the scheme
+        for cname, compressor in self.compressors.items():
+            if verbose:
+                print(f"Applying compression '{cname}' for module {self.path}")
+            compressor.apply(module=module, hard=hard, soft_applied=self.soft_applied)
+                    
         # Flag as applied
         self.soft_applied = True
         self.hard_applied = hard
@@ -427,6 +418,9 @@ class CompressionScheme:
         Raises:
             ValueError: If the module has been hard applied and cannot be restored.
         """
+        if not self._is_to_compress() or not self.soft_applied:
+            return # nothing to restore
+
         if self.hard_applied:
             raise ValueError("Cannot restore a module that has been hard applied (non-reversible changes).")
         
@@ -434,158 +428,36 @@ class CompressionScheme:
         if self.vcon_initialized:
             module = module.block_b # apply to block_b only
         
-        if topology:
-            # Restore original topology while maintaining compression
-            if hasattr(module, 'weight_2'):
-                if verbose:
-                    print(f"Restoring original topology for low-rank decomposed module {self.path}.")
-                # Rebuild low-rank weight
-                W = module.weight.data @ module.weight_2.data
-                module.weight = torch.nn.Parameter(W)
-                del module.weight_2
-                module.set_lrd_rank("full")
-            if hasattr(self, 'prune_mask'):
-                if verbose:
-                    print(f"Deleting prune mask for module {self.path} while maintaining pruning (topology restoration).")
-                del self.prune_mask
-            if hasattr(self, 'kept'):
-                del self.kept
-            if hasattr(module, '_weight_original'):
-                del module._weight_original
-        else:
-            # Restore original weights and topology
-            if hasattr(module, '_weight_original'):
-                if verbose:
-                    print(f"Restoring module {self.path} to its original state.")
-                module.weight = torch.nn.Parameter(module._weight_original)
-                del module._weight_original
-                module.set_lrd_rank("full")
+        # For each compression type, if it has been applied, call the corresponding restore function
+        for comp_name, compressor in self.compressors.items():
+            if verbose:
+                print(f"Restoring topology for compression '{comp_name}' for module {self.path}.")
+            compressor.restore(module) # Call the restore function of the compressor to reverse the changes
 
-        self.soft_applied = False # Reset the soft application flag
+        if not topology: # Restore original weights before compression
+            # Raise error if original weights are missing
+            if self._weight_original is None:
+                raise ValueError("Original weights not found for restoration. Cannot restore the module.")
+            if verbose:
+                print(f"Restoring parameters for module {self.path}.")
+            with torch.no_grad():
+                module.weight.copy_(self._weight_original)
+
+        # Clean up the backup of original weights
+        self._weight_original = None
+        # Reset the soft application flag
+        self.soft_applied = False 
 
     def __repr__(self):
-        return (f"CompressionScheme(name={self.name}, block_id={self.block_id}, "
-                f"path={self.path}, pruning_ratio={self.pruning_ratio}, pruning_mode={self.pruning_mode}, "
-                f"lrd_rank={self.lrd_rank}, "
-                f"module={self.get_module().__class__.__name__})")
-    
-    def _unstructured_pruning(self, weight, criterion="magnitude", pruning_ratio=0.0) -> torch.Tensor:
-        """
-        Returns a mask for unstructured pruning based on the specified criterion.
-        This function generates a binary mask that can be applied to the weight tensor
-        to zero out individual weights (unstructured pruning) based on their magnitude.
+        string = f"CompressionScheme(name={self.name}, block_id={self.block_id}, path={self.path}, applied=(soft={self.soft_applied}, hard={self.hard_applied}))\n"
+        for comp_name, compressor in self.compressors.items():
+            if compressor._to_compress(): # Only include compressors that are set to be applied
+                string += comp_name + ": " + compressor.__repr__() + "\n"
+        # Remove the last newline character for cleaner formatting
+        string = string.rstrip("\n")
+        # Add indentation for better readability
+        string = string.replace("\n", "\n  ")
+        return string
 
-        Args:
-            weight (torch.Tensor): The weight tensor to be pruned.
-            criterion (str): The criterion to use for calculating the importance of weights. Default is "magnitude".
-            pruning_ratio (float): The ratio of weights to prune (between 0 and 1). Default is 0.0 (no pruning).
-
-        Returns:
-            torch.Tensor: A binary mask with the same shape as the weight tensor.
-        """        
-        if pruning_ratio >= 1.0: # Prune all weights
-            return torch.zeros_like(weight, dtype=torch.bool, device=weight.device)
-        
-        # Determine the number of weights to prune
-        num_weights_to_prune = int(pruning_ratio * weight.numel())
-        
-        if pruning_ratio <= 0.0 or num_weights_to_prune == 0: # No pruning, return a mask of all ones
-            return torch.ones_like(weight, dtype=torch.bool, device=weight.device)
-        
-        # Calculate importance scores based on the criterion
-        if criterion == "magnitude":
-            scores = torch.abs(weight)
-        else:
-            raise ValueError(f"Unsupported criterion '{criterion}' for unstructured pruning.")
-        
-        # Generate the pruning mask
-        threshold = torch.topk(scores, num_weights_to_prune, largest=False, sorted=False).values.max()
-        mask = scores > threshold
-        
-        return mask.view_as(weight)
-
-    def _structured_pruning(self, weight, norm=2, pruning_ratio=0.0) -> torch.Tensor:
-        """
-        Returns a mask for structured pruning based on the specified norm.
-        This function generates a binary mask that can be applied to the weight tensor
-        to zero out entire rows (structured pruning) based on their L2 norm.
-
-        Args:
-            weight (torch.Tensor): The weight tensor to be pruned.
-            norm (int): The norm to use for calculating the importance of rows. Default is 2 (L2 norm).
-            pruning_ratio (float): The ratio of rows to prune (between 0 and 1). Default is 0.0 (no pruning).
-
-        Returns:
-            torch.Tensor: A binary mask vector with the same number of elements as the rows of the weight tensor.
-            kept (int): Number of rows kept after pruning.
-        """
-        current_rows = weight.size(0)
-        
-        if pruning_ratio >= 1.0: # Prune all rows
-            return torch.zeros(weight.size(0), dtype=torch.bool, device=weight.device), 0
-        
-        # Determine the number of rows to prune
-        num_rows_to_prune = int(pruning_ratio * current_rows)
-        kept = current_rows - num_rows_to_prune
-        
-        if pruning_ratio <= 0.0 or num_rows_to_prune == 0: # Prune no rows
-            return torch.ones(weight.size(0), dtype=torch.bool, device=weight.device), weight.size(0)
-        
-        # Generate scores
-        scores = torch.norm(weight, p=norm, dim=1) # Calculate the norm of each row
-
-        # Generate pruning mask
-        threshold = torch.topk(scores, num_rows_to_prune, largest=False, sorted=False).values.max()
-        mask = scores > threshold
-        
-        return mask, kept
-
-    def _low_rank_decomposition(self, weight, rank: int) -> torch.Tensor:
-        """
-        Performs low-rank decomposition on the given weight matrix using SVD.
-
-        Args:
-            weight (torch.Tensor): The weight matrix to be decomposed.
-            rank (int): The target rank for the decomposition.
-
-        Returns:
-            torch.Tensor: The first matrix of the low-rank decomposition.
-            torch.Tensor: The second matrix of the low-rank decomposition.
-        """
-        if rank >= min(weight.size()):
-            # No decomposition possible, launch error
-            raise ValueError(f"Rank {rank} must be less than the minimum dimension of the weight matrix ({weight.size(0), weight.size(1)}).")
-        
-        # Perform SVD
-        weight_f32 = weight.float() # Convert to float32 for SVD computation
-        U, S, Vh = torch.linalg.svd(weight_f32, full_matrices=False)
-
-        # Keep only the top 'rank' components
-        U_r = U[:, :rank]
-        S_r = S[:rank]
-        Vh_r = Vh[:rank, :]
-        # Reconstruct the low-rank approximation
-        US_r_out = (U_r * S_r.unsqueeze(0)).to(weight.dtype)
-        V_r_out = Vh_r.to(weight.dtype)
-        return US_r_out.contiguous(), V_r_out.contiguous()
-    
-    def _quantization(self, weight, qbits) -> torch.Tensor:
-        """
-        Performs Quntization on the given weight matrix using uniform quantization.
-
-        Args:
-            weight (torch.Tensor): The weight matrix to be quantized.
-            qbits (int): The number of bits for quantization.
-
-        Returns:
-            torch.Tensor: The quantized weight matrix.
-        """        
-        q_levels = 2 ** qbits
-        w_min, w_max = weight.min(), weight.max()
-        w_norm = (weight - w_min) / (w_max - w_min + 1e-8)
-        w_q = torch.round(w_norm * (q_levels - 1)) / (q_levels - 1)
-        w_q = w_q * (w_max - w_min) + w_min
-
-        return w_q
 
 __all__ = ["CompressionScheme"]
