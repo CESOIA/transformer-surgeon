@@ -163,7 +163,7 @@ class CompressionSchemesManager:
             num_blocks_attr = block_indexing['num_blocks_attr']
             path_list = block_indexing['path_list']
             path_template = block_indexing['path_template']
-            config_attr = block_indexing['config_attr']
+            config_attr = block_indexing['config_attr'] # added by babisant88: it's done twice.
 
             # Get the specific config for this block type
             if config_attr == '':
