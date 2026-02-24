@@ -20,6 +20,7 @@ class ViTConfigCompress(ViTConfig):
 # Define model
 class ViTForImageClassificationCompress(ViTForImageClassification):
     config_class = ViTConfigCompress
+    indexing = INDEXING
     def __init__(self, config):
         super().__init__(config)
         replace_layers_upon_init(self, INDEXING["vit"], config)

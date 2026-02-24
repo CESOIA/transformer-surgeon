@@ -15,7 +15,7 @@ model = Qwen2_5_VLForConditionalGenerationCompress.from_pretrained(MODEL_NAME)
 
 # Extract language backbone only
 embedding = model.get_input_embeddings()
-decoder = model.language_model
+decoder = model.model.language_model
 final_layer = model.lm_head
 
 # Convert to export-compatible modules
@@ -39,7 +39,7 @@ template = (
     "<|im_start|>user\n{instruction}\n<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
-prompt = """What is the capital of France?"""
+prompt = """What is the capital of France? Tell me something about it."""
 
 # Tokenize inputs (string to input_ids)
 inputs = tokenizer(
