@@ -343,7 +343,7 @@ class CompressionScheme:
             module = module.block_b # apply to block_b only
         
         if verbose:
-            print(f"Applying ({"hard" if hard else "soft"}) compression scheme {self} to module {self.path}.")
+            print(f"Applying ({'hard' if hard else 'soft'}) compression scheme {self} to module {self.path}.")
             if self.soft_applied:
                 if hard:
                     print(f"Compression already hard applied, making the changes permanent (HARD mode)")
@@ -500,7 +500,7 @@ class CompressionScheme:
             raise ValueError(f"Unsupported criterion '{criterion}' for unstructured pruning.")
         
         # Generate the pruning mask
-        threshold = torch.topk(scores, num_weights_to_prune, largest=False, sorted=False).values.max()
+        threshold = torch.topk(scores.reshape(-1), num_weights_to_prune, largest=False, sorted=False).values.max()
         mask = scores > threshold
         
         return mask.view_as(weight)
