@@ -4,49 +4,63 @@ from .abstract import Compressor
 def _unstructured_mask(
     weight,
     criterion="magnitude",
+    granularity="layer",
     pruning_ratio=0.0,
-    reverse=False,
     ) -> torch.Tensor:
     """
-    Returns a mask for unstructured pruning based on the specified criterion.
-    This function generates a binary mask that can be applied to the weight tensor
-    to zero out individual weights (unstructured pruning) based on their magnitude.
-
+    Generate an unstructured pruning mask for the given weight tensor based on the specified criterion and pruning ratio.
     Args:
         weight (torch.Tensor): The weight tensor to be pruned.
-        criterion (str): The criterion to use for calculating the importance of weights. Default is "magnitude". Supported criteria: "magnitude", "gradient", "random".
-        pruning_ratio (float): The ratio of weights to prune (between 0 and 1). Default is 0.0 (no pruning).
-        reverse (bool): If True, prunes the most important weights instead of the least important ones. Default is False.
-
-    Returns:
-        torch.Tensor: A binary mask with the same shape as the weight tensor.
-    """        
+        criterion (str): The criterion for scoring weights, one of "magnitude", "gradient", or "random".
+        granularity (str): 
+        pruning_ratio (float): The ratio of weights to prune, between 0.0 and 1.0.
+    """ 
     if pruning_ratio >= 1.0: # Prune all weights
         return torch.zeros_like(weight, dtype=torch.bool, device=weight.device)
     
-    # Determine the number of weights to prune
-    num_to_prune = int(pruning_ratio * weight.numel())
-    num_to_keep = weight.numel() - num_to_prune
+    # Determine the number of weights to prune based on granularity
+    if granularity == "layer": # remove % of weights across the entire layer
+        num_to_prune = int(round(pruning_ratio * weight.numel()))
+        num_to_keep = weight.numel() - num_to_prune
+        weight_reshaped = weight.view(-1).unsqueeze(0) # Flatten the weights for layer-wise pruning
+    elif granularity == "neuron": # remove % of weights per output neuron (row-wise)
+        num_to_prune = int(round(pruning_ratio * weight.size(1)))
+        num_to_keep = weight.size(1) - num_to_prune
+        weight_reshaped = weight # Keep original shape for neuron-wise pruning
+    elif isinstance(granularity, int) and granularity > 0: # remove % of weights each group of 'granularity' weights
+        num_to_prune = int(round(granularity * pruning_ratio))
+        num_to_keep = granularity - num_to_prune
+        weight_reshaped = weight.view(-1, granularity) # Reshape weights into groups of 'granularity'
+    else:
+        raise ValueError(f"Unsupported granularity '{granularity}' for unstructured pruning.")
     
     if pruning_ratio <= 0.0 or num_to_prune == 0: # No pruning, return a mask of all ones
         return torch.ones_like(weight, dtype=torch.bool, device=weight.device)
     
     # Calculate importance scores based on the criterion
     if criterion == "magnitude":
-        scores = torch.abs(weight)
+        scores = torch.abs(weight_reshaped)
     elif criterion == "gradient":
         if weight.grad is None:
             raise ValueError("Gradient is required for gradient-based scoring but is not available.")
-        scores = torch.abs(weight * weight.grad) # Element-wise product of weights and their gradients
+        grad_reshaped = weight.grad.view_as(weight_reshaped)
+        scores = torch.abs(weight_reshaped * grad_reshaped) # Element-wise product of weights and their gradients
     elif criterion == "random":
-        scores = torch.rand_like(weight)
+        scores = torch.rand_like(weight_reshaped)
     else:
         raise ValueError(f"Unsupported criterion '{criterion}' for unstructured pruning.")
     
-    # Generate the mask by selecting the top-k scores (either the smallest or largest based on the reverse flag)
-    values = torch.topk(scores.view(-1), num_to_keep, largest=not reverse, sorted=False).values
-    threshold = values.min() if not reverse else values.max()
-    mask = torch.ge(scores, threshold) if not reverse else torch.le(scores, threshold)
+    # Generate the mask by selecting the top-k scores, keeping the length of "indices" to the minimum
+    if num_to_prune < num_to_keep:
+        indices = torch.topk(scores, num_to_prune, largest=False, sorted=False, dim=-1).indices
+        row_ids = torch.arange(indices.size(0), device=weight.device)[:, None]
+        mask = torch.ones_like(weight_reshaped, dtype=torch.bool)
+        mask[row_ids, indices] = False
+    else:
+        indices = torch.topk(scores, num_to_keep, largest=True, sorted=False, dim=-1).indices
+        row_ids = torch.arange(indices.size(0), device=weight.device)[:, None]
+        mask = torch.zeros_like(weight_reshaped, dtype=torch.bool)
+        mask[row_ids, indices] = True
     
     return mask.view_as(weight)
 
@@ -55,24 +69,7 @@ def _structured_mask(
     norm=2,
     criterion="magnitude",
     pruning_ratio=0.0,
-    reverse=False,
     ) -> torch.Tensor:
-    """
-    Returns a mask for structured pruning based on the specified norm.
-    This function generates a binary mask that can be applied to the weight tensor
-    to zero out entire rows (structured pruning) based on their L2 norm.
-
-    Args:
-        weight (torch.Tensor): The weight tensor to be pruned.
-        norm (int): The norm to use for calculating the importance of rows. Default is 2 (L2 norm).
-        criterion (str): The criterion to use for calculating the importance of rows. Default is "magnitude". Supported criteria: "magnitude", "gradient", "random".
-        pruning_ratio (float): The ratio of rows to prune (between 0 and 1). Default is 0.0 (no pruning).
-        reverse (bool): If True, prunes the most important rows instead of the least important ones. Default is False.
-
-    Returns:
-        torch.Tensor: A binary mask vector with the same number of elements as the rows of the weight tensor.
-        kept (int): Number of rows kept after pruning.
-    """
     current_rows = weight.size(0)
     
     if pruning_ratio >= 1.0: # Prune all rows
@@ -97,10 +94,15 @@ def _structured_mask(
     else:
         raise ValueError(f"Unsupported criterion '{criterion}' for structured pruning.")
 
-    # Generate the mask by selecting the top-k scores (either the smallest or largest based on the reverse flag)
-    values = torch.topk(scores, num_to_keep, largest=not reverse, sorted=False).values
-    threshold = values.min() if not reverse else values.max()
-    mask = torch.ge(scores, threshold) if not reverse else torch.le(scores, threshold)
+    # Generate the mask by selecting the top-k scores, keeping the length of "indices" to the minimum
+    if num_to_prune < num_to_keep:
+        indices = torch.topk(scores, num_to_prune, largest=False, sorted=False).indices
+        mask = torch.ones(weight.size(0), dtype=torch.bool, device=weight.device)
+        mask[indices] = False
+    else:
+        indices = torch.topk(scores, num_to_keep, largest=True, sorted=False).indices
+        mask = torch.zeros(weight.size(0), dtype=torch.bool, device=weight.device)
+        mask[indices] = True
     
     return mask
 
@@ -109,12 +111,14 @@ class Pruner(Compressor):
         self,
         ratio=0.0,
         mode="structured",
+        granularity="layer",
         criterion="magnitude"
         ):
         # Configuration
         self.ratio = ratio
         self.mode = mode
         self.criterion = criterion
+        self.granularity = granularity
 
     def apply(self, module, hard=False, soft_applied=False):
         if not self._to_compress():
@@ -124,6 +128,7 @@ class Pruner(Compressor):
         ratio = self.ratio
         mode = self.mode
         criterion = self.criterion
+        granularity = self.granularity
 
         if ratio > 0:
             if not soft_applied:
@@ -137,6 +142,7 @@ class Pruner(Compressor):
                     prune_mask = _unstructured_mask(
                         module.weight,
                         criterion=criterion,
+                        granularity=granularity,
                         pruning_ratio=ratio)
                 else:
                     raise ValueError(f"Unsupported pruning mode '{mode}'.")
@@ -184,9 +190,15 @@ def validate_pruning_criterion(criterion: str) -> None:
     if criterion is not None and criterion not in valid_criteria:
         raise ValueError(f"Pruning criterion must be one of {valid_criteria}, but got '{criterion}'.")
 
+def validate_pruning_granularity(granularity: str) -> None:
+    valid_granularities = ["layer", "neuron"]
+    if granularity is not None and granularity not in valid_granularities and not (isinstance(granularity, int) and granularity > 0):
+        raise ValueError(f"Pruning granularity must be one of {valid_granularities} or a positive integer, but got '{granularity}'.")
+
 __all__ = [
     "Pruner",
     "validate_pruning_ratio",
     "validate_pruning_mode",
-    "validate_pruning_criterion"
+    "validate_pruning_criterion",
+    "validate_pruning_granularity"
 ]

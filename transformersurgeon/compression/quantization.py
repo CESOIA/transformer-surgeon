@@ -43,13 +43,11 @@ class Quantizer(Compressor):
         precision="full",
         sparsity=0.0,
         sparse_criterion="magnitude",
-        sparse_reverse=False
         ):
         # Configuration
         self.precision = precision
         self.sparsity = sparsity
         self.sparse_criterion = sparse_criterion
-        self.sparse_reverse = sparse_reverse
 
     def apply(self, module, hard=False, soft_applied=False):
         if not self._to_compress():
@@ -59,12 +57,11 @@ class Quantizer(Compressor):
         precision = self.precision
         sparsity = self.sparsity
         sparse_criterion = self.sparse_criterion
-        sparse_reverse = self.sparse_reverse
 
         if precision:
             if not hard and not soft_applied:
-                for param in module.parameters():
-                    if param.name not in ["weight", "weight_2"]:
+                for name, param in module.named_parameters():
+                    if name not in ["weight", "weight_2"]:
                         continue
 
                     if precision == "binary":
@@ -79,7 +76,6 @@ class Quantizer(Compressor):
                                 param,
                                 criterion=sparse_criterion,
                                 pruning_ratio=sparsity,
-                                reverse=sparse_reverse
                                 )
                             param.copy_(qweight * mask + param.data * (~mask))
                         else:
@@ -98,7 +94,7 @@ class Quantizer(Compressor):
         return self.precision != "full"
     
     def __repr__(self):
-        string = f"Quantizer(precision={self.precision}, sparsity={self.sparsity}, sparse_criterion='{self.sparse_criterion}', sparse_reverse={self.sparse_reverse})"
+        string = f"Quantizer(precision={self.precision}, sparsity={self.sparsity}, sparse_criterion='{self.sparse_criterion}')"
         return string
         
 def validate_precision(precision: Union[str, int]) -> None:
@@ -123,18 +119,9 @@ def validate_precision(precision: Union[str, int]) -> None:
 def validate_sparsity(sparsity: float) -> None:
     if sparsity < 0.0 or sparsity > 1.0:
         raise ValueError(f"Sparsity must be between 0.0 and 1.0, but got {sparsity}.")
-    
-def validate_sparse_criterion(criterion: str) -> None:
-    validate_pruning_criterion(criterion)
-
-def validate_sparse_reverse(reverse: bool) -> None:
-    if not isinstance(reverse, bool):
-        raise ValueError(f"Sparse reverse must be a boolean value, but got type {type(reverse)}.")
         
 __all__ = [
     "Quantizer",
     "validate_precision",
     "validate_sparsity",
-    "validate_sparse_criterion",
-    "validate_sparse_reverse"
 ]

@@ -3,6 +3,7 @@ from .pruning import (
     validate_pruning_ratio,
     validate_pruning_mode,
     validate_pruning_criterion,
+    validate_pruning_granularity
 )
 from .lrd import (
     LRDer,
@@ -12,8 +13,6 @@ from .quantization import (
     Quantizer,
     validate_precision,
     validate_sparsity,
-    validate_sparse_criterion,
-    validate_sparse_reverse
 )
 
 COMPRESSOR_DICT = {
@@ -27,6 +26,7 @@ COMPRESSION_REGISTRY = {
         "ratio": dict(default=0.0, validator=validate_pruning_ratio),
         "mode": dict(default="structured", validator=validate_pruning_mode),
         "criterion": dict(default="magnitude", validator=validate_pruning_criterion),
+        "granularity": dict(default="layer", validator=validate_pruning_granularity)
     },
     "lrd": {
         "rank": dict(default="full", validator=validate_lrd_rank)
@@ -34,8 +34,7 @@ COMPRESSION_REGISTRY = {
     "quantization": {
         "precision": dict(default="full", validator=validate_precision),
         "sparsity": dict(default=0.0, validator=validate_sparsity),
-        "sparse_criterion": dict(default="magnitude", validator=validate_sparse_criterion),
-        "sparse_reverse": dict(default=False, validator=validate_sparse_reverse)
+        "sparse_criterion": dict(default="magnitude", validator=validate_pruning_criterion,),
     }
 }
 
