@@ -5,7 +5,7 @@ from copy import deepcopy
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 MAX_AVAILABLE_THREADS = torch.get_num_threads()
-SELECTED_THREADS = 32
+SELECTED_THREADS = 1
 print(f"Available CPU threads: {MAX_AVAILABLE_THREADS}")
 torch.set_num_threads(min(MAX_AVAILABLE_THREADS, SELECTED_THREADS))  # Limit threads
 print(f"Using {torch.get_num_threads()} CPU threads for PyTorch operations")

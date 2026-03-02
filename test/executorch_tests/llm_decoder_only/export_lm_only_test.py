@@ -120,7 +120,10 @@ batch_size = 1
 seq_len = 20
 cache_len = 50
 max_seq_len = 1217
-embed_dim = model.config.hidden_size
+if hasattr(model.config, "text_config"):
+    embed_dim = model.config.text_config.hidden_size
+else:
+    embed_dim = model.config.hidden_size
 vocab_size = 152064
 
 # embedding
