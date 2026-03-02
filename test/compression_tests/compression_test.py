@@ -7,6 +7,7 @@ from transformers import (
 from test_messages import messages
 from qwen_vl_utils import process_vision_info
 import sys
+import time
 
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
@@ -95,39 +96,47 @@ if not USE_ORIGINAL_MODEL:
 print(model)
 
 ### INFERENCE AND TESTING ###
+def generate_text():
+    for i, message in enumerate(messages):
+        print(f"\nProcessing message {i + 1}...")
+        print("Input:", message["content"][1]["text"])
+        
+        # Preparation for inference for this single message
+        single_message = [message]
+        text = processor.apply_chat_template(
+            single_message, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(single_message)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(model.device)
+
+        # Inference: Generation of the output for this message
+        tic = time.perf_counter()
+        generated_ids = model.generate(**inputs, max_new_tokens=128)
+        torch.cuda.synchronize()  # Ensure all CUDA operations are finished before stopping the timer
+        toc = time.perf_counter()
+        generated_ids_trimmed = generated_ids[0][inputs["input_ids"].shape[1]:]  # Remove prompt tokens
+        message_output = processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        
+        # Display result immediately
+        print("Output:", message_output[0])
+        print("-" * 40)
+
+        print(generated_ids_trimmed)
+        print(f"Generated IDs shape: {len(generated_ids_trimmed)}")
+        print(f"Generation speed: {len(generated_ids_trimmed)/(toc - tic):.4f} tokens/s")
+
+# Generate text with the (potentially) compressed model
 print("Generating text with compressed model...")
-
-for i, message in enumerate(messages):
-    print(f"\nProcessing message {i + 1}...")
-    print("Input:", message["content"][1]["text"])
-    
-    # Preparation for inference for this single message
-    single_message = [message]
-    text = processor.apply_chat_template(
-        single_message, tokenize=False, add_generation_prompt=True
-    )
-    image_inputs, video_inputs = process_vision_info(single_message)
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to(model.device)
-
-    # Inference: Generation of the output for this message
-    generated_ids = model.generate(**inputs, max_new_tokens=128)
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    message_output = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
-    
-    # Display result immediately
-    print("Output:", message_output[0])
-    print("-" * 40)
+generate_text()
 
 if USE_ORIGINAL_MODEL:
     exit() # If we are only testing the original model, we can exit here without restoring
@@ -138,36 +147,7 @@ if use_vcon:
 # Restore the model to its original state and test again
 manager.restore(topology=restore_topology)
 
+# Generate text again after restoring the model
 print("Generating text with restored model...")
+generate_text()
 
-for i, message in enumerate(messages):
-    print(f"\nProcessing message {i + 1}...")
-    print("Input:", message["content"][1]["text"])
-    
-    # Preparation for inference for this single message
-    single_message = [message]
-    text = processor.apply_chat_template(
-        single_message, tokenize=False, add_generation_prompt=True
-    )
-    image_inputs, video_inputs = process_vision_info(single_message)
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to(model.device)
-
-    # Inference: Generation of the output for this message
-    generated_ids = model.generate(**inputs, max_new_tokens=128)
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    message_output = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
-    
-    # Display result immediately
-    print("Output:", message_output[0])
-    print("-" * 40)

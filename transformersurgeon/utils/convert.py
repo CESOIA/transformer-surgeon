@@ -96,9 +96,11 @@ def _instantiate_decoder_block(config, indexing, blocks_num):
             matched_block, matched_layer = matched.split('.')
             
             # Collect compression config parameters
-            compression_config[matched_block][matched_layer]['lrd_rank'] = config['lrd_ranks'][full_path_old]
-            compression_config[matched_block][matched_layer]['pruning_mode'] = config['pruning_modes'][full_path_old]
-            compression_config[matched_block][matched_layer]['pruning_ratio'] = config['pruning_ratios'][full_path_old]
+            old_compression_config = config['compression_config'].get(full_path_old, {})
+            for key in old_compression_config.keys():
+                old_subconfig = old_compression_config[key]
+                for subkey, value in old_subconfig.items():
+                    compression_config[matched_block][matched_layer][key][subkey] = value
 
             # Collect bias requirement
             bias_required[matched_block][matched_layer] = indexing['bias_required'][j]

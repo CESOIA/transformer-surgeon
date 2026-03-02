@@ -103,31 +103,31 @@ class MHABase(torch.nn.Module):
                 "out_proj": False
             }
         
-        q_lrd_rank = compression_config["q_proj"]["lrd_rank"]
-        k_lrd_rank = compression_config["k_proj"]["lrd_rank"]
-        v_lrd_rank = compression_config["v_proj"]["lrd_rank"]
-        out_lrd_rank = compression_config["out_proj"]["lrd_rank"]
+        q_lrd_rank = compression_config["q_proj"]["lrd"]["rank"]
+        k_lrd_rank = compression_config["k_proj"]["lrd"]["rank"]
+        v_lrd_rank = compression_config["v_proj"]["lrd"]["rank"]
+        out_lrd_rank = compression_config["out_proj"]["lrd"]["rank"]
         
         self.q_proj = LinearCompressed(
             embed_dim,
             embed_dim,
             bias=bias_required["q_proj"],
-            lrd_rank=q_lrd_rank)
+            rank=q_lrd_rank)
         self.k_proj = LinearCompressed(
             embed_dim,
             self.kv_out_dim,
             bias=bias_required["k_proj"],
-            lrd_rank=k_lrd_rank)
+            rank=k_lrd_rank)
         self.v_proj = LinearCompressed(
             embed_dim,
             self.kv_out_dim,
             bias=bias_required["v_proj"],
-            lrd_rank=v_lrd_rank)
+            rank=v_lrd_rank)
         self.out_proj = LinearCompressed(
             embed_dim,
             embed_dim,
             bias=bias_required["out_proj"],
-            lrd_rank=out_lrd_rank)
+            rank=out_lrd_rank)
 
 class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
     def __init__(self, *args, **kwargs):
@@ -189,20 +189,20 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
                 "out_proj": False
             }
         
-        qkv_lrd_rank = compression_config["qkv_proj"]["lrd_rank"]
-        out_lrd_rank = compression_config["out_proj"]["lrd_rank"]
+        qkv_lrd_rank = compression_config["qkv_proj"]["lrd"]["rank"]
+        out_lrd_rank = compression_config["out_proj"]["lrd"]["rank"]
         
         # Instantiate layers
         self.qkv_proj = LinearCompressed(
             embed_dim, 
             3 * embed_dim, 
             bias=bias_required["qkv_proj"],
-            lrd_rank=qkv_lrd_rank)
+            rank=qkv_lrd_rank)
         self.out_proj = LinearCompressed(
             embed_dim,
             embed_dim,
             bias=bias_required["out_proj"],
-            lrd_rank=out_lrd_rank)
+            rank=out_lrd_rank)
         
     def forward(self, x, rope=None):
         batch_size, seq_length, embed_dim = x.size()

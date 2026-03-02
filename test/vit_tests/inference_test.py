@@ -24,6 +24,7 @@ transform = transforms.Compose([
 ])
 
 # Load imagenet dataset
+
 file_name = os.path.join(os.path.dirname(__file__), "imagenet_location.txt")
 with open(file_name, 'r') as f:
     imagenet_path = f.readline().strip()

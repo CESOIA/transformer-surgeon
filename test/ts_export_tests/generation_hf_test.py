@@ -13,8 +13,9 @@ model = Qwen2_5_VLForConditionalGenerationCompress.from_pretrained(MODEL_NAME)
 model.config._attn_implementation = "eager"
 
 # Extract language backbone only
+print(model)
 embedding = model.get_input_embeddings()
-decoder = model.language_model
+decoder = model.model.language_model
 final_layer = model.lm_head
 data_type = torch.float32
 

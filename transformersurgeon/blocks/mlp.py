@@ -39,8 +39,8 @@ class MLP(torch.nn.Module):
                 "down_proj": {"lrd_rank": "full"}
             }
         
-        up_proj_lrd_rank = compression_config["up_proj"]["lrd_rank"]
-        down_proj_lrd_rank = compression_config["down_proj"]["lrd_rank"]
+        up_proj_lrd_rank = compression_config["up_proj"]["lrd"]["rank"]
+        down_proj_lrd_rank = compression_config["down_proj"]["lrd"]["rank"]
 
         # Setup bias requirement
         if bias_required is None:
@@ -53,7 +53,7 @@ class MLP(torch.nn.Module):
             embed_dim,
             hidden_dim,
             bias=bias_required["up_proj"],
-            lrd_rank=up_proj_lrd_rank)
+            rank=up_proj_lrd_rank)
         
         self.activation = activation_map[activation]()
 
@@ -61,7 +61,7 @@ class MLP(torch.nn.Module):
             hidden_dim,
             embed_dim,
             bias=bias_required["down_proj"],
-            lrd_rank=down_proj_lrd_rank)
+            rank=down_proj_lrd_rank)
 
     def forward(self, x):
         """
@@ -108,9 +108,9 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
                 "down_proj": {"lrd_rank": "full"}
             }
 
-        up_proj_lrd_rank = compression_config["up_proj"]["lrd_rank"]
-        gate_proj_lrd_rank = compression_config["gate_proj"]["lrd_rank"]
-        down_proj_lrd_rank = compression_config["down_proj"]["lrd_rank"]
+        up_proj_lrd_rank = compression_config["up_proj"]["lrd"]["rank"]
+        gate_proj_lrd_rank = compression_config["gate_proj"]["lrd"]["rank"]
+        down_proj_lrd_rank = compression_config["down_proj"]["lrd"]["rank"]
 
         # Setup bias requirement
         if bias_required is None:
@@ -124,13 +124,13 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
             embed_dim,
             hidden_dim,
             bias=bias_required["up_proj"],
-            lrd_rank=up_proj_lrd_rank)
+            rank=up_proj_lrd_rank)
         
         self.gate_proj = LinearCompressed(
             embed_dim,
             hidden_dim,
             bias=bias_required["gate_proj"],
-            lrd_rank=gate_proj_lrd_rank)
+            rank=gate_proj_lrd_rank)
         
         self.activation = activation_map[activation]()
 
@@ -138,7 +138,7 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
             hidden_dim,
             embed_dim,
             bias=bias_required["down_proj"],
-            lrd_rank=down_proj_lrd_rank)
+            rank=down_proj_lrd_rank)
 
     def forward(self, x):
         """
