@@ -305,6 +305,9 @@ class CompressionScheme:
         
         self.set_module(module)
 
+        if module.weight.device.type == "cuda":
+            torch.cuda.empty_cache() # Clear GPU cache to free up memory
+
         if verbose:
             kept = "block_b" if keep_block_b else "block_a"
             print(f"Cancelled VCONBlock at {self.path}, kept {kept}.")  

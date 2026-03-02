@@ -46,23 +46,33 @@ class LinearCompressed(nn.Linear):
             shape_change = False
             device = self.weight.device
             dtype = self.weight.dtype
+
             # Initialize weight_2 for low-rank decomposition
             if self.weight_2 is None or self.weight_2.shape[0] != rank:
+
+                # Free existing weight_2 if it exists
+                self.weight_2 = None 
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
                 self.weight_2 = Parameter(
                     torch.empty([self.rank, self.in_features], device=device, dtype=dtype),
                     requires_grad=True)
+
                 torch.nn.init.kaiming_uniform_(self.weight_2, a=math.sqrt(5))
-                shape_change = True
+
             # Adjust weight shape for low-rank decomposition if necessary
             if self.weight.shape[1] != self.rank:
+
+                # Free existing weight
+                self.weight = None 
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
                 self.weight = Parameter(
                     torch.empty([self.out_features, self.rank], device=device, dtype=dtype),
                     requires_grad=True)
                 torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-                shape_change = True
-            # Free cache if there was a shape change and we're on GPU
-            if shape_change and device.type == "cuda":
-                torch.cuda.empty_cache()
             
     def cancel_lrd(self):
         self.rank = "full"
