@@ -25,9 +25,9 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # ======================
 ARGS=$(cat <<EOF
 --model_name_or_path $MODEL_PATH 
---tune_mm_llm True
+--tune_mm_llm False
 --tune_mm_vision False 
---tune_mm_mlp False
+--tune_mm_mlp True
 --dataset_use $DATASETS 
 --output_dir $OUTPUT_DIR 
 --cache_dir $CACHE_DIR 
@@ -42,7 +42,7 @@ ARGS=$(cat <<EOF
 --data_flatten False
 --data_packing False 
 --base_interval 2 
---num_train_epochs 3 
+--num_train_epochs 1 
 --warmup_ratio 0.03 
 --lr_scheduler_type cosine 
 --weight_decay 0.01 

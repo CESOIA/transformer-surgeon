@@ -31,6 +31,7 @@ from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Tr
 from train_qwen import safe_save_model_for_hf_trainer, set_model
 
 from math import ceil
+from torch.utils.data import random_split
 
 from transformers import TrainerCallback
 import torch.distributed as dist
@@ -62,7 +63,7 @@ class VCON_beta_upd(TrainerCallback):
                 self.step_cnt = self.step_cnt + 1
             else:
                 self._beta_upd()
-                self.mgr.set_vcon_beta(self.beta)
+                self.mgr.set_vcon_beta_all(self.beta)
                 self.step_cnt = 0
 
     # When the number of steps in an epoch isn't divisible by grad_acc_steps
@@ -75,7 +76,7 @@ class VCON_beta_upd(TrainerCallback):
         
             if self.step_cnt: # if self.step_cnt is any value other than 0
                 self._beta_upd()
-                self.mgr.set_vcon_beta(self.beta)
+                self.mgr.set_vcon_beta_all(self.beta)
                 self.step_cnt = 0
                 
     def _beta_upd(self):
@@ -92,9 +93,9 @@ class VCON_beta_upd(TrainerCallback):
 ### COMPRESSION CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
 hard_mode = False
-use_vcon = True  # Whether to use VCON blocks
+use_vcon = False  # Whether to use VCON blocks
 vcon_beta = 1.0  # Beta value for VCON blocks (between 0 and 1)
-vcon_epochs = 2 # For how many epochs will we apply VCON?
+vcon_epochs = 1 # For how many epochs will we apply VCON?
 ##########################
 
 if model_type == "qwen2_vl_c":
@@ -138,9 +139,9 @@ def train(attn_implementation="flash_attention_2"):
 
     mgr = managerClass(model)
     mgr.set("lrd", "rank", 128, [
-        ["language_model", "mlp.down_proj"],
-        ["language_model", "mlp.up_proj"],
-        ["language_model", "mlp.gate_proj"]
+        ["language_model", "mlp.down_proj", 1],
+        ["language_model", "mlp.up_proj", 1],
+        ["language_model", "mlp.gate_proj", 1]
     ], verbose=True)
 
     if use_vcon:
@@ -185,6 +186,18 @@ def train(attn_implementation="flash_attention_2"):
         data_module = make_supervised_data_module_packed(tokenizer=tokenizer, data_args=data_args)
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+
+    # ---- 80/20 train / test split ----
+    full_dataset = data_module["train_dataset"]
+    n_total = len(full_dataset)
+    n_train = int(0.8 * n_total)
+    n_test  = n_total - n_train
+    train_dataset, test_dataset = random_split(
+        full_dataset,
+        [n_train, n_test],
+        generator=torch.Generator().manual_seed(42),  # reproducible split
+    )
+    data_module["train_dataset"] = train_dataset
     
     if use_vcon:
         
@@ -197,12 +210,19 @@ def train(attn_implementation="flash_attention_2"):
         
         VCON_beta_upd_callback = VCON_beta_upd(mgr, grad_acc_steps=grad_acc_steps, vcon_grad_acc=vcon_grad_acc, beta=vcon_beta)
         trainer = Trainer(
-            model=model, processing_class=tokenizer, args=training_args, **data_module, callbacks=[VCON_beta_upd_callback]
+            model=model, processing_class=tokenizer, args=training_args,
+            train_dataset=data_module["train_dataset"],
+            eval_dataset=test_dataset,
+            data_collator=data_module.get("data_collator"),
+            callbacks=[VCON_beta_upd_callback],
         )
     else:
-        
+
         trainer = Trainer(
-            model=model, processing_class=tokenizer, args=training_args, **data_module
+            model=model, processing_class=tokenizer, args=training_args,
+            train_dataset=data_module["train_dataset"],
+            eval_dataset=test_dataset,
+            data_collator=data_module.get("data_collator"),
         )
     
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
@@ -217,7 +237,82 @@ def train(attn_implementation="flash_attention_2"):
     model.config.use_cache = True
 
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+    # ---- Collect responses on the test split ----
+    if training_args.local_rank in [-1, 0]:
+        print("\n[eval] Collecting model responses on the test split...")
+        model.eval()
+        outputs = []
+        
+        # Use the processor we loaded earlier
+        # Note: training has applied compression surgery, so this inference 
+        # is for the compressed model state.
+        for i, idx in enumerate(test_dataset.indices):
+            raw = full_dataset[idx]
+            
+            # Extract data using the user's requested structure
+            conversations = raw.get("conversations", [])
+            img_path = raw.get("image", "")
+            img_fname = os.path.basename(img_path) if img_path else ""
+            
+            # Prep inputs for Qwen-VL
+            # Assuming conversations[0] is the user prompt
+            if not conversations:
+                continue
+                
+            instruction = conversations[0].get("value", "")
+            
+            # Format message for processor
+            content = []
+            if img_path and os.path.exists(img_path):
+                content.append({"type": "image", "image": img_path})
+            content.append({"type": "text", "text": instruction})
+            messages = [{"role": "user", "content": content}]
+            
+            # Process vision/text
+            text_prompt = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+            
+            inputs = processor(
+                text=[text_prompt],
+                images=image_inputs if image_inputs else None,
+                videos=video_inputs if video_inputs else None,
+                return_tensors="pt",
+            ).to(model.device)
+            
+            # Inference
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, max_new_tokens=256)
+                
+            # Trim prompt tokens
+            trimmed_ids = [
+                out_ids[len(in_ids):]
+                for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+            ]
+            output_text = tokenizer.batch_decode(
+                trimmed_ids, skip_special_tokens=True
+            )[0].strip()
+            
+            # Store in requested format
+            outputs.append({
+                "img_fname": img_fname,
+                "ref_answer": conversations[1]['value'] if len(conversations) > 1 else "",
+                "model_ut_response": output_text
+            })
+            
+            if (i + 1) % 10 == 0 or (i + 1) == len(test_dataset):
+                print(f"  Processed {i+1}/{len(test_dataset)} samples", end="\r")
+        
+        # Save to output_dir
+        responses_path = os.path.join(training_args.output_dir, "responses.json")
+        with open(responses_path, "w") as f:
+            json.dump(outputs, f, indent=2, ensure_ascii=False)
+        print(f"\n[eval] Saved {len(outputs)} responses to {responses_path}")
     
+    model.config.use_cache = True
+
 
 if __name__ == "__main__":
     train(attn_implementation="flash_attention_2")

@@ -1,10 +1,10 @@
 #!/bin/bash --login
 #SBATCH --constraint=a100
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2         # number of MP tasks
+#SBATCH --ntasks-per-node=1         # number of MP tasks
 #SBATCH --gres=gpu:2                # number of GPUs per node
 #SBATCH --cpus-per-task=15          # number of cores per tasks
-#SBATCH --time=2:00:00             # maximum execution time (HH:MM:SS)
+#SBATCH --time=24:00:00             # maximum execution time (HH:MM:SS)
 #SBATCH --mem=256G 
 #SBATCH --partition=batch 
 #SBATCH --mail-type=ALL
@@ -20,4 +20,4 @@ module load gcc/12.2.0
 conda activate /ibex/user/antonic/CESOIA/env
 
 bash train_3b.sh
-# bash train_single_gpu.sh
+# bash train_3b_single_GPU.sh

@@ -11,7 +11,7 @@ from ...utils import (
 class DistilBertConfigCompress(DistilBertConfig):
     def __init__(self, compression=None, **kwargs):
         super().__init__(**kwargs)
-        init_compression_config(
+        init_compressed_config(
             config_instance=self,
             indexing=INDEXING["distilbert"],
             **(compression or {})
