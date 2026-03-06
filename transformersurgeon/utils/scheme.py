@@ -220,7 +220,7 @@ class CompressionScheme:
         # Create a new instance of the same class
         module_copy = type(module)(**kwargs)
         for name, param in module.named_parameters(recurse=False):
-            getattr(module_copy, name).data = param.data.clone()
+            getattr(module_copy, name).copy_(param.detach().clone())
         for name, buf in module.named_buffers(recurse=False):
             setattr(module_copy, name, buf.clone())
         # Copy other attributes except parameters, buffers, and methods
@@ -304,9 +304,6 @@ class CompressionScheme:
             module = module.block_a
         
         self.set_module(module)
-
-        if module.weight.device.type == "cuda":
-            torch.cuda.empty_cache() # Clear GPU cache to free up memory
 
         if verbose:
             kept = "block_b" if keep_block_b else "block_a"
@@ -394,7 +391,7 @@ class CompressionScheme:
             module = module.block_b # apply to block_b only
         
         if not hard and not self.soft_applied: # Backup original weights if not already done
-            self._weight_original = module.weight.data.clone() # Store original weights for restoration if needed
+            self._weight_original = module.weight.detach().clone() # Store original weights for restoration if needed
         else: # Make changes permanent
             self._weight_original = None
 

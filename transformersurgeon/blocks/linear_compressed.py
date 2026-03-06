@@ -50,11 +50,6 @@ class LinearCompressed(nn.Linear):
             # Initialize weight_2 for low-rank decomposition
             if self.weight_2 is None or self.weight_2.shape[0] != rank:
 
-                # Free existing weight_2 if it exists
-                self.weight_2 = None 
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
                 self.weight_2 = Parameter(
                     torch.empty([self.rank, self.in_features], device=device, dtype=dtype),
                     requires_grad=True)
@@ -63,11 +58,6 @@ class LinearCompressed(nn.Linear):
 
             # Adjust weight shape for low-rank decomposition if necessary
             if self.weight.shape[1] != self.rank:
-
-                # Free existing weight
-                self.weight = None 
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
 
                 self.weight = Parameter(
                     torch.empty([self.out_features, self.rank], device=device, dtype=dtype),
@@ -78,20 +68,18 @@ class LinearCompressed(nn.Linear):
         self.rank = "full"
         device = self.weight.device
         dtype = self.weight.dtype
-        shape_change = False
+        
         # Remove weight_2 if it exists
         if self.weight_2 is not None:
             self.weight_2 = None
-            shape_change = True
+
         # Revert weight to original shape if it was changed for low-rank decomposition
         if self.weight.shape[1] != self.in_features:
+            self.weight = None
             self.weight = Parameter(
                 torch.empty([self.out_features, self.in_features], device=device, dtype=dtype),
                 requires_grad=True)
             torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        # Free cache if there was a shape change and we're on GPU
-        if shape_change and device.type == "cuda":
-            torch.cuda.empty_cache()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         x = input

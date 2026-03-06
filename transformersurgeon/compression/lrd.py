@@ -48,9 +48,9 @@ class LRDer(Compressor):
     
         if rank:
             if not soft_applied:
-                US_r, V_r = _low_rank_svd(module.weight.data, rank)
-                module.init_lrd(rank)
                 with torch.no_grad():
+                    US_r, V_r = _low_rank_svd(module.weight.detach(), rank)
+                    module.init_lrd(rank)
                     module.weight[:, :rank].copy_(US_r)
                     module.weight_2[:rank, :].copy_(V_r)
 
@@ -63,10 +63,9 @@ class LRDer(Compressor):
         
         # Combine the low-rank components to restore the original weight matrix
         with torch.no_grad():
-            restored_weight = module.weight @ module.weight_2
+            restored_weight = module.weight.detach() @ module.weight_2.detach()
             module.cancel_lrd()
-            with torch.no_grad():
-                module.weight.copy_(restored_weight)
+            module.weight.copy_(restored_weight)
         
     def _to_compress(self):
         # Check if LRD has to be applied based on the rank configuration
