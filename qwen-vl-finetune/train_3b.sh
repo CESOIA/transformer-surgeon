@@ -18,7 +18,7 @@ CACHE_DIR="./cache"                          # [TrainingArguments] Cache directo
 # ======================
 # Model Configuration
 # ======================
-DATASETS="coco_qa_cats_chair"                  # [DataArguments] Dataset with sampling rate
+DATASETS="/ibex/user/antonic/CESOIA/datasets/COCO/annotations/train2017_qa_cats_chair.json" # [DataArguments] Dataset with sampling rate
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # ======================
 # Training Hyperparameters
@@ -56,4 +56,4 @@ EOF
 torchrun --nproc_per_node=$NPROC_PER_NODE \
          --master_addr=$MASTER_ADDR \
          --master_port=$MASTER_PORT \
-         qwenvl/train/train_qwen_c.py ${ARGS}
+         qwenvl/train/train_qwen_c_v2.py ${ARGS}

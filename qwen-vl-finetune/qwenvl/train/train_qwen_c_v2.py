@@ -14,6 +14,30 @@ sys.path.append(str(project_root))
 
 import qwenvl.train.trainer
 from trainer import replace_qwen2_vl_attention_class
+import random
+
+
+def split_dataset_to_disk(original_path, train_path, test_path, split_ratio=0.8, seed=42):
+    """Splits the original JSON dataset into train and test parts on disk."""
+    with open(original_path, "r") as f:
+        data = json.load(f)
+
+    random.seed(seed)
+    random.shuffle(data)
+
+    split_idx = int(len(data) * split_ratio)
+    train_data = data[:split_idx]
+    test_data = data[split_idx:]
+
+    with open(train_path, "w") as f:
+        json.dump(train_data, f, indent=2, ensure_ascii=False)
+    
+    with open(test_path, "w") as f:
+        json.dump(test_data, f, indent=2, ensure_ascii=False)
+    
+    print(f"[data] Dataset split completed: {len(train_data)} train, {len(test_data)} test")
+    return len(train_data), len(test_data)
+
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -42,6 +66,7 @@ import numpy as np
 from PIL import Image
 import torch.nn as nn
 
+from pathlib import Path
 
 class VCON_beta_upd(TrainerCallback):
     
@@ -136,20 +161,20 @@ def train(attn_implementation="flash_attention_2"):
 
     device = next(model.parameters()).device
     print("Model is on:", device)
-
+    
     mgr = managerClass(model)
     mgr.set("lrd", "rank", 128, [
-        ["language_model", "mlp.down_proj", 1],
-        ["language_model", "mlp.up_proj", 1],
-        ["language_model", "mlp.gate_proj", 1]
+        ["language_model", "mlp.down_proj"],
+        ["language_model", "mlp.up_proj"],
+        ["language_model", "mlp.gate_proj"]
     ], verbose=True)
 
     if use_vcon:
         mgr.init_vcon(verbose=True)
         mgr.set_vcon_beta(beta=vcon_beta)
-
+    
     mgr.apply(verbose=True)
-
+        
     global local_rank
 
     parser = transformers.HfArgumentParser(
@@ -182,22 +207,27 @@ def train(attn_implementation="flash_attention_2"):
     # if torch.distributed.get_rank() == 0:
         # model.model.print_trainable_parameters()
 
+    # ---- Disk-based 80/20 train / test split ----
+    original_dataset_path = data_args.dataset_use
+    train_split_path = os.path.join("/ibex/user/antonic/CESOIA/datasets/COCO/annotations/", "train2017_qa_cats_chair_train.json")
+    test_split_path = os.path.join("/ibex/user/antonic/CESOIA/datasets/COCO/annotations/", "train2017_qa_cats_chair_test.json")
+    
+    if training_args.local_rank in [-1, 0]:
+        split_dataset_to_disk(original_dataset_path, train_split_path, test_split_path)
+    
+    # Wait for split to finish on rank 0
+    if training_args.local_rank != -1:
+        torch.distributed.barrier()
+        
+    data_args.dataset_use = "coco_qa_cats_chair_train" #train_split_path
+
     if data_args.data_packing:
         data_module = make_supervised_data_module_packed(tokenizer=tokenizer, data_args=data_args)
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
 
-    # ---- 80/20 train / test split ----
-    full_dataset = data_module["train_dataset"]
-    n_total = len(full_dataset)
-    n_train = int(0.8 * n_total)
-    n_test  = n_total - n_train
-    train_dataset, test_dataset = random_split(
-        full_dataset,
-        [n_train, n_test],
-        generator=torch.Generator().manual_seed(42),  # reproducible split
-    )
-    data_module["train_dataset"] = train_dataset
+    train_dataset = data_module["train_dataset"]
+
     
     if use_vcon:
         
@@ -210,19 +240,12 @@ def train(attn_implementation="flash_attention_2"):
         
         VCON_beta_upd_callback = VCON_beta_upd(mgr, grad_acc_steps=grad_acc_steps, vcon_grad_acc=vcon_grad_acc, beta=vcon_beta)
         trainer = Trainer(
-            model=model, processing_class=tokenizer, args=training_args,
-            train_dataset=data_module["train_dataset"],
-            eval_dataset=test_dataset,
-            data_collator=data_module.get("data_collator"),
-            callbacks=[VCON_beta_upd_callback],
+            model=model, processing_class=tokenizer, args=training_args, **data_module, callbacks=[VCON_beta_upd_callback]
         )
     else:
 
         trainer = Trainer(
-            model=model, processing_class=tokenizer, args=training_args,
-            train_dataset=data_module["train_dataset"],
-            eval_dataset=test_dataset,
-            data_collator=data_module.get("data_collator"),
+            model=model, processing_class=tokenizer, args=training_args, **data_module
         )
     
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
@@ -232,39 +255,41 @@ def train(attn_implementation="flash_attention_2"):
         trainer.train()
     
     trainer.save_state()
+        
     data_args.image_processor.save_pretrained(training_args.output_dir)
 
     model.config.use_cache = True
-
+        
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-
+'''
     # ---- Collect responses on the test split ----
     if training_args.local_rank in [-1, 0]:
-        print("\n[eval] Collecting model responses on the test split...")
+        print("\n[eval] Evaluating on the test split...")
         model.eval()
-        outputs = []
         
-        # Use the processor we loaded earlier
-        # Note: training has applied compression surgery, so this inference 
-        # is for the compressed model state.
-        for i, idx in enumerate(test_dataset.indices):
-            raw = full_dataset[idx]
+        test_split_path = os.path.join("/ibex/user/antonic/CESOIA/datasets/COCO/annotations/", "train2017_qa_cats_chair_test.json")
+        with open(test_split_path, "r") as f:
+            test_data = json.load(f)
             
-            # Extract data using the user's requested structure
-            conversations = raw.get("conversations", [])
-            img_path = raw.get("image", "")
-            img_fname = os.path.basename(img_path) if img_path else ""
+        outputs = []
+        for i, sample in enumerate(test_data):
+            img_path = sample.get("image", "")
+            img_fname = img_path
             
-            # Prep inputs for Qwen-VL
-            # Assuming conversations[0] is the user prompt
+            img_path = os.path.join("/ibex/user/antonic/CESOIA/datasets/COCO/train2017/", img_fname)
+            
+            conversations = sample.get("conversations", [])
             if not conversations:
                 continue
-                
+            
             instruction = conversations[0].get("value", "")
+            ref_answer = conversations[1].get("value", "") if len(conversations) > 1 else ""
             
             # Format message for processor
             content = []
-            if img_path and os.path.exists(img_path):
+            if img_path:
+                # Assuming images are in the current directory or paths are absolute
+                # If they are relative to a specific dir, we might need a root path
                 content.append({"type": "image", "image": img_path})
             content.append({"type": "text", "text": instruction})
             messages = [{"role": "user", "content": content}]
@@ -295,24 +320,26 @@ def train(attn_implementation="flash_attention_2"):
                 trimmed_ids, skip_special_tokens=True
             )[0].strip()
             
-            # Store in requested format
+            # Requested format
             outputs.append({
                 "img_fname": img_fname,
-                "ref_answer": conversations[1]['value'] if len(conversations) > 1 else "",
+                "ref_answer": ref_answer,
                 "model_ut_response": output_text
             })
             
-            if (i + 1) % 10 == 0 or (i + 1) == len(test_dataset):
-                print(f"  Processed {i+1}/{len(test_dataset)} samples", end="\r")
+            if (i + 1) % 10 == 0 or (i + 1) == len(test_data):
+                print(f"  Processed {i+1}/{len(test_data)} test samples", end="\r")
         
         # Save to output_dir
-        responses_path = os.path.join(training_args.output_dir, "responses.json")
+        responses_path = os.path.join(training_args.output_dir, "test_eval_responses.json")
         with open(responses_path, "w") as f:
             json.dump(outputs, f, indent=2, ensure_ascii=False)
-        print(f"\n[eval] Saved {len(outputs)} responses to {responses_path}")
+        print(f"\n[eval] Saved {len(outputs)} test responses to {responses_path}")
     
     model.config.use_cache = True
+'''
 
 
 if __name__ == "__main__":
     train(attn_implementation="flash_attention_2")
+
