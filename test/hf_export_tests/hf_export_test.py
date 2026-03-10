@@ -4,7 +4,7 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from test.qwen_tests.test_messages import messages
+# from test.qwen_tests.test_messages import messages
 from qwen_vl_utils import process_vision_info
 import sys
 
@@ -93,17 +93,17 @@ if DO_COMPRESSION:
     #         ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
     #         ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
     #     ], verbose=VERBOSE)
-    manager.set_lrd_rank(128, [["visual", "mlp.up_proj", 2]])
-    manager.set_lrd_rank(512, [
+    # manager.set_lrd_rank(128, [["visual", "mlp.up_proj", 2]])
+    manager.set("lrd", "rank", 64, [
         ["language_model", "mlp.down_proj", 26],
         ["language_model", "mlp.down_proj", 27]
-        ])
+        ], verbose=VERBOSE)
 
     # Optionally print the full compression configuration as a table
     # print(manager)  
 
     # Apply all compression schemes to the model
-    manager.apply_all(hard=hard_mode, verbose=VERBOSE)
+    manager.apply(hard=hard_mode, verbose=VERBOSE)
 
     # Update in-place the compressed model configuration from the manager
     compress_config = manager.update_config(verbose=VERBOSE)
@@ -118,7 +118,7 @@ if DO_EXPORT:
     from transformersurgeon.export import export_to_hf
     print("Exporting model to Hugging Face...")
     token = None
-    with open("./hf_token.txt") as f: token = f.read().strip()
+    #with open("./hf_token.txt") as f: token = f.read().strip()
     export_to_hf(
         model,
         repo_id=f"prolucio/Qwen2.5-VL-compress-custom",

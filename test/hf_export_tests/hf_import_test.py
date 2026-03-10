@@ -5,7 +5,7 @@ from transformers import (
     AutoTokenizer,
     AutoModel,  # Added to test AutoModel loading (with trust_remote_code=True)
 )
-from test.qwen_tests.test_messages import messages
+#from test.qwen_tests.test_messages import messages
 from qwen_vl_utils import process_vision_info
 import sys
 
@@ -15,7 +15,7 @@ hard_mode = True
 use_vcon = False  # Whether to use VCON blocks
 vcon_beta = 0.5  # Beta value for VCON blocks (between 0 and 1)
 VERBOSE = True  # Whether to print detailed information during compression
-USE_AUTOMODEL = True  # Whether to load the model with AutoModel (trust_remote_code=True) or with the custom class directly
+USE_AUTOMODEL = False  # Whether to load the model with AutoModel (trust_remote_code=True) or with the custom class directly
 LOAD_REMOTE = False  # Whether to load the model from the Hugging Face Hub (True) or from a local path (False)
 ##########################
 
@@ -46,6 +46,8 @@ if LOAD_REMOTE:
     model_name = "prolucio/Qwen2.5-VL-compress-custom"  # Hugging Face Hub repo with the exported compressed model
 else:
     model_name = "./models/Qwen2.5-VL-compress-custom"  # Local path with the exported compressed model
+
+model_name = "/ibex/user/antonic/CESOIA/models/Qwen2.5-VL-compress-custom"
 
 # Device
 # Get GPU number from command line arguments
