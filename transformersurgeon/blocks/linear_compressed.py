@@ -99,5 +99,8 @@ class LinearCompressed(nn.Linear):
 
     def __str__(self):
         return self.__repr__()
+
+    def __repr__(self):
+        return f"LinearCompressed(in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, rank={self.rank})" 
     
 __all__ = ["LinearCompressed"]

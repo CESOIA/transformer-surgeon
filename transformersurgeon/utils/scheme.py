@@ -72,14 +72,15 @@ class CompressionScheme:
 
         # Generate compressor list based on the provided configuration
         self.compressors = {}
+        self.config = compression_config
         # Extract path-specific compression configuration, if provided
-        if compression_config is not None:
+        if self.config is not None:
             for comp_name, comp_config in compression_config.items():
                 # Instantiate correct compressor with the provided configuration
-                compressor = COMPRESSOR_DICT.get(comp_name, None)
-                if compressor is None:
+                compressor_class = COMPRESSOR_DICT.get(comp_name, None)
+                if compressor_class is None:
                     raise ValueError(f"Unsupported compression type '{comp_name}' in configuration.")
-                self.compressors[comp_name] = compressor(**comp_config)
+                self.compressors[comp_name] = compressor_class(comp_config)
 
         # Check if the module exists in the model
         if self.model is not None:
@@ -124,12 +125,17 @@ class CompressionScheme:
 
         # Generate compressor if necessary
         if compression_name not in self.compressors:
+            # If compressor config existed, something went wrong
+            assert compression_name not in self.config, f"Configuration exists without related compressor for '{compression_name}'. Something went wrong."
+            # Get compressor class
             compressor_class = COMPRESSOR_DICT.get(compression_name, None)
             if compressor_class is None:
                 raise ValueError(f"Unsupported compression type '{compression_name}' in configuration.")
-            self.compressors[compression_name] = compressor_class(self.get_module)
+            # Build default dict
+            self.config[compression_name] = {key: value["default"] for key, value in COMPRESSION_REGISTRY[compression_name].items()}
+            self.compressors[compression_name] = compressor_class(self.config[compression_name])
 
-        # Set the specified property of the compressor
+        # Set the specified (temp) property of the compressor
         compressor = self.compressors[compression_name]
         if hasattr(compressor, compression_property):
             setattr(compressor, compression_property, value)

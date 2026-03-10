@@ -61,8 +61,8 @@ def replace_layers_upon_init(
             
                 # Get lrd rank from config if available
                 compression_config = config_dict.get('compression_config', {})
-                compression_config = compression_config.get(path, {})
-                lrd_config = config_dict.get("lrd", {})
+                compression_config = compression_config.get(full_path, {})
+                lrd_config = compression_config.get("lrd", {})
                 rank = lrd_config.get("rank", None)
 
                 new_module = LinearCompressed(

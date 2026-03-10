@@ -109,26 +109,30 @@ def _structured_mask(
 class Pruner(Compressor):
     def __init__(
         self,
-        ratio=0.0,
-        mode="structured",
-        granularity="layer",
-        criterion="magnitude"
+        config,
         ):
         # Configuration
-        self.ratio = ratio
-        self.mode = mode
-        self.criterion = criterion
-        self.granularity = granularity
+        self.config = config
+        # Local temporary configuration
+        self.ratio = self.config["ratio"]
+        self.mode = self.config["mode"]
+        self.criterion = self.config["criterion"]
+        self.granularity = self.config["granularity"]
 
     def apply(self, module, hard=False, soft_applied=False):
         if not self._to_compress():
             return # No compression needed based on the configuration
 
-        # Extract pruning configuration
+        # Extract temp configuration
         ratio = self.ratio
         mode = self.mode
         criterion = self.criterion
         granularity = self.granularity
+        # Apply temp configuration to module config
+        self.config["ratio"] = ratio
+        self.config["mode"] = mode
+        self.config["criterion"] = criterion
+        self.config["granularity"] = granularity
 
         if ratio > 0:
             if not soft_applied:
@@ -164,7 +168,11 @@ class Pruner(Compressor):
     def restore(self, module):
         # Hard pruning is not implemented, no restoration needed
         # Soft pruning does not change topology, so no restoration needed
-        pass
+        # Restore module configuration
+        self.config["ratio"] = 0.0
+        self.config["mode"] = "structured"
+        self.config["criterion"] = "magnitude"
+        self.config["granularity"] = "layer"
 
     def _to_compress(self):
         # Check if pruning has to be applied based on the ratio configuration

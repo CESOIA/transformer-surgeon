@@ -40,23 +40,27 @@ def _quantize_binarize(weight):
 class Quantizer(Compressor):
     def __init__(
         self,
-        precision="full",
-        sparsity=0.0,
-        sparse_criterion="magnitude",
+        config,
         ):
         # Configuration
-        self.precision = precision
-        self.sparsity = sparsity
-        self.sparse_criterion = sparse_criterion
+        self.config = config
+        # Local temporary configuration
+        self.precision = self.config["precision"]
+        self.sparsity = self.config["sparsity"]
+        self.sparse_criterion = self.config["sparse_criterion"]
 
     def apply(self, module, hard=False, soft_applied=False):
         if not self._to_compress():
             return # No compression needed based on the configuration
 
-        # Extract quantization configuration
+        # Extract temp configuration
         precision = self.precision
         sparsity = self.sparsity
         sparse_criterion = self.sparse_criterion
+        # Apply temp configuration to module config
+        self.config["precision"] = precision
+        self.config["sparsity"] = sparsity
+        self.config["sparse_criterion"] = sparse_criterion
 
         if precision:
             if not hard and not soft_applied:
@@ -88,6 +92,10 @@ class Quantizer(Compressor):
     def restore(self, module):
         module.precision = "full" # Reset precision to full to restore original weights
         module.qsparsity = 0.0 # Reset qsparsity to 0 to restore original weights
+        # Restore module configuration
+        self.config["precision"] = "full"
+        self.config["sparsity"] = 0.0
+        self.config["sparse_criterion"] = "magnitude"
         
     def _to_compress(self):
         # Check if quantization has to be applied based on the precision configuration
