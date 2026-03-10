@@ -13,28 +13,9 @@ from .scheme import CompressionScheme
 
 class CompressionSchemesManager:
     """
-    Manages multiple compression schemes for transformer models.
-
-    Args:
-        config (Dict[str, Any]): Configuration dictionary for compression. You can use model.config.to_dict() to get this.
-        model (torch.nn.Module): The model to be compressed.
-        indexing (List[Dict[str, Any]]): List of block-specific configuration dictionaries.
-
-    Methods:
-        init_vcon: Initialize VCON blocks for selected modules.
-        cancel_vcon: Remove VCON blocks and restore original modules.
-        set_vcon_beta: Set the beta parameter for VCON blocks.
-        freeze_uncompressed_vcon: Freeze original blocks in VCON.
-        apply: Apply compression schemes to the model.
-        restore: Restore the model to its original state.
-        init_vcon_all: Initialize VCON for all modules.
-        cancel_vcon_all: Cancel VCON for all modules.
-        set_vcon_beta_all: Set beta for all VCON blocks.
-        freeze_uncompressed_vcon_all: Freeze all uncompressed VCON blocks.
-        apply_all: Apply all compression schemes.
-        restore_all: Restore all modules.
+    Class for managing multiple compression schemes across different modules of a transformer model. It allows setting properties, initializing VCON blocks, applying compression, and restoring the original model state based on flexible filtering criteria.
     """
-    
+
     def __init__(self,
                  model: torch.nn.Module,
                  indexing: List[Dict[str, Any]]
@@ -43,20 +24,13 @@ class CompressionSchemesManager:
         Initialize the compression manager.
         
         Args:
-            config: The main configuration object
             model: The model to apply compression to
-            indexing: Model-specific indexing containing:
-                - block_configs: List of block configurations, each containing:
-                    - name: Name of the block type (e.g., 'vision', 'text')
-                    - num_blocks: Number of blocks
-                    - key_list: List of compression keys
-                    - path_list: List of corresponding module paths
-                    - path_template: Template for generating full paths
-                    - config_attr: Attribute name in main config for this block type
+            indexing: Model-specific indexing
         """
         self.model = model
         try:
             self.config = model.config
+            assert isinstance(self.config, PretrainedConfig), "Model config is not an instance of PretrainedConfig. Please provide a model with a valid Hugging Face configuration."
         except AttributeError:
             raise ValueError("The provided model does not have a 'config' attribute. Please provide a model with a valid configuration.")
         self.indexing = indexing
@@ -155,8 +129,6 @@ class CompressionSchemesManager:
             Dict[str, List[Dict[str, CompressionScheme]]]: Nested dictionary of compression schemes organized by block type and block index.
         """
         all_schemes = {}
-
-        config = self.config.to_dict() if isinstance(self.config, PretrainedConfig) else self.config
         
         for block_name, block_indexing in self.indexing.items():
             config_attr = block_indexing.get('config_attr', None)
@@ -167,12 +139,14 @@ class CompressionSchemesManager:
 
             # Get the specific config for this block type
             if config_attr == '':
-                block_specific_config = config
+                block_specific_config = self.config
             else:
-                block_specific_config = config[config_attr]
+                block_specific_config = getattr(self.config, config_attr, None)
+            assert block_specific_config is not None, f"Config attribute '{config_attr}' not found in the model configuration for block '{block_name}'. Please check the indexing configuration."
 
             # Get blocks number
-            num_blocks = block_specific_config[num_blocks_attr]
+            num_blocks = getattr(block_specific_config, num_blocks_attr, None)
+            assert num_blocks is not None, f"Number of blocks attribute '{num_blocks_attr}' not found in the model configuration for block '{block_name}'. Please check the indexing configuration."
 
             tmp_dict = {}
             for i in range(num_blocks):
@@ -181,8 +155,8 @@ class CompressionSchemesManager:
                     full_path = path_template.format(block_index=i, path=path)
 
                     # Get pruning ratio and LRD rank from config
-                    compression_config = block_specific_config.get('compression_config', {})
-                    compression_config = compression_config.get(full_path, None)
+                    compression_config = getattr(block_specific_config, 'compression_config', {})
+                    compression_config = compression_config.setdefault(full_path, {})
                     tmp_dict[full_path] = CompressionScheme(
                         name=path,
                         block_id=i,

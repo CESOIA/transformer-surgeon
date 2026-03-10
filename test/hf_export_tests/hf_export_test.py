@@ -4,9 +4,14 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
+<<<<<<< HEAD
 # from test.qwen_tests.test_messages import messages
 from qwen_vl_utils import process_vision_info
+=======
+>>>>>>> main
 import sys
+sys.path.append("../test_data")  # Add the path to the parent directory to import from it
+from test_messages import messages  # Import the messages defined in test_messages.py
 
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
@@ -14,6 +19,8 @@ hard_mode = True
 VERBOSE = True  # Whether to print detailed information during compression
 DO_COMPRESSION = True  # Whether to apply compression
 DO_EXPORT = True  # Whether to export the model to Hugging Face Hub
+LOCAL_ONLY = True  # Whether to avoid any interaction with Hugging Face Hub (e.g., for testing purposes without credentials)
+REPO_ID = "prolucio/Qwen2.5-VL-compress-custom"  # Repository ID for Hugging Face Hub (e.g., "username/repo_name")
 ##########################
 
 if model_type == "qwen2_vl_c":
@@ -28,7 +35,7 @@ if model_type == "qwen2_vl_c":
     managerClass = Qwen2VLCompressionSchemesManager
 
     # Model name
-    model_name = "Qwen/Qwen2-VL-7B-Instruct"
+    model_name = "Qwen/Qwen2-VL-2B-Instruct"
 elif model_type == "qwen2_5_vl_c":
     from transformersurgeon import (
         Qwen2_5_VLForConditionalGenerationCompress,
@@ -41,7 +48,7 @@ elif model_type == "qwen2_5_vl_c":
     managerClass = Qwen2_5_VLCompressionSchemesManager
 
     # Model name
-    model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+    model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 # Device
 # Get GPU number from command line arguments
@@ -57,9 +64,9 @@ device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 # Load processor, model and tokenizer
 # N.B.: using torch_dtype="auto" to automatically use bfloat16 if supported by the GPU (e.g., A100, H100)
 # Not using it results in loading the model in float32, which requires more memory
-processor = AutoProcessor.from_pretrained(model_name, torch_dtype="auto")
-tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
-model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
+processor = AutoProcessor.from_pretrained(model_name, dtype="auto")
+tokenizer = AutoTokenizer.from_pretrained(model_name, dtype="auto")
+model = modelClass.from_pretrained(model_name, dtype="auto").to(device)
 
 
 ### COMPRESSION AND HUGGING FACE EXPORT TEST ###
@@ -86,16 +93,15 @@ print("Number of parameters of the output layers:", sum(p.numel() for n, p in mo
 
 if DO_COMPRESSION:
     manager = managerClass(model)
-    # manager.set_lrd_rank(512,
+    # manager.set("lrd", "rank", 128,
     #     [
     #         ["visual", "mlp.up_proj"],                # Apply to all "mlp.up_proj" layers in vision_config
     #         ["visual", "mlp.down_proj", 0],           # Apply to the first "mlp.down_proj" layer in vision_config
     #         ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
     #         ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
     #     ], verbose=VERBOSE)
-    # manager.set_lrd_rank(128, [["visual", "mlp.up_proj", 2]])
-    manager.set("lrd", "rank", 64, [
-        ["language_model", "mlp.down_proj", 26],
+    manager.set("lrd", "rank", 128, [["visual", "mlp.up_proj", 2]])
+    manager.set("lrd", "rank", 128, [["language_model", "mlp.down_proj", 26],
         ["language_model", "mlp.down_proj", 27]
         ], verbose=VERBOSE)
 
@@ -118,10 +124,12 @@ if DO_EXPORT:
     from transformersurgeon.export import export_to_hf
     print("Exporting model to Hugging Face...")
     token = None
-    #with open("./hf_token.txt") as f: token = f.read().strip()
+    repo_id = REPO_ID
+    if not LOCAL_ONLY:
+        with open("./hf_token.txt") as f: token = f.read().strip()
     export_to_hf(
         model,
-        repo_id=f"prolucio/Qwen2.5-VL-compress-custom",
+        repo_id=repo_id,
         base_model=model_name,
         out_dir="models",
         readme="This is a compressed version of Qwen2.5-VL-7B-Instruct using custom compression schemes.",

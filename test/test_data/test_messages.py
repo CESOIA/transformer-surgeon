@@ -5,7 +5,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image.jpg",
+                "image": "../test_data/example_image.jpg",
             },
             {
                 "type": "text",
@@ -18,7 +18,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image.jpg",
+                "image": "../test_data/example_image.jpg",
             },
             {
                 "type": "text",
@@ -31,7 +31,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image2.png",
+                "image": "../test_data/example_image2.png",
             },
             {
                 "type": "text",
@@ -44,7 +44,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "example_image2.png",
+                "image": "../test_data/example_image2.png",
             },
             {
                 "type": "text",
