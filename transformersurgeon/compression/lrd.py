@@ -34,17 +34,21 @@ def _low_rank_svd(weight, rank: int) -> torch.Tensor:
 class LRDer(Compressor):
     def __init__(
         self,
-        rank="full"
+        config,
         ):
         # Configuration
-        self.rank = rank
+        self.config = config
+        # Local temporary configuration
+        self.rank = self.config["rank"]
 
     def apply(self, module, hard=False, soft_applied=False):
         if not self._to_compress():
             return # No compression needed based on the configuration
 
-        # Extract low-rank decomposition configuration
+        # Extract temp configuration
         rank = self.rank
+        # Apply temp configuration to module config
+        self.config["rank"] = rank
     
         if rank:
             if not soft_applied:
@@ -56,7 +60,8 @@ class LRDer(Compressor):
 
     def restore(self, module):
         if not self._to_compress():
-            return # No restoration needed based on the configuration
+            # Restore module configuration
+            self.config["rank"] = "full"
 
         if not hasattr(module, 'weight_2'):
             raise AttributeError("Module does not have 'weight_2' attribute required for LRD restoration.")
