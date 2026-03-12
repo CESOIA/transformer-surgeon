@@ -4,14 +4,9 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-<<<<<<< HEAD
-# from test.qwen_tests.test_messages import messages
-from qwen_vl_utils import process_vision_info
-=======
->>>>>>> main
+
 import sys
 sys.path.append("../test_data")  # Add the path to the parent directory to import from it
-from test_messages import messages  # Import the messages defined in test_messages.py
 
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
@@ -100,7 +95,7 @@ if DO_COMPRESSION:
     #         ["visual", "mlp.down_proj", 1],           # Apply to the second "mlp.down_proj" layer in vision_config
     #         ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
     #     ], verbose=VERBOSE)
-    manager.set("lrd", "rank", 128, [["visual", "mlp.up_proj", 2]])
+    #manager.set("lrd", "rank", 128, [["visual", "mlp.up_proj", 2]])
     manager.set("lrd", "rank", 128, [["language_model", "mlp.down_proj", 26],
         ["language_model", "mlp.down_proj", 27]
         ], verbose=VERBOSE)

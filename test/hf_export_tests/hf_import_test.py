@@ -8,7 +8,7 @@ from transformers import (
 from qwen_vl_utils import process_vision_info
 import sys
 sys.path.append("../test_data")  # Add the path to the parent directory to import from it
-from test_messages import messages  # Import the messages defined in test_messages.py
+#from test_messages import messages  # Import the messages defined in test_messages.py
 
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 

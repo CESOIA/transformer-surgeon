@@ -92,7 +92,7 @@ class VCON_beta_upd(TrainerCallback):
 ### COMPRESSION CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 
 hard_mode = False
-use_vcon = True  # Whether to use VCON blocks
+use_vcon = False  # Whether to use VCON blocks
 vcon_beta = 1.0  # Beta value for VCON blocks (between 0 and 1)
 vcon_epochs = 2 # For how many epochs will we apply VCON?
 ##########################

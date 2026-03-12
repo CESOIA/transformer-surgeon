@@ -60,6 +60,8 @@ device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 
 model_name = "/ibex/user/antonic/CESOIA/transformer-surgeon/qwen-vl-finetune/checkpoints"
 
+model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
+
 # Load processor, model and tokenizer
 # N.B.: using torch_dtype="auto" to automatically use bfloat16 if supported by the GPU (e.g., A100, H100)
 # Not using it results in loading the model in float32, which requires more memory
