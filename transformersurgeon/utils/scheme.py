@@ -225,22 +225,23 @@ class CompressionScheme:
                     kwargs[name] = getattr(module, name)
         # Create a new instance of the same class
         module_copy = type(module)(**kwargs)
-        for name, param in module.named_parameters(recurse=False):
-            getattr(module_copy, name).copy_(param.detach().clone())
-        for name, buf in module.named_buffers(recurse=False):
-            setattr(module_copy, name, buf.clone())
-        # Copy other attributes except parameters, buffers, and methods
-        for attr, value in module.__dict__.items():
-            if (
-                not attr.startswith('_')
-                and not isinstance(value, torch.nn.Parameter)
-                and not isinstance(value, torch.Tensor)
-                and not callable(value)
-            ):
-                try:
-                    setattr(module_copy, attr, copy.deepcopy(value))
-                except Exception:
-                    pass
+        with torch.no_grad():
+            for name, param in module.named_parameters(recurse=False):
+                getattr(module_copy, name).copy_(param.detach().clone())
+            for name, buf in module.named_buffers(recurse=False):
+                setattr(module_copy, name, buf.clone())
+            # Copy other attributes except parameters, buffers, and methods
+            for attr, value in module.__dict__.items():
+                if (
+                    not attr.startswith('_')
+                    and not isinstance(value, torch.nn.Parameter)
+                    and not isinstance(value, torch.Tensor)
+                    and not callable(value)
+                ):
+                    try:
+                        setattr(module_copy, attr, copy.deepcopy(value))
+                    except Exception:
+                        pass
         return module_copy
 
     def init_vcon(self, verbose=False):
