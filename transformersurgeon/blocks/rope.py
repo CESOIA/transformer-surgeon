@@ -41,16 +41,16 @@ def precompute_rope_cos_sin_half(
     # Broadcast cos and sin to match x's shape
     t = torch.arange(position, position+seq_len, device=device).float()
     angles = t.unsqueeze(-1) * inv_freq.unsqueeze(0)  # (seq_len, rotated_dim//2)
-    angles = angles.unsqueeze(0).unsqueeze(0)         # (1, 1, seq_len, rotated_dim//2)
+    angles = angles.unsqueeze(1).unsqueeze(0)         # (1, seq_len, 1, rotated_dim//2)
 
-    cos = torch.cos(angles)  # (1, 1, 1, rotated_dim//2)
-    sin = torch.sin(angles)  # (1, 1, 1, rotated_dim//2)
+    cos = torch.cos(angles)  # (1, seq_len, 1, rotated_dim//2)
+    sin = torch.sin(angles)  # (1, seq_len, 1, rotated_dim//2)
     return cos, sin
 
 def apply_rope_multihead(
         x : torch.Tensor,          # (batch_size, num_heads, seq_len, head_dim)
-        cos : torch.Tensor,        # Precomputed half-size cosine values for RoPE (1, 1, seq_len, rotated_dim//2)
-        sin : torch.Tensor,        # Precomputed half-size sine values for RoPE (1, 1, seq_len, rotated_dim//2)
+        cos : torch.Tensor,        # Precomputed half-size cosine values for RoPE (1, seq_len, 1, rotated_dim//2)
+        sin : torch.Tensor,        # Precomputed half-size sine values for RoPE (1, seq_len, 1, rotated_dim//2)
         ):
     """
     Apply the rotation to the input tensor x (query or key) using precomputed cosine and sine values.

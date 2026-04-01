@@ -3,30 +3,34 @@ import os
 import tqdm
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from transformersurgeon import Qwen2_5_VLForConditionalGenerationCompress
+# from transformersurgeon import Qwen2_5_VLForConditionalGenerationCompress
+from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.utils import convert_for_export
-from transformersurgeon import precompute_rope_inv_freqs
 from transformers import Qwen2TokenizerFast
 
-MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
+# MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
+MODEL_NAME = "Qwen/Qwen2-0.5B-Instruct"
 
 tokenizer = Qwen2TokenizerFast.from_pretrained(MODEL_NAME)
-model = Qwen2_5_VLForConditionalGenerationCompress.from_pretrained(MODEL_NAME)
+# model = Qwen2_5_VLForConditionalGenerationCompress.from_pretrained(MODEL_NAME)
+model = Qwen2ForCausalLMCompress.from_pretrained(MODEL_NAME)
 
 # Extract language backbone only
 embedding = model.get_input_embeddings()
-decoder = model.model.language_model
 final_layer = model.lm_head
 
 # Convert to export-compatible modules
-converted_models = convert_for_export(model, verbose=False)
+max_context_len = 512
+convert_options = {
+    "use_sdpa": True,  # Whether to use SDPA or regular MHA in the decoder wrapper
+    "max_cache_len": max_context_len,  # Maximum cache length for the decoder wrapper
+}
+converted_models = convert_for_export(model, options=convert_options, verbose=True)
 decoder = converted_models['text']
-print("Total cache length:", decoder.total_cache_length)
 
 # Set device and data type
-# device = torch.device("cpu")
-device = torch.device("cuda")
-data_type = torch.float16
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+data_type = torch.float32
 
 # Put all modules on the same device
 embedding = embedding.to(device, dtype=data_type)
@@ -62,28 +66,16 @@ def logits_to_input_id(logits, temperature=1.0):
     
     return torch.multinomial(probs, num_samples=1)
 
-# Precompute RoPE inverse frequencies
-inv_freq = precompute_rope_inv_freqs(
-    head_dim=128,
-    base=1e6,
-    device=device,
-    ).to(data_type)
-
 # Decode loop
-max_new_tokens = 512
-temperature = 0.0
+temperature = 0.2
 
 # Initialize embeddings sequence
 inputs_embeds = embedding(input_ids)
 
 # Prefill phase
-key_cache = torch.zeros((inputs_embeds.size(0), 1, decoder.total_cache_length), device=device, dtype=data_type)
-value_cache = torch.zeros_like(key_cache)
-output_embed, key_cache, value_cache = decoder(
+output_embed = decoder(
     inputs_embeds,
-    inv_freq=inv_freq,
-    key_cache=key_cache,
-    value_cache=value_cache,
+    cache_len=inputs_embeds.size(1),
     )
 # Extract logits from output embed
 logits = final_layer(output_embed[:, -1, :])
@@ -95,12 +87,14 @@ output_ids = torch.cat([input_ids, output_id], dim=1)
 inputs_embeds = embedding(output_id)
 
 with torch.no_grad():
-    for i in tqdm.tqdm(range(max_new_tokens), "Generating"):
-        output_embed, key_cache, value_cache = decoder(
+
+    start_context_len = output_ids.size(1)
+    for i in tqdm.tqdm(range(start_context_len, max_context_len), "Generating"):
+        cache_len = output_ids.size(1) + 1
+
+        output_embed = decoder(
             inputs_embeds[:, -1:, :],
-            inv_freq=inv_freq,
-            key_cache=key_cache,
-            value_cache=value_cache,
+            cache_len=cache_len,
             )
         
         # Extract logits from output embed
@@ -117,6 +111,7 @@ with torch.no_grad():
 
         # Check for end-of-sequence token
         if output_id.item() == tokenizer.eos_token_id:
+            print("End-of-sequence token generated, stopping generation.")
             break
 
 # Detokenize output_ids to string

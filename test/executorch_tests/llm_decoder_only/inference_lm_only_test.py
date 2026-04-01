@@ -15,13 +15,15 @@ device = torch.device("cpu")
 data_type = torch.float32  # Data type for model weights
 
 ### LOAD INPUT AND OUTPUT EXAMPLES FOR TESTING ###
-print("Load total cache length parameter to shape the input tensors for the decoder...")
-total_cache_length = torch.load("total_cache_length.pt")
-
 print("Loading example input tensors...")
 example_inputs_embedding = torch.load("example_inputs_embedding.pt")
 example_inputs_decoder = torch.load("example_inputs_decoder.pt")
 example_inputs_final_layer = torch.load("example_inputs_final_layer.pt")
+
+print("Example input shapes:")
+print("Embedding input shape:", example_inputs_embedding[0].shape)
+print("Decoder input shapes:", [tensor.shape for tensor in example_inputs_decoder])
+print("Final layer input shapes:", [tensor.shape for tensor in example_inputs_final_layer])
 
 print("Loading example output tensors for reference...")
 example_outputs_embedding = torch.load("example_outputs_embedding.pt")
@@ -53,18 +55,16 @@ print("Test full executorch pipeline with a different sequence length...")
 # Test with a different sequence length
 batch_size = 1
 seq_len = 10
-cache_len = 50
-max_seq_len = 1217
+cache_seq_len = 35
 embed_dim = 3584
 vocab_size = 152064
 
 example_input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long)
-example_key_cache = torch.randn(batch_size, cache_len, total_cache_length, dtype=data_type).to(device)
-example_value_cache = torch.randn(batch_size, cache_len, total_cache_length, dtype=data_type).to(device)
+cache_len_tensor = torch.ones(cache_seq_len, device=device)
 
 # run executorch methods
 outputs_embedding = method_embedding.execute([example_input_ids])
-outputs_decoder = method_decoder.execute([outputs_embedding[0], example_key_cache, example_value_cache])
+outputs_decoder = method_decoder.execute([outputs_embedding[0], cache_len_tensor])
 outputs_final_layer = method_final_layer.execute([outputs_decoder[0]])
 
 # if the program runs without error, we can consider the test successful. We can also check the output shapes

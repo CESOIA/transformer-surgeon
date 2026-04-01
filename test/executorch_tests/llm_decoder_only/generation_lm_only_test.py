@@ -1,24 +1,42 @@
 import torch
 import os
 import tqdm
+import time
 from copy import deepcopy
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-MAX_AVAILABLE_THREADS = torch.get_num_threads()
-SELECTED_THREADS = 1
-print(f"Available CPU threads: {MAX_AVAILABLE_THREADS}")
-torch.set_num_threads(min(MAX_AVAILABLE_THREADS, SELECTED_THREADS))  # Limit threads
-print(f"Using {torch.get_num_threads()} CPU threads for PyTorch operations")
+# MAX_AVAILABLE_THREADS = torch.get_num_threads()
+# SELECTED_THREADS = 1
+# print(f"Available CPU threads: {MAX_AVAILABLE_THREADS}")
+# torch.set_num_threads(min(MAX_AVAILABLE_THREADS, SELECTED_THREADS))  # Limit threads
+# print(f"Using {torch.get_num_threads()} CPU threads for PyTorch operations")
 
 from transformers import Qwen2TokenizerFast
 MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 from executorch.runtime import Runtime
 
+# Benchmark environment context manager
+class BenchmarkEnv:
+    def __init__(self):
+        self.lastmeasure = None
+
+    def __enter__(self):
+        self._tic = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        self.lastmeasure = time.perf_counter() - self._tic
+
+    def get_last_measure_us(self):
+        return self.lastmeasure/1e-6
+    
+benchmarkenv = BenchmarkEnv()
+
+# Device and data type setup
+
 device = torch.device("cpu")
 data_type = torch.float32  # Data type for model weights
 
-# Load total cache length from file
-TOTAL_CACHE_LENGTH = torch.load("total_cache_length.pt")
 # Load model runtime
 runtime = Runtime.get()
 # Load executorch model
@@ -60,21 +78,21 @@ def logits_to_input_id(logits, temperature=1.0):
 
 # Decode loop
 max_new_tokens = 256
-temperature = 0.6
+temperature = 0.3
 
 # Initialize embeddings sequence
 inputs_embeds = method_embedding.execute([input_ids])[0]
 
-# Initialize cache
-key_cache = torch.empty((inputs_embeds.size(0), 1, TOTAL_CACHE_LENGTH), device=device, dtype=data_type)
-value_cache = torch.empty_like(key_cache)
+cache_len_tensor = torch.ones(inputs_embeds.size(1))
 
 # Prefill
-output_embed, key_cache, value_cache = method_decoder.execute([
-    inputs_embeds,
-    key_cache,
-    value_cache,
-    ])
+
+with benchmarkenv:
+    output_embed, = method_decoder.execute([
+        inputs_embeds,
+        cache_len_tensor,
+        ])
+print(f"Prefill time: {benchmarkenv.get_last_measure_us():.2f} us for {inputs_embeds.size(1)} tokens")
 
 # Extract logits from output embed
 logits = method_final_layer.execute([output_embed[:, -1:, :]])[0]
@@ -85,14 +103,17 @@ output_ids = torch.cat([input_ids, output_id], dim=1)
 # Get next input embeddings
 inputs_embeds = method_embedding.execute([output_id])[0]
 
+elapsed_times = []
 position = output_embed.size(1)
 for i in tqdm.tqdm(range(max_new_tokens), "Generating"):
     # Decode
-    output_embed, key_cache, value_cache = method_decoder.execute([
-        inputs_embeds[:, -1:, :],
-        key_cache,
-        value_cache,
-        ])
+    cache_len_tensor = torch.cat([cache_len_tensor, torch.ones(1, device=device)], dim=0)
+    with benchmarkenv:
+        output_embed, = method_decoder.execute([
+            inputs_embeds[:, -1:, :],
+            cache_len_tensor,
+            ])
+    elapsed_times.append(benchmarkenv.get_last_measure_us())
     
     # Extract logits from output embed
     logits = method_final_layer.execute([output_embed[:, -1:, :]])[0]
@@ -110,3 +131,5 @@ for i in tqdm.tqdm(range(max_new_tokens), "Generating"):
 generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
 
 print("Generated text:", generated_text)
+
+print(f"Average decoding time per token: {sum(elapsed_times)/len(elapsed_times):.2f} us")
