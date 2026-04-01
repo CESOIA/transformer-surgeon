@@ -6,7 +6,7 @@ from collections import defaultdict
 def nested_dict():
     return defaultdict(nested_dict)
 
-def convert_for_export(model, verbose=False):
+def convert_for_export(model, options={}, verbose=False):
     """
     Convert model components to be compatible with export formats like ONNX.
 
@@ -35,13 +35,18 @@ def convert_for_export(model, verbose=False):
             continue
 
         # Get configuration of the specific model component
-        config = whole_config[indexing['config_attr']]
+        if indexing['config_attr'] == "":
+            config = whole_config
+        else:
+            config = whole_config[indexing['config_attr']]
 
         # Instantiate new model structure based on indexing
         num_blocks = config[indexing['num_blocks_attr']]
 
         if indexing['structure'] == 'transformer_decoder':
-            new_model = _instantiate_decoder_block(config, indexing, num_blocks)
+            use_sdpa = options.get('use_sdpa', False)
+            max_cache_len = options.get('max_cache_len', 2048)
+            new_model = _instantiate_decoder_block(config, indexing, num_blocks, use_sdpa, max_cache_len)
             path_template = "blocks.{i}.{path}"
         else:
             raise NotImplementedError(f"Conversion for structure '{indexing['structure']}' is not implemented.")
@@ -70,7 +75,7 @@ def convert_for_export(model, verbose=False):
 
     return new_models
         
-def _instantiate_decoder_block(config, indexing, blocks_num):
+def _instantiate_decoder_block(config, indexing, blocks_num, use_sdpa=False, max_cache_len=2048):
     """
     Instantiate a TransformerDecoder block based on the provided indexing and hf configuration.
     TransformerDecoder configuration is built as a list of independent block configurations, each defined as a nested dictionary.
@@ -126,6 +131,8 @@ def _instantiate_decoder_block(config, indexing, blocks_num):
             "norm_type": norm_type,            
             "compression_config": compression_config,
             "bias_required": bias_required,
+            "use_sdpa": use_sdpa,
+            "max_cache_len": max_cache_len,
         }
 
         blocks_config.append(block_config)
