@@ -12,7 +12,7 @@ class BertConfigCompress(BertConfig):
     def __init__(self, compression=None, **kwargs):
         compression_config = kwargs.pop("compression_config", {})
         super().__init__(**kwargs)
-        init_compression_config(
+        init_compressed_config(
             config_instance=self,
             indexing=INDEXING["bert"],
             compression_config=compression_config
