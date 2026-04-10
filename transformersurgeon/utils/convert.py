@@ -1,10 +1,26 @@
 import warnings
 from ..blocks import TransformerDecoder
+from ..blocks.indexing import CUSTOM_DECODER_INDEXING
+from ..blocks.config import build_custom_decoder_config
 from .utils import get_submodule
-from collections import defaultdict
+import copy
 
-def nested_dict():
-    return defaultdict(nested_dict)
+
+def _build_converted_compression_config(indexing, source_config_obj, num_blocks):
+    """
+    Remap source compression_config keys from original HF paths to converted custom graph paths.
+    """
+    layer_matching = indexing.get('layer_matching', indexing['path_list'])
+    source_cfg = getattr(source_config_obj, 'compression_config', {}) or {}
+
+    converted_cfg = {}
+    for i in range(num_blocks):
+        for old_path, new_path in zip(indexing['path_list'], layer_matching):
+            old_full = indexing['path_template'].format(block_index=i, path=old_path)
+            new_full = f"blocks.{i}.{new_path}"
+            converted_cfg[new_full] = copy.deepcopy(source_cfg.get(old_full, {}))
+
+    return converted_cfg
 
 def convert_for_export(model, options={}, verbose=False):
     """
@@ -21,6 +37,7 @@ def convert_for_export(model, options={}, verbose=False):
     # Get indexing and config for the whole model (e.g., vision + text)
     whole_indexing = model.indexing
     whole_config = model.config.to_dict()
+    whole_config_obj = model.config
 
     # Convert each model component separately
     new_models = {}
@@ -37,8 +54,10 @@ def convert_for_export(model, options={}, verbose=False):
         # Get configuration of the specific model component
         if indexing['config_attr'] == "":
             config = whole_config
+            source_config_obj = whole_config_obj
         else:
             config = whole_config[indexing['config_attr']]
+            source_config_obj = getattr(whole_config_obj, indexing['config_attr'])
 
         # Instantiate new model structure based on indexing
         num_blocks = config[indexing['num_blocks_attr']]
@@ -52,8 +71,9 @@ def convert_for_export(model, options={}, verbose=False):
             raise NotImplementedError(f"Conversion for structure '{indexing['structure']}' is not implemented.")
         
         # Import parameters from the original model to the new model
+        layer_matching = indexing.get('layer_matching', indexing['path_list'])
         for i in range(num_blocks):
-            for old_path, new_path in zip(indexing['path_list'], indexing['layer_matching']):
+            for old_path, new_path in zip(indexing['path_list'], layer_matching):
                 old_path = indexing['path_template'].format(block_index=i, path=old_path)
                 new_path = path_template.format(i=i, path=new_path)
                 if verbose:
@@ -64,12 +84,35 @@ def convert_for_export(model, options={}, verbose=False):
 
         # Handle extra layers if any
         if 'extra_layers' in indexing:
-            for old_path, new_path in zip(indexing['extra_layers'], indexing['extra_layers_matching']):
+            extra_layers_matching = indexing.get('extra_layers_matching', [])
+            if not extra_layers_matching:
+                extra_layers_matching = [path.split(".")[-1] for path in indexing['extra_layers']]
+            for old_path, new_path in zip(indexing['extra_layers'], extra_layers_matching):
                 if verbose:
                     print("Transfering extra layer parameters:", old_path, "->", new_path)
                 old_layer = get_submodule(model, old_path)
                 new_layer = get_submodule(new_model, new_path)
                 new_layer.load_state_dict(old_layer.state_dict())
+
+        # Attach converted config/indexing so manager can be used directly on converted graph.
+        converted_indexing = copy.deepcopy(CUSTOM_DECODER_INDEXING)
+        converted_indexing["decoder"]["num_blocks_attr"] = indexing["num_blocks_attr"]
+        converted_indexing["decoder"]["path_list"] = [
+            path
+            for path in layer_matching
+            if path.startswith("attn.") or path.startswith("mlp.")
+        ]
+        converted_compression_config = _build_converted_compression_config(
+            indexing,
+            source_config_obj,
+            num_blocks,
+        )
+        new_model.config = build_custom_decoder_config(
+            source_config_obj,
+            converted_indexing["decoder"],
+            compression_config=converted_compression_config,
+        )
+        new_model.indexing = converted_indexing
 
         new_models[name] = new_model
 
@@ -87,28 +130,39 @@ def _instantiate_decoder_block(config, indexing, blocks_num, use_sdpa=False, max
     """
     # Generate block configuration list from the hf configuration
     blocks_config = []
+    layer_matching = indexing.get('layer_matching', indexing['path_list'])
     for i in range(blocks_num):
 
-        # Define compression configuration as a nested dictionary
-        compression_config = nested_dict()
-        bias_required = nested_dict()
-        for j, (path, matched) in enumerate(zip(indexing['path_list'], indexing['layer_matching'])):
+        # Define compression and bias in strict nested block format.
+        compression_config = {
+            "attn": {},
+            "mlp": {},
+        }
+        bias_required = {
+            "attn": {},
+            "mlp": {},
+        }
+        for j, (path, matched) in enumerate(zip(indexing['path_list'], layer_matching)):
             full_path_old = indexing['path_template'].format(block_index=i, path=path)
 
-            if matched in ['norm_in', 'norm_out']:
-                continue  # Skip normalization layers
+            # Collect compression config parameters for compressible layers only.
+            if matched.startswith("attn."):
+                _, layer_name = matched.split(".", 1)
+                old_compression_config = config.get('compression_config', {}).get(full_path_old, {})
+                compression_config["attn"][layer_name] = copy.deepcopy(old_compression_config)
+            elif matched.startswith("mlp."):
+                _, layer_name = matched.split(".", 1)
+                old_compression_config = config.get('compression_config', {}).get(full_path_old, {})
+                compression_config["mlp"][layer_name] = copy.deepcopy(old_compression_config)
 
-            matched_block, matched_layer = matched.split('.')
-            
-            # Collect compression config parameters
-            old_compression_config = config['compression_config'].get(full_path_old, {})
-            for key in old_compression_config.keys():
-                old_subconfig = old_compression_config[key]
-                for subkey, value in old_subconfig.items():
-                    compression_config[matched_block][matched_layer][key][subkey] = value
-
-            # Collect bias requirement
-            bias_required[matched_block][matched_layer] = indexing['bias_required'][j]
+            # Collect bias requirement.
+            if 'bias_required' in indexing and j < len(indexing['bias_required']):
+                if matched.startswith("attn."):
+                    _, layer_name = matched.split(".", 1)
+                    bias_required["attn"][layer_name] = indexing['bias_required'][j]
+                elif matched.startswith("mlp."):
+                    _, layer_name = matched.split(".", 1)
+                    bias_required["mlp"][layer_name] = indexing['bias_required'][j]
 
         # Define block configuration
         embed_dim = config[indexing['embed_dim_attr']]
@@ -139,8 +193,11 @@ def _instantiate_decoder_block(config, indexing, blocks_num, use_sdpa=False, max
 
     # Define extra layers configuration
     extra_layers_config = {}
-    if 'extra_layers_matching' in indexing:
-        for extra_layer in indexing['extra_layers_matching']:
+    if 'extra_layers' in indexing:
+        extra_layers_matching = indexing.get('extra_layers_matching', [])
+        if not extra_layers_matching:
+            extra_layers_matching = [path.split(".")[-1] for path in indexing['extra_layers']]
+        for extra_layer in extra_layers_matching:
             if extra_layer == "norm":
                 extra_layers_config["norm"] = {
                     "embed_dim": config[indexing['embed_dim_attr']]

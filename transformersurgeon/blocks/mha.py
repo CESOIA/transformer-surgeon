@@ -81,10 +81,10 @@ class MHABase(torch.nn.Module):
         # Setup compression configuration
         if compression_config is None:
             compression_config = {
-                "q_proj": {"lrd_rank": "full"},
-                "k_proj": {"lrd_rank": "full"},
-                "v_proj": {"lrd_rank": "full"},
-                "out_proj": {"lrd_rank": "full"}
+                "q_proj": {"lrd": {"rank": "full"}},
+                "k_proj": {"lrd": {"rank": "full"}},
+                "v_proj": {"lrd": {"rank": "full"}},
+                "out_proj": {"lrd": {"rank": "full"}}
             }
 
         # Setup bias requirement
@@ -95,6 +95,12 @@ class MHABase(torch.nn.Module):
                 "v_proj": False,
                 "out_proj": False
             }
+        else:
+            bias_required = dict(bias_required)
+            bias_required.setdefault("q_proj", False)
+            bias_required.setdefault("k_proj", False)
+            bias_required.setdefault("v_proj", False)
+            bias_required.setdefault("out_proj", False)
         
         q_lrd_rank = compression_config["q_proj"]["lrd"]["rank"]
         k_lrd_rank = compression_config["k_proj"]["lrd"]["rank"]
@@ -171,8 +177,8 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         # Setup compression configuration
         if compression_config is None:
             compression_config = {
-                "qkv_proj": {"lrd_rank": "full"},
-                "out_proj": {"lrd_rank": "full"}
+                "qkv_proj": {"lrd": {"rank": "full"}},
+                "out_proj": {"lrd": {"rank": "full"}}
             }
 
         # Setup bias requirement
@@ -181,6 +187,10 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
                 "qkv_proj": False,
                 "out_proj": False
             }
+        else:
+            bias_required = dict(bias_required)
+            bias_required.setdefault("qkv_proj", False)
+            bias_required.setdefault("out_proj", False)
         
         qkv_lrd_rank = compression_config["qkv_proj"]["lrd"]["rank"]
         out_lrd_rank = compression_config["out_proj"]["lrd"]["rank"]

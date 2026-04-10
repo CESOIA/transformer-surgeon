@@ -9,6 +9,7 @@ from .rope import (
     precompute_rope_inv_freqs,
     precompute_rope_cos_sin_half,
 )
+from .atomic import AtomicSum
 
 class TransformerDecoderBlock(torch.nn.Module):
 
@@ -28,7 +29,7 @@ class TransformerDecoderBlock(torch.nn.Module):
                 - compression_config (dict, optional): Compression configuration for MHA and MLP layers
         """
 
-        # Extract configuration (mandatory)
+        # Extract configuration (strict schema).
         self.embed_dim = config["embed_dim"]
         self.num_heads = config["num_heads"]
         self.mlp_hidden_dim = config["mlp_hidden_dim"]
@@ -36,16 +37,19 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.mha_type = config["mha_type"]
         self.mlp_type = config["mlp_type"]
         self.norm_type = config["norm_type"]
-        self.bias_required = config["bias_required"]
         self.use_sdpa = config["use_sdpa"]
         self.max_cache_len = config["max_cache_len"]
 
         # Extract configuration (optional)
         self.kv_num_heads = None if "kv_num_heads" not in config else config["kv_num_heads"]
         self.compression_config = {
-            "attn": None,
-            "mlp": None,
+            "attn": {},
+            "mlp": {},
         } if "compression_config" not in config else config["compression_config"]
+        self.bias_required = {
+            "attn": {},
+            "mlp": {},
+        } if "bias_required" not in config else config["bias_required"]
 
         # Instantiate normalization modules
         if self.norm_type == "rmsnorm":
@@ -84,6 +88,9 @@ class TransformerDecoderBlock(torch.nn.Module):
                 compression_config=self.compression_config["mlp"])
         else:
             raise ValueError(f"Unsupported MLP type: {self.mlp_type}")
+        
+        # Instantiate skip connection atomicity module
+        self.atomic_sum = AtomicSum()
 
     def forward(
             self,
@@ -114,11 +121,11 @@ class TransformerDecoderBlock(torch.nn.Module):
             rope=rope,
             attn_mask=attn_mask,
             )
-        x = x + residual        # join skip connection
-        residual = x            # start skip connection
-        x = self.norm_out(x)    # norm layer
-        x = self.mlp(x)         # mlp block
-        x = residual + x        # join skip connection
+        x = self.atomic_sum(x, residual) # join skip connection
+        residual = x                     # start skip connection
+        x = self.norm_out(x)             # norm layer
+        x = self.mlp(x)                  # mlp block
+        x = residual + x                 # join skip connection
         return x
         
 
