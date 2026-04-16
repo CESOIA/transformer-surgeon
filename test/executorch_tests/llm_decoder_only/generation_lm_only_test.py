@@ -40,9 +40,10 @@ data_type = torch.float32  # Data type for model weights
 # Load model runtime
 runtime = Runtime.get()
 # Load executorch model
-program_embedding = runtime.load_program("embedding.pte")
-program_decoder = runtime.load_program("lm_decoder.pte")
-program_final_layer = runtime.load_program("final_layer.pte")
+flavour = "_int4"
+program_embedding = runtime.load_program(f"embedding{flavour}.pte")
+program_decoder = runtime.load_program(f"lm_decoder{flavour}.pte")
+program_final_layer = runtime.load_program(f"final_layer{flavour}.pte")
 # extract method
 method_embedding = program_embedding.load_method("forward")
 method_decoder = program_decoder.load_method("forward")

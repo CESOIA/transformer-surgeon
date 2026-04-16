@@ -30,7 +30,7 @@ decoder = converted_models['text']
 
 # Set device and data type
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-data_type = torch.float32
+data_type = torch.float16
 
 # Put all modules on the same device
 embedding = embedding.to(device, dtype=data_type)
@@ -43,7 +43,7 @@ template = (
     "<|im_start|>user\n{instruction}\n<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
-prompt = """What is the capital of France? Tell me something about it."""
+prompt = """Tell me a story."""
 
 # Tokenize inputs (string to input_ids)
 inputs = tokenizer(

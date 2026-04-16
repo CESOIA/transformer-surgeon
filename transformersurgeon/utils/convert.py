@@ -1,12 +1,41 @@
 import warnings
+import copy
+
 from ..blocks import TransformerDecoder
+from ..blocks.indexing import CUSTOM_DECODER_INDEXING
+from ..blocks.config import CustomDecoderConfigCompress
 from .utils import get_submodule
-from collections import defaultdict
 
-def nested_dict():
-    return defaultdict(nested_dict)
 
-def convert_for_export(model, options={}, verbose=False):
+def _build_converted_compression_config(indexing, source_config_obj, num_blocks):
+    """
+    Remap source compression_config keys from original HF paths to converted custom graph paths.
+    """
+    layer_matching = indexing.get('layer_matching', indexing['path_list'])
+    source_cfg = getattr(source_config_obj, 'compression_config', {}) or {}
+
+    converted_cfg = {}
+    for i in range(num_blocks):
+        for old_path, new_path in zip(indexing['path_list'], layer_matching):
+            old_full = indexing['path_template'].format(block_index=i, path=old_path)
+            new_full = f"blocks.{i}.{new_path}"
+            converted_cfg[new_full] = copy.deepcopy(source_cfg.get(old_full, {}))
+
+    return converted_cfg
+
+
+def _build_converted_decoder_indexing(indexing):
+    """Build converted indexing compatible with converted decoder config/model."""
+    converted_indexing = copy.deepcopy(CUSTOM_DECODER_INDEXING)
+    layer_matching = indexing.get("layer_matching", indexing["path_list"])
+    converted_indexing["decoder"]["path_list"] = [
+        path
+        for path in layer_matching
+        if path.startswith("attn.") or path.startswith("mlp.")
+    ]
+    return converted_indexing
+
+def convert_for_export(model, options=None, verbose=False):
     """
     Convert model components to be compatible with export formats like ONNX.
 
@@ -18,9 +47,11 @@ def convert_for_export(model, options={}, verbose=False):
         The converted model.
     """
 
+    options = options or {}
+
     # Get indexing and config for the whole model (e.g., vision + text)
     whole_indexing = model.indexing
-    whole_config = model.config.to_dict()
+    whole_config_obj = model.config
 
     # Convert each model component separately
     new_models = {}
@@ -36,24 +67,56 @@ def convert_for_export(model, options={}, verbose=False):
 
         # Get configuration of the specific model component
         if indexing['config_attr'] == "":
-            config = whole_config
+            source_config_obj = whole_config_obj
         else:
-            config = whole_config[indexing['config_attr']]
+            source_config_obj = getattr(whole_config_obj, indexing['config_attr'])
 
         # Instantiate new model structure based on indexing
-        num_blocks = config[indexing['num_blocks_attr']]
+        num_blocks = getattr(source_config_obj, indexing['num_blocks_attr'])
 
         if indexing['structure'] == 'transformer_decoder':
             use_sdpa = options.get('use_sdpa', False)
             max_cache_len = options.get('max_cache_len', 2048)
-            new_model = _instantiate_decoder_block(config, indexing, num_blocks, use_sdpa, max_cache_len)
+
+            converted_indexing = _build_converted_decoder_indexing(indexing)
+            converted_compression_config = _build_converted_compression_config(
+                indexing,
+                source_config_obj,
+                num_blocks,
+            )
+            layer_matching = indexing.get("layer_matching", indexing["path_list"])
+            source_bias = indexing.get("bias_required", [])
+            bias_required_config = {
+                "attn": {},
+                "mlp": {},
+            }
+            for j, new_path in enumerate(layer_matching):
+                if j >= len(source_bias):
+                    continue
+                if new_path.startswith("attn."):
+                    bias_required_config["attn"][new_path.split(".", 1)[1]] = source_bias[j]
+                elif new_path.startswith("mlp."):
+                    bias_required_config["mlp"][new_path.split(".", 1)[1]] = source_bias[j]
+
+            converted_config = CustomDecoderConfigCompress.from_source_config(
+                source_config_obj=source_config_obj,
+                source_indexing=indexing,
+                converted_indexing=converted_indexing["decoder"],
+                compression_config=converted_compression_config,
+                bias_required=bias_required_config,
+                use_sdpa=use_sdpa,
+                max_cache_len=max_cache_len,
+            )
+
+            new_model = TransformerDecoder(config=converted_config)
             path_template = "blocks.{i}.{path}"
         else:
             raise NotImplementedError(f"Conversion for structure '{indexing['structure']}' is not implemented.")
         
         # Import parameters from the original model to the new model
+        layer_matching = indexing.get('layer_matching', indexing['path_list'])
         for i in range(num_blocks):
-            for old_path, new_path in zip(indexing['path_list'], indexing['layer_matching']):
+            for old_path, new_path in zip(indexing['path_list'], layer_matching):
                 old_path = indexing['path_template'].format(block_index=i, path=old_path)
                 new_path = path_template.format(i=i, path=new_path)
                 if verbose:
@@ -64,88 +127,19 @@ def convert_for_export(model, options={}, verbose=False):
 
         # Handle extra layers if any
         if 'extra_layers' in indexing:
-            for old_path, new_path in zip(indexing['extra_layers'], indexing['extra_layers_matching']):
+            extra_layers_matching = indexing.get('extra_layers_matching', [])
+            if not extra_layers_matching:
+                extra_layers_matching = [path.split(".")[-1] for path in indexing['extra_layers']]
+            for old_path, new_path in zip(indexing['extra_layers'], extra_layers_matching):
                 if verbose:
                     print("Transfering extra layer parameters:", old_path, "->", new_path)
                 old_layer = get_submodule(model, old_path)
                 new_layer = get_submodule(new_model, new_path)
                 new_layer.load_state_dict(old_layer.state_dict())
 
+        # Attach converted indexing so manager can be used directly on converted graph.
+        new_model.indexing = converted_indexing
+
         new_models[name] = new_model
 
     return new_models
-        
-def _instantiate_decoder_block(config, indexing, blocks_num, use_sdpa=False, max_cache_len=2048):
-    """
-    Instantiate a TransformerDecoder block based on the provided indexing and hf configuration.
-    TransformerDecoder configuration is built as a list of independent block configurations, each defined as a nested dictionary.
-
-    Args:
-        config_dict: Configuration dictionary for the model.
-        indexing: Model-specific indexing dictionary.
-        blocks_num: Number of blocks in the transformer.
-    """
-    # Generate block configuration list from the hf configuration
-    blocks_config = []
-    for i in range(blocks_num):
-
-        # Define compression configuration as a nested dictionary
-        compression_config = nested_dict()
-        bias_required = nested_dict()
-        for j, (path, matched) in enumerate(zip(indexing['path_list'], indexing['layer_matching'])):
-            full_path_old = indexing['path_template'].format(block_index=i, path=path)
-
-            if matched in ['norm_in', 'norm_out']:
-                continue  # Skip normalization layers
-
-            matched_block, matched_layer = matched.split('.')
-            
-            # Collect compression config parameters
-            old_compression_config = config['compression_config'].get(full_path_old, {})
-            for key in old_compression_config.keys():
-                old_subconfig = old_compression_config[key]
-                for subkey, value in old_subconfig.items():
-                    compression_config[matched_block][matched_layer][key][subkey] = value
-
-            # Collect bias requirement
-            bias_required[matched_block][matched_layer] = indexing['bias_required'][j]
-
-        # Define block configuration
-        embed_dim = config[indexing['embed_dim_attr']]
-        num_heads = config[indexing['num_heads_attr']]
-        mlp_hidden_dim = config[indexing['mlp_hidden_dim_attr']]
-        mlp_activation = config[indexing['mlp_activation_attr']]
-        kv_num_heads = None if 'kv_num_heads_attr' not in indexing else config[indexing['kv_num_heads_attr']]
-        mha_type = indexing['attn_type']
-        mlp_type = indexing["mlp_type"]
-        norm_type = indexing["norm_type"]
-
-        block_config = {
-            "embed_dim": embed_dim,
-            "num_heads": num_heads,
-            "mlp_hidden_dim": mlp_hidden_dim,
-            "mlp_activation": mlp_activation,
-            "kv_num_heads": kv_num_heads,
-            "mha_type": mha_type,
-            "mlp_type": mlp_type,
-            "norm_type": norm_type,            
-            "compression_config": compression_config,
-            "bias_required": bias_required,
-            "use_sdpa": use_sdpa,
-            "max_cache_len": max_cache_len,
-        }
-
-        blocks_config.append(block_config)
-
-    # Define extra layers configuration
-    extra_layers_config = {}
-    if 'extra_layers_matching' in indexing:
-        for extra_layer in indexing['extra_layers_matching']:
-            if extra_layer == "norm":
-                extra_layers_config["norm"] = {
-                    "embed_dim": config[indexing['embed_dim_attr']]
-                }
-
-    # Instantiate the TransformerDecoder with the blocks configuration
-    decoder = TransformerDecoder(blocks_config, extra_layers_config)
-    return decoder

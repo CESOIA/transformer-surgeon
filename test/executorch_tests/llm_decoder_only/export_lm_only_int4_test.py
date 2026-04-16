@@ -16,6 +16,11 @@ from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
     get_symmetric_quantization_config,
 )
 
+from torchao.quantization import (
+    quantize_,
+    Int4WeightOnlyConfig,
+)
+
 from transformers import Qwen2TokenizerFast
 
 from transformersurgeon import (
@@ -33,7 +38,7 @@ EXPORT_LM_DECODER = True
 EXPORT_FINAL_LAYER = True
 CHECK_IR_VALIDITY = True
 
-data_type = torch.float32
+data_type = torch.float16
 device = torch.device("cpu")
 VERBOSE = False
 
@@ -124,27 +129,39 @@ dynamic_shapes_decoder = {
 }
 dynamic_shapes_final_layer = {"hidden_states": (Dim.STATIC, dyn_seq_len, Dim.STATIC)}
 
-# INT8 quantizer (per-channel weights, per-tensor activations — standard XNNPACK config)
+# INT4 quantizer (per-channel weights, per-tensor activations — standard XNNPACK config)
 quantizer = XNNPACKQuantizer().set_global(
-    get_symmetric_quantization_config(is_per_channel=True, is_dynamic=True)
+    get_symmetric_quantization_config(
+        is_per_channel=True,
+        is_dynamic=True,
+        weight_qmin=-8,
+        weight_qmax=7,)
 )
 
-def quantize_module(module, example_inputs, dynamic_shapes=None):
+def quantize_module(module, example_inputs, dynamic_shapes=None, use_torchao=False):
     module.eval()
-    if dynamic_shapes is not None:
-        exported = export(module, example_inputs, dynamic_shapes=dynamic_shapes)
+    if use_torchao:
+        quantize_(module, Int4WeightOnlyConfig(group_size=64))
+        if dynamic_shapes is not None:
+            quantized = export(module, example_inputs, dynamic_shapes=dynamic_shapes)
+        else:
+            quantized = export(module, example_inputs)
+        prepared = None
     else:
-        exported = export(module, example_inputs)
-    prepared = prepare_pt2e(exported.module(), quantizer)
-    # Run one forward pass so weight observers see the weight tensors.
-    # For proper activation calibration, replace example_inputs with representative data.
-    with torch.no_grad():
-        prepared(*example_inputs)
-    converted = convert_pt2e(prepared)
-    if dynamic_shapes is not None:
-        quantized = export(converted, example_inputs, dynamic_shapes=dynamic_shapes)
-    else:
-        quantized = export(converted, example_inputs)
+        if dynamic_shapes is not None:
+            exported = export(module, example_inputs, dynamic_shapes=dynamic_shapes)
+        else:
+            exported = export(module, example_inputs)
+        prepared = prepare_pt2e(exported.module(), quantizer)
+        # Run one forward pass so weight observers see the weight tensors.
+        # For proper activation calibration, replace example_inputs with representative data.
+        with torch.no_grad():
+            prepared(*example_inputs)
+        converted = convert_pt2e(prepared)
+        if dynamic_shapes is not None:
+            quantized = export(converted, example_inputs, dynamic_shapes=dynamic_shapes)
+        else:
+            quantized = export(converted, example_inputs)
     return prepared, quantized
 
 def write_to_file(filename: str, data: bytes):
@@ -159,34 +176,34 @@ def write_to_file(filename: str, data: bytes):
 if EXPORT_TO_EXECUTORCH:
 
     if EXPORT_EMBEDDING:
-        print("EXPORTING EMBEDDING LAYER (INT8)")
+        print("EXPORTING EMBEDDING LAYER (INT4)")
         prepared_embedding, quantized = quantize_module(wrapped_embedding, example_inputs_embedding, dynamic_shapes_embedding)
         edge = to_edge_transform_and_lower(
             quantized,
             compile_config=EdgeCompileConfig(_check_ir_validity=CHECK_IR_VALIDITY),
             partitioner=[PARTITIONER],
         )
-        write_to_file("embedding_int8.pte", edge.to_executorch().buffer)
+        write_to_file("embedding_int4.pte", edge.to_executorch().buffer)
 
     if EXPORT_LM_DECODER:
-        print("EXPORTING LANGUAGE DECODER (INT8)")
+        print("EXPORTING LANGUAGE DECODER (INT4)")
         prepared_decoder, quantized = quantize_module(wrapped_decoder, example_inputs_decoder, dynamic_shapes_decoder)
         edge = to_edge_transform_and_lower(
             quantized,
             compile_config=EdgeCompileConfig(_check_ir_validity=CHECK_IR_VALIDITY),
             partitioner=[PARTITIONER],
         )
-        open("lm_decoder_int8.log", "w").write(
+        open("lm_decoder_int4.log", "w").write(
             edge.exported_program().graph_module.print_readable(print_output=False)
         )
-        write_to_file("lm_decoder_int8.pte", edge.to_executorch().buffer)
+        write_to_file("lm_decoder_int4.pte", edge.to_executorch().buffer)
 
     if EXPORT_FINAL_LAYER:
-        print("EXPORTING FINAL LAYER (INT8)")
+        print("EXPORTING FINAL LAYER (INT4)")
         prepared_final_layer, quantized = quantize_module(wrapped_final_layer, example_inputs_final_layer, dynamic_shapes_final_layer)
         edge = to_edge_transform_and_lower(
             quantized,
             compile_config=EdgeCompileConfig(_check_ir_validity=CHECK_IR_VALIDITY),
             partitioner=[PARTITIONER],
         )
-        write_to_file("final_layer_int8.pte", edge.to_executorch().buffer)
+        write_to_file("final_layer_int4.pte", edge.to_executorch().buffer)
