@@ -6,11 +6,30 @@ import torch.nn.functional as F
 from .rope import apply_rope_multihead
 from . import LinearCompressed
 
-def attention_mask(q_seq_length, kv_seq_length, device="cpu"):
+def attention_mask(
+    q_seq_length,
+    kv_seq_length,          # effective KV length (current cache_len)
+    device="cpu",
+    kv_alloc_length=None,   # optional fixed width for static export
+    mask_value=-1e6,
+):
+    # If kv_alloc_length is set, mask shape is fixed to that width.
+    # Otherwise dynamic mode uses kv_seq_length as width.
+    kv_width = kv_seq_length if kv_alloc_length is None else kv_alloc_length
+
     i = torch.arange(q_seq_length, device=device).view(1, 1, q_seq_length, 1)
-    j = torch.arange(kv_seq_length, device=device).view(1, 1, 1, kv_seq_length)
-    i = i + (kv_seq_length - q_seq_length)
-    return (i < j).float() * -1e6
+    j = torch.arange(kv_width, device=device).view(1, 1, 1, kv_width)
+
+    # Align each query row to absolute position based on effective cache length.
+    q_abs_pos = i + (kv_seq_length - q_seq_length)
+
+    # Standard causal future mask
+    future = j > q_abs_pos
+
+    # In static mode, also mask slots not written yet (j >= kv_seq_length)
+    not_filled = j >= kv_seq_length
+
+    return (future | not_filled).to(torch.float32) * mask_value
 
 def attention(query, key, value, attn_mask=None):
     """
@@ -245,13 +264,13 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         self.register_buffer("key_cache", torch.zeros(batch_size, max_cache_length, self.kv_num_heads, self.head_dim), persistent=False)
         self.register_buffer("value_cache", torch.zeros(batch_size, max_cache_length, self.kv_num_heads, self.head_dim), persistent=False)
         
-    def forward(self, x, cache_len, attn_mask=None, rope=None):
+    def forward(self, x, last_pos, attn_mask=None, rope=None, static=False):
         """
         Forward pass of the causal Multi-Head Attention with caching.
         
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, in_seq_len, embed_dim).
-            cache_len (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
+            last_pos (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
             rope (tuple, optional): Tuple of (cos, sin) tensors for RoPE application.
         """
         batch_size, in_seq_len, embed_dim = x.size()
@@ -269,18 +288,26 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         # Update key and value caches in-place
         with torch.no_grad():
-            indexes = torch.arange(cache_len-in_seq_len, cache_len, device=x.device)
+            if static:
+                last_pos_tensor = torch.as_tensor(last_pos, device=x.device)
+                indexes = torch.arange(-in_seq_len, 0, device=x.device) + last_pos_tensor
+            else:
+                indexes = torch.arange(last_pos-in_seq_len, last_pos, device=x.device)
             self.key_cache.index_copy_(1, indexes, k)
             self.value_cache.index_copy_(1, indexes, v)
 
         # Slice cache
-        key_cache = self.key_cache[:, :cache_len] # (batch_size, cache_len, kv_num_heads, head_dim)
-        value_cache = self.value_cache[:, :cache_len] # (batch_size, cache_len, kv_num_heads, head_dim)
+        if static:
+            key_cache = self.key_cache
+            value_cache = self.value_cache
+        else:
+            key_cache = self.key_cache[:, :last_pos] # (batch_size, last_pos, kv_num_heads, head_dim)
+            value_cache = self.value_cache[:, :last_pos] # (batch_size, last_pos, kv_num_heads, head_dim)
 
         if self.use_sdpa:
             q = q.transpose(1, 2) # (batch_size, num_heads, in_seq_len, head_dim)
-            k = key_cache.transpose(1, 2) # (batch_size, kv_num_heads, cache_len, head_dim)
-            v = value_cache.transpose(1, 2) # (batch_size, kv_num_heads, cache_len, head_dim)
+            k = key_cache.transpose(1, 2) # (batch_size, kv_num_heads, last_pos, head_dim)
+            v = value_cache.transpose(1, 2) # (batch_size, kv_num_heads, last_pos, head_dim)
             attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
         else:
             attn_output = attention(q, key_cache, value_cache, attn_mask)

@@ -53,7 +53,7 @@ def _custom_generate_greedy(embedding, decoder, lm_head, input_ids, max_new_toke
 
     with torch.no_grad():
         x = embedding(generated)
-        hidden = decoder(x, cache_len=cur_cache_len)
+        hidden = decoder(x, cur_cache_len)
         hidden = hidden.to(dtype=lm_head.weight.dtype)
         logits = lm_head(hidden[:, -1, :])
 
@@ -67,7 +67,7 @@ def _custom_generate_greedy(embedding, decoder, lm_head, input_ids, max_new_toke
         cur_cache_len += 1
         with torch.no_grad():
             x = embedding(next_token)
-            hidden = decoder(x, cache_len=cur_cache_len)
+            hidden = decoder(x, cur_cache_len)
             hidden = hidden.to(dtype=lm_head.weight.dtype)
             logits = lm_head(hidden[:, -1, :])
 
@@ -120,6 +120,8 @@ def test_convert_then_compress(args):
     decoder = converted["text"].to(device).eval()
     embedding = model.get_input_embeddings().to(device).eval()
     lm_head = model.lm_head.to(device).eval()
+
+    print(decoder.config)
 
     # Converter should provide manager-ready config/indexing on converted model.
     manager = CompressionSchemesManager(decoder, decoder.indexing)

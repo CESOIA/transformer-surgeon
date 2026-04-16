@@ -66,8 +66,34 @@ class EmbeddingDecoderFinalWrapper(nn.Module):
         input_ids: torch.LongTensor,
         cache_len_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        cache_len = cache_len_tensor.size(0)
-        hidden = self.decoder(self.embedding(input_ids), cache_len=cache_len)
+        last_pos = cache_len_tensor.size(0)
+        hidden = self.decoder(self.embedding(input_ids), last_pos=last_pos)
+        logits = self.final_layer(hidden[:, -1, :])
+        return logits
+
+
+class EmbeddingDecoderFinalStaticSeqLen1Wrapper(nn.Module):
+    """Static export wrapper for decode with fixed seq_len=1.
+
+    Input contract:
+    - input_ids: shape (batch, 1)
+    - seq_pos_tensor: tensor containing a single long value with the token position
+      (0-based). Decoder cache_len is computed as seq_pos + 1.
+    """
+
+    def __init__(self, embedding: nn.Module, decoder: nn.Module, final_layer: nn.Module):
+        super().__init__()
+        self.embedding = embedding
+        self.decoder = decoder
+        self.final_layer = final_layer
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        seq_pos_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_pos = seq_pos_tensor.reshape(()).to(torch.long)
+        hidden = self.decoder(self.embedding(input_ids), last_pos=seq_pos, static=True)
         logits = self.final_layer(hidden[:, -1, :])
         return logits
 
@@ -344,6 +370,7 @@ def export_to_executorch(
     output_path: str,
     backend: str = "xnnpack",
     precision: str = "int4",
+    static_seq_len_1: bool = False,
     calibration_data: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     example_input_ids: torch.Tensor | None = None,
     example_cache_len_tensor: torch.Tensor | None = None,
@@ -394,8 +421,25 @@ def export_to_executorch(
     else:
         components = components_or_embedding
 
-    wrapper_builder = adapter.wrapper_builder or _default_wrapper_builder
-    wrapper = wrapper_builder(components, model_config)
+    if adapter.wrapper_builder is not None:
+        wrapper = adapter.wrapper_builder(components, model_config)
+    else:
+        if isinstance(components, dict):
+            embedding = components["embedding"]
+            decoder = components["decoder"]
+            final_layer = components["final_layer"]
+        elif isinstance(components, (tuple, list)) and len(components) == 3:
+            embedding, decoder, final_layer = components
+        else:
+            raise TypeError(
+                "Default wrapper builder expects dict {embedding, decoder, final_layer} "
+                "or tuple/list (embedding, decoder, final_layer)."
+            )
+
+        if static_seq_len_1:
+            wrapper = EmbeddingDecoderFinalStaticSeqLen1Wrapper(embedding, decoder, final_layer)
+        else:
+            wrapper = EmbeddingDecoderFinalWrapper(embedding, decoder, final_layer)
     wrapper.eval()
 
     # Placeholder for future mixed precision. Today we only enforce global int4/int8.
@@ -412,13 +456,19 @@ def export_to_executorch(
         else:
             if example_input_ids is None:
                 vocab_size = int(getattr(model_config, "vocab_size", 32000)) if model_config is not None else 32000
-                example_input_ids = torch.randint(0, vocab_size, (1, 2), dtype=torch.long)
+                default_seq_len = 1 if static_seq_len_1 else 2
+                example_input_ids = torch.randint(0, vocab_size, (1, default_seq_len), dtype=torch.long)
             if example_cache_len_tensor is None:
-                example_cache_len_tensor = torch.ones(5)
+                if static_seq_len_1:
+                    example_cache_len_tensor = torch.tensor([0], dtype=torch.long)
+                else:
+                    example_cache_len_tensor = torch.ones(5)
             example_inputs = (example_input_ids, example_cache_len_tensor)
 
     if dynamic_shapes is None:
-        if adapter.dynamic_shapes_builder is not None:
+        if static_seq_len_1:
+            dynamic_shapes = None
+        elif adapter.dynamic_shapes_builder is not None:
             dynamic_shapes = adapter.dynamic_shapes_builder(max_seq_len)
         else:
             dyn_seq_len = Dim("dyn_seq_len", min=1, max=max_seq_len - 1)

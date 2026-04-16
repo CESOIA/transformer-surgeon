@@ -23,6 +23,7 @@ def precompute_rope_cos_sin_half(
         inv_freq : torch.Tensor,  # (rotated_dim//2,)
         seq_len : int, 
         position : int,
+        static : bool = False,
         ):
     """
     Precompute the cosine and sine values for RoPE.
@@ -38,8 +39,15 @@ def precompute_rope_cos_sin_half(
         sin: Sine values for RoPE (half-size)
     """
     device = inv_freq.device
+    dtype = inv_freq.dtype
+    # position = torch.as_tensor(position, device=device, dtype=dtype)
+    
     # Broadcast cos and sin to match x's shape
-    t = torch.arange(position, position+seq_len, device=device).float()
+    if static:
+        position = torch.as_tensor(position, device=device, dtype=dtype)
+        t = torch.arange(seq_len, device=device, dtype=dtype) + position
+    else:
+        t = torch.arange(position, position + seq_len, device=device, dtype=dtype)
     angles = t.unsqueeze(-1) * inv_freq.unsqueeze(0)  # (seq_len, rotated_dim//2)
     angles = angles.unsqueeze(1).unsqueeze(0)         # (1, seq_len, 1, rotated_dim//2)
 

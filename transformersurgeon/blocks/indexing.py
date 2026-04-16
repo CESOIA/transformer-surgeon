@@ -1,6 +1,5 @@
 """Model-style indexing for converted custom decoder graph compression."""
 
-
 # Configuration for converted decoder graph compression schemes
 CUSTOM_DECODER_INDEXING = {
     "decoder": {
@@ -18,6 +17,5 @@ CUSTOM_DECODER_INDEXING = {
         "path_template": "blocks.{block_index}.{path}",
     }
 }
-
 
 __all__ = ["CUSTOM_DECODER_INDEXING"]
