@@ -130,4 +130,132 @@ class CustomDecoderConfigCompress(PretrainedConfig):
             **passthrough_kwargs,
         )
 
-__all__ = ["CustomDecoderConfigCompress"]
+
+class CustomEncoderConfigCompress(PretrainedConfig):
+    """Minimal encoder config used by converted TransformerEncoder graphs."""
+
+    model_type = "transformersurgeon-custom-encoder"
+
+    def __init__(
+        self,
+        num_hidden_layers=0,
+        hidden_size=0,
+        num_attention_heads=1,
+        intermediate_size=0,
+        hidden_act="gelu",
+        attn_type="mha_encoder",
+        mlp_type="mlp",
+        norm_type="layernorm",
+        norm_position="pre",
+        compression_config=None,
+        bias_required=None,
+        use_sdpa=False,
+        use_final_norm=True,
+        position_embedding_type="none",
+        indexing=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.num_hidden_layers = num_hidden_layers
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+
+        self.attn_type = attn_type
+        self.mlp_type = mlp_type
+        self.norm_type = norm_type
+        self.norm_position = norm_position
+        self.use_sdpa = use_sdpa
+        self.use_final_norm = use_final_norm
+        self.position_embedding_type = position_embedding_type
+        self.bias_required = bias_required or {"attn": {}, "mlp": {}}
+
+        if indexing is None:
+            self.compression_config = compression_config or {}
+        else:
+            init_compressed_config(
+                config_instance=self,
+                indexing=indexing,
+                compression_config=compression_config or {},
+            )
+
+    @classmethod
+    def from_source_config(
+        cls,
+        source_config_obj,
+        source_indexing,
+        converted_indexing,
+        compression_config=None,
+        bias_required=None,
+        use_sdpa=False,
+        use_final_norm=True,
+        position_embedding_type="none",
+    ):
+        """Build converted encoder config from source HF config using indexing metadata."""
+
+        source_cfg_dict = source_config_obj.to_dict()
+
+        def _get_attr_from_source(index_key):
+            source_attr = source_indexing.get(index_key)
+            if source_attr is None:
+                raise KeyError(
+                    f"Indexing is missing '{index_key}', required to build encoder config."
+                )
+
+            if source_attr in source_cfg_dict:
+                return source_cfg_dict[source_attr]
+            if hasattr(source_config_obj, source_attr):
+                return getattr(source_config_obj, source_attr)
+
+            raise KeyError(
+                f"Source config is missing attribute '{source_attr}' mapped by '{index_key}'."
+            )
+
+        consumed_attrs = {
+            source_indexing["num_blocks_attr"],
+            source_indexing["embed_dim_attr"],
+            source_indexing["num_heads_attr"],
+            source_indexing["mlp_hidden_dim_attr"],
+            source_indexing["mlp_activation_attr"],
+        }
+
+        passthrough_kwargs = {
+            k: v
+            for k, v in source_cfg_dict.items()
+            if k not in consumed_attrs
+            and k
+            not in {
+                "compression_config",
+                "bias_required",
+                "attn_type",
+                "mlp_type",
+                "norm_type",
+                "norm_position",
+                "use_sdpa",
+                "use_final_norm",
+                "position_embedding_type",
+            }
+        }
+
+        return cls(
+            num_hidden_layers=_get_attr_from_source("num_blocks_attr"),
+            hidden_size=_get_attr_from_source("embed_dim_attr"),
+            num_attention_heads=_get_attr_from_source("num_heads_attr"),
+            intermediate_size=_get_attr_from_source("mlp_hidden_dim_attr"),
+            hidden_act=_get_attr_from_source("mlp_activation_attr"),
+            attn_type=source_indexing.get("attn_type", "mha_encoder"),
+            mlp_type=source_indexing.get("mlp_type", "mlp"),
+            norm_type=source_indexing.get("norm_type", "layernorm"),
+            norm_position=source_indexing.get("norm_position", "pre"),
+            compression_config=compression_config or {},
+            bias_required=bias_required or {"attn": {}, "mlp": {}},
+            use_sdpa=use_sdpa,
+            use_final_norm=use_final_norm,
+            position_embedding_type=position_embedding_type,
+            indexing=converted_indexing,
+            **passthrough_kwargs,
+        )
+
+__all__ = ["CustomDecoderConfigCompress", "CustomEncoderConfigCompress"]

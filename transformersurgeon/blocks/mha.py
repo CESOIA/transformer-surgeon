@@ -169,7 +169,7 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
         if self.use_sdpa:
             attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
         else:
-            attn_output = attention(q, k, v, is_causal=False)
+            attn_output = attention(q, k, v)
         
         # Concatenate heads and project output
         attn_output = attn_output.permute(0, 2, 1, 3).view(batch_size, seq_length, embed_dim).contiguous()
@@ -243,7 +243,7 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         if self.use_sdpa:
             attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
         else:
-            attn_output = attention(q, k, v, is_causal=False)
+            attn_output = attention(q, k, v)
         
         # Concatenate heads and project output
         attn_output = attn_output.permute(0, 2, 1, 3).view(batch_size, seq_length, embed_dim).contiguous()

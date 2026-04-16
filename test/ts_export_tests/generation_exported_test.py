@@ -75,7 +75,7 @@ inputs_embeds = embedding(input_ids)
 # Prefill phase
 output_embed = decoder(
     inputs_embeds,
-    cache_len=inputs_embeds.size(1),
+    last_pos=inputs_embeds.size(1),
     )
 # Extract logits from output embed
 logits = final_layer(output_embed[:, -1, :])
@@ -90,11 +90,11 @@ with torch.no_grad():
 
     start_context_len = output_ids.size(1)
     for i in tqdm.tqdm(range(start_context_len, max_context_len), "Generating"):
-        cache_len = output_ids.size(1) + 1
+        last_pos = output_ids.size(1) + 1
 
         output_embed = decoder(
             inputs_embeds[:, -1:, :],
-            cache_len=cache_len,
+            last_pos=last_pos,
             )
         
         # Extract logits from output embed

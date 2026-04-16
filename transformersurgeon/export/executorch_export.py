@@ -108,36 +108,31 @@ def _resolve_partitioner(backend: str, allow_fallback: bool = True):
         return backend, XnnpackPartitioner()
 
     if backend == "qnn":
-        try:
-            from executorch.backends.qualcomm.partition.qnn_partitioner import (
-                QnnPartitioner,
-            )
-            from executorch.backends.qualcomm.serialization.qnn_compile_spec_schema import (
-                QcomChipset,
-            )
-            from executorch.backends.qualcomm.utils.utils import (
-                generate_qnn_executorch_compiler_spec,
-            )
-
-            compiler_spec = generate_qnn_executorch_compiler_spec(
-                soc_model=QcomChipset.SM8650,
-                is_online_prepare=True,
-            )
-            return backend, QnnPartitioner(compiler_spec)
-        except Exception as exc:
-            if not allow_fallback:
-                raise RuntimeError("QNN backend is not available in this environment") from exc
-            warnings.warn(
-                "QNN backend is not available, falling back to XNNPACK",
-                stacklevel=2,
-            )
-            from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
-                XnnpackPartitioner,
-            )
-
-            return "xnnpack", XnnpackPartitioner()
+        # QNN is lowered through Qualcomm helper APIs, not via generic partitioner.
+        return backend, None
 
     raise ValueError(f"Unsupported backend '{backend}'. Use 'xnnpack' or 'qnn'.")
+
+
+def _build_qnn_compiler_specs(qnn_soc_model: str = "SM8650", qnn_use_fp16: bool = False):
+    from executorch.backends.qualcomm.utils.utils import (
+        generate_htp_compiler_spec,
+        generate_qnn_executorch_compiler_spec,
+    )
+    try:
+        from executorch.backends.qualcomm.serialization.qc_schema import QcomChipset
+    except Exception:
+        # Keep compatibility with older/newer ExecuTorch layouts.
+        from executorch.backends.qualcomm.serialization.qnn_compile_spec_schema import QcomChipset
+
+    if not hasattr(QcomChipset, qnn_soc_model):
+        raise ValueError(f"Unknown QNN SoC '{qnn_soc_model}'.")
+
+    backend_options = generate_htp_compiler_spec(use_fp16=qnn_use_fp16)
+    return generate_qnn_executorch_compiler_spec(
+        soc_model=getattr(QcomChipset, qnn_soc_model),
+        backend_options=backend_options,
+    )
 
 
 def _build_quant_plan(
@@ -384,6 +379,8 @@ def export_to_executorch(
     example_inputs: tuple[Any, ...] | None = None,
     dynamic_shapes: dict[str, Any] | None = None,
     run_weight_mismatch_check: bool = True,
+    qnn_soc_model: str = "SM8650",
+    qnn_use_fp16: bool = False,
 ) -> ExecuTorchExportResult:
     """Export model to a single ExecuTorch program.
 
@@ -516,11 +513,45 @@ def export_to_executorch(
 
     from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
 
-    edge = to_edge_transform_and_lower(
-        quantized_exported,
-        compile_config=EdgeCompileConfig(_check_ir_validity=check_ir_validity),
-        partitioner=[partitioner],
-    )
+    if resolved_backend == "qnn":
+        try:
+            from executorch.backends.qualcomm.utils.utils import (
+                to_edge_transform_and_lower_to_qnn,
+            )
+
+            compiler_specs = _build_qnn_compiler_specs(
+                qnn_soc_model=qnn_soc_model,
+                qnn_use_fp16=qnn_use_fp16,
+            )
+            edge = to_edge_transform_and_lower_to_qnn(
+                converted,
+                example_inputs,
+                compiler_specs,
+                dynamic_shapes=dynamic_shapes,
+            )
+        except Exception as exc:
+            if not allow_backend_fallback:
+                raise RuntimeError("QNN backend is not available in this environment") from exc
+            warnings.warn(
+                "QNN backend is not available, falling back to XNNPACK",
+                stacklevel=2,
+            )
+            from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+                XnnpackPartitioner,
+            )
+
+            resolved_backend = "xnnpack"
+            edge = to_edge_transform_and_lower(
+                quantized_exported,
+                compile_config=EdgeCompileConfig(_check_ir_validity=check_ir_validity),
+                partitioner=[XnnpackPartitioner()],
+            )
+    else:
+        edge = to_edge_transform_and_lower(
+            quantized_exported,
+            compile_config=EdgeCompileConfig(_check_ir_validity=check_ir_validity),
+            partitioner=[partitioner],
+        )
 
     et_program = edge.to_executorch()
     with open(output_path, "wb") as f:

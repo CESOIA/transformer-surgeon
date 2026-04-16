@@ -2,8 +2,9 @@ import warnings
 import copy
 
 from ..blocks import TransformerDecoder
-from ..blocks.indexing import CUSTOM_DECODER_INDEXING
-from ..blocks.config import CustomDecoderConfigCompress
+from ..blocks.encoder import TransformerEncoder
+from ..blocks.indexing import CUSTOM_DECODER_INDEXING, CUSTOM_ENCODER_INDEXING
+from ..blocks.config import CustomDecoderConfigCompress, CustomEncoderConfigCompress
 from .utils import get_submodule
 
 
@@ -29,6 +30,18 @@ def _build_converted_decoder_indexing(indexing):
     converted_indexing = copy.deepcopy(CUSTOM_DECODER_INDEXING)
     layer_matching = indexing.get("layer_matching", indexing["path_list"])
     converted_indexing["decoder"]["path_list"] = [
+        path
+        for path in layer_matching
+        if path.startswith("attn.") or path.startswith("mlp.")
+    ]
+    return converted_indexing
+
+
+def _build_converted_encoder_indexing(indexing):
+    """Build converted indexing compatible with converted encoder config/model."""
+    converted_indexing = copy.deepcopy(CUSTOM_ENCODER_INDEXING)
+    layer_matching = indexing.get("layer_matching", indexing["path_list"])
+    converted_indexing["encoder"]["path_list"] = [
         path
         for path in layer_matching
         if path.startswith("attn.") or path.startswith("mlp.")
@@ -109,6 +122,42 @@ def convert_for_export(model, options=None, verbose=False):
             )
 
             new_model = TransformerDecoder(config=converted_config)
+            path_template = "blocks.{i}.{path}"
+        elif indexing['structure'] == 'transformer_encoder':
+            use_sdpa = options.get('use_sdpa', False)
+
+            converted_indexing = _build_converted_encoder_indexing(indexing)
+            converted_compression_config = _build_converted_compression_config(
+                indexing,
+                source_config_obj,
+                num_blocks,
+            )
+            layer_matching = indexing.get("layer_matching", indexing["path_list"])
+            source_bias = indexing.get("bias_required", [])
+            bias_required_config = {
+                "attn": {},
+                "mlp": {},
+            }
+            for j, new_path in enumerate(layer_matching):
+                if j >= len(source_bias):
+                    continue
+                if new_path.startswith("attn."):
+                    bias_required_config["attn"][new_path.split(".", 1)[1]] = source_bias[j]
+                elif new_path.startswith("mlp."):
+                    bias_required_config["mlp"][new_path.split(".", 1)[1]] = source_bias[j]
+
+            converted_config = CustomEncoderConfigCompress.from_source_config(
+                source_config_obj=source_config_obj,
+                source_indexing=indexing,
+                converted_indexing=converted_indexing["encoder"],
+                compression_config=converted_compression_config,
+                bias_required=bias_required_config,
+                use_sdpa=use_sdpa,
+                use_final_norm=indexing.get("use_final_norm", True),
+                position_embedding_type=indexing.get("position_embedding_type", "none"),
+            )
+
+            new_model = TransformerEncoder(config=converted_config)
             path_template = "blocks.{i}.{path}"
         else:
             raise NotImplementedError(f"Conversion for structure '{indexing['structure']}' is not implemented.")
