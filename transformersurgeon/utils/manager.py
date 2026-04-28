@@ -5,9 +5,10 @@ manager.py
 Provides the CompressionSchemesManager class for managing multiple compression schemes in transformer models.
 """
 
+from collections.abc import Mapping
 import torch
 from transformers import PretrainedConfig
-from typing import Dict, List, Any, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 import warnings
 from .scheme import CompressionScheme
 
@@ -28,6 +29,7 @@ class CompressionSchemesManager:
             indexing: Model-specific indexing
         """
         self.model = model
+        self.calibration_data = None
         try:
             self.config = model.config
             assert isinstance(self.config, PretrainedConfig), "Model config is not an instance of PretrainedConfig. Please provide a model with a valid Hugging Face configuration."
@@ -98,7 +100,112 @@ class CompressionSchemesManager:
             if scheme.vcon_initialized:
                 scheme.freeze_uncompressed_vcon(verbose=verbose)
 
-    def apply(self, hard=False, criteria=None, verbose=False):
+    def set_calibration_data(self, calibration_data):
+        """
+        Stores a calibration dataset/dataloader on the manager.
+
+        The stored data can later be consumed by calibrate_lrd().
+        """
+        self.calibration_data = calibration_data
+
+    def calibrate_lrd(
+        self,
+        calibration_data=None,
+        criteria=None,
+        max_batches: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        forward_fn: Optional[Callable] = None,
+        offload_to_cpu: bool = True,
+        verbose: bool = False,
+    ):
+        """
+        Runs calibration data once through the model and accumulates activation
+        covariance for all filtered LRD compressors using method "svd_llm_v2".
+
+        Args:
+            calibration_data: Iterable of model inputs. If None, uses data
+                previously provided via set_calibration_data().
+            criteria: Optional manager criteria to filter target modules.
+            max_batches: Optional cap on the number of calibration batches.
+            device: Device where model inputs should be moved before forward.
+                Defaults to the model's first parameter/buffer device.
+            forward_fn: Optional callable with signature
+                forward_fn(model, batch). Use this when the batch structure
+                needs custom model invocation.
+            offload_to_cpu: If True, activation covariance is accumulated on CPU.
+            verbose: If True, prints calibration progress information.
+
+        Returns:
+            int: Number of LRD compressors calibrated.
+        """
+        if calibration_data is None:
+            calibration_data = self.calibration_data
+        else:
+            self.calibration_data = calibration_data
+
+        if calibration_data is None:
+            raise ValueError("Calibration data is required to calibrate LRD with method 'svd_llm_v2'.")
+
+        targets = self._lrd_svd_llm_v2_targets(criteria=criteria)
+        if len(targets) == 0:
+            if verbose:
+                print("No LRD compressors with method 'svd_llm_v2' found for calibration.")
+            return 0
+
+        for _, compressor in targets:
+            compressor.clear_covariance()
+            compressor._covariance_sum = None
+            compressor._covariance_tokens = 0
+
+        handles = []
+        for scheme, compressor in targets:
+            module = scheme.get_module()
+            handles.append(module.register_forward_hook(self._make_lrd_calibration_hook(compressor, offload_to_cpu)))
+
+        if device is None:
+            device = self._infer_model_device()
+        device = torch.device(device)
+
+        was_training = self.model.training
+        num_batches = 0
+        try:
+            self.model.eval()
+            with torch.no_grad():
+                for batch_id, batch in enumerate(self._calibration_iter(calibration_data)):
+                    if max_batches is not None and batch_id >= max_batches:
+                        break
+                    batch = self._move_to_device(batch, device)
+                    self._run_calibration_batch(batch, forward_fn=forward_fn)
+                    num_batches += 1
+        finally:
+            for handle in handles:
+                handle.remove()
+            if was_training:
+                self.model.train()
+
+        if num_batches == 0:
+            raise ValueError("Calibration data must contain at least one batch.")
+
+        for scheme, compressor in targets:
+            if compressor._covariance_tokens == 0:
+                raise RuntimeError(f"No calibration activations were collected for module {scheme.path}.")
+            compressor.set_covariance(compressor._covariance_sum / compressor._covariance_tokens)
+            del compressor._covariance_sum
+            del compressor._covariance_tokens
+
+        if verbose:
+            print(f"Calibrated {len(targets)} LRD compressors over {num_batches} batches.")
+
+        return len(targets)
+
+    def clear_lrd_calibration(self, criteria=None):
+        """
+        Clears stored LRD activation covariance for filtered modules.
+        """
+        for _, compressor in self._lrd_svd_llm_v2_targets(criteria=criteria):
+            compressor.clear_covariance()
+
+    def apply(self, hard=False, criteria=None, verbose=False, calibration_data=None, calibration_kwargs=None):
         """
         Applies filtered compression schemes to their respective modules in the model.
 
@@ -106,9 +213,102 @@ class CompressionSchemesManager:
             hard: If True, applies hard compression (non-reversible); if False, applies soft compression (reversible)
             criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the application process
+            calibration_data: Optional calibration dataset/dataloader. When
+                provided, LRD compressors using method "svd_llm_v2" are
+                calibrated before compression is applied.
+            calibration_kwargs: Optional dict forwarded to calibrate_lrd().
         """
+        if calibration_data is not None:
+            calibration_kwargs = calibration_kwargs or {}
+            self.calibrate_lrd(
+                calibration_data=calibration_data,
+                criteria=criteria,
+                verbose=verbose,
+                **calibration_kwargs,
+            )
+
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.apply(hard=hard, verbose=verbose)
+
+    def _lrd_svd_llm_v2_targets(self, criteria=None):
+        targets = []
+        for scheme in self.iter_filtered(criteria=criteria):
+            compressor = scheme.compressors.get("lrd", None)
+            if compressor is None or not compressor._to_compress():
+                continue
+            method = getattr(compressor, "method", compressor.config.get("method", "svd"))
+            if method == "svd_llm_v2":
+                targets.append((scheme, compressor))
+        return targets
+
+    def _make_lrd_calibration_hook(self, compressor, offload_to_cpu: bool):
+        def hook(module, inputs, output):
+            if len(inputs) == 0:
+                raise ValueError("Cannot collect LRD calibration data from a module without input activations.")
+            activation = inputs[0].detach()
+            in_features = getattr(module, "in_features", activation.size(-1))
+            if activation.size(-1) != in_features:
+                raise ValueError(
+                    f"Calibration activation last dimension is {activation.size(-1)}, expected {in_features}."
+                )
+            if activation.dim() == 1:
+                activation = activation.reshape(1, -1)
+            else:
+                activation = activation.reshape(-1, activation.size(-1))
+            if offload_to_cpu:
+                activation = activation.cpu()
+            activation = activation.float()
+            covariance_sum = activation.transpose(0, 1) @ activation
+            if compressor._covariance_sum is None:
+                compressor._covariance_sum = covariance_sum
+            else:
+                compressor._covariance_sum.add_(covariance_sum)
+            compressor._covariance_tokens += activation.size(0)
+        return hook
+
+    def _calibration_iter(self, calibration_data):
+        if isinstance(calibration_data, torch.Tensor) or isinstance(calibration_data, Mapping):
+            return (calibration_data,)
+        if isinstance(calibration_data, tuple) and all(isinstance(item, torch.Tensor) for item in calibration_data):
+            return (calibration_data,)
+        return calibration_data
+
+    def _infer_model_device(self):
+        if hasattr(self.model, "device"):
+            return self.model.device
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            pass
+        try:
+            return next(self.model.buffers()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def _move_to_device(self, value, device: torch.device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, Mapping):
+            return {key: self._move_to_device(item, device) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(self._move_to_device(item, device) for item in value)
+        if isinstance(value, list):
+            return [self._move_to_device(item, device) for item in value]
+        if hasattr(value, "to"):
+            try:
+                return value.to(device)
+            except TypeError:
+                pass
+        return value
+
+    def _run_calibration_batch(self, batch, forward_fn: Optional[Callable] = None):
+        if forward_fn is not None:
+            return forward_fn(self.model, batch)
+        if isinstance(batch, Mapping):
+            return self.model(**batch)
+        if isinstance(batch, (tuple, list)):
+            return self.model(*batch)
+        return self.model(batch)
 
     def restore(self, topology=False, criteria=None, verbose=False):
         """

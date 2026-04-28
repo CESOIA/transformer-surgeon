@@ -4,13 +4,43 @@ import argparse
 from tqdm import tqdm
 
 import torch
-from transformers import AutoProcessor,  Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info
+
+
+### TEST CONFIGURATION ###
+model_type = "qwen2_5_vl_c"
+##########################
+
+
+if model_type == "qwen2_vl_c":
+    from transformersurgeon import Qwen2VLForConditionalGenerationCompress
+    modelClass = Qwen2VLForConditionalGenerationCompress
+    DEFAULT_MODEL_NAME = "Qwen/Qwen2-VL-3B-Instruct"
+
+elif model_type == "qwen2_5_vl_c":
+    from transformersurgeon import Qwen2_5_VLForConditionalGenerationCompress
+    modelClass = Qwen2_5_VLForConditionalGenerationCompress
+    DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+else:
+    raise ValueError(f"Unsupported model_type '{model_type}'")
+
+
+def get_model_input_device(model):
+    """
+    Get a reasonable device for placing inputs.
+    Works better than model.device when device_map='auto' is used.
+    """
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def build_qwen_messages(img_path, user_text):
     """
-    Convert one sample from your dataset format into Qwen-VL message format.
+    Convert one sample from dataset format into Qwen-VL message format.
     """
     return [
         {
@@ -33,41 +63,55 @@ def clean_user_prompt(text):
     return text.replace("<image>", "").strip()
 
 
-def model_eval(eval_data_path, img_folder, output_path, model_name_or_path, max_samples=None, max_new_tokens=128):
+def model_eval(
+    eval_data_path,
+    img_folder,
+    output_path,
+    model_name_or_path,
+    max_samples=100,
+    max_new_tokens=128,
+):
     # === Load dataset ===
-    with open(eval_data_path, "r") as f:
+    with open(eval_data_path, "r", encoding="utf-8") as f:
         eval_dataset = json.load(f)
+
+    if not isinstance(eval_dataset, list):
+        raise ValueError(f"Expected eval dataset to be a list, got {type(eval_dataset)}")
 
     if max_samples is not None:
         eval_dataset = eval_dataset[:max_samples]
 
-    # === Load Qwen-VL model and processor ===
-    model =  Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    # === Load model and processor ===
+    model = modelClass.from_pretrained(
         model_name_or_path,
         torch_dtype="auto",
-        device_map="auto"
+        device_map="auto",
     )
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
 
+    # temprorary fix
+    model = model.to(torch.float32)
+
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
     model.eval()
 
+    input_device = get_model_input_device(model)
     outputs = []
 
     # === Evaluate ===
-    for example in tqdm(eval_dataset, desc="Processing"):
+    for idx, example in enumerate(tqdm(eval_dataset, desc="Processing")):
+        #try:
         img_fname = example["image"]
         full_image_path = os.path.join(img_folder, img_fname)
 
         if not os.path.exists(full_image_path):
-            print(f"Image not found: {full_image_path}")
+            print(f"[Warning] Image not found: {full_image_path}")
             continue
 
         conversations = example.get("conversations", [])
         if len(conversations) < 2:
-            print(f"Skipping malformed example for image {img_fname}")
+            print(f"[Warning] Skipping malformed example for image {img_fname}")
             continue
 
-        # Your format:
         # conversations[0] -> human question
         # conversations[1] -> gpt reference answer
         user_prompt = clean_user_prompt(conversations[0].get("value", ""))
@@ -80,10 +124,10 @@ def model_eval(eval_data_path, img_folder, output_path, model_name_or_path, max_
         text = processor.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
         )
 
-        # === Prepare image/video inputs ===
+        # === Prepare vision inputs ===
         image_inputs, video_inputs = process_vision_info(messages)
 
         inputs = processor(
@@ -91,16 +135,21 @@ def model_eval(eval_data_path, img_folder, output_path, model_name_or_path, max_
             images=image_inputs,
             videos=video_inputs,
             padding=True,
-            return_tensors="pt"
+            return_tensors="pt",
         )
 
-        inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        # Move tensor inputs to the device used for the first model shard
+        inputs = {
+            k: v.to(input_device) if torch.is_tensor(v) else v
+            for k, v in inputs.items()
+        }
 
         # === Run inference ===
         with torch.no_grad():
             generated_ids = model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
             )
 
         # Remove prompt tokens from generated output
@@ -112,60 +161,71 @@ def model_eval(eval_data_path, img_folder, output_path, model_name_or_path, max_
         output_text = processor.batch_decode(
             generated_ids_trimmed,
             skip_special_tokens=True,
-            clean_up_tokenization_spaces=False
+            clean_up_tokenization_spaces=False,
         )[0]
 
         outputs.append({
+            "user_prompt": user_prompt,
             "img_fname": img_fname,
             "ref_answer": ref_answer,
             "model_ut_response": output_text,
         })
 
+        #except Exception as e:
+        #    print(f"[Error] Failed on sample index {idx}: {e}")
+        #    continue
+
     # === Save results ===
-    with open(output_path, "w") as f:
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(outputs, f, indent=2, ensure_ascii=False)
 
     print(f"Saved {len(outputs)} results to {output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Qwen-VL on a LLaVA-style JSON dataset.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Qwen-VL on a LLaVA-style JSON dataset."
+    )
 
     parser.add_argument(
         "--eval_data_path",
         type=str,
         required=True,
-        help="Path to the JSON annotation file"
+        help="Path to the JSON annotation file",
     )
     parser.add_argument(
         "--img_folder",
         type=str,
         required=True,
-        help="Folder containing the images"
+        help="Folder containing the images",
     )
     parser.add_argument(
         "--output_path",
         type=str,
-        default="eval.res",
-        help="Path to save the output JSON"
+        default="eval_results.json",
+        help="Path to save the output JSON",
     )
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen2-VL-7B-Instruct",
-        help="Qwen-VL model name or local path"
+        default=DEFAULT_MODEL_NAME,
+        help="Qwen-VL model name or local path",
     )
     parser.add_argument(
         "--max_samples",
         type=int,
-        default=None,
-        help="Optional number of samples to evaluate"
+        default=10,
+        help="Optional number of samples to evaluate",
     )
     parser.add_argument(
         "--max_new_tokens",
         type=int,
         default=128,
-        help="Maximum number of generated tokens"
+        help="Maximum number of generated tokens",
     )
 
     args = parser.parse_args()
@@ -175,8 +235,10 @@ def main():
         img_folder=args.img_folder,
         output_path=args.output_path,
         model_name_or_path=args.model_name_or_path,
+        max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens
     )
+
 
 if __name__ == "__main__":
     main()

@@ -96,9 +96,13 @@ if DO_COMPRESSION:
     #         ["language_model", "mlp.down_proj", 27],  # Apply to the last "mlp.down_proj" layer in text_config
     #     ], verbose=VERBOSE)
     #manager.set("lrd", "rank", 128, [["visual", "mlp.up_proj", 2]])
+
     manager.set("lrd", "rank", 128, [["language_model", "mlp.down_proj", 26],
         ["language_model", "mlp.down_proj", 27]
         ], verbose=VERBOSE)
+
+    manager.init_vcon(verbose=True)
+    manager.set_vcon_beta(beta=1.0)
 
     # Optionally print the full compression configuration as a table
     # print(manager)  

@@ -7,6 +7,7 @@ from .pruning import (
 )
 from .lrd import (
     LRDer,
+    validate_lrd_method,
     validate_lrd_rank
 )
 from .quantization import (
@@ -29,7 +30,8 @@ COMPRESSION_REGISTRY = {
         "granularity": dict(default="layer", validator=validate_pruning_granularity)
     },
     "lrd": {
-        "rank": dict(default="full", validator=validate_lrd_rank)
+        "rank": dict(default="full", validator=validate_lrd_rank),
+        "method": dict(default="svd", validator=validate_lrd_method)
     },
     "quantization": {
         "precision": dict(default="full", validator=validate_precision),
