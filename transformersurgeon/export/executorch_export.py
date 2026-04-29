@@ -7,6 +7,10 @@ import torch
 import torch.nn as nn
 from torch.export import Dim, export as torch_export
 
+import re
+from executorch.exir.dialects._ops import ops as exir_ops
+from executorch.exir.pass_base import ExportPass, PassResult
+
 from ..blocks import TransformerDecoder
 from ..utils import convert_for_export
 
@@ -51,6 +55,48 @@ class ExportAdapter:
     exported_weight_extractor: Any | None = None
     original_weight_extractor: Any | None = None
 
+class SplitGraphBlocks(ExportPass):
+                """Split graph at 'blocks.N' boundaries for transformersurgeon models."""
+                def __init__(self, shard_layers):
+                    super().__init__()
+                    self.shard_layers = shard_layers
+
+                def _insert_fallback_op(self, graph_module):
+                    from executorch.backends.qualcomm.utils.constants import (
+                        QCOM_QUANT_ATTRS,
+                    )
+                    pattern = r"blocks\.(\d+)"
+                    prev_node = None
+                    prev_layer = None
+                    for node in graph_module.graph.nodes:
+                        if node.op != "call_function" or "nn_module_stack" not in node.meta:
+                            continue
+                        module_values_list = list(node.meta["nn_module_stack"].values())
+                        full_qualified_name = module_values_list[-1][0]
+                        match = re.search(pattern, full_qualified_name)
+                        if match is None:
+                            continue
+                        cur_layer = int(match.group(1))
+                        if cur_layer in self.shard_layers and prev_layer == cur_layer - 1:
+                            with graph_module.graph.inserting_after(prev_node):
+                                users = list(prev_node.users.keys())
+                                inserted_node = graph_module.graph.create_node(
+                                    "call_function",
+                                    exir_ops.edge.llama.fallback.default,
+                                    (prev_node,),
+                                )
+                                inserted_node.meta["val"] = prev_node.meta["val"]
+                                if prev_node.meta.get(QCOM_QUANT_ATTRS, None):
+                                    inserted_node.meta[QCOM_QUANT_ATTRS] = prev_node.meta[QCOM_QUANT_ATTRS]
+                                for user in users:
+                                    user.replace_input_with(prev_node, inserted_node)
+                        prev_layer = cur_layer
+                        prev_node = node
+
+                def call(self, graph_module):
+                    self._insert_fallback_op(graph_module)
+                    graph_module.recompile()
+                    return PassResult(graph_module, True)
 
 class EmbeddingDecoderFinalWrapper(nn.Module):
     """Single wrapper that chains embedding -> decoder -> final layer."""
@@ -77,7 +123,7 @@ class EmbeddingDecoderFinalStaticSeqLen1Wrapper(nn.Module):
 
     Input contract:
     - input_ids: shape (batch, 1)
-    - seq_pos_tensor: tensor containing a single long value with the token position
+    - last_pos_tensor: tensor containing a single long value with the token position
       (0-based). Decoder cache_len is computed as seq_pos + 1.
     """
 
@@ -90,10 +136,10 @@ class EmbeddingDecoderFinalStaticSeqLen1Wrapper(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        seq_pos_tensor: torch.Tensor,
+        last_pos_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        seq_pos = seq_pos_tensor.reshape(()).to(torch.long)
-        hidden = self.decoder(self.embedding(input_ids), last_pos=seq_pos, static=True)
+        last_pos = last_pos_tensor.to(torch.long)
+        hidden = self.decoder(self.embedding(input_ids), last_pos=last_pos, static=True)
         logits = self.final_layer(hidden[:, -1, :])
         return logits
 
@@ -114,7 +160,7 @@ def _resolve_partitioner(backend: str, allow_fallback: bool = True):
     raise ValueError(f"Unsupported backend '{backend}'. Use 'xnnpack' or 'qnn'.")
 
 
-def _build_qnn_compiler_specs(qnn_soc_model: str = "SM8650", qnn_use_fp16: bool = False):
+def _build_qnn_compiler_specs(qnn_soc_model: str = "SM8650", qnn_use_fp16: bool = False, use_multi_contexts: bool = False):
     from executorch.backends.qualcomm.utils.utils import (
         generate_htp_compiler_spec,
         generate_qnn_executorch_compiler_spec,
@@ -132,6 +178,7 @@ def _build_qnn_compiler_specs(qnn_soc_model: str = "SM8650", qnn_use_fp16: bool 
     return generate_qnn_executorch_compiler_spec(
         soc_model=getattr(QcomChipset, qnn_soc_model),
         backend_options=backend_options,
+        use_multi_contexts=use_multi_contexts,
     )
 
 
@@ -374,11 +421,13 @@ def export_to_executorch(
     check_ir_validity: bool = True,
     verbose: bool = False,
     weight_mismatch_eps: float = 1e-4,
-    allow_backend_fallback: bool = True,
+    allow_backend_fallback: bool = False,
     adapter: ExportAdapter | None = None,
     example_inputs: tuple[Any, ...] | None = None,
     dynamic_shapes: dict[str, Any] | None = None,
     run_weight_mismatch_check: bool = True,
+    qnn_n_layers: int = 24,
+    qnn_n_shards: int = 4,
     qnn_soc_model: str = "SM8650",
     qnn_use_fp16: bool = False,
 ) -> ExecuTorchExportResult:
@@ -390,7 +439,7 @@ def export_to_executorch(
     - Uses one combined wrapper containing embedding + decoder + final layer.
     - PT2E export to XNNPACK/QNN with optional calibration data.
     - No custom fake quantization is applied.
-    - Int4 enabled now with placeholder quant plan for future mixed precision.
+    - Supports precision in {"int4", "int8", "full"} where "full" skips quantization.
     - If verbose, prints simple inference error statistics.
     - Warns when original-vs-exported(dequantized) weight mismatch > eps.
     """
@@ -439,8 +488,13 @@ def export_to_executorch(
             wrapper = EmbeddingDecoderFinalWrapper(embedding, decoder, final_layer)
     wrapper.eval()
 
-    # Placeholder for future mixed precision. Today we only enforce global int4/int8.
+    # Placeholder for future mixed precision. Today we support global int4/int8/full.
     quant_plan = _build_quant_plan(model_config, requested_precision=precision)
+    if quant_plan.global_precision not in {"int4", "int8", "full"}:
+        raise ValueError(
+            f"Unsupported precision '{quant_plan.global_precision}'. "
+            "Use 'int4', 'int8', or 'full'."
+        )
     if quant_plan.layer_precisions:
         warnings.warn(
             "Per-layer precision overrides are not implemented yet; using global precision only.",
@@ -457,7 +511,7 @@ def export_to_executorch(
                 example_input_ids = torch.randint(0, vocab_size, (1, default_seq_len), dtype=torch.long)
             if example_cache_len_tensor is None:
                 if static_seq_len_1:
-                    example_cache_len_tensor = torch.tensor([0], dtype=torch.long)
+                    example_cache_len_tensor = torch.tensor([1], dtype=torch.long)
                 else:
                     example_cache_len_tensor = torch.ones(5)
             example_inputs = (example_input_ids, example_cache_len_tensor)
@@ -485,31 +539,43 @@ def export_to_executorch(
         example_inputs,
         dynamic_shapes=dynamic_shapes,
     )
+    export_for_edge = exported
+    module_for_qnn = exported.module()
+    exported_for_mismatch = None
 
-    from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
+    if quant_plan.global_precision != "full":
+        from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 
-    quantizer = _build_quantizer(quant_plan.global_precision)
-    prepared = prepare_pt2e(exported.module(), quantizer)
+        quantizer = _build_quantizer(quant_plan.global_precision)
+        prepared = prepare_pt2e(exported.module(), quantizer)
 
-    with torch.no_grad():
-        if calibration_data:
-            if adapter.calibration_runner is not None:
-                adapter.calibration_runner(prepared, calibration_data)
+        with torch.no_grad():
+            if calibration_data:
+                if adapter.calibration_runner is not None:
+                    adapter.calibration_runner(prepared, calibration_data)
+                else:
+                    for cal_inputs in calibration_data:
+                        if isinstance(cal_inputs, (tuple, list)):
+                            prepared(*cal_inputs)
+                        else:
+                            prepared(cal_inputs)
             else:
-                for cal_inputs in calibration_data:
-                    if isinstance(cal_inputs, (tuple, list)):
-                        prepared(*cal_inputs)
-                    else:
-                        prepared(cal_inputs)
-        else:
-            prepared(*example_inputs)
+                prepared(*example_inputs)
 
-    converted = convert_pt2e(prepared)
-    quantized_exported = torch_export(
-        converted,
-        example_inputs,
-        dynamic_shapes=dynamic_shapes,
-    )
+        converted = convert_pt2e(prepared)
+        quantized_exported = torch_export(
+            converted,
+            example_inputs,
+            dynamic_shapes=dynamic_shapes,
+        )
+        export_for_edge = quantized_exported
+        module_for_qnn = converted
+        exported_for_mismatch = quantized_exported
+    elif calibration_data:
+        warnings.warn(
+            "Calibration data is ignored when precision='full' (no quantization).",
+            stacklevel=2,
+        )
 
     from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
 
@@ -518,15 +584,37 @@ def export_to_executorch(
             from executorch.backends.qualcomm.utils.utils import (
                 to_edge_transform_and_lower_to_qnn,
             )
+            from executorch.backends.qualcomm.utils.constants import (
+                QCOM_PASS_ACTIVATE_KEY,
+                QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
+            )
+            from executorch.backends.qualcomm._passes.qnn_pass_manager import (
+                get_capture_program_passes,
+            )
+            from executorch.backends.qualcomm._passes.utils import (
+                get_passes_dependency_for_capture_program,
+            )
 
             compiler_specs = _build_qnn_compiler_specs(
                 qnn_soc_model=qnn_soc_model,
                 qnn_use_fp16=qnn_use_fp16,
+                use_multi_contexts=(qnn_n_shards > 1),
             )
+
+            passes_job = get_capture_program_passes()
+            dep_table = get_passes_dependency_for_capture_program()
+            shard_layers = list(range(0, qnn_n_layers, qnn_n_layers // qnn_n_shards))
+            passes_job[SplitGraphBlocks] = {
+                QCOM_PASS_ACTIVATE_KEY: True,
+                QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY: {"shard_layers": shard_layers},
+            }
+
             edge = to_edge_transform_and_lower_to_qnn(
-                converted,
+                module_for_qnn,
                 example_inputs,
                 compiler_specs,
+                passes_job=passes_job,
+                dep_table=dep_table,
                 dynamic_shapes=dynamic_shapes,
             )
         except Exception as exc:
@@ -542,13 +630,13 @@ def export_to_executorch(
 
             resolved_backend = "xnnpack"
             edge = to_edge_transform_and_lower(
-                quantized_exported,
+                export_for_edge,
                 compile_config=EdgeCompileConfig(_check_ir_validity=check_ir_validity),
                 partitioner=[XnnpackPartitioner()],
             )
     else:
         edge = to_edge_transform_and_lower(
-            quantized_exported,
+            export_for_edge,
             compile_config=EdgeCompileConfig(_check_ir_validity=check_ir_validity),
             partitioner=[partitioner],
         )
@@ -558,11 +646,11 @@ def export_to_executorch(
         f.write(et_program.buffer)
 
     mismatches = []
-    if run_weight_mismatch_check:
+    if run_weight_mismatch_check and exported_for_mismatch is not None:
         try:
             mismatches = _find_weight_mismatches(
                 wrapper,
-                quantized_exported,
+                exported_for_mismatch,
                 eps=weight_mismatch_eps,
                 exported_weight_extractor=adapter.exported_weight_extractor,
                 original_weight_extractor=adapter.original_weight_extractor,
@@ -572,6 +660,11 @@ def export_to_executorch(
                 f"Weight mismatch check skipped due to extractor incompatibility: {exc}",
                 stacklevel=2,
             )
+    elif run_weight_mismatch_check and quant_plan.global_precision == "full":
+        warnings.warn(
+            "Weight mismatch check is skipped for precision='full' (no quantized frozen params).",
+            stacklevel=2,
+        )
     if mismatches:
         worst = max(mismatches, key=lambda x: x["max_abs_err"])
         warnings.warn(
