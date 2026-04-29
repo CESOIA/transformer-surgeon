@@ -1,4 +1,4 @@
-"""Model-style indexing for converted custom decoder graph compression."""
+"""Model-style indexing for converted custom graph compression."""
 
 # Configuration for converted decoder graph compression schemes
 CUSTOM_DECODER_INDEXING = {
@@ -18,4 +18,22 @@ CUSTOM_DECODER_INDEXING = {
     }
 }
 
-__all__ = ["CUSTOM_DECODER_INDEXING"]
+# Configuration for converted encoder graph compression schemes
+CUSTOM_ENCODER_INDEXING = {
+    "encoder": {
+        "config_attr": "",
+        "num_blocks_attr": "num_hidden_layers",
+        "path_list": [
+            "attn.q_proj",
+            "attn.k_proj",
+            "attn.v_proj",
+            "attn.out_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ],
+        "path_template": "blocks.{block_index}.{path}",
+    }
+}
+
+__all__ = ["CUSTOM_DECODER_INDEXING", "CUSTOM_ENCODER_INDEXING"]

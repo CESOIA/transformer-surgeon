@@ -225,6 +225,9 @@ class CompressionScheme:
                     kwargs[name] = getattr(module, name)
         # Create a new instance of the same class
         module_copy = type(module)(**kwargs)
+        src_param = next(module.parameters(), None)
+        if src_param is not None:
+            module_copy = module_copy.to(device=src_param.device)
         with torch.no_grad():
             for name, param in module.named_parameters(recurse=False):
                 getattr(module_copy, name).copy_(param.detach().clone())

@@ -20,7 +20,7 @@ embedding = model.get_input_embeddings()
 final_layer = model.lm_head
 
 # Convert to export-compatible modules
-max_context_len = 512
+max_context_len = 128
 convert_options = {
     "use_sdpa": True,  # Whether to use SDPA or regular MHA in the decoder wrapper
     "max_cache_len": max_context_len,  # Maximum cache length for the decoder wrapper
@@ -30,7 +30,7 @@ decoder = converted_models['text']
 
 # Set device and data type
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-data_type = torch.float16
+data_type = torch.float32
 
 # Put all modules on the same device
 embedding = embedding.to(device, dtype=data_type)
@@ -75,7 +75,7 @@ inputs_embeds = embedding(input_ids)
 # Prefill phase
 output_embed = decoder(
     inputs_embeds,
-    cache_len=inputs_embeds.size(1),
+    last_pos=inputs_embeds.size(1),
     )
 # Extract logits from output embed
 logits = final_layer(output_embed[:, -1, :])
@@ -90,11 +90,11 @@ with torch.no_grad():
 
     start_context_len = output_ids.size(1)
     for i in tqdm.tqdm(range(start_context_len, max_context_len), "Generating"):
-        cache_len = output_ids.size(1) + 1
+        last_pos = output_ids.size(1) + 1
 
         output_embed = decoder(
             inputs_embeds[:, -1:, :],
-            cache_len=cache_len,
+            last_pos=last_pos,
             )
         
         # Extract logits from output embed
