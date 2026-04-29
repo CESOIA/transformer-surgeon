@@ -27,7 +27,7 @@ def parse_args():
         "--precision",
         type=str,
         default="int8",
-        choices=["int4", "int8"],
+        choices=["full", "int4", "int8"],
         help="Global quant precision",
     )
     parser.add_argument(
