@@ -9,7 +9,7 @@ from collections.abc import Mapping
 import torch
 from transformers import PretrainedConfig
 from typing import Any, Callable, Dict, List, Optional, Union
-import warnings
+from ..compression.lrd import validate_lrd_method
 from .scheme import CompressionScheme
 
 class CompressionSchemesManager:
@@ -30,6 +30,12 @@ class CompressionSchemesManager:
         """
         self.model = model
         self.calibration_data = None
+        self.methods = {
+            "lrd_method": "svd",
+            "quant_method": None,
+            "str_prune_method": None,
+            "ustr_prune_method": None,
+        }
         try:
             self.config = model.config
             assert isinstance(self.config, PretrainedConfig), "Model config is not an instance of PretrainedConfig. Please provide a model with a valid Hugging Face configuration."
@@ -51,6 +57,15 @@ class CompressionSchemesManager:
         """
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.set(compression, property, value, verbose=verbose)
+
+    def set_lrd_method(self, method, verbose=False):
+        """
+        Sets the manager-level LRD method used when applying LRD compressors.
+        """
+        validate_lrd_method(method)
+        self.methods["lrd_method"] = method
+        if verbose:
+            print(f"Setting LRD method to {method}.")
 
     def init_vcon(self, criteria=None, verbose=False):
         """
@@ -104,63 +119,41 @@ class CompressionSchemesManager:
         """
         Stores a calibration dataset/dataloader on the manager.
 
-        The stored data can later be consumed by calibrate_lrd().
+        The stored data can later be consumed by run_calibration().
         """
         self.calibration_data = calibration_data
 
-    def calibrate_lrd(
+    def _run_calibration_forward(
         self,
-        calibration_data=None,
-        criteria=None,
         max_batches: Optional[int] = None,
         device: Optional[Union[str, torch.device]] = None,
         forward_fn: Optional[Callable] = None,
-        offload_to_cpu: bool = True,
         verbose: bool = False,
     ):
         """
-        Runs calibration data once through the model and accumulates activation
-        covariance for all filtered LRD compressors using method "svd_llm_v2".
+        Runs calibration data through the model.
+
+        This is intentionally generic: callers can register their own hooks
+        before invoking it to collect statistics for compression, quantization,
+        tracing, or diagnostics.
 
         Args:
-            calibration_data: Iterable of model inputs. If None, uses data
-                previously provided via set_calibration_data().
-            criteria: Optional manager criteria to filter target modules.
             max_batches: Optional cap on the number of calibration batches.
             device: Device where model inputs should be moved before forward.
                 Defaults to the model's first parameter/buffer device.
             forward_fn: Optional callable with signature
                 forward_fn(model, batch). Use this when the batch structure
                 needs custom model invocation.
-            offload_to_cpu: If True, activation covariance is accumulated on CPU.
             verbose: If True, prints calibration progress information.
 
         Returns:
-            int: Number of LRD compressors calibrated.
+            int: Number of calibration batches executed.
         """
-        if calibration_data is None:
-            calibration_data = self.calibration_data
-        else:
-            self.calibration_data = calibration_data
-
-        if calibration_data is None:
-            raise ValueError("Calibration data is required to calibrate LRD with method 'svd_llm_v2'.")
-
-        targets = self._lrd_svd_llm_v2_targets(criteria=criteria)
-        if len(targets) == 0:
-            if verbose:
-                print("No LRD compressors with method 'svd_llm_v2' found for calibration.")
-            return 0
-
-        for _, compressor in targets:
-            compressor.clear_covariance()
-            compressor._covariance_sum = None
-            compressor._covariance_tokens = 0
-
-        handles = []
-        for scheme, compressor in targets:
-            module = scheme.get_module()
-            handles.append(module.register_forward_hook(self._make_lrd_calibration_hook(compressor, offload_to_cpu)))
+        if self.calibration_data is None:
+            raise ValueError(
+                "Calibration data is required to run calibration. "
+                "Call manager.set_calibration_data(...) before manager.apply(...)."
+            )
 
         if device is None:
             device = self._infer_model_device()
@@ -171,21 +164,90 @@ class CompressionSchemesManager:
         try:
             self.model.eval()
             with torch.no_grad():
-                for batch_id, batch in enumerate(self._calibration_iter(calibration_data)):
+                for batch_id, batch in enumerate(self._calibration_iter(self.calibration_data)):
                     if max_batches is not None and batch_id >= max_batches:
                         break
                     batch = self._move_to_device(batch, device)
                     self._run_calibration_batch(batch, forward_fn=forward_fn)
                     num_batches += 1
         finally:
-            for handle in handles:
-                handle.remove()
             if was_training:
                 self.model.train()
 
         if num_batches == 0:
             raise ValueError("Calibration data must contain at least one batch.")
 
+        if verbose:
+            print(f"Ran {num_batches} calibration batches.")
+
+        return num_batches
+
+    def run_calibration(
+        self,
+        criteria=None,
+        max_batches: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        forward_fn: Optional[Callable] = None,
+        offload_to_cpu: bool = True,
+        verbose: bool = False,
+    ):
+        """
+        Runs calibration data and stores activation covariance for all filtered
+        LRD compressors using method "wsvd".
+
+        Returns:
+            int: Number of LRD compressors calibrated.
+        """
+        if self.methods["lrd_method"] != "wsvd":
+            return 0
+
+        targets = self._lrd_targets(criteria=criteria)
+        if len(targets) == 0:
+            if verbose:
+                print("No LRD compressors found for calibration.")
+            return 0
+
+        if self.calibration_data is None:
+            raise ValueError(
+                "LRD method 'wsvd' requires calibration data before apply. "
+                "Call manager.set_calibration_data(...) before manager.apply(...)."
+            )
+
+        handles = self._prepare_lrd_covariance_collection(
+            targets=targets,
+            offload_to_cpu=offload_to_cpu,
+        )
+        try:
+            num_batches = self._run_calibration_forward(
+                max_batches=max_batches,
+                device=device,
+                forward_fn=forward_fn,
+                verbose=verbose,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self._finalize_lrd_covariance(targets)
+
+        if verbose:
+            print(f"Calibrated {len(targets)} LRD compressors over {num_batches} batches.")
+
+        return len(targets)
+
+    def _prepare_lrd_covariance_collection(self, targets, offload_to_cpu: bool):
+        for _, compressor in targets:
+            compressor.clear_covariance()
+            compressor._covariance_sum = None
+            compressor._covariance_tokens = 0
+
+        handles = []
+        for scheme, compressor in targets:
+            module = scheme.get_module()
+            handles.append(module.register_forward_hook(self._make_lrd_calibration_hook(compressor, offload_to_cpu)))
+        return handles
+
+    def _finalize_lrd_covariance(self, targets):
         for scheme, compressor in targets:
             if compressor._covariance_tokens == 0:
                 raise RuntimeError(f"No calibration activations were collected for module {scheme.path}.")
@@ -193,19 +255,23 @@ class CompressionSchemesManager:
             del compressor._covariance_sum
             del compressor._covariance_tokens
 
-        if verbose:
-            print(f"Calibrated {len(targets)} LRD compressors over {num_batches} batches.")
-
-        return len(targets)
-
     def clear_lrd_calibration(self, criteria=None):
         """
         Clears stored LRD activation covariance for filtered modules.
         """
-        for _, compressor in self._lrd_svd_llm_v2_targets(criteria=criteria):
+        for _, compressor in self._lrd_targets(criteria=criteria):
             compressor.clear_covariance()
 
-    def apply(self, hard=False, criteria=None, verbose=False, calibration_data=None, calibration_kwargs=None):
+    def apply(
+        self,
+        hard=False,
+        criteria=None,
+        verbose=False,
+        max_batches: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        forward_fn: Optional[Callable] = None,
+        offload_to_cpu: bool = True,
+    ):
         """
         Applies filtered compression schemes to their respective modules in the model.
 
@@ -213,32 +279,44 @@ class CompressionSchemesManager:
             hard: If True, applies hard compression (non-reversible); if False, applies soft compression (reversible)
             criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the application process
-            calibration_data: Optional calibration dataset/dataloader. When
-                provided, LRD compressors using method "svd_llm_v2" are
-                calibrated before compression is applied.
-            calibration_kwargs: Optional dict forwarded to calibrate_lrd().
+            max_batches: Optional cap on calibration batches.
+            device: Device where calibration batches should be moved before forward.
+            forward_fn: Optional callable with signature forward_fn(model, batch).
+            offload_to_cpu: If True, LRD covariance is accumulated on CPU.
         """
-        if calibration_data is not None:
-            calibration_kwargs = calibration_kwargs or {}
-            self.calibrate_lrd(
-                calibration_data=calibration_data,
+        lrd_targets = self._lrd_targets(criteria=criteria)
+
+        if self.methods["lrd_method"] == "wsvd" and lrd_targets:
+            if self.calibration_data is None:
+                missing_covariance = [scheme.path for scheme, _ in lrd_targets]
+                raise ValueError(
+                    "LRD method 'wsvd' requires calibration data before apply. "
+                    "Call manager.set_calibration_data(...) before manager.apply(...) "
+                    f"for: {missing_covariance}"
+                )
+            self.run_calibration(
                 criteria=criteria,
+                max_batches=max_batches,
+                device=device,
+                forward_fn=forward_fn,
+                offload_to_cpu=offload_to_cpu,
                 verbose=verbose,
-                **calibration_kwargs,
             )
 
         for scheme in self.iter_filtered(criteria=criteria):
+            compressor = scheme.compressors.get("lrd", None)
+            if compressor is not None:
+                compressor.method = self.methods["lrd_method"]
+                compressor.config["method"] = self.methods["lrd_method"]
             scheme.apply(hard=hard, verbose=verbose)
 
-    def _lrd_svd_llm_v2_targets(self, criteria=None):
+    def _lrd_targets(self, criteria=None):
         targets = []
         for scheme in self.iter_filtered(criteria=criteria):
             compressor = scheme.compressors.get("lrd", None)
             if compressor is None or not compressor._to_compress():
                 continue
-            method = getattr(compressor, "method", compressor.config.get("method", "svd"))
-            if method == "svd_llm_v2":
-                targets.append((scheme, compressor))
+            targets.append((scheme, compressor))
         return targets
 
     def _make_lrd_calibration_hook(self, compressor, offload_to_cpu: bool):

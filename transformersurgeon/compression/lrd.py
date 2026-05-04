@@ -3,8 +3,8 @@ from typing import Tuple, Union
 from .abstract import Compressor
 
 _DEFAULT_LRD_METHOD = "svd"
-_SVD_LLM_V2_METHOD = "svd_llm_v2"
-_LRD_METHODS = (_DEFAULT_LRD_METHOD, _SVD_LLM_V2_METHOD)
+_WSVD_METHOD = "wsvd"
+_LRD_METHODS = (_DEFAULT_LRD_METHOD, _WSVD_METHOD)
 
 
 def _validate_rank(weight, rank: int) -> None:
@@ -49,14 +49,14 @@ def _low_rank_svd(weight, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
     return US_r_out.contiguous(), V_r_out.contiguous()
 
 
-def svd_llm_v2(
+def wsvd(
     weight,
     rank: int,
     covariance: torch.Tensor,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Performs activation-aware low-rank decomposition using the SVD-LLM v2
+    Performs activation-aware low-rank decomposition using the WSVD
     transform.
 
     Args:
@@ -81,8 +81,8 @@ def svd_llm_v2(
 
     if covariance is None:
         raise ValueError(
-            "The svd_llm_v2 LRD method requires a precomputed covariance tensor. "
-            "Run manager.calibrate_lrd(...) before applying compression."
+            "The wsvd LRD method requires a precomputed covariance tensor. "
+            "Call manager.set_calibration_data(...) before manager.apply(...)."
         )
     if covariance.shape != (in_features, in_features):
         raise ValueError(
@@ -160,8 +160,8 @@ class LRDer(Compressor):
                 with torch.no_grad():
                     if method == _DEFAULT_LRD_METHOD:
                         US_r, V_r = _low_rank_svd(module.weight.detach(), rank)
-                    elif method == _SVD_LLM_V2_METHOD:
-                        US_r, V_r = svd_llm_v2(
+                    elif method == _WSVD_METHOD:
+                        US_r, V_r = wsvd(
                             module.weight.detach(),
                             rank,
                             covariance=covariance,
@@ -211,7 +211,7 @@ def validate_lrd_rank(rank: Union[int, str]) -> None:
 
 __all__ = [
     "LRDer",
-    "svd_llm_v2",
+    "wsvd",
     "validate_lrd_method",
     "validate_lrd_rank"
 ]
