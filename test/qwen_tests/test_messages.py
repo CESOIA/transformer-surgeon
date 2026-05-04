@@ -1,55 +1,19 @@
-# Message
+# Text-only messages for Qwen2 language model testing
 messages = [
     {
         "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "What kind of apples are these?"
-            },
-        ],
+        "content": "What is the capital of France?"
     },
     {
         "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "What kind of oranges are these?"
-            },
-        ],
+        "content": "Explain the concept of neural networks in two sentences."
     },
     {
         "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "Describe the picture in a sentence."
-            },
-        ],
+        "content": "Write a short poem about the ocean."
     },
     {
         "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/example_image.jpg",
-            },
-            {
-                "type": "text",
-                "text": "How many apples are there in the image?"
-            },
-        ],
-    }
+        "content": "What are the main differences between Python and C++?"
+    },
 ]

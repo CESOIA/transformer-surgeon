@@ -35,8 +35,8 @@ class MLP(torch.nn.Module):
         # Setup compression configuration
         if compression_config is None:
             compression_config = {
-                "up_proj": {"lrd_rank": "full"},
-                "down_proj": {"lrd_rank": "full"}
+                "up_proj": {"lrd": {"rank": "full"}},
+                "down_proj": {"lrd": {"rank": "full"}}
             }
         
         up_proj_lrd_rank = compression_config["up_proj"]["lrd"]["rank"]
@@ -48,6 +48,10 @@ class MLP(torch.nn.Module):
                 "up_proj": False,
                 "down_proj": False
             }
+        else:
+            bias_required = dict(bias_required)
+            bias_required.setdefault("up_proj", False)
+            bias_required.setdefault("down_proj", False)
 
         self.up_proj = LinearCompressed(
             embed_dim,
@@ -103,9 +107,9 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
         # Setup compression configuration
         if compression_config is None:
             compression_config = {
-                "up_proj": {"lrd_rank": "full"},
-                "gate_proj": {"lrd_rank": "full"},
-                "down_proj": {"lrd_rank": "full"}
+                "up_proj": {"lrd": {"rank": "full"}},
+                "gate_proj": {"lrd": {"rank": "full"}},
+                "down_proj": {"lrd": {"rank": "full"}}
             }
 
         up_proj_lrd_rank = compression_config["up_proj"]["lrd"]["rank"]
@@ -119,6 +123,11 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
                 "gate_proj": False,
                 "down_proj": False
             }
+        else:
+            bias_required = dict(bias_required)
+            bias_required.setdefault("up_proj", False)
+            bias_required.setdefault("gate_proj", False)
+            bias_required.setdefault("down_proj", False)
 
         self.up_proj = LinearCompressed(
             embed_dim,

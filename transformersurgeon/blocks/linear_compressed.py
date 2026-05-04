@@ -95,7 +95,7 @@ class LinearCompressed(nn.Linear):
         else:
             weight = self.weight
 
-        return F.linear(x, weight, self.bias)    
+        return F.linear(x, weight, self.bias)
 
     def __str__(self):
         return self.__repr__()
