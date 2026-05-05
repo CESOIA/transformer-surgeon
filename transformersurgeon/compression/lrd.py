@@ -6,6 +6,8 @@ _DEFAULT_LRD_METHOD = "svd"
 _WSVD_METHOD = "wsvd"
 _LRD_METHODS = (_DEFAULT_LRD_METHOD, _WSVD_METHOD)
 
+_LRD_METHOD = _DEFAULT_LRD_METHOD
+
 
 def _validate_rank(weight, rank: int) -> None:
     if rank >= min(weight.size()):
@@ -19,6 +21,16 @@ def validate_lrd_method(method: str) -> None:
 
     if method not in _LRD_METHODS:
         raise ValueError(f"Unsupported LRD method '{method}'. Supported methods are: {_LRD_METHODS}.")
+
+
+def _get_lrd_method() -> str:
+    return _LRD_METHOD
+
+
+def _set_lrd_method(method: str):
+    global _LRD_METHOD
+    validate_lrd_method(method)
+    _LRD_METHOD = method
 
 
 def _low_rank_svd(weight, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -124,7 +136,6 @@ class LRDer(Compressor):
         self.config = config
         # Local temporary configuration
         self.rank = self.config["rank"]
-        self.method = self.config.get("method", _DEFAULT_LRD_METHOD)
         self.eps = self.config.get("eps", 1e-6)
         self.covariance = self.config.get(
             "covariance",
@@ -146,13 +157,12 @@ class LRDer(Compressor):
 
         # Extract temp configuration
         rank = self.rank
-        method = self.method
+        method = _get_lrd_method()
         validate_lrd_method(method)
         eps = self.eps
         covariance = self.covariance
         # Apply temp configuration to module config
         self.config["rank"] = rank
-        self.config["method"] = method
         self.config["eps"] = eps
     
         if rank:
@@ -177,7 +187,6 @@ class LRDer(Compressor):
         if not self._to_compress():
             # Restore module configuration
             self.config["rank"] = "full"
-            self.config["method"] = _DEFAULT_LRD_METHOD
 
         if not hasattr(module, 'weight_2'):
             raise AttributeError("Module does not have 'weight_2' attribute required for LRD restoration.")
@@ -193,7 +202,8 @@ class LRDer(Compressor):
         return self.rank != "full"
     
     def __repr__(self):
-        string = f"LRDer(rank={self.rank}, method='{self.method}')"
+        method = _get_lrd_method()
+        string = f"LRDer(rank={self.rank}, method='{method}')"
         return string
 
 # Configuration validators

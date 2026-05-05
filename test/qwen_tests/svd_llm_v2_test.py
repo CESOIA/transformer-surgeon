@@ -77,13 +77,9 @@ def set_ranks_for_selected_linear_layers(manager, ranks_by_layer: Dict[str, int]
     """
     if ranks_by_layer is None:
         ranks_by_layer = {
-            "self_attn.q_proj": 313,
-            "self_attn.k_proj": 78,
-            "self_attn.v_proj": 78,
-            "self_attn.o_proj": 313,
-            "mlp.up_proj": 529,
-            "mlp.gate_proj": 529,
-            "mlp.down_proj": 529
+            "mlp.up_proj": 497,
+            "mlp.gate_proj": 497,
+            "mlp.down_proj": 497
         }
 
     updated = 0
@@ -136,7 +132,7 @@ print(model.config)
 print(model)
 
 ### WSVD COMPRESSION CONFIGURATION AND APPLICATION ###
-dataset = JsonlMessagesDataset("/ibex/user/antonic/CESOIA/transformer-surgeon/test/qwen_tests/automotive_990_examples.jsonl")
+dataset = JsonlMessagesDataset("/ibex/user/antonic/CESOIA-draft/transformer-surgeon/test/qwen_tests/automotive_990_examples.jsonl")
 collate_fn = build_dialog_collate_fn(tokenizer)
 calibration_loader = DataLoader(
     dataset,

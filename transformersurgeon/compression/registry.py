@@ -29,7 +29,7 @@ COMPRESSION_REGISTRY = {
         "granularity": dict(default="layer", validator=validate_pruning_granularity)
     },
     "lrd": {
-        "rank": dict(default="full", validator=validate_lrd_rank)
+        "rank": dict(default="full", validator=validate_lrd_rank),
     },
     "quantization": {
         "precision": dict(default="full", validator=validate_precision),
