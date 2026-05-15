@@ -83,11 +83,11 @@ class LinearCompressed(nn.Linear):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         x = input
-
+          
         # Skip logic
         if self.skip:
             return x
-
+        
         # LRD logic
         if isinstance(self.rank, int):
             weight = self.weight[:, :self.rank]

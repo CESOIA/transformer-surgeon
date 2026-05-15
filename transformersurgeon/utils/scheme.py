@@ -385,8 +385,10 @@ class CompressionScheme:
             return # nothing to apply
 
         if verbose:
+            
             cmp_msg = "HARD (non-reversible)" if hard else "soft"
             print(f"Applying ({cmp_msg}) compression scheme:\n{self}.")
+            
             if self.soft_applied:
                 if hard:
                     print(f"  ! Compression already hard applied, making the changes permanent (HARD mode)")

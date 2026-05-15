@@ -5,15 +5,27 @@ manager.py
 Provides the CompressionSchemesManager class for managing multiple compression schemes in transformer models.
 """
 
+from collections.abc import Mapping
 import torch
 from transformers import PretrainedConfig
-from typing import Dict, List, Any, Union
-import warnings
+from typing import Any, Dict, List, Optional, Union
+from ..compression.lrd import validate_lrd_method, _set_lrd_method
+from .calibration import LRDCalibration
 from .scheme import CompressionScheme
 
 class CompressionSchemesManager:
     """
-    Class for managing multiple compression schemes across different modules of a transformer model. It allows setting properties, initializing VCON blocks, applying compression, and restoring the original model state based on flexible filtering criteria.
+    Manages multiple compression schemes across different modules of a transformer model.
+    
+    Core features:
+    - Setting compression properties (rank, ratio, method) on filtered modules.
+    - Initializing and managing VCON (Virtual Compression On-demand Network) blocks.
+    - Applying compression schemes with optional calibration for activation-aware methods.
+    - Restoring original model state.
+    
+    Calibration:
+    - Uses an embedded LRDCalibration instance to handle weighted SVD (wsvd) calibration.
+    - LRDCalibration can also be used independently if needed.
     """
 
     def __init__(self,
@@ -28,6 +40,13 @@ class CompressionSchemesManager:
             indexing: Model-specific indexing
         """
         self.model = model
+        self.calibration_data = None
+        self.methods = {
+            "lrd_method": "svd",
+            "quant_method": None,
+            "str_prune_method": None,
+            "ustr_prune_method": None,
+        }
         try:
             self.config = model.config
             assert isinstance(self.config, PretrainedConfig), "Model config is not an instance of PretrainedConfig. Please provide a model with a valid Hugging Face configuration."
@@ -35,6 +54,7 @@ class CompressionSchemesManager:
             raise ValueError("The provided model does not have a 'config' attribute. Please provide a model with a valid configuration.")
         self.indexing = indexing
         self.schemes = self._generate_schemes()
+        self.calibrator = LRDCalibration(self.model)
 
     def set(self, compression, property, value, criteria=None, verbose=False):
         """
@@ -49,6 +69,16 @@ class CompressionSchemesManager:
         """
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.set(compression, property, value, verbose=verbose)
+
+    def set_lrd_method(self, method, verbose=False):
+        """
+        Sets the manager-level LRD method used when applying LRD compressors.
+        """
+        validate_lrd_method(method)
+        self.methods["lrd_method"] = method
+        _set_lrd_method(method)
+        if verbose:
+            print(f"Setting LRD method to {method}.")
 
     def init_vcon(self, criteria=None, verbose=False):
         """
@@ -98,7 +128,68 @@ class CompressionSchemesManager:
             if scheme.vcon_initialized:
                 scheme.freeze_uncompressed_vcon(verbose=verbose)
 
-    def apply(self, hard=False, criteria=None, verbose=False):
+    def set_calibration_data(self, calibration_data):
+        """
+        Stores a calibration dataset/dataloader for weighted SVD calibration.
+
+        Args:
+            calibration_data: An iterable of batches (Tensor, Mapping, tuple, or list).
+                             Can later be consumed by run_calibration() when method is 'wsvd'.
+        """
+        self.calibration_data = calibration_data
+        self.calibrator.set_calibration_data(calibration_data)
+
+    def run_calibration(
+        self,
+        criteria=None,
+        max_batches: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        offload_to_cpu: bool = True,
+        verbose: bool = False,
+    ):
+        """
+        Run calibration to collect input covariance for weighted SVD (wsvd) method.
+        
+        Delegates to the embedded LRDCalibration instance.
+        
+        Args:
+            criteria: Filter criteria for target schemes.
+            max_batches: Maximum calibration batches to process.
+            device: Device to move batches to.
+            offload_to_cpu: If True, accumulate covariance on CPU.
+            verbose: If True, print progress.
+        
+        Returns:
+            Number of compressors calibrated.
+        """
+        targets = self._collect_lrd_targets(criteria=criteria)
+        return self.calibrator.run(
+            targets,
+            max_batches=max_batches,
+            device=device,
+            offload_to_cpu=offload_to_cpu,
+            verbose=verbose,
+        )
+
+    def clear_lrd_calibration(self, criteria=None):
+        """
+        Clear stored covariance from LRD compressors (optionally filtered by criteria).
+        
+        Args:
+            criteria: Filter criteria for target schemes. None = all schemes.
+        """
+        targets = self._collect_lrd_targets(criteria=criteria)
+        return self.calibrator.clear(targets)
+
+    def apply(
+        self,
+        hard=False,
+        criteria=None,
+        verbose=False,
+        max_batches: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        offload_to_cpu: bool = True,
+    ):
         """
         Applies filtered compression schemes to their respective modules in the model.
 
@@ -106,9 +197,67 @@ class CompressionSchemesManager:
             hard: If True, applies hard compression (non-reversible); if False, applies soft compression (reversible)
             criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the application process
+            max_batches: Optional cap on calibration batches.
+            device: Device where calibration batches should be moved before forward.
+            offload_to_cpu: If True, LRD covariance is accumulated on CPU.
         """
+        lrd_targets = self._collect_lrd_targets(criteria=criteria)
+
+        if self.methods["lrd_method"] == "wsvd" and lrd_targets:
+            if self.calibration_data is None:
+                missing_covariance = [scheme.path for scheme, _ in lrd_targets]
+                raise ValueError(
+                    "LRD method 'wsvd' requires calibration data before apply. "
+                    "Call manager.set_calibration_data(...) before manager.apply(...) "
+                    f"for: {missing_covariance}"
+                )
+            self.run_calibration(
+                criteria=criteria,
+                max_batches=max_batches,
+                device=device,
+                offload_to_cpu=offload_to_cpu,
+                verbose=verbose,
+            )
+
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.apply(hard=hard, verbose=verbose)
+
+    def _collect_lrd_targets(self, criteria=None):
+        targets = []
+        for scheme in self.iter_filtered(criteria=criteria):
+            compressor = scheme.compressors.get("lrd", None)
+            if compressor is None or not compressor._to_compress():
+                continue
+            targets.append((scheme, compressor))
+        return targets
+
+    def _infer_model_device(self):
+        if hasattr(self.model, "device"):
+            return self.model.device
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            pass
+        try:
+            return next(self.model.buffers()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def _move_to_device(self, value, device: torch.device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, Mapping):
+            return {key: self._move_to_device(item, device) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(self._move_to_device(item, device) for item in value)
+        if isinstance(value, list):
+            return [self._move_to_device(item, device) for item in value]
+        if hasattr(value, "to"):
+            try:
+                return value.to(device)
+            except TypeError:
+                pass
+        return value
 
     def restore(self, topology=False, criteria=None, verbose=False):
         """

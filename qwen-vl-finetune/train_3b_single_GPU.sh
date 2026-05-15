@@ -9,7 +9,7 @@ CACHE_DIR="./cache"                          # [TrainingArguments] Cache directo
 # ======================
 # Model Configuration
 # ======================
-DATASETS="coco_indoor%10"                  # [DataArguments] Dataset with sampling rate
+DATASETS="coco_qa_cats_chair"                  # [DataArguments] Dataset with sampling rate
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 ARGS=$(cat <<EOF
@@ -22,12 +22,12 @@ ARGS=$(cat <<EOF
 --cache_dir $CACHE_DIR 
 --bf16 true 
 --per_device_train_batch_size 1 
---gradient_accumulation_steps 16 
+--gradient_accumulation_steps 1 
 --learning_rate 2e-7 
 --mm_projector_lr 1e-5 
 --vision_tower_lr 1e-6 
 --optim adamw_torch 
---model_max_length 4096 
+--model_max_length 1024
 --data_flatten False
 --data_packing False 
 --base_interval 2 
@@ -37,7 +37,8 @@ ARGS=$(cat <<EOF
 --weight_decay 0.01 
 --logging_steps 10 
 --save_steps 500 
---save_total_limit 3 
+--save_total_limit 3
+--deepspeed scripts/zero3.json
 EOF
 )
 
