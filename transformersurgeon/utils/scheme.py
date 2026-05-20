@@ -88,6 +88,7 @@ class CompressionScheme:
 
         # Backup objects
         self._weight_original = None # This will store the original weights for restoration if needed
+        self.calibration_data = {}
 
     def get_module(self):
         """
@@ -168,6 +169,17 @@ class CompressionScheme:
         
         # Set the new module at the specified path
         setattr(tmp_module, split_path[-1], new_module)
+
+    def get_compression_module(self):
+        """
+        Returns the module that will be directly compressed.
+
+        If a VCONBlock is initialized, compression is applied to block_b.
+        """
+        module = self.get_module()
+        if self.vcon_initialized:
+            module = module.block_b
+        return module
     
     def _is_to_compress(self):
         """
@@ -399,9 +411,7 @@ class CompressionScheme:
             return # Nothing to do
         
         # Get the module to compress
-        module = self.get_module()
-        if self.vcon_initialized:
-            module = module.block_b # apply to block_b only
+        module = self.get_compression_module()
         
         if not hard and not self.soft_applied: # Backup original weights if not already done
             self._weight_original = module.weight.detach().clone() # Store original weights for restoration if needed
@@ -412,6 +422,7 @@ class CompressionScheme:
         for cname, compressor in self.compressors.items():
             if verbose:
                 print(f"Applying compression '{cname}' for module {self.path}")
+            compressor.set_calibration_store(self.calibration_data)
             compressor.apply(module=module, hard=hard, soft_applied=self.soft_applied)
                     
         # Flag as applied
@@ -437,9 +448,7 @@ class CompressionScheme:
         if self.hard_applied:
             raise ValueError("Cannot restore a module that has been hard applied (non-reversible changes).")
         
-        module = self.get_module()
-        if self.vcon_initialized:
-            module = module.block_b # apply to block_b only
+        module = self.get_compression_module()
         
         # For each compression type, if it has been applied, call the corresponding restore function
         for comp_name, compressor in self.compressors.items():
