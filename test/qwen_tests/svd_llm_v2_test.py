@@ -128,11 +128,10 @@ device = torch.device(f"cuda:{gpu_num}" if torch.cuda.is_available() else "cpu")
 # Not using it results in loading the model in float32, which requires more memory
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype="auto")
 model = modelClass.from_pretrained(model_name, torch_dtype="auto").to(device)
-print(model.config)
 print(model)
 
 ### WSVD COMPRESSION CONFIGURATION AND APPLICATION ###
-dataset = JsonlMessagesDataset("/ibex/user/antonic/CESOIA-draft/transformer-surgeon/test/qwen_tests/automotive_990_examples.jsonl")
+dataset = JsonlMessagesDataset("../../experiments/llm_export/qwen2_compressed/automotive_990_examples.jsonl")
 collate_fn = build_dialog_collate_fn(tokenizer)
 calibration_loader = DataLoader(
     dataset,
@@ -142,7 +141,7 @@ calibration_loader = DataLoader(
 )
 
 manager = Qwen2CompressionSchemesManager(model)
-manager.set_lrd_method("wsvd", verbose=True)
+manager.set("lrd", "method", "svd-llm-v2", verbose=True)
 count = set_min_rank_for_all_lrd_layers(manager)
 count = set_ranks_for_selected_linear_layers(manager, None)
 print(f"Configured LRD rank for {count} candidate schemes to min(n, m).")
@@ -154,7 +153,7 @@ manager.apply(
     criteria="all",
     verbose=True,
     device=device,
-    offload_to_cpu=True,
+    offload_to_cpu=False,
 )
 ##########################
 
@@ -171,6 +170,9 @@ manager.apply(
     Examples of criteria:
     criteria = [3, ["mlp", "down_proj"]]  # apply to blocks with ID 3 OR containing "mlp" AND "down_proj"
 """
+
+print("Model after compression")
+print(model)
 
 ### INFERENCE AND TESTING ###
 print("Generating text...")

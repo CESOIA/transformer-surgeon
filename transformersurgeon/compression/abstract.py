@@ -3,6 +3,20 @@ from abc import ABC, abstractmethod
 class Compressor(ABC):
 
     @abstractmethod
+    def set_calibration_store(self, calibration_data):
+        """
+        Store a reference to scheme-level calibration summaries.
+        """
+        pass
+
+    @abstractmethod
+    def needs_calibration(self):
+        """
+        Return a tuple of required calibration summaries for the compressor's method, or an empty tuple if no calibration is needed.
+        """
+        pass
+
+    @abstractmethod
     def apply(self, module, hard=False, soft_applied=False):
         """
         Apply the compression to the given module. The behavior of the method can be influenced by the parameters:

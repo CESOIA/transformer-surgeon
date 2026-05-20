@@ -1,114 +1,124 @@
 import torch
-from .abstract import Compressor
-from .pruning import (
-    _unstructured_mask,
-    validate_pruning_criterion,
-)
 from typing import Union
 
-def _quantize_maxabs(weight, precision) -> torch.Tensor:
-    """
-    Perform single scale/zero-point fake-quantization of the weight matrix.
-    This function preserves the norm of the original weight matrix.
+from .abstract import Compressor
+from .quantization_methods import METHOD_FUNCTIONS
+from .unstructured_pruning_methods import METHOD_FUNCTIONS as SPARSITY_FUNCTIONS
+from .unstructured_pruning import validate_unstructured_pruning_ratio
 
-    Args:
-        weight (torch.Tensor): The weight matrix to be quantized.
-        qbits (int): The number of bits for quantization.
 
-    Returns:
-        torch.Tensor: The fake-quantized weight matrix.
-    """
-    qmax = 2**precision - 1
-    scale = weight.abs().max() / qmax
-    q = torch.clamp(torch.round(weight / scale), -qmax, qmax)
-    return q * scale
+VALID_METHODS = ["vanilla"]
+VALID_SPARSE_METHODS = ["magnitude", "random"]
+CALIBRATED_METHOD_DICT = {}
 
-def _quantize_binarize(weight):
-    """
-    Binarize the weight matrix using the sign function.
-
-    Args:
-        weight (torch.Tensor): The weight matrix to be binarized.
-
-    Returns:
-        torch.int8: The binarized weight matrix.
-    """
-    s = torch.sign(weight)
-    scale = weight.abs().mean()
-    return s * scale
 
 class Quantizer(Compressor):
-    def __init__(
-        self,
-        config,
-        ):
-        # Configuration
+    def __init__(self, config):
         self.config = config
-        # Local temporary configuration
+        self.method = self.config["method"]
         self.precision = self.config["precision"]
         self.sparsity = self.config["sparsity"]
-        self.sparse_criterion = self.config["sparse_criterion"]
+        self.sparse_method = self.config["sparse_method"]
+        self.eps = self.config["eps"]
+        self.calibration_store = None
+
+    def set_calibration_store(self, calibration_data):
+        self.calibration_store = calibration_data
+
+    def needs_calibration(self):
+        if not self._to_compress():
+            return ()
+        return CALIBRATED_METHOD_DICT.get(self.method, ())
 
     def apply(self, module, hard=False, soft_applied=False):
         if not self._to_compress():
-            return # No compression needed based on the configuration
+            return
 
-        # Extract temp configuration
+        method = self.method
         precision = self.precision
         sparsity = self.sparsity
-        sparse_criterion = self.sparse_criterion
-        # Apply temp configuration to module config
+        sparse_method = self.sparse_method
+        eps = self.eps
+
+        validate_quantization_method(method)
+        validate_precision(precision)
+        validate_unstructured_pruning_ratio(sparsity)
+        validate_sparse_method(sparse_method)
+        validate_quantization_eps(eps)
+
+        self.config["method"] = method
         self.config["precision"] = precision
         self.config["sparsity"] = sparsity
-        self.config["sparse_criterion"] = sparse_criterion
+        self.config["sparse_method"] = sparse_method
+        self.config["eps"] = eps
 
-        if precision:
-            if not hard and not soft_applied:
-                for name, param in module.named_parameters():
-                    if name not in ["weight", "weight_2"]:
-                        continue
+        if precision and not hard and not soft_applied:
+            # Apply quantization to all parameters in the module
+            for name, param in module.named_parameters():
+                if name not in ["weight", "weight_2"]:
+                    continue
 
-                    if precision == "binary":
-                        qweight = _quantize_binarize(param.data)
+                # To maintain flexibility for future methods, we handle methods with different input requirements separately.
+
+                if method == "vanilla":
+                    qweight = METHOD_FUNCTIONS[method](
+                        param.data,
+                        precision,
+                        eps
+                    )
+
+                else:
+                    raise ValueError(f"Unsupported quantization method '{method}'.")
+
+                # Support for sparse quantization (useful for iterative compression)
+                if sparsity > 0.0:
+                    if sparse_method == "magnitude":
+                        mask = SPARSITY_FUNCTIONS[sparse_method](
+                            param,
+                            pruning_ratio=sparsity,
+                        )
+                    elif sparse_method == "random":
+                        mask = SPARSITY_FUNCTIONS[sparse_method](
+                            param,
+                            pruning_ratio=sparsity,
+                        )
                     else:
-                        qweight = _quantize_maxabs(param.data, precision)
-                    
-                    with torch.no_grad():
-                        # Possibly apply sparse quantization if configured
-                        if sparsity > 0.0:
-                            mask = _unstructured_mask(
-                                param,
-                                criterion=sparse_criterion,
-                                pruning_ratio=sparsity,
-                                )
-                            param.copy_(qweight * mask + param.data * (~mask))
-                        else:
-                            param.copy_(qweight)
-                    
-            if hard:
-                # NOT IMPLEMENTED
-                raise NotImplementedError("Hard quantization is not implemented yet.")
+                        raise ValueError(f"Unsupported sparsity method '{sparse_method}'.")
+
+                # Apply quantization, optionally with sparsity
+                if sparsity > 0.0:
+                    param.copy_(qweight * mask + param.data * (~mask))
+                else:
+                    param.copy_(qweight)
+
+        if hard:
+            raise Warning("Currently, there is no support for quantized operators. Parameters are quantized and dequantized in-place, so hard quantization is effectively the same as soft quantization.")
 
     def restore(self, module):
-        module.precision = "full" # Reset precision to full to restore original weights
-        module.qsparsity = 0.0 # Reset qsparsity to 0 to restore original weights
-        # Restore module configuration
+        # N.B. module argument is not used but required for API consistency with other compressors
+        self.config["method"] = "vanilla"
         self.config["precision"] = "full"
         self.config["sparsity"] = 0.0
-        self.config["sparse_criterion"] = "magnitude"
-        
+        self.config["sparse_method"] = "magnitude"
+
     def _to_compress(self):
-        # Check if quantization has to be applied based on the precision configuration
         return self.precision != "full"
-    
+
     def __repr__(self):
-        string = f"Quantizer(precision={self.precision}, sparsity={self.sparsity}, sparse_criterion='{self.sparse_criterion}')"
-        return string
-        
+        return (
+            f"Quantizer(method='{self.method}', precision={self.precision}, "
+            f"sparsity={self.sparsity}, sparse_method='{self.sparse_method}')"
+        )
+
+
+### CONFIGURATION VALIDATORS ###
+
+def validate_quantization_method(method: str) -> None:
+    if method not in VALID_METHODS:
+        raise ValueError(f"Quantization method must be one of {VALID_METHODS}, but got '{method}'.")
+
+
 def validate_precision(precision: Union[str, int]) -> None:
-    if precision is not None:
-        return
-    
     if isinstance(precision, str):
         if precision not in ["full", "binary"]:
             raise ValueError(
@@ -123,13 +133,20 @@ def validate_precision(precision: Union[str, int]) -> None:
         raise ValueError(
             f"Precision must be an integer, 'full' or 'binary', but got type {type(precision)}."
         )
-        
-def validate_sparsity(sparsity: float) -> None:
-    if sparsity < 0.0 or sparsity > 1.0:
-        raise ValueError(f"Sparsity must be between 0.0 and 1.0, but got {sparsity}.")
-        
+    
+def validate_sparse_method(sparse_method: str) -> None:
+    if sparse_method not in VALID_SPARSE_METHODS:
+        raise ValueError(f"Sparse method must be one of {VALID_SPARSE_METHODS}, but got '{sparse_method}'.")
+    
+def validate_quantization_eps(eps: float) -> None:
+    if not isinstance(eps, (int, float)):
+        raise ValueError(f"Quantization eps must be numeric, but got type {type(eps)}.")
+    if eps <= 0:
+        raise ValueError(f"Quantization eps must be positive, but got {eps}.")
+
 __all__ = [
     "Quantizer",
+    "validate_quantization_method",
     "validate_precision",
-    "validate_sparsity",
+    "validate_sparse_method",
 ]

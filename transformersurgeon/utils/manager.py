@@ -5,12 +5,11 @@ manager.py
 Provides the CompressionSchemesManager class for managing multiple compression schemes in transformer models.
 """
 
-from collections.abc import Mapping
 import torch
+from torch.utils.data import DataLoader
 from transformers import PretrainedConfig
 from typing import Any, Dict, List, Optional, Union
-from ..compression.lrd import validate_lrd_method, _set_lrd_method
-from .calibration import LRDCalibration
+from ..calibration import run_compression_calibration
 from .scheme import CompressionScheme
 
 class CompressionSchemesManager:
@@ -23,9 +22,12 @@ class CompressionSchemesManager:
     - Applying compression schemes with optional calibration for activation-aware methods.
     - Restoring original model state.
     
-    Calibration:
-    - Uses an embedded LRDCalibration instance to handle weighted SVD (wsvd) calibration.
-    - LRDCalibration can also be used independently if needed.
+        Calibration:
+        - Uses a single, method-agnostic calibration pass to collect shared activation
+            statistics for all compressors that require calibration.
+        - Each compressor reports needed summary names when calibration is required.
+        - Calibration data is managed by the manager and consumed by the
+            run_compression_calibration utility.
     """
 
     def __init__(self,
@@ -41,12 +43,6 @@ class CompressionSchemesManager:
         """
         self.model = model
         self.calibration_data = None
-        self.methods = {
-            "lrd_method": "svd",
-            "quant_method": None,
-            "str_prune_method": None,
-            "ustr_prune_method": None,
-        }
         try:
             self.config = model.config
             assert isinstance(self.config, PretrainedConfig), "Model config is not an instance of PretrainedConfig. Please provide a model with a valid Hugging Face configuration."
@@ -54,7 +50,6 @@ class CompressionSchemesManager:
             raise ValueError("The provided model does not have a 'config' attribute. Please provide a model with a valid configuration.")
         self.indexing = indexing
         self.schemes = self._generate_schemes()
-        self.calibrator = LRDCalibration(self.model)
 
     def set(self, compression, property, value, criteria=None, verbose=False):
         """
@@ -69,16 +64,6 @@ class CompressionSchemesManager:
         """
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.set(compression, property, value, verbose=verbose)
-
-    def set_lrd_method(self, method, verbose=False):
-        """
-        Sets the manager-level LRD method used when applying LRD compressors.
-        """
-        validate_lrd_method(method)
-        self.methods["lrd_method"] = method
-        _set_lrd_method(method)
-        if verbose:
-            print(f"Setting LRD method to {method}.")
 
     def init_vcon(self, criteria=None, verbose=False):
         """
@@ -130,14 +115,20 @@ class CompressionSchemesManager:
 
     def set_calibration_data(self, calibration_data):
         """
-        Stores a calibration dataset/dataloader for weighted SVD calibration.
+        Stores a calibration dataset/dataloader.
 
         Args:
-            calibration_data: An iterable of batches (Tensor, Mapping, tuple, or list).
-                             Can later be consumed by run_calibration() when method is 'wsvd'.
+            calibration_data: A torch.utils.data.DataLoader that yields
+                             framework-compatible batches (mapping kwargs,
+                             (data, label), positional tuples/lists, or single
+                             input objects).
         """
+        if not isinstance(calibration_data, DataLoader):
+            raise TypeError(
+                "calibration_data must be a torch.utils.data.DataLoader. "
+                f"Got {type(calibration_data)}."
+            )
         self.calibration_data = calibration_data
-        self.calibrator.set_calibration_data(calibration_data)
 
     def run_calibration(
         self,
@@ -146,40 +137,46 @@ class CompressionSchemesManager:
         device: Optional[Union[str, torch.device]] = None,
         offload_to_cpu: bool = True,
         verbose: bool = False,
+        show_progress: bool = True,
     ):
         """
-        Run calibration to collect input covariance for weighted SVD (wsvd) method.
-        
-        Delegates to the embedded LRDCalibration instance.
+        Run a single calibration pass to collect shared activation statistics.
         
         Args:
             criteria: Filter criteria for target schemes.
             max_batches: Maximum calibration batches to process.
             device: Device to move batches to.
-            offload_to_cpu: If True, accumulate covariance on CPU.
+            offload_to_cpu: If True, accumulate calibration tensors on CPU.
             verbose: If True, print progress.
+            show_progress: If True, show calibration batch progress.
         
         Returns:
-            Number of compressors calibrated.
+            Number of schemes calibrated.
         """
-        targets = self._collect_lrd_targets(criteria=criteria)
-        return self.calibrator.run(
-            targets,
+        return run_compression_calibration(
+            manager=self,
+            criteria=criteria,
             max_batches=max_batches,
             device=device,
             offload_to_cpu=offload_to_cpu,
             verbose=verbose,
+            show_progress=show_progress,
         )
 
-    def clear_lrd_calibration(self, criteria=None):
+    def clear_calibration(self, criteria=None):
         """
-        Clear stored covariance from LRD compressors (optionally filtered by criteria).
-        
-        Args:
-            criteria: Filter criteria for target schemes. None = all schemes.
+        Clear stored calibration stats (optionally filtered by criteria).
         """
-        targets = self._collect_lrd_targets(criteria=criteria)
-        return self.calibrator.clear(targets)
+        schemes = list(self.iter_filtered(criteria=criteria))
+        for scheme in schemes:
+            scheme.calibration_data.pop("covariance", None)
+            scheme.calibration_data.pop("weight_grad", None)
+            # Backward compatibility cleanup for old calibration storage keys.
+            scheme.calibration_data.pop("covariance_sum", None)
+            scheme.calibration_data.pop("num_tokens", None)
+            scheme.calibration_data.pop("weight_grad_sum", None)
+            scheme.calibration_data.pop("num_weight_grad_batches", None)
+        return len(schemes)
 
     def apply(
         self,
@@ -189,6 +186,7 @@ class CompressionSchemesManager:
         max_batches: Optional[int] = None,
         device: Optional[Union[str, torch.device]] = None,
         offload_to_cpu: bool = True,
+        show_progress: bool = True,
     ):
         """
         Applies filtered compression schemes to their respective modules in the model.
@@ -199,17 +197,18 @@ class CompressionSchemesManager:
             verbose: If True, prints information about the application process
             max_batches: Optional cap on calibration batches.
             device: Device where calibration batches should be moved before forward.
-            offload_to_cpu: If True, LRD covariance is accumulated on CPU.
+            offload_to_cpu: If True, calibration tensors are accumulated on CPU.
+            show_progress: If True, show calibration batch progress.
         """
-        lrd_targets = self._collect_lrd_targets(criteria=criteria)
+        calibration_targets = self._collect_calibration_targets(criteria=criteria)
 
-        if self.methods["lrd_method"] == "wsvd" and lrd_targets:
+        if calibration_targets:
             if self.calibration_data is None:
-                missing_covariance = [scheme.path for scheme, _ in lrd_targets]
+                missing_stats = [scheme.path for scheme, _ in calibration_targets]
                 raise ValueError(
-                    "LRD method 'wsvd' requires calibration data before apply. "
+                    "Calibration-required compression needs calibration data before apply. "
                     "Call manager.set_calibration_data(...) before manager.apply(...) "
-                    f"for: {missing_covariance}"
+                    f"for: {missing_stats}"
                 )
             self.run_calibration(
                 criteria=criteria,
@@ -217,47 +216,61 @@ class CompressionSchemesManager:
                 device=device,
                 offload_to_cpu=offload_to_cpu,
                 verbose=verbose,
+                show_progress=show_progress,
             )
 
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.apply(hard=hard, verbose=verbose)
 
-    def _collect_lrd_targets(self, criteria=None):
+    def _collect_calibration_targets(self, criteria=None):
         targets = []
         for scheme in self.iter_filtered(criteria=criteria):
-            compressor = scheme.compressors.get("lrd", None)
-            if compressor is None or not compressor._to_compress():
-                continue
-            targets.append((scheme, compressor))
+            required_summaries = []
+
+            for compressor in scheme.compressors.values():
+                if not compressor._to_compress():
+                    continue
+
+                compressor.set_calibration_store(scheme.calibration_data)
+
+                needs_calibration_fn = getattr(compressor, "needs_calibration", None)
+                if not callable(needs_calibration_fn):
+                    continue
+                needs_calibration = needs_calibration_fn()
+                if needs_calibration is False or needs_calibration is None:
+                    continue
+
+                summary_names = needs_calibration
+                if summary_names is True:
+                    raise ValueError(
+                        f"Compressor {type(compressor).__name__} needs calibration but did not provide summary names."
+                    )
+
+                if isinstance(summary_names, str):
+                    summary_names = (summary_names,)
+                elif not isinstance(summary_names, (tuple, list, set)):
+                    raise TypeError(
+                        "needs_calibration must return False/None or a string/sequence of summary names."
+                    )
+
+                compressor_summary_names = []
+                for summary_name in summary_names:
+                    if summary_name not in compressor_summary_names:
+                        compressor_summary_names.append(summary_name)
+
+                if len(compressor_summary_names) == 0:
+                    raise ValueError(
+                        f"Compressor {type(compressor).__name__} needs calibration but returned no summaries."
+                    )
+
+                for summary_name in compressor_summary_names:
+                    if summary_name not in required_summaries:
+                        required_summaries.append(summary_name)
+
+            if len(required_summaries) > 0:
+                targets.append((scheme, tuple(required_summaries)))
+
         return targets
-
-    def _infer_model_device(self):
-        if hasattr(self.model, "device"):
-            return self.model.device
-        try:
-            return next(self.model.parameters()).device
-        except StopIteration:
-            pass
-        try:
-            return next(self.model.buffers()).device
-        except StopIteration:
-            return torch.device("cpu")
-
-    def _move_to_device(self, value, device: torch.device):
-        if isinstance(value, torch.Tensor):
-            return value.to(device)
-        if isinstance(value, Mapping):
-            return {key: self._move_to_device(item, device) for key, item in value.items()}
-        if isinstance(value, tuple):
-            return tuple(self._move_to_device(item, device) for item in value)
-        if isinstance(value, list):
-            return [self._move_to_device(item, device) for item in value]
-        if hasattr(value, "to"):
-            try:
-                return value.to(device)
-            except TypeError:
-                pass
-        return value
 
     def restore(self, topology=False, criteria=None, verbose=False):
         """

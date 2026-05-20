@@ -1,51 +1,10 @@
-# transformer-surgeon
+# 🩺 transformer-surgeon
 
-Transformer models library with compression options 🪡
+**Compression-aware transformer models built on PyTorch and Hugging Face.**
 
-## Overview
+Apply low-rank decomposition, pruning, or quantization to any supported model in a few lines — then keep calling `model.generate()` as usual. Compression is reversible by default.
 
-**transformer-surgeon** is a PyTorch-based library for building, compressing, and experimenting with transformer models.  
-It supports structured pruning, low-rank decomposition, and flexible configuration for both vision and text transformer architectures.
-
-## Documentation
-
-- [API Reference](https://cesoia.github.io/transformer-surgeon)
-
-## Features
-
-- **Modular transformer blocks** for vision and text
-- **Structured pruning** (layer or block-wise) with magnitude-based neuron removal
-- **Low-rank decomposition (LRD)** for linear layers with configurable ranks
-- **Generic compression manager** that works across different model architectures
-- **Custom configuration classes** for compression with automatic dimension calculation
-- **Support for multi-modal models** (images, videos, text)
-- **LinearLRD layers** with integrated pruning mask support
-- **Reversible compression** (soft application) or permanent compression (hard application)
-- **QKV concatenated layer support** for attention mechanisms
-- **Easy integration** with HuggingFace Transformers
-
-### 🔧 **Generic Compression Manager**
-- `CompressionSchemesManager`: Universal compression manager that works with any transformer architecture
-- Model-specific configurations through simple config dictionaries
-- Support for multiple block types (vision, text) in the same model
-
-### 🧮 **LinearCompression Layer**
-- Drop-in replacement for `nn.Linear` with built-in low-rank decomposition
-- Configurable rank: integer values or "full" for no decomposition
-- Integrated pruning mask support (WIP)
-- Maintains same interface as standard linear layers
-
-### 🌗 **Vanishing Contributions (VCON)**
-- Drop-in replacement of layers with VCONBlock
-- Perform affine combination of original full size block and compressed block
-- Revert VCONBlock placement with the original full layer or with the compressed (and fine-tuned) layer
-
-### 🔄 **Reversible Operations**
-- **Soft application**: Compression can be reversed (restores original weights)
-- **Hard application**: Permanent compression (reduces model size)
-- `restore_all()` method to undo all compression operations
-
-## Installation
+## ⚡ Quick Install
 
 ```bash
 git clone https://github.com/CESOIA/transformer-surgeon.git
@@ -53,128 +12,145 @@ cd transformer-surgeon
 pip install -e .
 ```
 
-## Quick Start
+## 🗂️ What's Included
 
-### Basic Usage
+**Compression methods**
+- `lrd` — low-rank decomposition (SVD, calibration-aware SVD-LLM-v2)
+- `structured_pruning` — output neuron removal by magnitude, gradient, or random
+- `unstructured_pruning` — weight-level sparsity masks
+- `quantization` — fixed-point and binary weights
 
-```python
-from transformersurgeon.qwen2_vl_c import (
-    Qwen2VLConfigCompress, 
-    Qwen2VLForConditionalGenerationCompress,
-    Qwen2VLCompressionSchemesManager
-)
+**Core abstractions**
+- `CompressionScheme` — per-layer compression config and application
+- `CompressionSchemesManager` — model-level orchestration with flexible layer filtering
 
-# Create compressed model configuration
-config = Qwen2VLConfigCompress(
-    # Pruning ratios for different layer types
-    pruning_ratio_lists={
-        "sa_qkv": [0.2, 0.3, 0.4],  # Attention layers
-        "mlp_up": [0.1, 0.2, 0.3],  # MLP layers
-    },
-    # Low-rank decomposition ranks
-    lrd_rank_lists={
-        "sa_out": [64, 32, 16],     # Output projection ranks
-        "mlp_down": ["full", 128, 64], # "full" means no decomposition
-    },
-    # Skip connection pruning
-    pruning_ratio_skip_connections=0.1,
-)
+**Compression-ready building blocks**
+- `LinearCompressed` — drop-in `nn.Linear` replacement with built-in LRD support
+- `VCONBlock` — smooth transition between original and compressed modules during fine-tuning
 
-# Load model with compression
-model = Qwen2VLForConditionalGenerationCompress(config)
+**Export**
+- `convert_for_export` — rewrite model to compact custom decoder/encoder graphs
+- `export_to_hf` — push compressed model to Hugging Face Hub
+- ExecuTorch export pipeline under `transformersurgeon.export`
 
-# Create compression manager
-manager = Qwen2VLCompressionSchemesManager(config, model)
+## 🤖 Supported Model Families
 
-# Apply compression (soft - reversible)
-manager.apply_all(hard=False)
+| Model | Type | Import |
+|---|---|---|
+| Qwen2 | Causal LM | `Qwen2ForCausalLMCompress` |
+| Qwen2-VL | Vision-language | `Qwen2VLForConditionalGenerationCompress` |
+| Qwen2.5-VL | Vision-language | `Qwen2_5_VLForConditionalGenerationCompress` |
+| BERT | Encoder | `BertForSequenceClassificationCompress` |
+| DistilBERT | Encoder | `DistilBertForSequenceClassificationCompress` |
+| ViT | Vision encoder | `ViTForImageClassificationCompress` |
 
-# View compression schemes
-print(manager)
-```
+All follow the same three-class pattern: a compressed config, a compressed model, and a compression manager — all HuggingFace-compatible.
 
-## Compression Options
+## 🚀 Usage Examples
 
-### **Low-Rank Decomposition (LRD)**
-- **Configurable ranks**: Integer values or "full" for no decomposition
-- **SVD-based**: Uses singular value decomposition for optimal approximation
-- **Layer-wise control**: Different ranks for different layers
-- **Integrated with LinearLRD**: Seamless integration with custom linear layers
-
-### **Advanced Features**
-- **Flexible compression configuration**: You can customize the compression of each layer and block independently
-- **QKV concatenated support**: Special handling for attention layer concatenated projections
-- **Multi-block architectures**: Support for vision + text models
-
-## Vanishing Contribution (VCON) Blocks
-
-**Vanishing Contribution (VCON)** is a mechanism for smoothly transitioning a model from its original (uncompressed) state to a compressed version.  
-A `VCONBlock` wraps both the original and compressed modules, and combines their outputs using an affine combination controlled by a parameter `beta`. By gradually adjusting `beta` from `1` (full contribution from the original block) to `0` (full contribution from the compressed block), you can interpolate between the two representations during training.
-
-### Example Usage
-
-See [`test/qwen_tests/inference_test.py`](test/qwen_tests/inference_test.py) for a complete example.
+### Basic: low-rank decomposition on a causal LM
 
 ```python
-# Initialize VCON blocks for all modules: modules are duplicated (only where needed) and put in parallel
-manager.init_vcon_all(verbose=True)
+import torch
+from transformers import AutoTokenizer
+from transformersurgeon import Qwen2ForCausalLMCompress, Qwen2CompressionSchemesManager
 
-# Apply all compression schemes to the model (soft mode, reversible)
-# This is applied only to one of the two parallelized blocks
-manager.apply_all(hard=False, verbose=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = Qwen2ForCausalLMCompress.from_pretrained("Qwen/Qwen2-0.5B-Instruct", torch_dtype="auto").to(device)
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
-# Set the beta value for all VCON blocks (e.g., 0.5 for equal contribution of the two parallel blocks)
-manager.set_vcon_beta_all(0.5)
+manager = Qwen2CompressionSchemesManager(model)
+manager.set("lrd", "rank", 640, criteria=[[0, "self_attn.q_proj"]])  # block 0, q_proj
+manager.set("lrd", "rank", 640, criteria=[[1, "mlp.up_proj"]])       # block 1, up_proj
+manager.apply(hard=False)   # reversible
+
+inputs = tokenizer("Write a sentence about compression.", return_tensors="pt").to(device)
+print(tokenizer.decode(model.generate(**inputs, max_new_tokens=32)[0], skip_special_tokens=True))
+
+manager.restore()  # undo all compression, back to original weights
 ```
 
-During training, you can gradually decrease `beta` from `1` to `0` to smoothly shift the model from the original to the compressed architecture.
+### Calibration-aware LRD (SVD-LLM-v2)
 
----
+```python
+manager = Qwen2CompressionSchemesManager(model)
+manager.set("lrd", "method", "svd-llm-v2")
+manager.set("lrd", "rank", 128, criteria="mlp.up_proj")
 
+manager.set_calibration_data(calibration_loader)  # any torch DataLoader
+manager.apply(device=device)
+```
 
-## Architecture Support
+### Convert to export-friendly graph, then compress
 
-Currently supported models:
-- **Qwen2.5-VL**: Vision-language model with compression support
+```python
+from transformersurgeon import convert_for_export
+from transformersurgeon.utils import CompressionSchemesManager
 
-**Adding new models**: The generic `CompressionSchemesManager` can be easily extended to support new architectures by providing a model-specific configuration dictionary.
+converted = convert_for_export(model, options={"use_sdpa": False})
+decoder = converted["text"].to(device).eval()
 
-## Hard and soft application
+manager = CompressionSchemesManager(decoder, decoder.indexing)
+manager.set("lrd", "rank", 256, criteria=[[0, "attn.q_proj"]])
+manager.apply(hard=False)
+```
 
-When using `manager.apply_all()` function from the class `CompressionSchemesManager`, one can choose to perform a **soft** application (default behavior) or to perform a **hard** application (`manager.apply_all(hard=True)`).
-- Soft application: the performed compression is reversible and does not influence the structure of the model. Use this option when fine-tuning the model with STE or iterative approaches.
-    - When performing pruning, a mask is applied, leaving the original weights unaltered.
-    - When performing LRD, the original weight matrix is stored to allow retrieval.
-- Hard application: the performed compression is not reversible and influences the structure of the model. Use this option for the final release of the compressed model.
-    - When performing pruning, rows of the matrix are removed permanently.
-    - When performing LRD, the original matrix is not stored to save memory.
+## 🎯 Filtering Layers with `criteria`
 
-When using `manager.apply_all()` a second time:
-- If hard=False, nothing is done. This way, if weights have been fine-tuned, they won't be initialized.
-- If hard=True, soft compression is converted in a hard one. Pruning mask are used to permanently remove weights and the stored original matrix is deleted.
+The `criteria` argument selects which layers to target. It supports strings, block IDs, and nested logic:
 
-To reinitialize compression, first restore the model with `manager.restore_all()`, then use `apply_all()` again.
+```python
+manager.set("lrd", "rank", 64, criteria="mlp")           # all layers with "mlp" in the path
+manager.set("lrd", "rank", 32, criteria=2)               # block 2 only
+manager.set("lrd", "rank", 16, criteria=[["mlp", 5]])    # block 5 AND "mlp"  (AND)
+manager.set("lrd", "rank", 16, criteria=["q_proj", 3])   # "q_proj" OR block 3 (OR)
+```
 
-## Roadmap
+## 🔀 VCON — Smooth Compression Transitions
 
-### ✅ **Completed**
-- Generic compression manager architecture
-- Low Rank Decomposition integration
-- Qwen2.5-VL model compression support
-- Reversible compression operations
+`VCONBlock` runs original and compressed modules in parallel during fine-tuning, blending their outputs with a scalar `beta`:
 
-### 🚧 **In progress/planned**
-- Support for more transformer models (e.g., BLIP)
-- Structured pruning integration
-- Vanishing contribution model compression integration
-- Quantization integration
+- `beta=1.0` → original output only
+- `beta=0.0` → compressed output only
+- Intermediate values → smooth interpolation
+
+```python
+manager.init_vcon(criteria="mlp")           # wrap target layers in VCONBlock
+manager.apply(hard=False, criteria="mlp")   # compress only the secondary block
+manager.set_vcon_beta(0.5, criteria="mlp")  # blend at 50%
+# fine-tune, gradually lower beta → 0, then:
+manager.cancel_vcon(keep_block_b=True)      # collapse to compressed module
+```
+
+## 🔧 Soft vs Hard Apply
+
+| | `hard=False` (default) | `hard=True` |
+|---|---|---|
+| Reversible | ✅ `manager.restore()` works | ❌ |
+| Use case | Exploration, iterative fine-tuning | Final deployment |
+
+## 📋 Manager API
+
+| Method | Description |
+|---|---|
+| `set(compression, prop, value, criteria)` | Configure compression on filtered layers |
+| `apply(hard, criteria, ...)` | Apply all configured schemes |
+| `restore(topology, criteria)` | Undo compression |
+| `init_vcon(criteria)` | Wrap target layers with `VCONBlock` |
+| `set_vcon_beta(beta, criteria)` | Set blending weight |
+| `cancel_vcon(keep_block_b, criteria)` | Collapse `VCONBlock` to one branch |
+| `set_calibration_data(dataloader)` | Attach calibration `DataLoader` |
+| `run_calibration(criteria, ...)` | Run calibration pass |
+| `iter_filtered(criteria)` | Iterate over matching schemes |
+
+## 📂 References
+
+- [test/compression_tests/compression_test.py](test/compression_tests/compression_test.py) — manager basics and convert-then-compress flow
+- [test/qwen_tests/inference_test.py](test/qwen_tests/inference_test.py) — Qwen2 end-to-end
+- [test/qwen_tests/svd_llm_v2_test.py](test/qwen_tests/svd_llm_v2_test.py) — calibrated LRD
+- [test/qwen_vl_tests/inference_test.py](test/qwen_vl_tests/inference_test.py) — vision-language
+- [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package internals and extension guide
 
 ## License
 
-MIT License
-
----
-
-**Maintainer:** Luciano Prono  
-**Contact:** [luciano.prono@polito.it](mailto:luciano.prono@polito.it)  
-**Institution:** Politecnico di Torino & King Abdullah University of Science and Technology (KAUST)
+MIT · Maintainer: Luciano Prono · Politecnico di Torino & KAUST

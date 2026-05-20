@@ -1,213 +1,103 @@
 import torch
-from typing import Tuple, Union
+from typing import Union
+
 from .abstract import Compressor
-
-_DEFAULT_LRD_METHOD = "svd"
-_WSVD_METHOD = "wsvd"
-_LRD_METHODS = (_DEFAULT_LRD_METHOD, _WSVD_METHOD)
-
-_LRD_METHOD = _DEFAULT_LRD_METHOD
+from .lrd_methods import METHOD_FUNCTIONS
 
 
-def _validate_rank(weight, rank: int) -> None:
-    if rank >= min(weight.size()):
-        # No decomposition possible, launch error
-        raise ValueError(f"Rank {rank} must be less than the minimum dimension of the weight matrix ({weight.size(0), weight.size(1)}).")
+VALID_METHODS = ["svd", "svd-llm-v2"]
+CALIBRATED_METHOD_DICT = {
+    "svd-llm-v2": ("covariance",),
+}
 
-
-def validate_lrd_method(method: str) -> None:
-    if not isinstance(method, str):
-        raise ValueError(f"LRD method must be a string, but got type {type(method)}.")
-
-    if method not in _LRD_METHODS:
-        raise ValueError(f"Unsupported LRD method '{method}'. Supported methods are: {_LRD_METHODS}.")
-
-
-def _get_lrd_method() -> str:
-    return _LRD_METHOD
-
-
-def _set_lrd_method(method: str):
-    global _LRD_METHOD
-    validate_lrd_method(method)
-    _LRD_METHOD = method
-
-
-def _low_rank_svd(weight, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Performs low-rank decomposition on the given weight matrix using SVD.
-
-    Args:
-        weight (torch.Tensor): The weight matrix to be decomposed.
-        rank (int): The target rank for the decomposition.
-
-    Returns:
-        torch.Tensor: The first matrix of the low-rank decomposition.
-        torch.Tensor: The second matrix of the low-rank decomposition.
-    """
-    _validate_rank(weight, rank)
-    
-    # Perform SVD
-    weight_f32 = weight.float() # Convert to float32 for SVD computation
-    U, S, Vh = torch.linalg.svd(weight_f32, full_matrices=False)
-
-    # Keep only the top 'rank' components
-    U_r = U[:, :rank]
-    S_r = S[:rank]
-    Vh_r = Vh[:rank, :]
-    # Reconstruct the low-rank approximation
-    US_r_out = (U_r * S_r.unsqueeze(0)).to(weight.dtype)
-    V_r_out = Vh_r.to(weight.dtype)
-    return US_r_out.contiguous(), V_r_out.contiguous()
-
-
-def wsvd(
-    weight,
-    rank: int,
-    covariance: torch.Tensor,
-    eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Performs activation-aware low-rank decomposition using the WSVD
-    transform.
-
-    Args:
-        weight (torch.Tensor): The weight matrix to be decomposed.
-        rank (int): The target rank for the decomposition.
-        covariance (torch.Tensor): Precomputed X.T @ X / num_tokens for this
-            exact linear layer.
-        eps (float): Minimum singular value used when inverting the covariance
-            square root.
-
-    Returns:
-        torch.Tensor: The first matrix of the low-rank decomposition.
-        torch.Tensor: The second matrix of the low-rank decomposition.
-    """
-    _validate_rank(weight, rank)
-
-    if eps <= 0:
-        raise ValueError(f"eps must be positive, but got {eps}.")
-
-    in_features = weight.size(1)
-    device = weight.device
-
-    if covariance is None:
-        raise ValueError(
-            "The wsvd LRD method requires a precomputed covariance tensor. "
-            "Call manager.set_calibration_data(...) before manager.apply(...)."
-        )
-    if covariance.shape != (in_features, in_features):
-        raise ValueError(
-            f"Covariance shape must be {(in_features, in_features)}, but got {tuple(covariance.shape)}."
-        )
-    covariance = covariance.to(device=device, dtype=torch.float32)
-
-    weight_f32 = weight.float()
-    covariance = (covariance + covariance.transpose(0, 1)) * 0.5
-
-    # Decompose C and clamp the singular values before taking inverse square roots.
-    Uc, Sc, _ = torch.linalg.svd(covariance, full_matrices=False)
-    Sc = torch.clamp_min(Sc, eps)
-    sqrt_Sc = torch.sqrt(Sc)
-
-    # Transform by C_sqrt = Uc @ diag(sqrt(Sc)) without materializing the diagonal.
-    C_sqrt = Uc * sqrt_Sc.unsqueeze(0)
-    W_tilde = weight_f32 @ C_sqrt
-
-    U, S, Vh = torch.linalg.svd(W_tilde, full_matrices=False)
-
-    U_r = U[:, :rank]
-    S_r = S[:rank]
-    Vh_r = Vh[:rank, :]
-    sqrt_S_r = torch.sqrt(S_r)
-
-    # Map back with C_inv_sqrt = diag(1 / sqrt(Sc)) @ Uc.T.
-    L = U_r * sqrt_S_r.unsqueeze(0)
-    R = sqrt_S_r.unsqueeze(1) * ((Vh_r / sqrt_Sc.unsqueeze(0)) @ Uc.transpose(0, 1))
-
-    return L.to(weight.dtype).contiguous(), R.to(weight.dtype).contiguous()
 
 class LRDer(Compressor):
-    def __init__(
-        self,
-        config,
-        ):
-        # Configuration
+    def __init__(self, config):
         self.config = config
-        # Local temporary configuration
         self.rank = self.config["rank"]
+        self.method = self.config.get("method", "svd")
         self.eps = self.config.get("eps", 1e-6)
-        self.covariance = self.config.get(
-            "covariance",
-            self.config.get("activation_covariance", None),
-        )
+        self.calibration_store = None
 
-    def set_covariance(self, covariance):
-        self.covariance = covariance
+    def set_calibration_store(self, calibration_data):
+        self.calibration_store = calibration_data
 
-    def clear_covariance(self):
-        self.covariance = None
-        for attr in ("_covariance_sum", "_covariance_tokens"):
-            if hasattr(self, attr):
-                delattr(self, attr)
+    def needs_calibration(self):
+        if not self._to_compress():
+            return ()
+        return CALIBRATED_METHOD_DICT.get(self.method, ())
 
     def apply(self, module, hard=False, soft_applied=False):
         if not self._to_compress():
-            return # No compression needed based on the configuration
+            return
 
-        # Extract temp configuration
         rank = self.rank
-        method = _get_lrd_method()
-        validate_lrd_method(method)
+        method = self.method
         eps = self.eps
-        covariance = self.covariance
-        # Apply temp configuration to module config
+        
+        validate_lrd_rank(rank)
+        validate_lrd_method(method)
+        validate_lrd_eps(eps)
+
         self.config["rank"] = rank
+        self.config["method"] = method
         self.config["eps"] = eps
-    
-        if rank:
-            if not soft_applied:
-                with torch.no_grad():
-                    if method == _DEFAULT_LRD_METHOD:
-                        US_r, V_r = _low_rank_svd(module.weight.detach(), rank)
-                    elif method == _WSVD_METHOD:
-                        US_r, V_r = wsvd(
-                            module.weight.detach(),
-                            rank,
-                            covariance=covariance,
-                            eps=eps,
-                        )
-                    else:
-                        raise ValueError(f"Unsupported LRD method '{method}'.")
-                    module.init_lrd(rank)
-                    module.weight[:, :rank].copy_(US_r)
-                    module.weight_2[:rank, :].copy_(V_r)
+
+        if rank and not soft_applied:
+            with torch.no_grad():
+
+                # To maintain flexibility for future methods, we handle methods with different input requirements separately.
+
+                if method == "svd":
+                    US_r, V_r = METHOD_FUNCTIONS[method](
+                        module.weight.detach(),
+                        rank
+                    )
+                    
+                elif method == "svd-llm-v2":
+                    covariance = self.calibration_store["covariance"]
+                    US_r, V_r = METHOD_FUNCTIONS[method](
+                        module.weight.detach(),
+                        rank,
+                        covariance=covariance,
+                        eps=eps,
+                    )
+
+                else:
+                    raise ValueError(f"Unsupported LRD method '{method}'.")
+
+                # Apply the low-rank decomposition to the module
+                module.init_lrd(rank)
+                module.weight[:, :rank].copy_(US_r)
+                module.weight_2[:rank, :].copy_(V_r)
+
+        if hard:
+            pass # LRD implementation is "hard" by nature
 
     def restore(self, module):
+        if module.rank == "full":
+            return  # No need to restore if the module is already full rank
+
         if not self._to_compress():
-            # Restore module configuration
             self.config["rank"] = "full"
 
-        if not hasattr(module, 'weight_2'):
+        if not hasattr(module, "weight_2"):
             raise AttributeError("Module does not have 'weight_2' attribute required for LRD restoration.")
-        
-        # Combine the low-rank components to restore the original weight matrix
+
         with torch.no_grad():
             restored_weight = module.weight.detach() @ module.weight_2.detach()
             module.cancel_lrd()
             module.weight.copy_(restored_weight)
-        
-    def _to_compress(self):
-        # Check if LRD has to be applied based on the rank configuration
-        return self.rank != "full"
-    
-    def __repr__(self):
-        method = _get_lrd_method()
-        string = f"LRDer(rank={self.rank}, method='{method}')"
-        return string
 
-# Configuration validators
-        
+    def _to_compress(self):
+        return self.rank != "full"
+
+    def __repr__(self):
+        return f"LRDer(rank={self.rank}, method='{self.method}')"
+
+
+### CONFIGURATION VALIDATORS ###
+
 def validate_lrd_rank(rank: Union[int, str]) -> None:
     if rank is not None:
         if isinstance(rank, str):
@@ -219,9 +109,25 @@ def validate_lrd_rank(rank: Union[int, str]) -> None:
         else:
             raise ValueError(f"LRD rank must be 'full' or a positive integer, but got type {type(rank)}.")
 
+
+def validate_lrd_method(method: str) -> None:
+    if not isinstance(method, str):
+        raise ValueError(f"LRD method must be a string, but got type {type(method)}.")
+
+    if method not in VALID_METHODS:
+        raise ValueError(f"Unsupported LRD method '{method}'. Supported methods are: {VALID_METHODS}.")
+
+
+def validate_lrd_eps(eps: float) -> None:
+    if not isinstance(eps, (int, float)):
+        raise ValueError(f"LRD eps must be numeric, but got type {type(eps)}.")
+    if eps <= 0:
+        raise ValueError(f"LRD eps must be positive, but got {eps}.")
+
+
 __all__ = [
     "LRDer",
-    "wsvd",
     "validate_lrd_method",
-    "validate_lrd_rank"
+    "validate_lrd_rank",
+    "validate_lrd_eps",
 ]
