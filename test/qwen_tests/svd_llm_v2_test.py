@@ -1,11 +1,12 @@
 import torch
 import json
 import sys
-from transformers import AutoTokenizer, Qwen2ForCausalLM
+from transformers import AutoTokenizer
 from test_cars_qa_msgs import messages
 from pathlib import Path
 from typing import Dict
 from torch.utils.data import DataLoader, Dataset
+from transformersurgeon.hf import export_to_hf
 
 ### DATATEST BUILD ###
 class JsonlMessagesDataset(Dataset):
@@ -112,6 +113,11 @@ managerClass = Qwen2CompressionSchemesManager
 # Model name
 model_name = "Qwen/Qwen2-0.5B-Instruct"
 
+# Local export configuration
+default_export_root = Path(__file__).resolve().parent / "artifacts"
+export_repo_id = "qwen2-0.5b-instruct-svd-llm-v2-local"
+export_root = Path(sys.argv[2]) if len(sys.argv) > 2 else default_export_root
+
 # Device
 # Get GPU number from command line arguments
 gpu_num = 0  # Default GPU
@@ -155,6 +161,17 @@ manager.apply(
     device=device,
     offload_to_cpu=False,
 )
+##########################
+
+### SAVE COMPRESSED MODEL LOCALLY ###
+export_root.mkdir(parents=True, exist_ok=True)
+saved_model_dir = export_to_hf(
+    model=model,
+    repo_id=export_repo_id,
+    base_model=model_name,
+    out_dir=str(export_root),
+)
+print(f"Saved compressed model to: {saved_model_dir}")
 ##########################
 
 ### COMPRESSION CONFIGURATION AND APPLICATION ###
