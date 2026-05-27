@@ -5,6 +5,7 @@ import torch
 
 from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.export import export_to_executorch
+from transformersurgeon.export.executorch_exporters.xnnpack import XNNPACKExportConfig
 from transformersurgeon.utils import convert_for_export
 
 
@@ -20,7 +21,7 @@ def parse_args():
         "--backend",
         type=str,
         default="xnnpack",
-        choices=["xnnpack", "qnn"],
+        choices=["xnnpack"],
         help="Target backend for lowering",
     )
     parser.add_argument(
@@ -61,11 +62,6 @@ def parse_args():
         "--verbose",
         action="store_true",
         help="Print simple inference error statistics",
-    )
-    parser.add_argument(
-        "--no-fallback",
-        action="store_true",
-        help="Disable backend fallback (qnn -> xnnpack)",
     )
     return parser.parse_args()
 
@@ -111,8 +107,7 @@ def main():
         f"{'_static_seq1' if args.static_seq_len_1 else ''}.pte",
     )
 
-    result = export_to_executorch(
-        model_input,
+    export_config = XNNPACKExportConfig(
         output_path=output_path,
         backend=args.backend,
         precision=args.precision,
@@ -123,7 +118,11 @@ def main():
         max_seq_len=args.max_sequence_length,
         convert_options={"use_sdpa": False},
         verbose=args.verbose,
-        allow_backend_fallback=not args.no_fallback,
+    )
+
+    result = export_to_executorch(
+        model_input,
+        config=export_config,
     )
 
     print("\nExport result:")
