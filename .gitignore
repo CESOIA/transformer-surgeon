@@ -239,6 +239,7 @@ secrets.env
 .cache/
 .huggingface/
 .transformers_cache/
+*artifacts/
 
 # Conda environment
 .conda/
