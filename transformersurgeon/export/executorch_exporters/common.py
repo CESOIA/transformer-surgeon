@@ -60,7 +60,7 @@ class LLMWrapper(nn.Module):
     ) -> torch.Tensor:
         last_pos = last_pos_tensor
         hidden = self.decoder(self.embedding(input_ids), last_pos=last_pos)
-        logits = self.final_layer(hidden[:, -1, :])
+        logits = self.final_layer(hidden[-1, :])
         return logits
 
 
@@ -90,7 +90,7 @@ def build_example_inputs(
     config: Any,
 ) -> tuple[Any, ...]:
     vocab_size = int(getattr(model_config, "vocab_size", 100)) if model_config is not None else 100
-    example_input_ids = torch.randint(0, vocab_size, (1, 1), dtype=torch.long)
+    example_input_ids = torch.randint(0, vocab_size, (1,), dtype=torch.long)
     example_cache_len_tensor = torch.tensor([1], dtype=torch.long)
 
     max_seq_len = getattr(config, "max_seq_len", None)

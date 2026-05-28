@@ -79,7 +79,7 @@ def main():
         return_tensors="pt",
     )["input_ids"].long()
 
-    output_ids = input_ids.clone()
+    output_ids = input_ids[0].clone()
     generated_tokens = 0
 
     t_start = time.perf_counter()
@@ -94,21 +94,21 @@ def main():
 
     logits = None
     # Prefill by decode-iteration: feed each prompt token with its position.
-    for effective_len in range(1, output_ids.size(1) + 1):
-        logits = _execute_static(output_ids[:, effective_len - 1 : effective_len], effective_len)
+    for effective_len in range(1, output_ids.size(0) + 1):
+        logits = _execute_static(output_ids[effective_len - 1 : effective_len], effective_len)
 
     for _ in range(args.max_new_tokens):
         if logits is None:
             raise RuntimeError("No logits produced before generation loop")
 
         next_id = logits_to_next_id(logits, args.temperature)
-        output_ids = torch.cat([output_ids, next_id], dim=1)
+        output_ids = torch.cat([output_ids, next_id], dim=0)
         generated_tokens += 1
 
         if next_id.item() == tokenizer.eos_token_id:
             break
 
-        logits = _execute_static(next_id, output_ids.size(1))
+        logits = _execute_static(next_id, output_ids.size(0))
 
     total_time_s = time.perf_counter() - t_start
     tokens_per_s = generated_tokens / max(total_time_s, 1e-12)

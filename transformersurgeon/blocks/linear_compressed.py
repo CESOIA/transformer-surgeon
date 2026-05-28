@@ -88,6 +88,7 @@ class LinearCompressed(nn.Linear):
         if self.skip:
             return x
 
+        # TODO make reshape optional and only for QNN export, check if view is enough
         # QNN FullyConnected is more robust with rank-2 inputs. Flatten leading
         # dimensions, run linear(s), and then restore the original leading shape.
         restore_shape = None

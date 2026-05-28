@@ -89,7 +89,7 @@ def main():
 
     output_path = os.path.join(
         args.out_dir,
-        f"export_{args.mode}_{args.backend}_{args.precision}",
+        f"export_{args.mode}_{args.backend}_{args.precision}.pte",
     )
 
     export_config = XNNPACKExportConfig(

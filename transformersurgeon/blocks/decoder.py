@@ -102,15 +102,15 @@ class TransformerDecoderBlock(torch.nn.Module):
         Forward pass of the Transformer Decoder Block.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_seq_len, embed_dim).
+            x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
             cache_len (int, optional): Effective sequence length seen by attention.
             attn_mask (torch.Tensor, optional): Attention mask for causal decoding.
             rope (tuple(torch.Tensor, torch.Tensor), optional): Precomputed RoPE cos/sin tensors.
 
         Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, embed_dim).
-            torch.Tensor: Updated key cache of shape (batch_size, num_heads, total_seq_len+1, head_dim).
-            torch.Tensor: Updated value cache of shape (batch_size, num_heads, total_seq_len+1, head_dim).
+            torch.Tensor: Output tensor of shape (seq_len, embed_dim).
+            torch.Tensor: Updated key cache of shape (num_heads, total_seq_len+1, head_dim).
+            torch.Tensor: Updated value cache of shape (num_heads, total_seq_len+1, head_dim).
         """
         residual = x            # start skip connection
         x = self.norm_in(x)     # norm layer
@@ -159,21 +159,21 @@ class TransformerDecoder(torch.nn.Module):
 
     def forward(
             self,
-            x : torch.Tensor,                   # (batch_size, in_seq_len, embed_dim)
+            x : torch.Tensor,  # (in_seq_len, embed_dim)
             last_pos : int,
     ):
         """
         Forward pass of the Transformer Decoder.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_seq_len, embed_dim).
+            x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
             last_pos (int): The position index of the last token in the expected output sequence.
 
         Returns:
-            torch.Tensor: Output tensor of shape (batch_size, in_seq_len, embed_dim).
+            torch.Tensor: Output tensor of shape (in_seq_len, embed_dim).
         """
         # Get dimensions
-        _, in_seq_len, _ = x.shape
+        in_seq_len, _ = x.shape
 
         # Evaluate RoPE cos and sin once
         # torch._check(cache_len - in_seq_len >= 0, f"Cache length ({cache_len}) must be greater than or equal to input sequence length ({in_seq_len}).") # Ensure cache_len is sufficient for the current input sequence length
@@ -181,8 +181,7 @@ class TransformerDecoder(torch.nn.Module):
         rope = precompute_rope_cos_sin_half(
             self.inv_freq,
             in_seq_len,
-            rope_pos,
-            static=True) # (1, 1, cache_len+in_seq_len, head_dim//2)
+            rope_pos) # (cache_len+in_seq_len, 1, head_dim//2)
 
         # Compute attention mask once
         attn_mask = attention_mask(
@@ -197,15 +196,15 @@ class TransformerDecoder(torch.nn.Module):
 
             # Inference (prefill or decode)
             x = block(
-                x,               # (batch_size, in_seq_len, embed_dim)
-                last_pos=last_pos, # int
+                x,                   # (in_seq_len, embed_dim)
+                last_pos=last_pos,   # int
                 attn_mask=attn_mask, # (in_seq_len, cache_len)
-                rope=rope,       # (1, 1, cache_seq_len, head_dim//2)
+                rope=rope,           # (cache_seq_len, 1, head_dim//2)
             )
-            # x is output embeddings: (batch_size, cache_seq_len, embed_dim)
+            # x is output embeddings: (cache_seq_len, embed_dim)
 
         # Final normalization
-        x = self.norm(x) # (batch_size, cache_seq_len, embed_dim)
+        x = self.norm(x) # (cache_seq_len, embed_dim)
 
         return x
     
