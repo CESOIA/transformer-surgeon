@@ -43,14 +43,6 @@ def parse_args():
         default=0.0,
         help="Sampling temperature. <= 0 uses greedy decoding.",
     )
-    parser.add_argument(
-        "--static-seq-len-1",
-        action="store_true",
-        help=(
-            "Use static seq_len=1 invocation contract: prefill is performed "
-            "by iterating decode one token at a time."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -92,14 +84,6 @@ def main():
 
     t_start = time.perf_counter()
 
-    def _execute_dynamic(cur_ids: torch.Tensor) -> torch.Tensor:
-        # Dynamic wrapper uses cache_len_tensor.size(0) as cache length.
-        cache_len_tensor = torch.ones(cur_ids.size(1), dtype=torch.float32)
-        out = method.execute([cur_ids, cache_len_tensor])[0]
-        if not isinstance(out, torch.Tensor):
-            out = torch.tensor(out)
-        return out
-
     def _execute_static(next_input_ids: torch.Tensor, effective_len: int) -> torch.Tensor:
         # Static wrapper expects a 1-based effective KV length for the current token.
         effective_len_tensor = torch.tensor([effective_len], dtype=torch.long)
@@ -109,12 +93,9 @@ def main():
         return out
 
     logits = None
-    if args.static_seq_len_1:
-        # Prefill by decode-iteration: feed each prompt token with its position.
-        for effective_len in range(1, output_ids.size(1) + 1):
-            logits = _execute_static(output_ids[:, effective_len - 1 : effective_len], effective_len)
-    else:
-        logits = _execute_dynamic(output_ids)
+    # Prefill by decode-iteration: feed each prompt token with its position.
+    for effective_len in range(1, output_ids.size(1) + 1):
+        logits = _execute_static(output_ids[:, effective_len - 1 : effective_len], effective_len)
 
     for _ in range(args.max_new_tokens):
         if logits is None:
@@ -127,10 +108,7 @@ def main():
         if next_id.item() == tokenizer.eos_token_id:
             break
 
-        if args.static_seq_len_1:
-            logits = _execute_static(next_id, output_ids.size(1))
-        else:
-            logits = _execute_dynamic(output_ids)
+        logits = _execute_static(next_id, output_ids.size(1))
 
     total_time_s = time.perf_counter() - t_start
     tokens_per_s = generated_tokens / max(total_time_s, 1e-12)

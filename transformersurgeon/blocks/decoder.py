@@ -97,7 +97,6 @@ class TransformerDecoderBlock(torch.nn.Module):
             last_pos=None,
             attn_mask=None,
             rope=None,
-            static=False,
     ):
         """
         Forward pass of the Transformer Decoder Block.
@@ -120,7 +119,6 @@ class TransformerDecoderBlock(torch.nn.Module):
             last_pos=last_pos,
             rope=rope,
             attn_mask=attn_mask,
-            static=static,
             )
         x = self.atomic_sum(x, residual) # join skip connection
         residual = x                     # start skip connection
@@ -163,7 +161,6 @@ class TransformerDecoder(torch.nn.Module):
             self,
             x : torch.Tensor,                   # (batch_size, in_seq_len, embed_dim)
             last_pos : int,
-            static : bool = False,
     ):
         """
         Forward pass of the Transformer Decoder.
@@ -171,7 +168,6 @@ class TransformerDecoder(torch.nn.Module):
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, in_seq_len, embed_dim).
             last_pos (int): The position index of the last token in the expected output sequence.
-            static (bool): Whether to use static positional indexing (for non-autoregressive decoding).
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, in_seq_len, embed_dim).
@@ -186,13 +182,13 @@ class TransformerDecoder(torch.nn.Module):
             self.inv_freq,
             in_seq_len,
             rope_pos,
-            static=static) # (1, 1, cache_len+in_seq_len, head_dim//2)
+            static=True) # (1, 1, cache_len+in_seq_len, head_dim//2)
 
         # Compute attention mask once
         attn_mask = attention_mask(
             q_seq_length=in_seq_len,
             kv_seq_length=last_pos,  # effective length
-            kv_alloc_length=self.max_cache_len if static else None,
+            kv_alloc_length=self.max_cache_len,
             device=x.device,
         )
 
@@ -205,7 +201,6 @@ class TransformerDecoder(torch.nn.Module):
                 last_pos=last_pos, # int
                 attn_mask=attn_mask, # (in_seq_len, cache_len)
                 rope=rope,       # (1, 1, cache_seq_len, head_dim//2)
-                static=static,
             )
             # x is output embeddings: (batch_size, cache_seq_len, embed_dim)
 

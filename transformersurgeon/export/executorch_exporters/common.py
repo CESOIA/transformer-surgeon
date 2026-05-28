@@ -1,11 +1,10 @@
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.export import Dim
 
 from ..config import BackendExportConfig
 
@@ -16,6 +15,16 @@ class QuantizationPlan:
 
     global_precision: str = "int4"
     layer_precisions: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def build(
+        cls,
+        model_config: Any | None,
+        requested_precision: str = "int4",
+    ) -> "QuantizationPlan":
+        _ = model_config
+        # TODO: implement per-layer precision logic based on model_config and requested_precision
+        return cls(global_precision=requested_precision, layer_precisions={})
 
 
 @dataclass
@@ -28,57 +37,14 @@ class ExecuTorchExportResult:
 
 
 @dataclass
-class ExportAdapter:
-    """Adapter hooks to support non-text models in future exports."""
-
-    wrapper_builder: Any | None = None
-    example_input_builder: Any | None = None
-    calibration_runner: Any | None = None
-    dynamic_shapes_builder: Any | None = None
-    exported_weight_extractor: Any | None = None
-    original_weight_extractor: Any | None = None
-
-
-@dataclass
-class BaseExporterConfig(BackendExportConfig, ABC):
+class ExecutorchExporterConfig(BackendExportConfig, ABC):
     """Abstract base config shared by backend-specific exporters."""
 
-    adapter: ExportAdapter = field(default_factory=ExportAdapter)
-
-    @classmethod
-    @abstractmethod
-    def from_kwargs(
-        cls,
-        *,
-        output_path: str,
-        backend: str,
-        adapter: ExportAdapter | None = None,
-        **kwargs,
-    ) -> "BaseExporterConfig":
-        """Build backend config from keyword arguments."""
+    precision: str = "int4"
+    dynamic_shapes: dict[str, Any] | None = None
 
 
-class EmbeddingDecoderFinalWrapper(nn.Module):
-    """Single wrapper that chains embedding -> decoder -> final layer."""
-
-    def __init__(self, embedding: nn.Module, decoder: nn.Module, final_layer: nn.Module):
-        super().__init__()
-        self.embedding = embedding
-        self.decoder = decoder
-        self.final_layer = final_layer
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        cache_len_tensor: torch.Tensor,
-    ) -> torch.Tensor:
-        last_pos = cache_len_tensor.size(0)
-        hidden = self.decoder(self.embedding(input_ids), last_pos=last_pos)
-        logits = self.final_layer(hidden[:, -1, :])
-        return logits
-
-
-class EmbeddingDecoderFinalStaticSeqLen1Wrapper(nn.Module):
+class LLMWrapper(nn.Module):
     """Static export wrapper for decode with fixed seq_len=1."""
 
     def __init__(self, embedding: nn.Module, decoder: nn.Module, final_layer: nn.Module):
@@ -90,32 +56,19 @@ class EmbeddingDecoderFinalStaticSeqLen1Wrapper(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        last_pos_tensor: torch.Tensor,
+        last_pos_tensor: torch.LongTensor,
     ) -> torch.Tensor:
-        last_pos = last_pos_tensor.to(torch.long)
-        hidden = self.decoder(self.embedding(input_ids), last_pos=last_pos, static=True)
+        last_pos = last_pos_tensor
+        hidden = self.decoder(self.embedding(input_ids), last_pos=last_pos)
         logits = self.final_layer(hidden[:, -1, :])
         return logits
-
-
-def _build_quant_plan(
-    model_config: Any | None,
-    requested_precision: str = "int4",
-) -> QuantizationPlan:
-    _ = model_config
-    return QuantizationPlan(global_precision=requested_precision, layer_precisions={})
 
 
 def build_wrapper(
     components: Any,
     *,
-    static_seq_len_1: bool,
-    adapter: ExportAdapter,
     model_config: Any | None,
 ) -> nn.Module:
-    if adapter.wrapper_builder is not None:
-        return adapter.wrapper_builder(components, model_config)
-
     if isinstance(components, dict):
         embedding = components["embedding"]
         decoder = components["decoder"]
@@ -128,10 +81,7 @@ def build_wrapper(
             "or tuple/list (embedding, decoder, final_layer)."
         )
 
-    if static_seq_len_1:
-        return EmbeddingDecoderFinalStaticSeqLen1Wrapper(embedding, decoder, final_layer)
-
-    return EmbeddingDecoderFinalWrapper(embedding, decoder, final_layer)
+    return LLMWrapper(embedding, decoder, final_layer)
 
 
 def build_example_inputs(
@@ -139,45 +89,19 @@ def build_example_inputs(
     *,
     config: Any,
 ) -> tuple[Any, ...]:
-    if config.example_inputs is not None:
-        return config.example_inputs
+    vocab_size = int(getattr(model_config, "vocab_size", 100)) if model_config is not None else 100
+    example_input_ids = torch.randint(0, vocab_size, (1, 1), dtype=torch.long)
+    example_cache_len_tensor = torch.tensor([1], dtype=torch.long)
 
-    if config.adapter.example_input_builder is not None:
-        return config.adapter.example_input_builder(model_config)
-
-    example_input_ids = config.example_input_ids
-    example_cache_len_tensor = config.example_cache_len_tensor
-
-    if example_input_ids is None:
-        vocab_size = int(getattr(model_config, "vocab_size", 32000)) if model_config is not None else 32000
-        default_seq_len = 1 if config.static_seq_len_1 else 2
-        example_input_ids = torch.randint(0, vocab_size, (1, default_seq_len), dtype=torch.long)
-
-    if example_cache_len_tensor is None:
-        if config.static_seq_len_1:
-            example_cache_len_tensor = torch.tensor([1], dtype=torch.long)
-        else:
-            example_cache_len_tensor = torch.ones(5)
+    max_seq_len = getattr(config, "max_seq_len", None)
+    if isinstance(max_seq_len, int) and max_seq_len > 0:
+        cache_len_value = int(example_cache_len_tensor.reshape(-1)[0].item())
+        if cache_len_value > max_seq_len:
+            raise ValueError(
+                f"example_cache_len_tensor value ({cache_len_value}) exceeds max_seq_len ({max_seq_len})."
+            )
 
     return (example_input_ids, example_cache_len_tensor)
-
-
-def build_dynamic_shapes(config: Any) -> dict[str, Any] | None:
-    if config.dynamic_shapes is not None:
-        return config.dynamic_shapes
-
-    if config.static_seq_len_1:
-        return None
-
-    if config.adapter.dynamic_shapes_builder is not None:
-        return config.adapter.dynamic_shapes_builder(config.max_seq_len)
-
-    dyn_seq_len = Dim("dyn_seq_len", min=1, max=config.max_seq_len - 1)
-    dyn_cache_len = Dim("dyn_cache_len", min=1, max=config.max_seq_len - 1)
-    return {
-        "input_ids": (Dim.STATIC, dyn_seq_len),
-        "cache_len_tensor": (dyn_cache_len,),
-    }
 
 
 def build_quantizer(precision: str):
@@ -230,31 +154,27 @@ def dequant_from_exported_state_dict(state_dict: dict[str, torch.Tensor]) -> lis
     return dequantized
 
 
-def default_original_weight_extractor(wrapper: nn.Module) -> list[tuple[str, torch.Tensor]]:
-    candidates: list[tuple[str, torch.Tensor]] = []
-    for name, tensor in wrapper.state_dict().items():
-        if tensor.ndim == 2 and tensor.is_floating_point():
-            candidates.append((name, tensor.detach().float()))
-    return candidates
-
-
-def default_exported_weight_extractor(quantized_exported) -> list[torch.Tensor]:
-    return dequant_from_exported_state_dict(quantized_exported.state_dict)
-
-
 def find_weight_mismatches(
     wrapper: nn.Module,
     quantized_exported,
     eps: float,
-    *,
-    exported_weight_extractor=None,
-    original_weight_extractor=None,
 ) -> list[dict[str, Any]]:
     """Best-effort match of exported dequantized tensors against original weights."""
-    original_weight_extractor = original_weight_extractor or default_original_weight_extractor
-    exported_weight_extractor = exported_weight_extractor or default_exported_weight_extractor
-    original_candidates = original_weight_extractor(wrapper)
-    dequantized = exported_weight_extractor(quantized_exported)
+    # Restrict matching to float 2D tensors to compare exported linear-like weights.
+    original_candidates: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in wrapper.state_dict().items():
+        if tensor.ndim == 2 and tensor.is_floating_point():
+            original_candidates.append((name, tensor.detach().float()))
+
+    exported_state_dict_attr = getattr(quantized_exported, "state_dict", None)
+    exported_state_dict = (
+        exported_state_dict_attr()
+        if callable(exported_state_dict_attr)
+        else exported_state_dict_attr
+    )
+    if not isinstance(exported_state_dict, dict):
+        raise TypeError("exported object does not expose a dict-like state_dict")
+    dequantized = dequant_from_exported_state_dict(exported_state_dict)
 
     mismatches = []
     for idx, dq in enumerate(dequantized):
@@ -326,7 +246,6 @@ def finalize_export_result(
     exported_for_mismatch: Any | None,
     run_weight_mismatch_check: bool,
     weight_mismatch_eps: float,
-    adapter: ExportAdapter,
     verbose: bool,
 ) -> ExecuTorchExportResult:
     """Run backend-agnostic post-export checks and build the final result."""
@@ -337,8 +256,6 @@ def finalize_export_result(
                 wrapper,
                 exported_for_mismatch,
                 eps=weight_mismatch_eps,
-                exported_weight_extractor=adapter.exported_weight_extractor,
-                original_weight_extractor=adapter.original_weight_extractor,
             )
         except Exception as exc:
             warnings.warn(
@@ -388,7 +305,7 @@ def resolve_components_and_wrapper(
     model_or_graph: Any,
     *,
     config: Any,
-) -> tuple[nn.Module, Any | None, tuple[Any, ...], dict[str, Any] | None, QuantizationPlan]:
+) -> tuple[nn.Module, Any | None, tuple[Any, ...], QuantizationPlan]:
     if isinstance(model_or_graph, dict):
         components = {
             "embedding": model_or_graph["embedding"],
@@ -408,13 +325,11 @@ def resolve_components_and_wrapper(
 
     wrapper = build_wrapper(
         components,
-        static_seq_len_1=config.static_seq_len_1,
-        adapter=config.adapter,
         model_config=model_config,
     )
     wrapper.eval()
 
-    quant_plan = _build_quant_plan(model_config, requested_precision=config.precision)
+    quant_plan = QuantizationPlan.build(model_config, requested_precision=config.precision)
     if quant_plan.global_precision not in {"int4", "int8", "full"}:
         raise ValueError(
             f"Unsupported precision '{quant_plan.global_precision}'. "
@@ -427,6 +342,10 @@ def resolve_components_and_wrapper(
         )
 
     example_inputs = build_example_inputs(model_config, config=config)
-    dynamic_shapes = build_dynamic_shapes(config)
+    if config.dynamic_shapes is not None:
+        warnings.warn(
+            "dynamic_shapes is ignored; exporter now uses static seq_len=1 contract.",
+            stacklevel=2,
+        )
 
-    return wrapper, model_config, example_inputs, dynamic_shapes, quant_plan
+    return wrapper, model_config, example_inputs, quant_plan

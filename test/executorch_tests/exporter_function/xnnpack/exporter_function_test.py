@@ -38,11 +38,6 @@ def parse_args():
         help="Maximum sequence length for export (used for cache size)",
     )
     parser.add_argument(
-        "--static-seq-len-1",
-        action="store_true",
-        help="Export static decode graph with fixed input seq_len=1",
-    )
-    parser.add_argument(
         "--mode",
         type=str,
         default="hf",
@@ -77,15 +72,6 @@ def main():
     )
     model.eval()
 
-    # Keep examples tiny for quick smoke runs.
-    if args.static_seq_len_1:
-        example_input_ids = torch.randint(0, model.config.vocab_size, (1, 1), dtype=torch.long)
-        # Static wrapper currently expects 1-based effective length for seq_len=1 decode.
-        example_cache_len = torch.tensor([1], dtype=torch.long)
-    else:
-        example_input_ids = torch.randint(0, model.config.vocab_size, (1, 3), dtype=torch.long)
-        example_cache_len = torch.ones(7)
-
     if args.mode == "hf":
         model_input = model
     else:
@@ -103,18 +89,13 @@ def main():
 
     output_path = os.path.join(
         args.out_dir,
-        f"export_{args.mode}_{args.backend}_{args.precision}"
-        f"{'_static_seq1' if args.static_seq_len_1 else ''}.pte",
+        f"export_{args.mode}_{args.backend}_{args.precision}",
     )
 
     export_config = XNNPACKExportConfig(
         output_path=output_path,
         backend=args.backend,
         precision=args.precision,
-        static_seq_len_1=args.static_seq_len_1,
-        calibration_data=None,
-        example_input_ids=example_input_ids,
-        example_cache_len_tensor=example_cache_len,
         max_seq_len=args.max_sequence_length,
         convert_options={"use_sdpa": False},
         verbose=args.verbose,

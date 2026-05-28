@@ -8,11 +8,6 @@ from .config import BackendExportConfig
 from ..blocks import TransformerDecoder
 from ..utils import convert_for_export
 
-
-def _is_tsurgeon_decoder(module: nn.Module) -> bool:
-    return isinstance(module, TransformerDecoder)
-
-
 def _resolve_model_components_for_export(
     model_or_graph: Any,
     *,
@@ -37,7 +32,8 @@ def _resolve_model_components_for_export(
         embedding = model_or_graph.get_input_embeddings()
         final_layer = model_or_graph.lm_head
 
-        if _is_tsurgeon_decoder(model_or_graph):
+        # Check if the model is already converted to tsurgeon's graph
+        if isinstance(model_or_graph, TransformerDecoder):
             decoder = model_or_graph
         else:
             converted = convert_for_export(

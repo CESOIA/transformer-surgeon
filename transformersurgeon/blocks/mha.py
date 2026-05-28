@@ -10,11 +10,10 @@ def attention_mask(
     q_seq_length,
     kv_seq_length,          # effective KV length (current cache_len)
     device="cpu",
-    kv_alloc_length=None,   # optional fixed width for static export
+    kv_alloc_length=None,   # kept for API compatibility; static width is required
     mask_value=-1e6,
 ):
-    # If kv_alloc_length is set, mask shape is fixed to that width.
-    # Otherwise dynamic mode uses kv_seq_length as width.
+    # Static export requires a fixed KV width.
     kv_width = kv_seq_length if kv_alloc_length is None else kv_alloc_length
 
     i = torch.arange(q_seq_length, device=device).view(1, 1, q_seq_length, 1)
@@ -264,7 +263,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         self.register_buffer("key_cache", torch.zeros(batch_size, max_cache_length, self.kv_num_heads, self.head_dim), persistent=False)
         self.register_buffer("value_cache", torch.zeros(batch_size, max_cache_length, self.kv_num_heads, self.head_dim), persistent=False)
         
-    def forward(self, x, last_pos, attn_mask=None, rope=None, static=False):
+    def forward(self, x, last_pos, attn_mask=None, rope=None):
         """
         Forward pass of the causal Multi-Head Attention with caching.
         
@@ -288,21 +287,14 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         # Update key and value caches in-place
         with torch.no_grad():
-            if static:
-                last_pos_tensor = torch.as_tensor(last_pos, device=x.device)
-                indexes = torch.arange(-in_seq_len, 0, device=x.device) + last_pos_tensor
-            else:
-                indexes = torch.arange(last_pos-in_seq_len, last_pos, device=x.device)
+            last_pos_tensor = torch.as_tensor(last_pos, device=x.device)
+            indexes = torch.arange(-in_seq_len, 0, device=x.device) + last_pos_tensor
             self.key_cache.index_copy_(1, indexes, k)
             self.value_cache.index_copy_(1, indexes, v)
 
-        # Slice cache
-        if static:
-            key_cache = self.key_cache
-            value_cache = self.value_cache
-        else:
-            key_cache = self.key_cache[:, :last_pos] # (batch_size, last_pos, kv_num_heads, head_dim)
-            value_cache = self.value_cache[:, :last_pos] # (batch_size, last_pos, kv_num_heads, head_dim)
+        # Static path always attends over fixed-size caches, with masking handling valid range.
+        key_cache = self.key_cache
+        value_cache = self.value_cache
 
         if self.use_sdpa:
             q = q.transpose(1, 2) # (batch_size, num_heads, in_seq_len, head_dim)
