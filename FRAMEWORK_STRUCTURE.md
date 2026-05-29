@@ -43,6 +43,7 @@ transformersurgeon/
 ├── models/
 │   ├── __init__.py
 │   ├── qwen2_c/
+│   ├── llama_c/
 │   ├── qwen2_vl_c/
 │   ├── qwen2_5_vl_c/
 │   ├── bert_c/
@@ -87,7 +88,11 @@ These are the primitive modules modified by compression schemes.
 		- `apply(...)`
 		- `restore(...)`
 		- VCON helpers (`init_vcon`, `set_vcon_beta`, `cancel_vcon`)
-	- Integrates calibration through `set_calibration_data` and `run_calibration`.
+	- Integrates calibration through:
+		- `set_calibration_data(...)`
+		- `set_calibration_mode(mode="standard"|"cascade")`
+		- `run_calibration(...)`
+	- In cascade mode, consumes indexing-provided `calibration_groups`.
 
 ### 4) Configuration and model patching
 
@@ -100,13 +105,26 @@ These are the primitive modules modified by compression schemes.
 
 `models/*_c/` contains architecture-specific glue code:
 
-- `indexing_*.py`: path templates and model metadata
+- `indexing_*.py`: path templates, model metadata, and optional cascade calibration scheduling metadata (`calibration_groups`)
 - `define_*.py`:
 	- compressed config class (HF-compatible)
 	- compressed model class
 	- model-specific manager subclass
 
 The manager itself stays generic; model-specific behavior lives in indexing.
+
+### 5.1) Cascade calibration groups in indexing
+
+Each indexing block can define explicit parallel calibration groups:
+
+```python
+"calibration_groups": [
+	["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+	["mlp.gate_proj", "mlp.up_proj"],
+]
+```
+
+Groups are interpreted with the same matching semantics used by manager filtering (substring criteria over layer paths). Ungrouped layers are calibrated as singleton stages.
 
 ### 6) Export pipeline
 
@@ -125,10 +143,12 @@ The manager itself stays generic; model-specific behavior lives in indexing.
 3. Create manager (`CompressionSchemesManager` subclass).
 4. Manager builds `CompressionScheme` objects from indexing + `compression_config`.
 5. Use `manager.set(...)` with criteria to configure selected layers.
-6. Optional: provide calibration dataloader and run/apply calibration-required methods.
-7. Call `manager.apply(...)` to update weights/modules.
-8. Optional: use VCON utilities for smooth transition training.
-9. Optional: convert and export using `convert_for_export(...)` and export modules.
+6. Optional: provide calibration dataloader.
+7. Optional: choose calibration scheduling with `set_calibration_mode(...)`.
+8. Run `manager.apply(...)` (or `run_calibration(...)`) for calibration-required methods.
+9. During shifted-summary calibration, backbone can report shifted-activation sanity metrics (`pairs`, `mean_rel_l2_diff`, `max_rel_l2_diff`) in verbose mode.
+10. Optional: use VCON utilities for smooth transition training.
+11. Optional: convert and export using `convert_for_export(...)` and export modules.
 
 ## Extending to a New Architecture
 

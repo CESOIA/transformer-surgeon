@@ -15,7 +15,7 @@ pip install -e .
 ## 🗂️ What's Included
 
 **Compression methods**
-- `lrd` — low-rank decomposition (SVD, calibration-aware SVD-LLM-v2)
+- `lrd` — low-rank decomposition (SVD, calibration-aware SVD-LLM-v2, AA-SVD)
 - `structured_pruning` — output neuron removal by magnitude, gradient, or random
 - `unstructured_pruning` — weight-level sparsity masks
 - `quantization` — fixed-point and binary weights
@@ -38,6 +38,7 @@ pip install -e .
 | Model | Type | Import |
 |---|---|---|
 | Qwen2 | Causal LM | `Qwen2ForCausalLMCompress` |
+| Llama | Causal LM | `LlamaForCausalLMCompress` |
 | Qwen2-VL | Vision-language | `Qwen2VLForConditionalGenerationCompress` |
 | Qwen2.5-VL | Vision-language | `Qwen2_5_VLForConditionalGenerationCompress` |
 | BERT | Encoder | `BertForSequenceClassificationCompress` |
@@ -80,6 +81,25 @@ manager.set("lrd", "rank", 128, criteria="mlp.up_proj")
 manager.set_calibration_data(calibration_loader)  # any torch DataLoader
 manager.apply(device=device)
 ```
+
+### Cascade calibration with indexing-defined groups (AA-SVD)
+
+`set_calibration_mode(mode="cascade")` uses model indexing metadata (`calibration_groups`) to define layer groups that can be calibrated in parallel.
+
+```python
+manager = Qwen2CompressionSchemesManager(model)
+manager.set("lrd", "method", "aa-svd")
+manager.set("lrd", "rank", 128, criteria="all")
+
+manager.set_calibration_mode(mode="cascade")
+manager.set_calibration_data(calibration_loader)
+manager.apply(device=device, verbose=True)
+```
+
+With `verbose=True`, cascade calibration prints shifted-activation sanity diagnostics for shifted summaries:
+- `pairs`: number of paired `activation` / `activation_shifted` samples
+- `mean_rel_l2_diff`: mean relative $\ell_2$ difference between base and shifted activations
+- `max_rel_l2_diff`: maximum relative $\ell_2$ difference observed in the stage
 
 ### Convert to export-friendly graph, then compress
 
@@ -140,13 +160,28 @@ manager.cancel_vcon(keep_block_b=True)      # collapse to compressed module
 | `set_vcon_beta(beta, criteria)` | Set blending weight |
 | `cancel_vcon(keep_block_b, criteria)` | Collapse `VCONBlock` to one branch |
 | `set_calibration_data(dataloader)` | Attach calibration `DataLoader` |
+| `set_calibration_mode(mode)` | Select `standard` or `cascade` calibration scheduling |
 | `run_calibration(criteria, ...)` | Run calibration pass |
 | `iter_filtered(criteria)` | Iterate over matching schemes |
+
+## 🧩 Indexing Calibration Groups
+
+For cascade mode, each model indexing block can declare explicit parallel calibration groups:
+
+```python
+"calibration_groups": [
+	["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+	["mlp.gate_proj", "mlp.up_proj"],
+]
+```
+
+These groups are consumed by `CompressionSchemesManager` exactly like previous user-provided group criteria, but now live in model indexing to keep calibration scheduling model-specific and reproducible.
 
 ## 📂 References
 
 - [test/compression_tests/compression_test.py](test/compression_tests/compression_test.py) — manager basics and convert-then-compress flow
 - [test/qwen_tests/inference_test.py](test/qwen_tests/inference_test.py) — Qwen2 end-to-end
+- [test/llama_tests/svd_llm_v2_test.py](test/llama_tests/svd_llm_v2_test.py) — Llama calibrated LRD
 - [test/qwen_tests/svd_llm_v2_test.py](test/qwen_tests/svd_llm_v2_test.py) — calibrated LRD
 - [test/qwen_vl_tests/inference_test.py](test/qwen_vl_tests/inference_test.py) — vision-language
 - [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package internals and extension guide
