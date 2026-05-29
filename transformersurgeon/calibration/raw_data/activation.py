@@ -12,8 +12,9 @@ from .base import RawDataCollector
 class ActivationCollector(RawDataCollector):
     name = "activation"
 
-    def __init__(self, *, offload_to_cpu: bool = False):
+    def __init__(self, *, offload_to_cpu: bool = False, raw_name: str = "activation"):
         self.offload_to_cpu = offload_to_cpu
+        self.name = raw_name
 
     def build_forward_hook(self, *, emit_raw: Callable[[str, torch.Tensor], None]):
         def _hook(module, inputs, _output):
@@ -43,3 +44,12 @@ class ActivationCollector(RawDataCollector):
             emit_raw(self.name, activation.float())
 
         return _hook
+
+
+class ShiftedActivationCollector(ActivationCollector):
+    name = "activation_shifted"
+    # This stream is collected from the shifted model.
+    uses_shifted_model = True
+
+    def __init__(self, *, offload_to_cpu: bool = False):
+        super().__init__(offload_to_cpu=offload_to_cpu, raw_name=self.name)

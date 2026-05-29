@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from .covariance import CovarianceSummary
+from .covariance import CovarianceSummary, CrossCovarianceSummary, ShiftedCovarianceSummary
 from .weight_grad import WeightGradSummary
 
 
 SUMMARY_REGISTRY = {
     # Running activation covariance, used by calibrated LRD methods (e.g. svd-llm-v2).
     "covariance": CovarianceSummary(),
+    # Running covariance over shifted-model activations.
+    "shifted_covariance": ShiftedCovarianceSummary(),
+    # Running cross covariance between base and shifted activations.
+    "cross_covariance": CrossCovarianceSummary(),
     # Running weight-gradient average, used by gradient-based pruning methods.
     "weight_grad": WeightGradSummary(),
 }

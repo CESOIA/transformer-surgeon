@@ -14,9 +14,8 @@ from torch.utils.data import DataLoader
 
 from .raw_data import instantiate_raw_collector, normalize_calibration_batch
 from .summaries import SummaryRuntime, get_summary
-from .targets import collect_targets
 from ..utils.interface import build_progress_bar
-from ..utils.utils import infer_model_device, move_to_device
+from ..utils.utils import get_submodule, infer_model_device, move_to_device
 
 
 def _compute_calibration_loss(loss_fn, model_output, label):
@@ -27,8 +26,10 @@ def _compute_calibration_loss(loss_fn, model_output, label):
 
 
 def run_compression_calibration(
-    manager,
-    criteria=None,
+    model,
+    calibration_data,
+    target_stages,
+    shifted_model=None,
     loss_fn=None,
     max_batches: Optional[int] = None,
     device: Optional[Union[str, torch.device]] = None,
@@ -49,11 +50,10 @@ def run_compression_calibration(
     - Single tensor/object batches
     """
     # Validate calibration input source first: this runner expects a DataLoader.
-    calibration_data = manager.calibration_data
     if calibration_data is None:
         raise ValueError(
             "Calibration data is required before running calibration. "
-            "Call manager.set_calibration_data(...) before manager.apply(...)."
+            "Call manager.set_calibration_data(...) before manager.apply(...) or manager.run_calibration(...)."
         )
     if not isinstance(calibration_data, DataLoader):
         raise TypeError(
@@ -61,26 +61,21 @@ def run_compression_calibration(
             f"Got {type(calibration_data)}."
         )
 
-    # Discover only the schemes/summaries needed by active compressors.
-    if hasattr(manager, "collect_calibration_target_stages") and callable(
-        getattr(manager, "collect_calibration_target_stages")
-    ):
-        target_stages = manager.collect_calibration_target_stages(criteria=criteria)
-    else:
-        targets = collect_targets(manager, criteria=criteria)
-        target_stages = [targets] if len(targets) > 0 else []
-
     if len(target_stages) == 0:
         if verbose:
             print("No compression schemes found for calibration.")
         return 0
 
-    model = manager.model
     if device is None:
         device = infer_model_device(model)
     device = torch.device(device)
 
+    shifted_device = None
+    if shifted_model is not None:
+        shifted_device = torch.device(infer_model_device(shifted_model))
+
     was_training = model.training
+    shifted_was_training = shifted_model.training if shifted_model is not None else None
     calibrated_schemes = set()
 
     total_stages = len(target_stages)
@@ -112,6 +107,25 @@ def run_compression_calibration(
             for raw_name in required_raw_names
         }
 
+        requires_shifted_model = any(
+            runtime.summary.requires_shifted_model
+            for runtimes in runtimes_by_scheme.values()
+            for runtime in runtimes
+        )
+        if requires_shifted_model and shifted_model is None:
+            raise ValueError(
+                "Selected calibration summaries require shifted_model. "
+                "Pass shifted_model=... to manager.run_calibration(...) or manager.apply(...)."
+            )
+
+        shifted_module_by_scheme = {}
+        if requires_shifted_model:
+            for scheme in module_by_scheme:
+                shifted_module = get_submodule(shifted_model, scheme.path)
+                if hasattr(shifted_module, "block_b"):
+                    shifted_module = shifted_module.block_b
+                shifted_module_by_scheme[scheme] = shifted_module
+
         # Global execution mode flags drive forward-only vs forward+backward calibration.
         requires_backward = any(c.requires_backward for c in raw_collectors.values())
         if requires_backward and loss_fn is None:
@@ -135,7 +149,8 @@ def run_compression_calibration(
                     emit_raw=lambda name, value, _scheme=scheme: _dispatch_raw(_scheme, name, value)
                 )
                 if hook is not None:
-                    hook_handles.append(module.register_forward_hook(hook))
+                    hook_module = shifted_module_by_scheme.get(scheme, module) if collector.uses_shifted_model else module
+                    hook_handles.append(hook_module.register_forward_hook(hook))
 
         num_batches = 0
         total_batches = None
@@ -151,6 +166,8 @@ def run_compression_calibration(
 
         try:
             model.eval()
+            if requires_shifted_model:
+                shifted_model.eval()
 
             for batch_id, batch in enumerate(calibration_data):
                 if max_batches is not None and batch_id >= max_batches:
@@ -169,6 +186,11 @@ def run_compression_calibration(
 
                 model_args = tuple(model_args)
                 model_kwargs = dict(model_kwargs)
+                shifted_model_args = model_args
+                shifted_model_kwargs = model_kwargs
+                if requires_shifted_model and shifted_device is not None:
+                    shifted_model_args = tuple(move_to_device(model_args, shifted_device))
+                    shifted_model_kwargs = dict(move_to_device(model_kwargs, shifted_device))
 
                 if requires_backward:
                     # Backward path: run forward, compute user-provided loss, backprop, then pull post-backward raw values.
@@ -182,6 +204,11 @@ def run_compression_calibration(
                         )
                     loss.backward()
 
+                    if requires_shifted_model:
+                        # Shifted model is used for activation summaries only.
+                        with torch.no_grad():
+                            shifted_model(*shifted_model_args, **shifted_model_kwargs)
+
                     for scheme, module in module_by_scheme.items():
                         for raw_name in raw_required_by_scheme[scheme]:
                             collector = raw_collectors[raw_name]
@@ -193,6 +220,8 @@ def run_compression_calibration(
                     # Forward-only path for summaries based solely on activations.
                     with torch.no_grad():
                         model(*model_args, **model_kwargs)
+                        if requires_shifted_model:
+                            shifted_model(*shifted_model_args, **shifted_model_kwargs)
 
                 num_batches += 1
                 progress_bar.update(1)
@@ -205,6 +234,8 @@ def run_compression_calibration(
             model.zero_grad(set_to_none=True)
             if was_training:
                 model.train()
+            if requires_shifted_model and shifted_was_training:
+                shifted_model.train()
 
         if num_batches == 0:
             raise ValueError("Calibration data must contain at least one batch.")

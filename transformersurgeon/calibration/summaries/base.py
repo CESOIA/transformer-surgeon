@@ -16,6 +16,8 @@ class CalibrationSummary(ABC):
     name: str
     # Raw streams required before one summary update can happen.
     required_raw_data: Tuple[str, ...]
+    # If True, this summary requires a shifted model activation stream.
+    requires_shifted_model: bool = False
 
     def initialize_store(self, calibration_store: dict) -> None:
         """Prepare storage keys owned by this summary."""

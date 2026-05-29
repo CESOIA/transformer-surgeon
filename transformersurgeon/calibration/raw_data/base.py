@@ -23,6 +23,8 @@ class RawDataCollector(ABC):
     # Reserved capability flag for collectors that depend on explicit targets.
     # The current backbone does not auto-inject targets into model kwargs.
     requires_labels: bool = False
+    # If True, collector hook must be attached to shifted model modules.
+    uses_shifted_model: bool = False
 
     def build_forward_hook(
         self,

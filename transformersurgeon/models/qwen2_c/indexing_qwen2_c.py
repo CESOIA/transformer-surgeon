@@ -24,6 +24,8 @@ QWEN2_C_INDEXING = {
         },
         'path_template': "model.layers.{block_index}.{path}",
         'extra_layers': ["model.norm"],
+        'preprocessing': "model.embed_tokens",
+        'final_layer': "lm_head",
 
         # Transformersurgeon's topology export model specifics
         'structure': 'transformer_decoder',

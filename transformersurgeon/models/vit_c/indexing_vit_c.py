@@ -26,6 +26,8 @@ VIT_C_INDEXING = {
         },
         'path_template': "vit.encoder.layer.{block_index}.{path}",
         'qkv_paths': [],
+        'preprocessing': "vit.embeddings",
+        'final_layer': "classifier",
 
         # Transformersurgeon export topology specifics
         'structure': 'transformer_encoder',

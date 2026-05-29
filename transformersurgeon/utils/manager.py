@@ -197,6 +197,7 @@ class CompressionSchemesManager:
 
     def run_calibration(
         self,
+        shifted_model: Optional[torch.nn.Module] = None,
         criteria=None,
         max_batches: Optional[int] = None,
         device: Optional[Union[str, torch.device]] = None,
@@ -208,6 +209,7 @@ class CompressionSchemesManager:
         Run a single calibration pass to collect shared activation statistics.
         
         Args:
+            shifted_model: Optional second model used by shifted/cross summaries.
             criteria: Filter criteria for target schemes.
             max_batches: Maximum calibration batches to process.
             device: Device to move batches to.
@@ -220,9 +222,13 @@ class CompressionSchemesManager:
         Returns:
             Number of schemes calibrated.
         """
+        target_stages = self.collect_calibration_target_stages(criteria=criteria)
+
         return run_compression_calibration(
-            manager=self,
-            criteria=criteria,
+            model=self.model,
+            calibration_data=self.calibration_data,
+            target_stages=target_stages,
+            shifted_model=shifted_model,
             loss_fn=self.calibration_loss_fn,
             max_batches=max_batches,
             device=device,
@@ -244,6 +250,7 @@ class CompressionSchemesManager:
     def apply(
         self,
         hard=False,
+        shifted_model: Optional[torch.nn.Module] = None,
         criteria=None,
         verbose=False,
         max_batches: Optional[int] = None,
@@ -256,6 +263,7 @@ class CompressionSchemesManager:
 
         Args:
             hard: If True, applies hard compression (non-reversible); if False, applies soft compression (reversible)
+            shifted_model: Optional second model used by shifted/cross summaries.
             criteria: List of criteria to filter modules (by name or block_id). No criteria = all
             verbose: If True, prints information about the application process
             max_batches: Optional cap on calibration batches.
@@ -276,6 +284,7 @@ class CompressionSchemesManager:
                     f"for: {missing_stats}"
                 )
             self.run_calibration(
+                shifted_model=shifted_model,
                 criteria=criteria,
                 max_batches=max_batches,
                 device=device,

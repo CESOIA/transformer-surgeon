@@ -8,11 +8,15 @@ QWEN2_5_VL_C_INDEXING = {
     {
         'config_attr': 'vision_config',
         'num_blocks_attr': 'depth',
+
+        # HF model structure specifics
         'path_list': {
             'attn': ['qkv', 'proj'],
             'mlp': ['gate_proj', 'up_proj', 'down_proj'],
         },
         'path_template': "model.visual.blocks.{block_index}.{path}",
+        'preprocessing': "model.visual.patch_embed",
+        'final_layer': "model.visual.merger",
         'pruning_supported': [],
     },
     'text':
@@ -35,6 +39,8 @@ QWEN2_5_VL_C_INDEXING = {
         },
         'path_template': "model.language_model.layers.{block_index}.{path}",
         'extra_layers': ["model.language_model.norm"],
+        'preprocessing': "model.language_model.embed_tokens",
+        'final_layer': "lm_head",
 
         # Transformersurgeon's topology export model specifics
         'structure': 'transformer_decoder',

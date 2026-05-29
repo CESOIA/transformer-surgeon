@@ -24,6 +24,8 @@ BERT_C_INDEXING = {
         },
         'path_template': "bert.encoder.layer.{block_index}.{path}",
         'qkv_paths': [],
+        'preprocessing': "bert.embeddings",
+        'final_layer': "classifier",
 
         # Transformersurgeon export topology specifics
         'structure': 'transformer_encoder',
