@@ -49,7 +49,6 @@ class CompressionSchemesManager:
         self.calibration_loss_fn: Optional[Callable[[Any, Any], torch.Tensor]] = None
         self.calibration_mode = "standard"
         self.calibration_groups: List[List[Union[int, str, list]]] = []
-        self.calibration_no_data_dependency = False
         try:
             self.config = model.config
             assert isinstance(self.config, PretrainedConfig), "Model config is not an instance of PretrainedConfig. Please provide a model with a valid Hugging Face configuration."
@@ -170,7 +169,6 @@ class CompressionSchemesManager:
     def set_calibration_mode(
         self,
         mode: str = "standard",
-        no_data_dependency: bool = False,
     ):
         """
         Configure calibration target scheduling.
@@ -180,9 +178,6 @@ class CompressionSchemesManager:
                 - "standard": single-stage calibration over selected schemes.
                 - "cascade": multi-stage calibration using indexing-provided
                   calibration_groups.
-            no_data_dependency:
-                If True in cascade mode, all grouped schemes are merged into one
-                stage (parallel collection), behaving like iter_filtered selection.
         """
         if not isinstance(mode, str):
             raise TypeError(f"calibration mode must be a string. Got {type(mode)}.")
@@ -193,14 +188,8 @@ class CompressionSchemesManager:
                 f"Unsupported calibration mode '{mode}'. Supported modes are: ['standard', 'cascade']."
             )
 
-        if not isinstance(no_data_dependency, bool):
-            raise TypeError(
-                f"no_data_dependency must be a bool. Got {type(no_data_dependency)}."
-            )
-
         self.calibration_mode = mode
         self.calibration_groups = self._get_calibration_groups_from_indexing()
-        self.calibration_no_data_dependency = no_data_dependency
 
     def run_calibration(
         self,
@@ -419,22 +408,6 @@ class CompressionSchemesManager:
                 grouped_scheme_stages.append(group_schemes)
 
         ungrouped = [scheme for scheme in selected_schemes if scheme not in grouped_set]
-
-        if self.calibration_no_data_dependency:
-            merged_schemes = []
-            seen = set()
-            for group_schemes in grouped_scheme_stages:
-                for scheme in group_schemes:
-                    if scheme not in seen:
-                        seen.add(scheme)
-                        merged_schemes.append(scheme)
-            for scheme in ungrouped:
-                if scheme not in seen:
-                    seen.add(scheme)
-                    merged_schemes.append(scheme)
-
-            stage = self._collect_calibration_targets_for_schemes(merged_schemes)
-            return [stage] if len(stage) > 0 else []
 
         stages = []
         for group_schemes in grouped_scheme_stages:

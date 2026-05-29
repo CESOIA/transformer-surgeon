@@ -154,7 +154,6 @@ print(f"Configured LRD rank for {count} candidate schemes to min(n, m).")
 
 manager.set_calibration_mode(
     mode="cascade",
-    no_data_dependency=False,
 )
 
 manager.set_calibration_data(calibration_loader)

@@ -325,23 +325,6 @@ def _build_layer_stages_for_block(
 
     ungrouped_layers = [layer for layer in available_layers if layer not in grouped_set]
 
-    if manager.calibration_no_data_dependency:
-        merged = []
-        seen = set()
-
-        for group_layers in grouped_stages:
-            for layer in group_layers:
-                if layer not in seen:
-                    seen.add(layer)
-                    merged.append(layer)
-
-        for layer in ungrouped_layers:
-            if layer not in seen:
-                seen.add(layer)
-                merged.append(layer)
-
-        return [merged] if len(merged) > 0 else []
-
     stages: List[List[str]] = list(grouped_stages)
     for layer in ungrouped_layers:
         stages.append([layer])
