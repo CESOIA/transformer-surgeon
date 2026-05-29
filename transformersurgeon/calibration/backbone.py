@@ -14,50 +14,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from .raw_data import inject_labels_if_needed, instantiate_raw_collector, normalize_calibration_batch
-from .summaries import SummaryRuntime, get_summary, unique_summaries
+from .summaries import SummaryRuntime, get_summary
+from .targets import collect_targets
+from ..utils.interface import build_progress_bar
 from ..utils.utils import infer_model_device, move_to_device
 
 
-class _FallbackProgressBar:
-    """Minimal in-place progress bar used when tqdm is unavailable."""
-
-    def __init__(self, *, total: Optional[int], enabled: bool):
-        self.total = total
-        self.enabled = enabled
-        self.current = 0
-
-    def update(self, n: int = 1):
-        if not self.enabled:
-            return
-        self.current += n
-        if self.total is None or self.total <= 0:
-            print(f"\rCalibration batches: {self.current}", end="", flush=True)
-        else:
-            pct = int((100 * self.current) / self.total)
-            print(
-                f"\rCalibration: {self.current}/{self.total} ({pct}%)",
-                end="",
-                flush=True,
-            )
-
-    def close(self):
-        if self.enabled:
-            print("", flush=True)
-
-
-def _build_progress_bar(*, enabled: bool, total: Optional[int], verbose: bool):
-    if not enabled:
-        return _FallbackProgressBar(total=total, enabled=False)
-
-    try:
-        from tqdm.auto import tqdm
-
-        return tqdm(total=total, desc="Calibration", leave=False, disable=not verbose)
-    except Exception:
-        return _FallbackProgressBar(total=total, enabled=verbose)
-
-
 def _extract_loss(model_output, label, loss_fn):
+    # Accept different model return conventions: tensor, dataclass-like, or mapping.
     if isinstance(model_output, torch.Tensor):
         loss = model_output
     elif hasattr(model_output, "loss"):
@@ -68,6 +32,7 @@ def _extract_loss(model_output, label, loss_fn):
         loss = None
 
     if loss is None and loss_fn is not None:
+        # Allow callers to define a custom extraction rule when model output is non-standard.
         loss = loss_fn(model_output, label)
 
     if loss is None:
@@ -75,6 +40,7 @@ def _extract_loss(model_output, label, loss_fn):
 
     if not isinstance(loss, torch.Tensor):
         raise TypeError(f"Extracted loss must be a torch.Tensor, but got {type(loss)}.")
+    # Backward-based collectors require a scalar differentiable finite loss.
     if loss.numel() != 1:
         raise ValueError(f"Extracted loss must be scalar, but got shape {tuple(loss.shape)}.")
     if not loss.requires_grad:
@@ -83,54 +49,6 @@ def _extract_loss(model_output, label, loss_fn):
         raise ValueError("Extracted loss is not finite (NaN/Inf) during calibration.")
 
     return loss
-
-
-def _collect_targets(manager, criteria=None):
-    targets = []
-    for scheme in manager.iter_filtered(criteria=criteria):
-        required_summaries = []
-
-        for compressor in scheme.compressors.values():
-            if not compressor._to_compress():
-                continue
-
-            compressor.set_calibration_store(scheme.calibration_data)
-
-            needs_calibration_fn = getattr(compressor, "needs_calibration", None)
-            if not callable(needs_calibration_fn):
-                continue
-
-            needs_calibration = needs_calibration_fn()
-            if needs_calibration is False or needs_calibration is None:
-                continue
-
-            if needs_calibration is True:
-                raise ValueError(
-                    f"Compressor {type(compressor).__name__} needs calibration but did not provide summary names."
-                )
-
-            if isinstance(needs_calibration, str):
-                summary_names = (needs_calibration,)
-            elif isinstance(needs_calibration, (tuple, list, set)):
-                summary_names = tuple(needs_calibration)
-            else:
-                raise TypeError(
-                    "needs_calibration must return False/None or a string/sequence of summary names."
-                )
-
-            if len(summary_names) == 0:
-                raise ValueError(
-                    f"Compressor {type(compressor).__name__} needs calibration but returned no summaries."
-                )
-
-            for summary_name in summary_names:
-                if summary_name not in required_summaries:
-                    required_summaries.append(summary_name)
-
-        if len(required_summaries) > 0:
-            targets.append((scheme, unique_summaries(required_summaries)))
-
-    return targets
 
 
 def run_compression_calibration(
@@ -152,6 +70,7 @@ def run_compression_calibration(
     - Positional tuple/list batches
     - Single tensor/object batches
     """
+    # Validate calibration input source first: this runner expects a DataLoader.
     calibration_data = manager.calibration_data
     if calibration_data is None:
         raise ValueError(
@@ -164,7 +83,8 @@ def run_compression_calibration(
             f"Got {type(calibration_data)}."
         )
 
-    targets = _collect_targets(manager, criteria=criteria)
+    # Discover only the schemes/summaries needed by active compressors.
+    targets = collect_targets(manager, criteria=criteria)
     if len(targets) == 0:
         if verbose:
             print("No compression schemes found for calibration.")
@@ -178,10 +98,12 @@ def run_compression_calibration(
     required_raw_names = set()
 
     for scheme, summary_names in targets:
+        # Build one runtime per requested summary and accumulate required raw streams.
         runtimes = []
         raw_names = set()
         for summary_name in summary_names:
             summary = get_summary(summary_name)
+            # Summary owns only its own key in this scheme's calibration store.
             summary.initialize_store(scheme.calibration_data)
             runtime = SummaryRuntime(summary=summary)
             runtimes.append(runtime)
@@ -190,23 +112,27 @@ def run_compression_calibration(
         raw_required_by_scheme[scheme] = raw_names
         required_raw_names.update(raw_names)
 
+    # Instantiate raw collectors once per raw stream type (shared across schemes).
     raw_collectors = {
         raw_name: instantiate_raw_collector(raw_name, offload_to_cpu=offload_to_cpu)
         for raw_name in required_raw_names
     }
 
+    # Global execution mode flags drive forward-only vs forward+backward calibration.
     requires_backward = any(c.requires_backward for c in raw_collectors.values())
     requires_labels = any(c.requires_labels for c in raw_collectors.values())
 
     hook_handles = []
 
     def _dispatch_raw(scheme, raw_name: str, raw_value: torch.Tensor):
+        # Fan out each raw tensor to all summary runtimes attached to that scheme.
         for runtime in runtimes_by_scheme[scheme]:
             runtime.on_raw(scheme.calibration_data, raw_name, raw_value)
 
     for scheme, module in module_by_scheme.items():
         for raw_name in raw_required_by_scheme[scheme]:
             collector = raw_collectors[raw_name]
+            # Collectors expose optional forward hooks; hook output is always routed by raw name.
             hook = collector.build_forward_hook(
                 emit_raw=lambda name, value, _scheme=scheme: _dispatch_raw(_scheme, name, value)
             )
@@ -228,7 +154,7 @@ def run_compression_calibration(
         if max_batches is not None:
             total_batches = max_batches
 
-    progress_bar = _build_progress_bar(enabled=show_progress, total=total_batches, verbose=verbose)
+    progress_bar = build_progress_bar(enabled=show_progress, total=total_batches, verbose=verbose)
 
     try:
         model.eval()
@@ -237,10 +163,12 @@ def run_compression_calibration(
             if max_batches is not None and batch_id >= max_batches:
                 break
 
+            # Reset per-batch runtime cache so each update uses only current-batch raw values.
             for runtimes in runtimes_by_scheme.values():
                 for runtime in runtimes:
                     runtime.reset_batch()
 
+            # Normalize heterogeneous loader outputs to a canonical model invocation form.
             model_args, model_kwargs, label = normalize_calibration_batch(batch, batch_id=batch_id)
             model_args = move_to_device(model_args, device)
             model_kwargs = move_to_device(model_kwargs, device)
@@ -250,9 +178,11 @@ def run_compression_calibration(
             model_kwargs = dict(model_kwargs)
 
             if requires_labels:
+                # Backward collectors that rely on loss require labels to be injected consistently.
                 model_args, model_kwargs = inject_labels_if_needed(model_args, model_kwargs, label)
 
             if requires_backward:
+                # Backward path: run forward, extract scalar loss, backprop, then pull post-backward raw values.
                 model.zero_grad(set_to_none=True)
                 model_output = model(*model_args, **model_kwargs)
                 loss = _extract_loss(model_output, label, loss_fn)
@@ -271,6 +201,7 @@ def run_compression_calibration(
                             continue
                         _dispatch_raw(scheme, raw_name, raw_value)
             else:
+                # Forward-only path for summaries based solely on activations.
                 with torch.no_grad():
                     model(*model_args, **model_kwargs)
 
@@ -278,6 +209,7 @@ def run_compression_calibration(
             progress_bar.update(1)
 
     finally:
+        # Always clean hooks and restore training mode, even on failure.
         progress_bar.close()
         for handle in hook_handles:
             handle.remove()
@@ -290,11 +222,13 @@ def run_compression_calibration(
 
     for scheme, runtimes in runtimes_by_scheme.items():
         for runtime in runtimes:
+            # Guard against silent failures where hooks never emitted required raw data.
             if runtime.num_updates == 0:
                 raise RuntimeError(
                     f"No calibration raw data were collected for summary {runtime.summary.name} "
                     f"on module {scheme.path}."
                 )
+            # Finalization hook allows summaries to post-process at end of all batches.
             runtime.summary.finalize_store(scheme.calibration_data)
 
     if verbose:
