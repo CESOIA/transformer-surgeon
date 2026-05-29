@@ -45,6 +45,9 @@ class CompressionSchemesManager:
         self.model = model
         self.calibration_data = None
         self.calibration_loss_fn: Optional[Callable[[Any, Any], torch.Tensor]] = None
+        self.calibration_mode = "standard"
+        self.calibration_groups: List[List[Union[int, str, list]]] = []
+        self.calibration_no_data_dependency = False
         try:
             self.config = model.config
             assert isinstance(self.config, PretrainedConfig), "Model config is not an instance of PretrainedConfig. Please provide a model with a valid Hugging Face configuration."
@@ -143,6 +146,55 @@ class CompressionSchemesManager:
             raise TypeError(f"calibration loss function must be callable. Got {type(loss_fn)}.")
         self.calibration_loss_fn = loss_fn
 
+    def set_calibration_mode(
+        self,
+        mode: str = "standard",
+        groups: Optional[List[List[Union[int, str, list]]]] = None,
+        no_data_dependency: bool = False,
+    ):
+        """
+        Configure calibration target scheduling.
+
+        Args:
+            mode:
+                - "standard": single-stage calibration over selected schemes.
+                - "cascade": multi-stage calibration using user-provided groups.
+            groups:
+                Optional list of groups where each group is passed to iter_filtered,
+                e.g. [["layer1", "layer2"], ["layer4", "layer5", "layer6"]].
+            no_data_dependency:
+                If True in cascade mode, all grouped schemes are merged into one
+                stage (parallel collection), behaving like iter_filtered selection.
+        """
+        if not isinstance(mode, str):
+            raise TypeError(f"calibration mode must be a string. Got {type(mode)}.")
+
+        mode = mode.lower()
+        if mode not in ["standard", "cascade"]:
+            raise ValueError(
+                f"Unsupported calibration mode '{mode}'. Supported modes are: ['standard', 'cascade']."
+            )
+
+        if groups is None:
+            groups = []
+        if not isinstance(groups, list):
+            raise TypeError(f"calibration groups must be a list of groups. Got {type(groups)}.")
+        for idx, group in enumerate(groups):
+            if not isinstance(group, list):
+                raise TypeError(
+                    f"Each calibration group must be a list compatible with iter_filtered criteria. "
+                    f"Invalid group at index {idx}: {type(group)}."
+                )
+
+        if not isinstance(no_data_dependency, bool):
+            raise TypeError(
+                f"no_data_dependency must be a bool. Got {type(no_data_dependency)}."
+            )
+
+        self.calibration_mode = mode
+        self.calibration_groups = groups
+        self.calibration_no_data_dependency = no_data_dependency
+
     def run_calibration(
         self,
         criteria=None,
@@ -185,13 +237,8 @@ class CompressionSchemesManager:
         """
         schemes = list(self.iter_filtered(criteria=criteria))
         for scheme in schemes:
-            scheme.calibration_data.pop("covariance", None)
-            scheme.calibration_data.pop("weight_grad", None)
-            # Backward compatibility cleanup for old calibration storage keys.
-            scheme.calibration_data.pop("covariance_sum", None)
-            scheme.calibration_data.pop("num_tokens", None)
-            scheme.calibration_data.pop("weight_grad_sum", None)
-            scheme.calibration_data.pop("num_weight_grad_batches", None)
+            # Keep the same dictionary object and clear all summary keys generically.
+            scheme.calibration_data.clear()
         return len(schemes)
 
     def apply(
@@ -241,8 +288,23 @@ class CompressionSchemesManager:
             scheme.apply(hard=hard, verbose=verbose)
 
     def _collect_calibration_targets(self, criteria=None):
+        stages = self.collect_calibration_target_stages(criteria=criteria)
+        merged = {}
+        order = []
+        for stage in stages:
+            for scheme, summary_names in stage:
+                if scheme not in merged:
+                    merged[scheme] = []
+                    order.append(scheme)
+                for summary_name in summary_names:
+                    if summary_name not in merged[scheme]:
+                        merged[scheme].append(summary_name)
+
+        return [(scheme, tuple(merged[scheme])) for scheme in order]
+
+    def _collect_calibration_targets_for_schemes(self, schemes):
         targets = []
-        for scheme in self.iter_filtered(criteria=criteria):
+        for scheme in schemes:
             required_summaries = []
 
             for compressor in scheme.compressors.values():
@@ -289,6 +351,74 @@ class CompressionSchemesManager:
                 targets.append((scheme, tuple(required_summaries)))
 
         return targets
+
+    def collect_calibration_target_stages(self, criteria=None):
+        """
+        Return a list of calibration stages.
+
+        Each stage is a list of tuples: (scheme, summary_names).
+        """
+        selected_schemes = list(self.iter_filtered(criteria=criteria))
+        if len(selected_schemes) == 0:
+            return []
+
+        if self.calibration_mode == "standard":
+            stage = self._collect_calibration_targets_for_schemes(selected_schemes)
+            return [stage] if len(stage) > 0 else []
+
+        if len(self.calibration_groups) == 0:
+            stage = self._collect_calibration_targets_for_schemes(selected_schemes)
+            return [stage] if len(stage) > 0 else []
+
+        selected_set = set(selected_schemes)
+
+        grouped_scheme_stages = []
+        grouped_set = set()
+        for group in self.calibration_groups:
+            group_schemes = []
+            seen_in_group = set()
+            for scheme in self.iter_filtered(criteria=group):
+                if scheme not in selected_set:
+                    continue
+                if scheme in seen_in_group:
+                    continue
+                seen_in_group.add(scheme)
+                group_schemes.append(scheme)
+                grouped_set.add(scheme)
+
+            if len(group_schemes) > 0:
+                grouped_scheme_stages.append(group_schemes)
+
+        ungrouped = [scheme for scheme in selected_schemes if scheme not in grouped_set]
+
+        if self.calibration_no_data_dependency:
+            merged_schemes = []
+            seen = set()
+            for group_schemes in grouped_scheme_stages:
+                for scheme in group_schemes:
+                    if scheme not in seen:
+                        seen.add(scheme)
+                        merged_schemes.append(scheme)
+            for scheme in ungrouped:
+                if scheme not in seen:
+                    seen.add(scheme)
+                    merged_schemes.append(scheme)
+
+            stage = self._collect_calibration_targets_for_schemes(merged_schemes)
+            return [stage] if len(stage) > 0 else []
+
+        stages = []
+        for group_schemes in grouped_scheme_stages:
+            stage = self._collect_calibration_targets_for_schemes(group_schemes)
+            if len(stage) > 0:
+                stages.append(stage)
+
+        for scheme in ungrouped:
+            stage = self._collect_calibration_targets_for_schemes([scheme])
+            if len(stage) > 0:
+                stages.append(stage)
+
+        return stages
 
     def restore(self, topology=False, criteria=None, verbose=False):
         """
