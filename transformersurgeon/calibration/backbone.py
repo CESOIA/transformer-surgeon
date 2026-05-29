@@ -135,11 +135,49 @@ def run_compression_calibration(
             )
 
         hook_handles = []
+        sanity_pending_raw: Dict[object, Dict[str, torch.Tensor]] = {}
+        sanity_rel_diff_sum = 0.0
+        sanity_rel_diff_count = 0
+        sanity_rel_diff_max = 0.0
+
+        def _update_shifted_sanity_stats(scheme, raw_name: str, raw_value: torch.Tensor):
+            nonlocal sanity_rel_diff_sum, sanity_rel_diff_count, sanity_rel_diff_max
+
+            if not requires_shifted_model:
+                return
+            if raw_name not in ["activation", "activation_shifted"]:
+                return
+
+            bucket = sanity_pending_raw.setdefault(scheme, {})
+            bucket[raw_name] = raw_value
+            if "activation" not in bucket or "activation_shifted" not in bucket:
+                return
+
+            activation = bucket["activation"]
+            activation_shifted = bucket["activation_shifted"]
+            if activation.shape != activation_shifted.shape:
+                raise ValueError(
+                    "Shifted sanity check received mismatched activation shapes "
+                    f"for module {scheme.path}: {tuple(activation.shape)} vs {tuple(activation_shifted.shape)}."
+                )
+
+            diff = torch.linalg.norm(activation - activation_shifted)
+            base = torch.linalg.norm(activation)
+            rel_diff = (diff / torch.clamp_min(base, 1e-12)).item()
+
+            sanity_rel_diff_sum += rel_diff
+            sanity_rel_diff_count += 1
+            sanity_rel_diff_max = max(sanity_rel_diff_max, rel_diff)
+
+            # Consume pair so we only count one sample per matching forward pair.
+            bucket.pop("activation", None)
+            bucket.pop("activation_shifted", None)
 
         def _dispatch_raw(scheme, raw_name: str, raw_value: torch.Tensor):
             # Fan out each raw tensor to all summary runtimes attached to that scheme.
             for runtime in runtimes_by_scheme[scheme]:
                 runtime.on_raw(scheme.calibration_data, raw_name, raw_value)
+            _update_shifted_sanity_stats(scheme, raw_name, raw_value)
 
         for scheme, module in module_by_scheme.items():
             for raw_name in raw_required_by_scheme[scheme]:
@@ -257,6 +295,20 @@ def run_compression_calibration(
                 f"Calibrated stage {stage_idx}/{total_stages}: "
                 f"{len(targets)} schemes over {num_batches} batches."
             )
+            if requires_shifted_model:
+                if sanity_rel_diff_count == 0:
+                    print(
+                        "Shifted sanity check: no paired activation/activation_shifted "
+                        "samples were observed in this stage."
+                    )
+                else:
+                    mean_rel_diff = sanity_rel_diff_sum / sanity_rel_diff_count
+                    print(
+                        "Shifted sanity check: "
+                        f"pairs={sanity_rel_diff_count}, "
+                        f"mean_rel_l2_diff={mean_rel_diff:.6e}, "
+                        f"max_rel_l2_diff={sanity_rel_diff_max:.6e}."
+                    )
 
     return len(calibrated_schemes)
 

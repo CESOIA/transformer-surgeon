@@ -9,9 +9,11 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import PretrainedConfig
 from typing import Any, Callable, Dict, List, Optional, Union
+from copy import deepcopy
 from ..calibration import run_compression_calibration
 from .scheme import CompressionScheme
 from .utils import flatten_index_paths
+from .cascade import apply_cascade
 
 class CompressionSchemesManager:
     """
@@ -54,7 +56,26 @@ class CompressionSchemesManager:
         except AttributeError:
             raise ValueError("The provided model does not have a 'config' attribute. Please provide a model with a valid configuration.")
         self.indexing = indexing
+        self.calibration_groups = self._get_calibration_groups_from_indexing()
         self.schemes = self._generate_schemes()
+
+    def _get_calibration_groups_from_indexing(self):
+        groups = []
+        for _, block_indexing in self.indexing.items():
+            block_groups = block_indexing.get("calibration_groups", [])
+            if not isinstance(block_groups, list):
+                raise TypeError(
+                    "Indexing field 'calibration_groups' must be a list of groups. "
+                    f"Got {type(block_groups)}."
+                )
+            for idx, group in enumerate(block_groups):
+                if not isinstance(group, list):
+                    raise TypeError(
+                        "Each 'calibration_groups' entry must be a list compatible with iter_filtered criteria. "
+                        f"Invalid group at index {idx}: {type(group)}."
+                    )
+            groups.extend(deepcopy(block_groups))
+        return groups
 
     def set(self, compression, property, value, criteria=None, verbose=False):
         """
@@ -149,7 +170,6 @@ class CompressionSchemesManager:
     def set_calibration_mode(
         self,
         mode: str = "standard",
-        groups: Optional[List[List[Union[int, str, list]]]] = None,
         no_data_dependency: bool = False,
     ):
         """
@@ -158,10 +178,8 @@ class CompressionSchemesManager:
         Args:
             mode:
                 - "standard": single-stage calibration over selected schemes.
-                - "cascade": multi-stage calibration using user-provided groups.
-            groups:
-                Optional list of groups where each group is passed to iter_filtered,
-                e.g. [["layer1", "layer2"], ["layer4", "layer5", "layer6"]].
+                - "cascade": multi-stage calibration using indexing-provided
+                  calibration_groups.
             no_data_dependency:
                 If True in cascade mode, all grouped schemes are merged into one
                 stage (parallel collection), behaving like iter_filtered selection.
@@ -175,24 +193,13 @@ class CompressionSchemesManager:
                 f"Unsupported calibration mode '{mode}'. Supported modes are: ['standard', 'cascade']."
             )
 
-        if groups is None:
-            groups = []
-        if not isinstance(groups, list):
-            raise TypeError(f"calibration groups must be a list of groups. Got {type(groups)}.")
-        for idx, group in enumerate(groups):
-            if not isinstance(group, list):
-                raise TypeError(
-                    f"Each calibration group must be a list compatible with iter_filtered criteria. "
-                    f"Invalid group at index {idx}: {type(group)}."
-                )
-
         if not isinstance(no_data_dependency, bool):
             raise TypeError(
                 f"no_data_dependency must be a bool. Got {type(no_data_dependency)}."
             )
 
         self.calibration_mode = mode
-        self.calibration_groups = groups
+        self.calibration_groups = self._get_calibration_groups_from_indexing()
         self.calibration_no_data_dependency = no_data_dependency
 
     def run_calibration(
@@ -273,6 +280,19 @@ class CompressionSchemesManager:
             Note: If selected compressors require backward-based calibration,
                   set both calibration data and calibration loss first.
         """
+        if self.calibration_mode == "cascade":
+            apply_cascade(
+                manager=self,
+                hard=hard,
+                criteria=criteria,
+                verbose=verbose,
+                max_batches=max_batches,
+                device=device,
+                offload_to_cpu=offload_to_cpu,
+                show_progress=show_progress,
+            )
+            return
+
         calibration_targets = self._collect_calibration_targets(criteria=criteria)
 
         if calibration_targets:

@@ -42,6 +42,36 @@ class RawDataCollector(ABC):
 
 def normalize_calibration_batch(batch, batch_id: int):
     """Normalize dataloader output into model args/kwargs and optional target object."""
+    # Internal fast-path used by block-wise cascade flow.
+    # Expected shape:
+    # {
+    #   "__ts_args__": tuple | list | single positional arg,
+    #   "__ts_kwargs__": mapping of keyword args,
+    #   "__ts_label__": optional target/label
+    # }
+    if isinstance(batch, Mapping) and "__ts_args__" in batch:
+        # Read reserved pre-normalized fields with safe defaults.
+        model_args = batch.get("__ts_args__", tuple())
+        model_kwargs = batch.get("__ts_kwargs__", {})
+        label = batch.get("__ts_label__", None)
+
+        # Normalize positional args to tuple for a stable downstream call contract.
+        if not isinstance(model_args, tuple):
+            if isinstance(model_args, list):
+                model_args = tuple(model_args)
+            else:
+                # Single positional value -> one-element args tuple.
+                model_args = (model_args,)
+
+        # kwargs must always be mapping-like (dict-compatible for **kwargs usage).
+        if not isinstance(model_kwargs, Mapping):
+            raise TypeError(
+                "Pre-normalized calibration batch '__ts_kwargs__' must be a mapping. "
+                f"Got {type(model_kwargs)} at batch index {batch_id}."
+            )
+
+        return model_args, dict(model_kwargs), label
+
     # Mapping batch => keyword-only model call.
     if isinstance(batch, Mapping):
         return tuple(), dict(batch), None
