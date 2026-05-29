@@ -2,6 +2,7 @@
 
 from typing import Dict, Any, Optional
 from ..compression import COMPRESSION_REGISTRY
+from .utils import flatten_index_paths
 
 def init_compressed_config(
     config_instance,
@@ -43,10 +44,11 @@ def init_compressed_config(
     depth = getattr(config_instance, indexing["num_blocks_attr"])
 
     # Build the list of all layer paths based on the indexing information
+    flat_paths = flatten_index_paths(indexing["path_list"])
     paths = [
         path_template.format(block_index=i, path=p)
         for i in range(depth)
-        for p in indexing["path_list"]
+        for p in flat_paths
     ]
 
     # Explore compression input and set default values for missing properties

@@ -3,6 +3,39 @@ from collections.abc import Mapping
 import torch
 
 
+def flatten_index_paths(path_list):
+    """Normalize indexing path definitions to a flat list of dotted paths."""
+    if isinstance(path_list, dict):
+        flattened_paths = []
+        for parent_path, child_paths in path_list.items():
+            if not isinstance(child_paths, (list, tuple)):
+                raise TypeError(
+                    "Grouped path_list values must be a list/tuple of sublayers. "
+                    f"Found {type(child_paths).__name__} for key '{parent_path}'."
+                )
+
+            if len(child_paths) == 0:
+                flattened_paths.append(parent_path)
+                continue
+
+            for child_path in child_paths:
+                child_path = str(child_path)
+                if parent_path:
+                    flattened_paths.append(f"{parent_path}.{child_path}")
+                else:
+                    flattened_paths.append(child_path)
+
+        return flattened_paths
+
+    if isinstance(path_list, (list, tuple)):
+        return list(path_list)
+
+    raise TypeError(
+        "Indexing 'path_list' must be a list/tuple or grouped dict, "
+        f"got {type(path_list).__name__}."
+    )
+
+
 def get_submodule(module, submodule_path):
     """
     Returns the submodule of a given module based on the dot-separated path.
@@ -70,4 +103,4 @@ def move_to_device(value, target_device: torch.device):
     return value
 
 
-__all__ = ["get_submodule", "infer_model_device", "move_to_device"]
+__all__ = ["get_submodule", "infer_model_device", "move_to_device", "flatten_index_paths"]

@@ -7,48 +7,23 @@ execution and dispatches raw data to summary runtimes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
 
-from .raw_data import inject_labels_if_needed, instantiate_raw_collector, normalize_calibration_batch
+from .raw_data import instantiate_raw_collector, normalize_calibration_batch
 from .summaries import SummaryRuntime, get_summary
 from .targets import collect_targets
 from ..utils.interface import build_progress_bar
 from ..utils.utils import infer_model_device, move_to_device
 
 
-def _extract_loss(model_output, label, loss_fn):
-    # Accept different model return conventions: tensor, dataclass-like, or mapping.
-    if isinstance(model_output, torch.Tensor):
-        loss = model_output
-    elif hasattr(model_output, "loss"):
-        loss = model_output.loss
-    elif isinstance(model_output, Mapping) and "loss" in model_output:
-        loss = model_output["loss"]
-    else:
-        loss = None
-
-    if loss is None and loss_fn is not None:
-        # Allow callers to define a custom extraction rule when model output is non-standard.
-        loss = loss_fn(model_output, label)
-
-    if loss is None:
+def _compute_calibration_loss(loss_fn, model_output, label):
+    """Compute calibration loss via the user-provided callback."""
+    if loss_fn is None:
         return None
-
-    if not isinstance(loss, torch.Tensor):
-        raise TypeError(f"Extracted loss must be a torch.Tensor, but got {type(loss)}.")
-    # Backward-based collectors require a scalar differentiable finite loss.
-    if loss.numel() != 1:
-        raise ValueError(f"Extracted loss must be scalar, but got shape {tuple(loss.shape)}.")
-    if not loss.requires_grad:
-        raise ValueError("Extracted loss does not require gradients.")
-    if not torch.isfinite(loss.detach()).all():
-        raise ValueError("Extracted loss is not finite (NaN/Inf) during calibration.")
-
-    return loss
+    return loss_fn(model_output, label)
 
 
 def run_compression_calibration(
@@ -64,9 +39,12 @@ def run_compression_calibration(
     """
     Run calibration by routing raw data through summary runtimes.
 
+    For backward-based collectors, loss_fn must be provided and must return
+    a differentiable loss tensor from (model_output, label).
+
     Expected calibration dataloader format:
     - Mapping kwargs batches
-    - (data, label) where data is mapping
+    - (data, target) where data is mapping
     - Positional tuple/list batches
     - Single tensor/object batches
     """
@@ -120,7 +98,11 @@ def run_compression_calibration(
 
     # Global execution mode flags drive forward-only vs forward+backward calibration.
     requires_backward = any(c.requires_backward for c in raw_collectors.values())
-    requires_labels = any(c.requires_labels for c in raw_collectors.values())
+    if requires_backward and loss_fn is None:
+        raise ValueError(
+            "Calibration path requiring backward needs a calibration loss function. "
+            "Call manager.set_calibration_loss(...) before manager.apply(...) or manager.run_calibration(...)."
+        )
 
     hook_handles = []
 
@@ -177,19 +159,15 @@ def run_compression_calibration(
             model_args = tuple(model_args)
             model_kwargs = dict(model_kwargs)
 
-            if requires_labels:
-                # Backward collectors that rely on loss require labels to be injected consistently.
-                model_args, model_kwargs = inject_labels_if_needed(model_args, model_kwargs, label)
-
             if requires_backward:
-                # Backward path: run forward, extract scalar loss, backprop, then pull post-backward raw values.
+                # Backward path: run forward, compute user-provided loss, backprop, then pull post-backward raw values.
                 model.zero_grad(set_to_none=True)
                 model_output = model(*model_args, **model_kwargs)
-                loss = _extract_loss(model_output, label, loss_fn)
+                loss = _compute_calibration_loss(loss_fn, model_output, label)
                 if loss is None:
                     raise ValueError(
                         "Calibration path requiring backward did not produce a loss value. "
-                        f"No loss was found for batch {batch_id}."
+                        f"Loss function returned None for batch {batch_id}."
                     )
                 loss.backward()
 

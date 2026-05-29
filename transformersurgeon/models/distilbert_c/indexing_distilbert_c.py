@@ -8,14 +8,10 @@ DISTILBERT_C_INDEXING = {
     "distilbert": {
         "config_attr": "",
         "num_blocks_attr": "n_layers",
-        "path_list": [
-            "attention.q_lin",
-            "attention.k_lin",
-            "attention.v_lin",
-            "attention.out_lin",
-            "ffn.lin1",
-            "ffn.lin2",
-        ],
+        "path_list": {
+            "attention": ["q_lin", "k_lin", "v_lin", "out_lin"],
+            "ffn": ["lin1", "lin2"],
+        },
         "path_template": "distilbert.transformer.layer.{block_index}.{path}",
         "qkv_paths": [
             "attention.q_lin",

@@ -5,19 +5,20 @@ from ..blocks import TransformerDecoder
 from ..blocks.encoder import TransformerEncoder
 from ..blocks.indexing import CUSTOM_DECODER_INDEXING, CUSTOM_ENCODER_INDEXING
 from ..blocks.config import CustomDecoderConfigCompress, CustomEncoderConfigCompress
-from .utils import get_submodule
+from .utils import get_submodule, flatten_index_paths
 
 
 def _build_converted_compression_config(indexing, source_config_obj, num_blocks):
     """
     Remap source compression_config keys from original HF paths to converted custom graph paths.
     """
-    layer_matching = indexing.get('layer_matching', indexing['path_list'])
+    source_paths = flatten_index_paths(indexing['path_list'])
+    layer_matching = indexing.get('layer_matching', source_paths)
     source_cfg = getattr(source_config_obj, 'compression_config', {}) or {}
 
     converted_cfg = {}
     for i in range(num_blocks):
-        for old_path, new_path in zip(indexing['path_list'], layer_matching):
+        for old_path, new_path in zip(source_paths, layer_matching):
             old_full = indexing['path_template'].format(block_index=i, path=old_path)
             new_full = f"blocks.{i}.{new_path}"
             converted_cfg[new_full] = copy.deepcopy(source_cfg.get(old_full, {}))
@@ -28,7 +29,8 @@ def _build_converted_compression_config(indexing, source_config_obj, num_blocks)
 def _build_converted_decoder_indexing(indexing):
     """Build converted indexing compatible with converted decoder config/model."""
     converted_indexing = copy.deepcopy(CUSTOM_DECODER_INDEXING)
-    layer_matching = indexing.get("layer_matching", indexing["path_list"])
+    source_paths = flatten_index_paths(indexing["path_list"])
+    layer_matching = indexing.get("layer_matching", source_paths)
     converted_indexing["decoder"]["path_list"] = [
         path
         for path in layer_matching
@@ -40,7 +42,8 @@ def _build_converted_decoder_indexing(indexing):
 def _build_converted_encoder_indexing(indexing):
     """Build converted indexing compatible with converted encoder config/model."""
     converted_indexing = copy.deepcopy(CUSTOM_ENCODER_INDEXING)
-    layer_matching = indexing.get("layer_matching", indexing["path_list"])
+    source_paths = flatten_index_paths(indexing["path_list"])
+    layer_matching = indexing.get("layer_matching", source_paths)
     converted_indexing["encoder"]["path_list"] = [
         path
         for path in layer_matching
@@ -97,7 +100,8 @@ def convert_for_export(model, options=None, verbose=False):
                 source_config_obj,
                 num_blocks,
             )
-            layer_matching = indexing.get("layer_matching", indexing["path_list"])
+            source_paths = flatten_index_paths(indexing["path_list"])
+            layer_matching = indexing.get("layer_matching", source_paths)
             source_bias = indexing.get("bias_required", [])
             bias_required_config = {
                 "attn": {},
@@ -132,7 +136,8 @@ def convert_for_export(model, options=None, verbose=False):
                 source_config_obj,
                 num_blocks,
             )
-            layer_matching = indexing.get("layer_matching", indexing["path_list"])
+            source_paths = flatten_index_paths(indexing["path_list"])
+            layer_matching = indexing.get("layer_matching", source_paths)
             source_bias = indexing.get("bias_required", [])
             bias_required_config = {
                 "attn": {},
@@ -163,9 +168,10 @@ def convert_for_export(model, options=None, verbose=False):
             raise NotImplementedError(f"Conversion for structure '{indexing['structure']}' is not implemented.")
         
         # Import parameters from the original model to the new model
-        layer_matching = indexing.get('layer_matching', indexing['path_list'])
+        source_paths = flatten_index_paths(indexing['path_list'])
+        layer_matching = indexing.get('layer_matching', source_paths)
         for i in range(num_blocks):
-            for old_path, new_path in zip(indexing['path_list'], layer_matching):
+            for old_path, new_path in zip(source_paths, layer_matching):
                 old_path = indexing['path_template'].format(block_index=i, path=old_path)
                 new_path = path_template.format(i=i, path=new_path)
                 if verbose:

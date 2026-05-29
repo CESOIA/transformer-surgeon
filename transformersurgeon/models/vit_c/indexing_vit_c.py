@@ -16,14 +16,14 @@ VIT_C_INDEXING = {
         'mlp_activation_attr': 'hidden_act',
 
         # HF model structure specifics
-        'path_list': ["attention.attention.query",
-                      "attention.attention.key",
-                      "attention.attention.value",
-                      "attention.output.dense",
-                      "layernorm_before",
-                      "intermediate.dense",
-                      "output.dense",
-                      "layernorm_after"],
+        'path_list': {
+            'attention.attention': ['query', 'key', 'value'],
+            'attention.output': ['dense'],
+            'layernorm_before': [],
+            'intermediate': ['dense'],
+            'output': ['dense'],
+            'layernorm_after': [],
+        },
         'path_template': "vit.encoder.layer.{block_index}.{path}",
         'qkv_paths': [],
 

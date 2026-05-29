@@ -16,14 +16,12 @@ BERT_C_INDEXING = {
         'mlp_activation_attr': 'hidden_act',
 
         # HF model structure specifics
-        'path_list': ["attention.self.query",
-                      "attention.self.key",
-                      "attention.self.value",
-                      "attention.output.dense",
-                      "attention.output.LayerNorm",
-                      "intermediate.dense",
-                      "output.dense",
-                      "output.LayerNorm"],
+        'path_list': {
+            'attention.self': ['query', 'key', 'value'],
+            'attention.output': ['dense', 'LayerNorm'],
+            'intermediate': ['dense'],
+            'output': ['dense', 'LayerNorm'],
+        },
         'path_template': "bert.encoder.layer.{block_index}.{path}",
         'qkv_paths': [],
 

@@ -8,7 +8,10 @@ QWEN2_5_VL_C_INDEXING = {
     {
         'config_attr': 'vision_config',
         'num_blocks_attr': 'depth',
-        'path_list': ["attn.qkv", "attn.proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"],
+        'path_list': {
+            'attn': ['qkv', 'proj'],
+            'mlp': ['gate_proj', 'up_proj', 'down_proj'],
+        },
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'pruning_supported': [],
     },
@@ -24,7 +27,12 @@ QWEN2_5_VL_C_INDEXING = {
         'kv_num_heads_attr': 'num_key_value_heads',
 
         # HF model structure specifics
-        'path_list': ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm"],
+        'path_list': {
+            'self_attn': ['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+            'mlp': ['gate_proj', 'up_proj', 'down_proj'],
+            'input_layernorm': [],
+            'post_attention_layernorm': [],
+        },
         'path_template': "model.language_model.layers.{block_index}.{path}",
         'extra_layers': ["model.language_model.norm"],
 

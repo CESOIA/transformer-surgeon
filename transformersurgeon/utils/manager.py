@@ -8,9 +8,10 @@ Provides the CompressionSchemesManager class for managing multiple compression s
 import torch
 from torch.utils.data import DataLoader
 from transformers import PretrainedConfig
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 from ..calibration import run_compression_calibration
 from .scheme import CompressionScheme
+from .utils import flatten_index_paths
 
 class CompressionSchemesManager:
     """
@@ -43,6 +44,7 @@ class CompressionSchemesManager:
         """
         self.model = model
         self.calibration_data = None
+        self.calibration_loss_fn: Optional[Callable[[Any, Any], torch.Tensor]] = None
         try:
             self.config = model.config
             assert isinstance(self.config, PretrainedConfig), "Model config is not an instance of PretrainedConfig. Please provide a model with a valid Hugging Face configuration."
@@ -130,6 +132,17 @@ class CompressionSchemesManager:
             )
         self.calibration_data = calibration_data
 
+    def set_calibration_loss(self, loss_fn: Callable[[Any, Any], torch.Tensor]):
+        """
+        Stores a user-defined loss function used during calibration backward passes.
+
+        The callable is invoked as `loss_fn(model_output, target)` for each batch.
+        Calibration does not infer or extract loss from model outputs.
+        """
+        if not callable(loss_fn):
+            raise TypeError(f"calibration loss function must be callable. Got {type(loss_fn)}.")
+        self.calibration_loss_fn = loss_fn
+
     def run_calibration(
         self,
         criteria=None,
@@ -149,6 +162,8 @@ class CompressionSchemesManager:
             offload_to_cpu: If True, accumulate calibration tensors on CPU.
             verbose: If True, print progress.
             show_progress: If True, show calibration batch progress.
+            Note: For backward-based calibration summaries, set a loss callback
+                  first with set_calibration_loss(...).
         
         Returns:
             Number of schemes calibrated.
@@ -156,6 +171,7 @@ class CompressionSchemesManager:
         return run_compression_calibration(
             manager=self,
             criteria=criteria,
+            loss_fn=self.calibration_loss_fn,
             max_batches=max_batches,
             device=device,
             offload_to_cpu=offload_to_cpu,
@@ -199,6 +215,8 @@ class CompressionSchemesManager:
             device: Device where calibration batches should be moved before forward.
             offload_to_cpu: If True, calibration tensors are accumulated on CPU.
             show_progress: If True, show calibration batch progress.
+            Note: If selected compressors require backward-based calibration,
+                  set both calibration data and calibration loss first.
         """
         calibration_targets = self._collect_calibration_targets(criteria=criteria)
 
@@ -295,7 +313,7 @@ class CompressionSchemesManager:
         for block_name, block_indexing in self.indexing.items():
             config_attr = block_indexing.get('config_attr', None)
             num_blocks_attr = block_indexing['num_blocks_attr']
-            path_list = block_indexing['path_list']
+            path_list = flatten_index_paths(block_indexing['path_list'])
             path_template = block_indexing['path_template']
             config_attr = block_indexing['config_attr'] # added by babisant88: it's done twice.
 

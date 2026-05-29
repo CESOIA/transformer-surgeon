@@ -4,6 +4,7 @@ from transformers import PretrainedConfig
 from ..blocks import LinearCompressed
 from typing import Dict, Any
 import math
+from .utils import flatten_index_paths
 
 def replace_layers_upon_init(
         model: torch.nn.Module, # model to modify (e.g., vision encoder, language decoder)
@@ -28,7 +29,7 @@ def replace_layers_upon_init(
 
     # Extract layer path information
     path_template = indexing['path_template']
-    path_list = indexing['path_list']
+    path_list = flatten_index_paths(indexing['path_list'])
     blocks_num = config_dict.get(indexing['num_blocks_attr'], None)
     if blocks_num is None:
         raise ValueError(f"Configuration does not contain the attribute '{indexing['num_blocks_attr']}' required to determine the number of blocks.")
