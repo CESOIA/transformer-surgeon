@@ -87,6 +87,14 @@ class LinearCompressed(nn.Linear):
         # Skip logic
         if self.skip:
             return x
+
+        # TODO make reshape optional and only for QNN export, check if view is enough
+        # QNN FullyConnected is more robust with rank-2 inputs. Flatten leading
+        # dimensions, run linear(s), and then restore the original leading shape.
+        restore_shape = None
+        if x.dim() > 2:
+            restore_shape = x.shape[:-1]
+            x = x.reshape(-1, x.shape[-1])
         
         # LRD logic
         if isinstance(self.rank, int):
@@ -95,7 +103,12 @@ class LinearCompressed(nn.Linear):
         else:
             weight = self.weight
 
-        return F.linear(x, weight, self.bias)
+        y = F.linear(x, weight, self.bias)
+
+        if restore_shape is not None:
+            y = y.reshape(*restore_shape, y.shape[-1])
+
+        return y
 
     def __str__(self):
         return self.__repr__()

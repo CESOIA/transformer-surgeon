@@ -5,9 +5,10 @@ from .abstract import Compressor
 from .lrd_methods import METHOD_FUNCTIONS
 
 
-VALID_METHODS = ["svd", "svd-llm-v2"]
+VALID_METHODS = ["svd", "svd-llm-v2", "aa-svd"]
 CALIBRATED_METHOD_DICT = {
     "svd-llm-v2": ("covariance",),
+    "aa-svd": ("cross_covariance", "shifted_covariance"),
 }
 
 
@@ -60,6 +61,17 @@ class LRDer(Compressor):
                         module.weight.detach(),
                         rank,
                         covariance=covariance,
+                        eps=eps,
+                    )
+
+                elif method == "aa-svd":
+                    cross_covariance = self.calibration_store["cross_covariance"]
+                    shifted_covariance = self.calibration_store["shifted_covariance"]
+                    US_r, V_r = METHOD_FUNCTIONS[method](
+                        module.weight.detach(),
+                        rank,
+                        cross_covariance=cross_covariance,
+                        shifted_covariance=shifted_covariance,
                         eps=eps,
                     )
 

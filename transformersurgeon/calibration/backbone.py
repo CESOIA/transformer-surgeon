@@ -7,135 +7,29 @@ execution and dispatches raw data to summary runtimes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
 
-from .raw_data import inject_labels_if_needed, instantiate_raw_collector, normalize_calibration_batch
-from .summaries import SummaryRuntime, get_summary, unique_summaries
-from ..utils.utils import infer_model_device, move_to_device
+from .raw_data import instantiate_raw_collector, normalize_calibration_batch
+from .summaries import SummaryRuntime, get_summary
+from ..utils.interface import build_progress_bar
+from ..utils.utils import get_submodule, infer_model_device, move_to_device
 
 
-class _FallbackProgressBar:
-    """Minimal in-place progress bar used when tqdm is unavailable."""
-
-    def __init__(self, *, total: Optional[int], enabled: bool):
-        self.total = total
-        self.enabled = enabled
-        self.current = 0
-
-    def update(self, n: int = 1):
-        if not self.enabled:
-            return
-        self.current += n
-        if self.total is None or self.total <= 0:
-            print(f"\rCalibration batches: {self.current}", end="", flush=True)
-        else:
-            pct = int((100 * self.current) / self.total)
-            print(
-                f"\rCalibration: {self.current}/{self.total} ({pct}%)",
-                end="",
-                flush=True,
-            )
-
-    def close(self):
-        if self.enabled:
-            print("", flush=True)
-
-
-def _build_progress_bar(*, enabled: bool, total: Optional[int], verbose: bool):
-    if not enabled:
-        return _FallbackProgressBar(total=total, enabled=False)
-
-    try:
-        from tqdm.auto import tqdm
-
-        return tqdm(total=total, desc="Calibration", leave=False, disable=not verbose)
-    except Exception:
-        return _FallbackProgressBar(total=total, enabled=verbose)
-
-
-def _extract_loss(model_output, label, loss_fn):
-    if isinstance(model_output, torch.Tensor):
-        loss = model_output
-    elif hasattr(model_output, "loss"):
-        loss = model_output.loss
-    elif isinstance(model_output, Mapping) and "loss" in model_output:
-        loss = model_output["loss"]
-    else:
-        loss = None
-
-    if loss is None and loss_fn is not None:
-        loss = loss_fn(model_output, label)
-
-    if loss is None:
+def _compute_calibration_loss(loss_fn, model_output, label):
+    """Compute calibration loss via the user-provided callback."""
+    if loss_fn is None:
         return None
-
-    if not isinstance(loss, torch.Tensor):
-        raise TypeError(f"Extracted loss must be a torch.Tensor, but got {type(loss)}.")
-    if loss.numel() != 1:
-        raise ValueError(f"Extracted loss must be scalar, but got shape {tuple(loss.shape)}.")
-    if not loss.requires_grad:
-        raise ValueError("Extracted loss does not require gradients.")
-    if not torch.isfinite(loss.detach()).all():
-        raise ValueError("Extracted loss is not finite (NaN/Inf) during calibration.")
-
-    return loss
-
-
-def _collect_targets(manager, criteria=None):
-    targets = []
-    for scheme in manager.iter_filtered(criteria=criteria):
-        required_summaries = []
-
-        for compressor in scheme.compressors.values():
-            if not compressor._to_compress():
-                continue
-
-            compressor.set_calibration_store(scheme.calibration_data)
-
-            needs_calibration_fn = getattr(compressor, "needs_calibration", None)
-            if not callable(needs_calibration_fn):
-                continue
-
-            needs_calibration = needs_calibration_fn()
-            if needs_calibration is False or needs_calibration is None:
-                continue
-
-            if needs_calibration is True:
-                raise ValueError(
-                    f"Compressor {type(compressor).__name__} needs calibration but did not provide summary names."
-                )
-
-            if isinstance(needs_calibration, str):
-                summary_names = (needs_calibration,)
-            elif isinstance(needs_calibration, (tuple, list, set)):
-                summary_names = tuple(needs_calibration)
-            else:
-                raise TypeError(
-                    "needs_calibration must return False/None or a string/sequence of summary names."
-                )
-
-            if len(summary_names) == 0:
-                raise ValueError(
-                    f"Compressor {type(compressor).__name__} needs calibration but returned no summaries."
-                )
-
-            for summary_name in summary_names:
-                if summary_name not in required_summaries:
-                    required_summaries.append(summary_name)
-
-        if len(required_summaries) > 0:
-            targets.append((scheme, unique_summaries(required_summaries)))
-
-    return targets
+    return loss_fn(model_output, label)
 
 
 def run_compression_calibration(
-    manager,
-    criteria=None,
+    model,
+    calibration_data,
+    target_stages,
+    shifted_model=None,
     loss_fn=None,
     max_batches: Optional[int] = None,
     device: Optional[Union[str, torch.device]] = None,
@@ -146,17 +40,20 @@ def run_compression_calibration(
     """
     Run calibration by routing raw data through summary runtimes.
 
+    For backward-based collectors, loss_fn must be provided and must return
+    a differentiable loss tensor from (model_output, label).
+
     Expected calibration dataloader format:
     - Mapping kwargs batches
-    - (data, label) where data is mapping
+    - (data, target) where data is mapping
     - Positional tuple/list batches
     - Single tensor/object batches
     """
-    calibration_data = manager.calibration_data
+    # Validate calibration input source first: this runner expects a DataLoader.
     if calibration_data is None:
         raise ValueError(
             "Calibration data is required before running calibration. "
-            "Call manager.set_calibration_data(...) before manager.apply(...)."
+            "Call manager.set_calibration_data(...) before manager.apply(...) or manager.run_calibration(...)."
         )
     if not isinstance(calibration_data, DataLoader):
         raise TypeError(
@@ -164,143 +61,256 @@ def run_compression_calibration(
             f"Got {type(calibration_data)}."
         )
 
-    targets = _collect_targets(manager, criteria=criteria)
-    if len(targets) == 0:
+    if len(target_stages) == 0:
         if verbose:
             print("No compression schemes found for calibration.")
         return 0
-
-    model = manager.model
-    module_by_scheme = {scheme: scheme.get_compression_module() for scheme, _ in targets}
-
-    runtimes_by_scheme: Dict[object, Tuple[SummaryRuntime, ...]] = {}
-    raw_required_by_scheme: Dict[object, set] = {}
-    required_raw_names = set()
-
-    for scheme, summary_names in targets:
-        runtimes = []
-        raw_names = set()
-        for summary_name in summary_names:
-            summary = get_summary(summary_name)
-            summary.initialize_store(scheme.calibration_data)
-            runtime = SummaryRuntime(summary=summary)
-            runtimes.append(runtime)
-            raw_names.update(summary.required_raw_data)
-        runtimes_by_scheme[scheme] = tuple(runtimes)
-        raw_required_by_scheme[scheme] = raw_names
-        required_raw_names.update(raw_names)
-
-    raw_collectors = {
-        raw_name: instantiate_raw_collector(raw_name, offload_to_cpu=offload_to_cpu)
-        for raw_name in required_raw_names
-    }
-
-    requires_backward = any(c.requires_backward for c in raw_collectors.values())
-    requires_labels = any(c.requires_labels for c in raw_collectors.values())
-
-    hook_handles = []
-
-    def _dispatch_raw(scheme, raw_name: str, raw_value: torch.Tensor):
-        for runtime in runtimes_by_scheme[scheme]:
-            runtime.on_raw(scheme.calibration_data, raw_name, raw_value)
-
-    for scheme, module in module_by_scheme.items():
-        for raw_name in raw_required_by_scheme[scheme]:
-            collector = raw_collectors[raw_name]
-            hook = collector.build_forward_hook(
-                emit_raw=lambda name, value, _scheme=scheme: _dispatch_raw(_scheme, name, value)
-            )
-            if hook is not None:
-                hook_handles.append(module.register_forward_hook(hook))
 
     if device is None:
         device = infer_model_device(model)
     device = torch.device(device)
 
+    shifted_device = None
+    if shifted_model is not None:
+        shifted_device = torch.device(infer_model_device(shifted_model))
+
     was_training = model.training
-    num_batches = 0
-    total_batches = None
-    try:
-        total_batches = len(calibration_data)
-        if max_batches is not None:
-            total_batches = min(total_batches, max_batches)
-    except TypeError:
-        if max_batches is not None:
-            total_batches = max_batches
+    shifted_was_training = shifted_model.training if shifted_model is not None else None
+    calibrated_schemes = set()
 
-    progress_bar = _build_progress_bar(enabled=show_progress, total=total_batches, verbose=verbose)
+    total_stages = len(target_stages)
+    for stage_idx, targets in enumerate(target_stages, start=1):
+        module_by_scheme = {scheme: scheme.get_compression_module() for scheme, _ in targets}
 
-    try:
-        model.eval()
+        runtimes_by_scheme: Dict[object, Tuple[SummaryRuntime, ...]] = {}
+        raw_required_by_scheme: Dict[object, set] = {}
+        required_raw_names = set()
 
-        for batch_id, batch in enumerate(calibration_data):
-            if max_batches is not None and batch_id >= max_batches:
-                break
+        for scheme, summary_names in targets:
+            # Build one runtime per requested summary and accumulate required raw streams.
+            runtimes = []
+            raw_names = set()
+            for summary_name in summary_names:
+                summary = get_summary(summary_name)
+                # Summary owns only its own key in this scheme's calibration store.
+                summary.initialize_store(scheme.calibration_data)
+                runtime = SummaryRuntime(summary=summary)
+                runtimes.append(runtime)
+                raw_names.update(summary.required_raw_data)
+            runtimes_by_scheme[scheme] = tuple(runtimes)
+            raw_required_by_scheme[scheme] = raw_names
+            required_raw_names.update(raw_names)
 
-            for runtimes in runtimes_by_scheme.values():
-                for runtime in runtimes:
-                    runtime.reset_batch()
+        # Instantiate raw collectors once per raw stream type (shared across schemes in stage).
+        raw_collectors = {
+            raw_name: instantiate_raw_collector(raw_name, offload_to_cpu=offload_to_cpu)
+            for raw_name in required_raw_names
+        }
 
-            model_args, model_kwargs, label = normalize_calibration_batch(batch, batch_id=batch_id)
-            model_args = move_to_device(model_args, device)
-            model_kwargs = move_to_device(model_kwargs, device)
-            label = move_to_device(label, device)
+        requires_shifted_model = any(
+            runtime.summary.requires_shifted_model
+            for runtimes in runtimes_by_scheme.values()
+            for runtime in runtimes
+        )
+        if requires_shifted_model and shifted_model is None:
+            raise ValueError(
+                "Selected calibration summaries require shifted_model. "
+                "Pass shifted_model=... to manager.run_calibration(...) or manager.apply(...)."
+            )
 
-            model_args = tuple(model_args)
-            model_kwargs = dict(model_kwargs)
+        shifted_module_by_scheme = {}
+        if requires_shifted_model:
+            for scheme in module_by_scheme:
+                shifted_module = get_submodule(shifted_model, scheme.path)
+                if hasattr(shifted_module, "block_b"):
+                    shifted_module = shifted_module.block_b
+                shifted_module_by_scheme[scheme] = shifted_module
 
-            if requires_labels:
-                model_args, model_kwargs = inject_labels_if_needed(model_args, model_kwargs, label)
+        # Global execution mode flags drive forward-only vs forward+backward calibration.
+        requires_backward = any(c.requires_backward for c in raw_collectors.values())
+        if requires_backward and loss_fn is None:
+            raise ValueError(
+                "Calibration path requiring backward needs a calibration loss function. "
+                "Call manager.set_calibration_loss(...) before manager.apply(...) or manager.run_calibration(...)."
+            )
 
-            if requires_backward:
-                model.zero_grad(set_to_none=True)
-                model_output = model(*model_args, **model_kwargs)
-                loss = _extract_loss(model_output, label, loss_fn)
-                if loss is None:
-                    raise ValueError(
-                        "Calibration path requiring backward did not produce a loss value. "
-                        f"No loss was found for batch {batch_id}."
-                    )
-                loss.backward()
+        hook_handles = []
+        sanity_pending_raw: Dict[object, Dict[str, torch.Tensor]] = {}
+        sanity_rel_diff_sum = 0.0
+        sanity_rel_diff_count = 0
+        sanity_rel_diff_max = 0.0
 
-                for scheme, module in module_by_scheme.items():
-                    for raw_name in raw_required_by_scheme[scheme]:
-                        collector = raw_collectors[raw_name]
-                        raw_value = collector.collect_after_backward(module)
-                        if raw_value is None:
-                            continue
-                        _dispatch_raw(scheme, raw_name, raw_value)
-            else:
-                with torch.no_grad():
-                    model(*model_args, **model_kwargs)
+        def _update_shifted_sanity_stats(scheme, raw_name: str, raw_value: torch.Tensor):
+            nonlocal sanity_rel_diff_sum, sanity_rel_diff_count, sanity_rel_diff_max
 
-            num_batches += 1
-            progress_bar.update(1)
+            if not requires_shifted_model:
+                return
+            if raw_name not in ["activation", "activation_shifted"]:
+                return
 
-    finally:
-        progress_bar.close()
-        for handle in hook_handles:
-            handle.remove()
-        model.zero_grad(set_to_none=True)
-        if was_training:
-            model.train()
+            bucket = sanity_pending_raw.setdefault(scheme, {})
+            bucket[raw_name] = raw_value
+            if "activation" not in bucket or "activation_shifted" not in bucket:
+                return
 
-    if num_batches == 0:
-        raise ValueError("Calibration data must contain at least one batch.")
-
-    for scheme, runtimes in runtimes_by_scheme.items():
-        for runtime in runtimes:
-            if runtime.num_updates == 0:
-                raise RuntimeError(
-                    f"No calibration raw data were collected for summary {runtime.summary.name} "
-                    f"on module {scheme.path}."
+            activation = bucket["activation"]
+            activation_shifted = bucket["activation_shifted"]
+            if activation.shape != activation_shifted.shape:
+                raise ValueError(
+                    "Shifted sanity check received mismatched activation shapes "
+                    f"for module {scheme.path}: {tuple(activation.shape)} vs {tuple(activation_shifted.shape)}."
                 )
-            runtime.summary.finalize_store(scheme.calibration_data)
 
-    if verbose:
-        print(f"Calibrated {len(targets)} schemes over {num_batches} batches.")
+            diff = torch.linalg.norm(activation - activation_shifted)
+            base = torch.linalg.norm(activation)
+            rel_diff = (diff / torch.clamp_min(base, 1e-12)).item()
 
-    return len(targets)
+            sanity_rel_diff_sum += rel_diff
+            sanity_rel_diff_count += 1
+            sanity_rel_diff_max = max(sanity_rel_diff_max, rel_diff)
+
+            # Consume pair so we only count one sample per matching forward pair.
+            bucket.pop("activation", None)
+            bucket.pop("activation_shifted", None)
+
+        def _dispatch_raw(scheme, raw_name: str, raw_value: torch.Tensor):
+            # Fan out each raw tensor to all summary runtimes attached to that scheme.
+            for runtime in runtimes_by_scheme[scheme]:
+                runtime.on_raw(scheme.calibration_data, raw_name, raw_value)
+            _update_shifted_sanity_stats(scheme, raw_name, raw_value)
+
+        for scheme, module in module_by_scheme.items():
+            for raw_name in raw_required_by_scheme[scheme]:
+                collector = raw_collectors[raw_name]
+                # Collectors expose optional forward hooks; hook output is always routed by raw name.
+                hook = collector.build_forward_hook(
+                    emit_raw=lambda name, value, _scheme=scheme: _dispatch_raw(_scheme, name, value)
+                )
+                if hook is not None:
+                    hook_module = shifted_module_by_scheme.get(scheme, module) if collector.uses_shifted_model else module
+                    hook_handles.append(hook_module.register_forward_hook(hook))
+
+        num_batches = 0
+        total_batches = None
+        try:
+            total_batches = len(calibration_data)
+            if max_batches is not None:
+                total_batches = min(total_batches, max_batches)
+        except TypeError:
+            if max_batches is not None:
+                total_batches = max_batches
+
+        progress_bar = build_progress_bar(enabled=show_progress, total=total_batches, verbose=verbose)
+
+        try:
+            model.eval()
+            if requires_shifted_model:
+                shifted_model.eval()
+
+            for batch_id, batch in enumerate(calibration_data):
+                if max_batches is not None and batch_id >= max_batches:
+                    break
+
+                # Reset per-batch runtime cache so each update uses only current-batch raw values.
+                for runtimes in runtimes_by_scheme.values():
+                    for runtime in runtimes:
+                        runtime.reset_batch()
+
+                # Normalize heterogeneous loader outputs to a canonical model invocation form.
+                model_args, model_kwargs, label = normalize_calibration_batch(batch, batch_id=batch_id)
+                model_args = move_to_device(model_args, device)
+                model_kwargs = move_to_device(model_kwargs, device)
+                label = move_to_device(label, device)
+
+                model_args = tuple(model_args)
+                model_kwargs = dict(model_kwargs)
+                shifted_model_args = model_args
+                shifted_model_kwargs = model_kwargs
+                if requires_shifted_model and shifted_device is not None:
+                    shifted_model_args = tuple(move_to_device(model_args, shifted_device))
+                    shifted_model_kwargs = dict(move_to_device(model_kwargs, shifted_device))
+
+                if requires_backward:
+                    # Backward path: run forward, compute user-provided loss, backprop, then pull post-backward raw values.
+                    model.zero_grad(set_to_none=True)
+                    model_output = model(*model_args, **model_kwargs)
+                    loss = _compute_calibration_loss(loss_fn, model_output, label)
+                    if loss is None:
+                        raise ValueError(
+                            "Calibration path requiring backward did not produce a loss value. "
+                            f"Loss function returned None for batch {batch_id}."
+                        )
+                    loss.backward()
+
+                    if requires_shifted_model:
+                        # Shifted model is used for activation summaries only.
+                        with torch.no_grad():
+                            shifted_model(*shifted_model_args, **shifted_model_kwargs)
+
+                    for scheme, module in module_by_scheme.items():
+                        for raw_name in raw_required_by_scheme[scheme]:
+                            collector = raw_collectors[raw_name]
+                            raw_value = collector.collect_after_backward(module)
+                            if raw_value is None:
+                                continue
+                            _dispatch_raw(scheme, raw_name, raw_value)
+                else:
+                    # Forward-only path for summaries based solely on activations.
+                    with torch.no_grad():
+                        model(*model_args, **model_kwargs)
+                        if requires_shifted_model:
+                            shifted_model(*shifted_model_args, **shifted_model_kwargs)
+
+                num_batches += 1
+                progress_bar.update(1)
+
+        finally:
+            # Always clean hooks and restore training mode, even on failure.
+            progress_bar.close()
+            for handle in hook_handles:
+                handle.remove()
+            model.zero_grad(set_to_none=True)
+            if was_training:
+                model.train()
+            if requires_shifted_model and shifted_was_training:
+                shifted_model.train()
+
+        if num_batches == 0:
+            raise ValueError("Calibration data must contain at least one batch.")
+
+        for scheme, runtimes in runtimes_by_scheme.items():
+            calibrated_schemes.add(scheme)
+            for runtime in runtimes:
+                # Guard against silent failures where hooks never emitted required raw data.
+                if runtime.num_updates == 0:
+                    raise RuntimeError(
+                        f"No calibration raw data were collected for summary {runtime.summary.name} "
+                        f"on module {scheme.path}."
+                    )
+                # Finalization hook allows summaries to post-process at end of all batches.
+                runtime.summary.finalize_store(scheme.calibration_data)
+
+        if verbose:
+            print(
+                f"Calibrated stage {stage_idx}/{total_stages}: "
+                f"{len(targets)} schemes over {num_batches} batches."
+            )
+            if requires_shifted_model:
+                if sanity_rel_diff_count == 0:
+                    print(
+                        "Shifted sanity check: no paired activation/activation_shifted "
+                        "samples were observed in this stage."
+                    )
+                else:
+                    mean_rel_diff = sanity_rel_diff_sum / sanity_rel_diff_count
+                    print(
+                        "Shifted sanity check: "
+                        f"pairs={sanity_rel_diff_count}, "
+                        f"mean_rel_l2_diff={mean_rel_diff:.6e}, "
+                        f"max_rel_l2_diff={sanity_rel_diff_max:.6e}."
+                    )
+
+    return len(calibrated_schemes)
 
 
 __all__ = ["run_compression_calibration"]

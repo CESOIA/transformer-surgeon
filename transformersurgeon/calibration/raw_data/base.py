@@ -11,16 +11,20 @@ from typing import Callable, Optional
 import torch
 
 
-LABEL_KEYS = ("labels", "label", "lm_labels", "start_positions", "end_positions")
-
-
 class RawDataCollector(ABC):
     """Base collector used by the calibration backbone."""
 
+    # Registry name used in summary.required_raw_data.
     name: str
+    # If True, collector needs post-backward extraction.
     requires_backward: bool = False
+    # Reserved capability flag for collectors requiring explicit loss access.
     requires_loss: bool = False
+    # Reserved capability flag for collectors that depend on explicit targets.
+    # The current backbone does not auto-inject targets into model kwargs.
     requires_labels: bool = False
+    # If True, collector hook must be attached to shifted model modules.
+    uses_shifted_model: bool = False
 
     def build_forward_hook(
         self,
@@ -28,6 +32,7 @@ class RawDataCollector(ABC):
         emit_raw: Callable[[str, torch.Tensor], None],
     ):
         """Optional forward hook factory."""
+        # Return None when collector does not use forward-hook collection.
         return None
 
     def collect_after_backward(self, module) -> Optional[torch.Tensor]:
@@ -36,7 +41,38 @@ class RawDataCollector(ABC):
 
 
 def normalize_calibration_batch(batch, batch_id: int):
-    """Normalize dataloader output into model args/kwargs and optional explicit label."""
+    """Normalize dataloader output into model args/kwargs and optional target object."""
+    # Internal fast-path used by block-wise cascade flow.
+    # Expected shape:
+    # {
+    #   "__ts_args__": tuple | list | single positional arg,
+    #   "__ts_kwargs__": mapping of keyword args,
+    #   "__ts_label__": optional target/label
+    # }
+    if isinstance(batch, Mapping) and "__ts_args__" in batch:
+        # Read reserved pre-normalized fields with safe defaults.
+        model_args = batch.get("__ts_args__", tuple())
+        model_kwargs = batch.get("__ts_kwargs__", {})
+        label = batch.get("__ts_label__", None)
+
+        # Normalize positional args to tuple for a stable downstream call contract.
+        if not isinstance(model_args, tuple):
+            if isinstance(model_args, list):
+                model_args = tuple(model_args)
+            else:
+                # Single positional value -> one-element args tuple.
+                model_args = (model_args,)
+
+        # kwargs must always be mapping-like (dict-compatible for **kwargs usage).
+        if not isinstance(model_kwargs, Mapping):
+            raise TypeError(
+                "Pre-normalized calibration batch '__ts_kwargs__' must be a mapping. "
+                f"Got {type(model_kwargs)} at batch index {batch_id}."
+            )
+
+        return model_args, dict(model_kwargs), label
+
+    # Mapping batch => keyword-only model call.
     if isinstance(batch, Mapping):
         return tuple(), dict(batch), None
 
@@ -46,42 +82,22 @@ def normalize_calibration_batch(batch, batch_id: int):
 
         if len(batch) == 1:
             item = batch[0]
+            # Preserve mapping semantics even when wrapped in a single-element tuple/list.
             if isinstance(item, Mapping):
                 return tuple(), dict(item), None
             return (item,), {}, None
 
+        # Canonical (data_mapping, target) form.
         if len(batch) == 2 and isinstance(batch[0], Mapping):
             return tuple(), dict(batch[0]), batch[1]
 
+        # Also support swapped form (target, data_mapping).
         if len(batch) == 2 and isinstance(batch[1], Mapping):
             return tuple(), dict(batch[1]), batch[0]
 
+        # Fallback: treat as pure positional model args.
         return tuple(batch), {}, None
 
+    # Single object/tensor batch => one positional argument.
     return (batch,), {}, None
 
-
-def inject_labels_if_needed(model_args, model_kwargs, label):
-    """Inject labels into kwargs for loss-producing calibration paths."""
-    if isinstance(label, Mapping):
-        for key, value in label.items():
-            if key in model_kwargs:
-                raise ValueError(f"Label key '{key}' already exists in calibration data mapping.")
-            model_kwargs[key] = value
-        return model_args, model_kwargs
-
-    if any(key in model_kwargs for key in LABEL_KEYS):
-        return model_args, model_kwargs
-
-    if label is not None:
-        model_kwargs["labels"] = label
-        return model_args, model_kwargs
-
-    if len(model_args) >= 2:
-        model_kwargs["labels"] = model_args[-1]
-        return model_args[:-1], model_kwargs
-
-    raise ValueError(
-        "Calibration path requiring labels could not infer them. "
-        "Use batches with labels in kwargs, (data, label), or positional args ending with label."
-    )

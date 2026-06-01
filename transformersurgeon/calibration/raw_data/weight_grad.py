@@ -11,14 +11,18 @@ from .base import RawDataCollector
 
 class WeightGradCollector(RawDataCollector):
     name = "weight_grad"
+    # Gradient data is only available after loss.backward().
     requires_backward = True
+    # A differentiable calibration loss is required and provided by the manager.
     requires_loss = True
-    requires_labels = True
+    # Labels are optional and fully defined by the user-provided loss function.
+    requires_labels = False
 
     def __init__(self, *, offload_to_cpu: bool = False):
         self.offload_to_cpu = offload_to_cpu
 
     def collect_after_backward(self, module) -> Optional[torch.Tensor]:
+        # Pull dLoss/dW from the compressed module's weight parameter.
         weight_grad = getattr(module.weight, "grad", None)
         if weight_grad is None:
             return None

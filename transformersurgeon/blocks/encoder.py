@@ -145,7 +145,7 @@ class TransformerEncoder(torch.nn.Module):
                 bias=bool(getattr(config, "patch_bias", True)),
             )
             if self.use_cls_token:
-                self.cls_token = torch.nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+                self.cls_token = torch.nn.Parameter(torch.zeros(1, self.embed_dim))
 
         self.blocks = torch.nn.ModuleList(
             [TransformerEncoderBlock(config, block_index=i) for i in range(self.depth)]
@@ -188,7 +188,7 @@ class TransformerEncoder(torch.nn.Module):
         elif self.position_embedding_type == "trained_absolute":
             max_pos = int(getattr(config, "max_position_embeddings", 2048))
             self.position_embeddings = torch.nn.Parameter(
-                torch.zeros(1, max_pos, self.embed_dim)
+                torch.zeros(max_pos, self.embed_dim)
             )
         elif self.position_embedding_type == "none":
             pass
@@ -198,7 +198,7 @@ class TransformerEncoder(torch.nn.Module):
             )
 
     def _image_to_patches(self, images):
-        batch_size, channels, height, width = images.shape
+        channels, height, width = images.shape
         if channels != self.num_channels:
             raise ValueError(
                 f"Expected {self.num_channels} channels, got {channels} channels"
@@ -208,17 +208,17 @@ class TransformerEncoder(torch.nn.Module):
                 "Input image size must be divisible by patch_size for patchify export path"
             )
 
-        patches = images.unfold(2, self.patch_size, self.patch_size).unfold(
-            3, self.patch_size, self.patch_size
+        patches = images.unfold(1, self.patch_size, self.patch_size).unfold(
+            2, self.patch_size, self.patch_size
         )
-        patches = patches.contiguous().permute(0, 2, 3, 1, 4, 5)
-        patches = patches.reshape(batch_size, -1, channels * self.patch_size * self.patch_size)
+        patches = patches.contiguous().permute(1, 2, 0, 3, 4)
+        patches = patches.reshape(-1, channels * self.patch_size * self.patch_size)
         return patches
 
     def _prepare_input(self, x, preprocess_images=False):
         if preprocess_images:
-            if x.ndim != 4:
-                raise ValueError("With image preprocessing enabled, expected 4D image input")
+            if x.ndim != 3:
+                raise ValueError("With image preprocessing enabled, expected 3D image input")
             if not self.enable_patchify_input:
                 raise ValueError(
                     "Image preprocessing requested but enable_patchify_input=False in config"
@@ -226,12 +226,11 @@ class TransformerEncoder(torch.nn.Module):
             patches = self._image_to_patches(x)
             x = self.patch_projection(patches)
             if self.use_cls_token:
-                cls = self.cls_token.expand(x.size(0), -1, -1)
-                x = torch.cat([cls, x], dim=1)
+                x = torch.cat([self.cls_token, x], dim=0)
             return x
 
-        if x.ndim != 3:
-            raise ValueError("Expected token embedding input of shape (batch, seq, hidden)")
+        if x.ndim != 2:
+            raise ValueError("Expected token embedding input of shape (seq, hidden)")
         return x
 
     def _build_rope(self, seq_len, rope_pos=0):
@@ -260,10 +259,12 @@ class TransformerEncoder(torch.nn.Module):
         if self.position_embedding_type != "trained_absolute":
             return x
 
-        seq_len = x.size(1)
+        seq_len = x.size(0)
         if position_ids is None:
-            positions = torch.arange(seq_len, device=x.device).unsqueeze(0)
+            positions = torch.arange(seq_len, device=x.device)
         else:
+            if position_ids.ndim != 1:
+                raise ValueError("Expected position_ids of shape (seq,)")
             positions = position_ids
 
         max_pos = self.position_embeddings.size(1)
@@ -272,8 +273,7 @@ class TransformerEncoder(torch.nn.Module):
                 f"position_ids exceed max_position_embeddings={max_pos}"
             )
 
-        pos_emb = self.position_embeddings.index_select(1, positions.reshape(-1))
-        pos_emb = pos_emb.view(positions.size(0), positions.size(1), -1)
+        pos_emb = self.position_embeddings.index_select(0, positions.reshape(-1))
         return x + pos_emb
 
     def forward(
@@ -289,7 +289,7 @@ class TransformerEncoder(torch.nn.Module):
         )
         x = self._apply_absolute_positional_embeddings(x, position_ids=position_ids)
 
-        rope = self._build_rope(seq_len=x.size(1), rope_pos=rope_pos)
+        rope = self._build_rope(seq_len=x.size(0), rope_pos=rope_pos)
 
         for block in self.blocks:
             x = block(x, rope=rope)
