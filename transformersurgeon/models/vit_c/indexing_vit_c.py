@@ -18,16 +18,18 @@ VIT_C_INDEXING = {
         # HF model structure specifics
         'path_list': {
             'layernorm_before': [],
-            'attention.attention': ['query', 'key', 'value'],
-            'attention.output': ['dense'],
+            'attention': ['q_proj', 'k_proj', 'v_proj', 'o_proj'],
             'layernorm_after': [],
-            'intermediate': ['dense'],
-            'output': ['dense'],
+            'mlp': ['fc1', 'fc2'],
         },
-        'calibration_groups': [
-            ['attention.attention.query', 'attention.attention.key', 'attention.attention.value'],
+        'skip_connections': [
+            ['layernorm_before', 'attention'],
+            ['layernorm_after', 'mlp'],
         ],
-        'path_template': "vit.encoder.layer.{block_index}.{path}",
+        'calibration_groups': [
+            ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
+        ],
+        'path_template': "vit.layers.{block_index}.{path}",
         'qkv_paths': [],
         'preprocessing': "vit.embeddings",
         'final_layer': "classifier",
@@ -40,11 +42,9 @@ VIT_C_INDEXING = {
         'norm_position': 'pre',
         'layer_matching': {
             'layernorm_before': 'norm_in',
-            'attention.attention': ['attn.q_proj', 'attn.k_proj', 'attn.v_proj'],
-            'attention.output': ['attn.out_proj'],
+            'attention': ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.out_proj'],
             'layernorm_after': 'norm_out',
-            'intermediate': ['mlp.up_proj'],
-            'output': ['mlp.down_proj'],
+            'mlp': ['mlp.up_proj', 'mlp.down_proj'],
         },
         'bias_required': {
             'attn.q_proj': True,

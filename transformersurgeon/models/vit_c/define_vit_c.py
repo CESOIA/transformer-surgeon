@@ -9,13 +9,12 @@ from ...utils import (
 
 # Define configuration
 class ViTConfigCompress(ViTConfig):
-    def __init__(self, compression=None, **kwargs):
-        compression_config = kwargs.pop("compression_config", {})
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
         init_compressed_config(
             config_instance=self,
             indexing=INDEXING["vit"],
-            compression_config=compression_config
+            compression_config=kwargs.get("compression_config", {})
         )
 
 # Define model

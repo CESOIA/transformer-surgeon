@@ -21,6 +21,10 @@ LLAMA_C_INDEXING = {
             'post_attention_layernorm': [],
             'mlp': ['gate_proj', 'up_proj', 'down_proj'],
         },
+        'skip_connections': [
+            ['input_layernorm', 'self_attn'],
+            ['post_attention_layernorm', 'mlp'],
+        ],
         'calibration_groups': [
             ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
             ['mlp.gate_proj', 'mlp.up_proj'],

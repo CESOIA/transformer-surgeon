@@ -16,12 +16,23 @@ QWEN2_C_INDEXING = {
         'kv_num_heads_attr': 'num_key_value_heads',
 
         # HF model structure specifics
+        # - keys correspond to the model's block (e.g., mha, mlp)
+        # - list entries correspond to single layers/projections within those blocks
+        # - N.B. non-projection layers (e.g., normalization layers) point to empty lists
         'path_list': {
             'input_layernorm': [],
             'self_attn': ['q_proj', 'k_proj', 'v_proj', 'o_proj'],
             'post_attention_layernorm': [],
             'mlp': ['gate_proj', 'up_proj', 'down_proj'],
         },
+        # Skip connections:
+        # - they are defined as INPUT of layer A to OUTPUT of layer B
+        # - they are defined at the block level
+        # - if hf's implementation defines a skip connection internally within a block, it must not be defined here.
+        'skip_connections': [
+            ['input_layernorm', 'self_attn'],
+            ['post_attention_layernorm', 'mlp'],
+        ],
         'calibration_groups': [
             ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
             ['mlp.gate_proj', 'mlp.up_proj'],

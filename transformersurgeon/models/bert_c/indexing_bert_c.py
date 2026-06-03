@@ -27,6 +27,7 @@ BERT_C_INDEXING = {
         'calibration_groups': [
             ['attention.self.query', 'attention.self.key', 'attention.self.value'],
         ],
+        'no_cascade_calibration': True,
         'path_template': "bert.encoder.layer.{block_index}.{path}",
         'qkv_paths': [],
         'preprocessing': "bert.embeddings",

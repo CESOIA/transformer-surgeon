@@ -200,6 +200,8 @@ class CompressionSchemesManager:
         offload_to_cpu: bool = True,
         verbose: bool = False,
         show_progress: bool = True,
+        summary_dump_dir: Optional[str] = None,
+        summary_dump_names: Optional[tuple] = None,
     ):
         """
         Run a single calibration pass to collect shared activation statistics.
@@ -231,6 +233,8 @@ class CompressionSchemesManager:
             offload_to_cpu=offload_to_cpu,
             verbose=verbose,
             show_progress=show_progress,
+            summary_dump_dir=summary_dump_dir,
+            summary_dump_names=summary_dump_names,
         )
 
     def clear_calibration(self, criteria=None):
@@ -253,6 +257,8 @@ class CompressionSchemesManager:
         device: Optional[Union[str, torch.device]] = None,
         offload_to_cpu: bool = True,
         show_progress: bool = True,
+        summary_dump_dir: Optional[str] = None,
+        summary_dump_names: Optional[tuple] = None,
     ):
         """
         Applies filtered compression schemes to their respective modules in the model.
@@ -279,6 +285,8 @@ class CompressionSchemesManager:
                 device=device,
                 offload_to_cpu=offload_to_cpu,
                 show_progress=show_progress,
+                summary_dump_dir=summary_dump_dir,
+                summary_dump_names=summary_dump_names,
             )
             return
 
@@ -300,6 +308,8 @@ class CompressionSchemesManager:
                 offload_to_cpu=offload_to_cpu,
                 verbose=verbose,
                 show_progress=show_progress,
+                summary_dump_dir=summary_dump_dir,
+                summary_dump_names=summary_dump_names,
             )
 
         for scheme in self.iter_filtered(criteria=criteria):

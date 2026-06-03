@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from ..calibration import run_compression_calibration
 from ..calibration.raw_data import normalize_calibration_batch
@@ -29,6 +30,8 @@ def apply_cascade(
     device: Optional[Union[str, torch.device]] = None,
     offload_to_cpu: bool = True,
     show_progress: bool = True,
+    summary_dump_dir: Optional[str] = None,
+    summary_dump_names: Optional[tuple] = None,
 ):
     """
     Apply compression in block-wise cascade mode.
@@ -43,6 +46,21 @@ def apply_cascade(
     selected_schemes = list(manager.iter_filtered(criteria=criteria))
     if len(selected_schemes) == 0:
         return
+
+    selected_by_block = {}
+    for scheme in selected_schemes:
+        selected_by_block.setdefault(scheme.block_name, []).append(scheme)
+
+    for block_name, block_indexing in manager.indexing.items():
+        if not block_indexing.get("no_cascade_calibration", False):
+            continue
+        if len(selected_by_block.get(block_name, [])) == 0:
+            continue
+        raise ValueError(
+            "Cascade calibration is disabled for this block family by indexing metadata: "
+            f"'{block_name}' has no_cascade_calibration=True. "
+            "Use standard calibration mode instead."
+        )
 
     if manager.calibration_data is None:
         raise ValueError(
@@ -67,13 +85,16 @@ def apply_cascade(
             if len(block_selected) == 0:
                 continue
 
+            raw_skip_connections = block_indexing.get("skip_connections", None)
+            skip_connections = raw_skip_connections if raw_skip_connections else []
+
             path_entries, ordered_subblocks = _extract_path_entries(block_indexing["path_list"])
             path_template = block_indexing["path_template"]
             preprocessing_path = block_indexing.get("preprocessing", None)
 
             if preprocessing_path:
                 preprocessing_module = get_submodule(manager.model, preprocessing_path)
-                cached_block_inputs = _collect_preprocessing_outputs(
+                cached_block_inputs_uncompressed = _collect_preprocessing_outputs(
                     preprocessing_module=preprocessing_module,
                     calibration_data=manager.calibration_data,
                     max_batches=max_batches,
@@ -81,16 +102,26 @@ def apply_cascade(
                     offload_to_cpu=offload_to_cpu,
                 )
             else:
-                cached_block_inputs = _collect_loader_inputs(
+                cached_block_inputs_uncompressed = _collect_loader_inputs(
                     calibration_data=manager.calibration_data,
                     max_batches=max_batches,
                     device=target_device,
                     offload_to_cpu=offload_to_cpu,
                 )
 
+            # Keep a second flow for compressed-stage activations used as shifted inputs.
+            cached_block_inputs_compressed = copy.deepcopy(cached_block_inputs_uncompressed)
+
             # Optional model-specific positional embedding injection.
-            cached_block_inputs = _attach_position_embeddings_if_configured(
-                cached_inputs=cached_block_inputs,
+            cached_block_inputs_uncompressed = _attach_position_embeddings_if_configured(
+                cached_inputs=cached_block_inputs_uncompressed,
+                block_indexing=block_indexing,
+                model=manager.model,
+                device=target_device,
+                offload_to_cpu=offload_to_cpu,
+            )
+            cached_block_inputs_compressed = _attach_position_embeddings_if_configured(
+                cached_inputs=cached_block_inputs_compressed,
                 block_indexing=block_indexing,
                 model=manager.model,
                 device=target_device,
@@ -99,8 +130,16 @@ def apply_cascade(
 
             block_ids = sorted({s.block_id for s in block_selected})
             selected_set = set(block_selected)
+            residual_cache_uncompressed = {}
+            residual_cache_compressed = {}
 
             for block_id in block_ids:
+                block_tokens = _build_block_tokens(
+                    block_name=block_name,
+                    block_id=block_id,
+                    path_template=path_template,
+                )
+
                 stage_layers = _build_layer_stages_for_block(
                     manager=manager,
                     block_id=block_id,
@@ -140,25 +179,47 @@ def apply_cascade(
 
                     calibration_targets = manager._collect_calibration_targets_for_schemes(stage_schemes)
                     if len(calibration_targets) > 0:
+                        if verbose or show_progress:
+                            layers_str = ", ".join(str(layer) for layer in layer_group)
+                            schemes_str = ", ".join(str(scheme.path) for scheme in stage_schemes)
+                            print(
+                                f"Cascade calibration: submodel '{block_name}' id {block_id} "
+                                f"stage {stage_idx}/{len(stage_layers)} | "
+                                f"calibrating layers [{layers_str}] | "
+                                f"compressing schemes [{schemes_str}]"
+                            )
+
                         localized_targets = _localize_targets_to_block(
                             calibration_targets=calibration_targets,
                             path_template=path_template,
                             block_id=block_id,
                             block_model=reference_block,
                         )
-                        cached_loader = DataLoader(cached_block_inputs, batch_size=None, shuffle=False)
+                        cached_loader_uncompressed = DataLoader(
+                            cached_block_inputs_uncompressed,
+                            batch_size=None,
+                            shuffle=False,
+                        )
+                        cached_loader_compressed = DataLoader(
+                            cached_block_inputs_compressed,
+                            batch_size=None,
+                            shuffle=False,
+                        )
 
                         run_compression_calibration(
                             model=reference_block,
-                            calibration_data=cached_loader,
+                            calibration_data=cached_loader_uncompressed,
                             target_stages=[localized_targets],
                             shifted_model=block_module,
+                            shifted_calibration_data=cached_loader_compressed,
                             loss_fn=manager.calibration_loss_fn,
                             max_batches=max_batches,
                             device=target_device,
                             offload_to_cpu=offload_to_cpu,
                             verbose=verbose,
                             show_progress=show_progress,
+                            summary_dump_dir=summary_dump_dir,
+                            summary_dump_names=summary_dump_names,
                         )
 
                     for scheme in stage_schemes:
@@ -170,19 +231,71 @@ def apply_cascade(
                             f"{stage_idx}/{len(stage_layers)} applied on {len(stage_schemes)} scheme(s)."
                         )
 
-                # Block outputs feed the next block id.
-                cached_block_inputs = _run_block_on_cached_inputs(
-                    block_module=block_module,
-                    cached_inputs=cached_block_inputs,
+                # Block outputs feed the next block id for both activation flows.
+                _cache_skip_residuals(
+                    cached_inputs=cached_block_inputs_uncompressed,
+                    skip_connections=skip_connections,
+                    block_tokens=block_tokens,
+                    residual_cache=residual_cache_uncompressed,
+                    store_block="a",
+                )
+                cached_block_inputs_uncompressed = _run_block_on_cached_inputs(
+                    block_module=reference_block,
+                    cached_inputs=cached_block_inputs_uncompressed,
                     device=target_device,
                     offload_to_cpu=offload_to_cpu,
+                    show_progress=show_progress,
+                    progress_desc=(
+                        f"Cascade inference: block '{block_name}' id {block_id} "
+                        "(uncompressed reference)"
+                    ),
+                )
+                cached_block_inputs_uncompressed = _apply_skip_residuals(
+                    cached_outputs=cached_block_inputs_uncompressed,
+                    skip_connections=skip_connections,
+                    block_tokens=block_tokens,
+                    residual_cache=residual_cache_uncompressed,
+                    apply_block="b",
+                )
+
+                _cache_skip_residuals(
+                    cached_inputs=cached_block_inputs_compressed,
+                    skip_connections=skip_connections,
+                    block_tokens=block_tokens,
+                    residual_cache=residual_cache_compressed,
+                    store_block="a",
+                )
+                cached_block_inputs_compressed = _run_block_on_cached_inputs(
+                    block_module=block_module,
+                    cached_inputs=cached_block_inputs_compressed,
+                    device=target_device,
+                    offload_to_cpu=offload_to_cpu,
+                    show_progress=show_progress,
+                    progress_desc=(
+                        f"Cascade inference: block '{block_name}' id {block_id} "
+                        "(compressed shifted)"
+                    ),
+                )
+                cached_block_inputs_compressed = _apply_skip_residuals(
+                    cached_outputs=cached_block_inputs_compressed,
+                    skip_connections=skip_connections,
+                    block_tokens=block_tokens,
+                    residual_cache=residual_cache_compressed,
+                    apply_block="b",
                 )
 
                 # Recompute/inject position embeddings for the next block.
                 # _run_block_on_cached_inputs stores clean kwargs, so any
                 # model-specific positional inputs must be reattached here.
-                cached_block_inputs = _attach_position_embeddings_if_configured(
-                    cached_inputs=cached_block_inputs,
+                cached_block_inputs_uncompressed = _attach_position_embeddings_if_configured(
+                    cached_inputs=cached_block_inputs_uncompressed,
+                    block_indexing=block_indexing,
+                    model=manager.model,
+                    device=target_device,
+                    offload_to_cpu=offload_to_cpu,
+                )
+                cached_block_inputs_compressed = _attach_position_embeddings_if_configured(
+                    cached_inputs=cached_block_inputs_compressed,
                     block_indexing=block_indexing,
                     model=manager.model,
                     device=target_device,
@@ -434,10 +547,11 @@ def _localize_targets_to_block(
     class _LocalCalibrationScheme:
         """Minimal scheme adapter expected by calibration backbone."""
 
-        def __init__(self, model, path, calibration_data):
+        def __init__(self, model, path, calibration_data, debug_full_path):
             self.model = model
             self.path = path
             self.calibration_data = calibration_data
+            self.debug_full_path = debug_full_path
 
         def get_compression_module(self):
             return get_submodule(self.model, self.path)
@@ -452,6 +566,7 @@ def _localize_targets_to_block(
             model=block_model,
             path=local_path,
             calibration_data=scheme.calibration_data,
+            debug_full_path=scheme.path,
         )
         localized.append((local_scheme, summary_names))
 
@@ -539,16 +654,28 @@ def _run_block_on_cached_inputs(
     cached_inputs,
     device: torch.device,
     offload_to_cpu: bool,
+    show_progress: bool = False,
+    progress_desc: Optional[str] = None,
 ):
     next_cached_inputs = []
+    batch_iter = cached_inputs
+
+    if show_progress:
+        batch_iter = tqdm(
+            cached_inputs,
+            total=len(cached_inputs),
+            desc=progress_desc or "Cascade cached inference",
+            leave=False,
+        )
 
     with torch.no_grad():
-        for batch in cached_inputs:
+        for batch in batch_iter:
             model_args = tuple(move_to_device(batch.get("__ts_args__", tuple()), device))
             model_kwargs = dict(move_to_device(batch.get("__ts_kwargs__", {}), device))
             label = batch.get("__ts_label__", None)
 
             out = block_module(*model_args, **model_kwargs)
+
             out = _detach_and_optionally_offload(out, offload_to_cpu)
             label = _detach_and_optionally_offload(label, offload_to_cpu)
 
@@ -561,6 +688,122 @@ def _run_block_on_cached_inputs(
             )
 
     return next_cached_inputs
+
+
+def _build_block_tokens(
+    block_name: str,
+    block_id: int,
+    path_template: str,
+) -> set:
+    tokens = {str(block_name), str(block_id)}
+    tokens.add(path_template.format(block_index=block_id, path="").rstrip("."))
+    return tokens
+
+
+def _cache_skip_residuals(
+    cached_inputs,
+    skip_connections,
+    block_tokens: set,
+    residual_cache: Dict[int, List[torch.Tensor]],
+    store_block: str,
+):
+    if not skip_connections:
+        return
+
+    for pair_idx, pair in enumerate(skip_connections):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise TypeError(
+                "Each skip connection entry must be a 2-item list/tuple [block_a, block_b]. "
+                f"Invalid entry at index {pair_idx}: {pair}."
+            )
+
+        endpoint = str(pair[0] if store_block == "a" else pair[1]).strip()
+        if endpoint not in block_tokens:
+            continue
+
+        residual_cache[pair_idx] = _extract_cached_hidden_states(cached_inputs)
+
+
+def _apply_skip_residuals(
+    cached_outputs,
+    skip_connections,
+    block_tokens: set,
+    residual_cache: Dict[int, List[torch.Tensor]],
+    apply_block: str,
+):
+    if not skip_connections:
+        return cached_outputs
+
+    updated_outputs = cached_outputs
+
+    for pair_idx, pair in enumerate(skip_connections):
+        endpoint = str(pair[0] if apply_block == "a" else pair[1]).strip()
+        if endpoint not in block_tokens:
+            continue
+
+        residual_hidden_states = residual_cache.get(pair_idx, None)
+        if residual_hidden_states is None:
+            raise ValueError(
+                "Skip connection residual not found before residual add in cached flow. "
+                f"Pair index {pair_idx}."
+            )
+
+        updated_outputs = _add_residual_to_cached_outputs(
+            cached_outputs=updated_outputs,
+            residual_hidden_states=residual_hidden_states,
+        )
+        residual_cache.pop(pair_idx, None)
+
+    return updated_outputs
+
+
+def _extract_cached_hidden_states(cached_inputs) -> List[torch.Tensor]:
+    hidden_states = []
+    for batch_idx, batch in enumerate(cached_inputs):
+        model_args = tuple(batch.get("__ts_args__", tuple()))
+        if len(model_args) == 0 or not isinstance(model_args[0], torch.Tensor):
+            raise ValueError(
+                "Skip connection residual capture expects tensor hidden states as first positional arg. "
+                f"Invalid batch index {batch_idx}."
+            )
+        hidden_states.append(model_args[0])
+    return hidden_states
+
+
+def _add_residual_to_cached_outputs(cached_outputs, residual_hidden_states: List[torch.Tensor]):
+    if len(cached_outputs) != len(residual_hidden_states):
+        raise ValueError(
+            "Skip connection residual add received different number of batches for outputs and residuals: "
+            f"outputs={len(cached_outputs)} residuals={len(residual_hidden_states)}."
+        )
+
+    updated_outputs = []
+    for batch_idx, (batch, residual) in enumerate(zip(cached_outputs, residual_hidden_states)):
+        model_args = tuple(batch.get("__ts_args__", tuple()))
+        label = batch.get("__ts_label__", None)
+
+        if len(model_args) == 0 or not isinstance(model_args[0], torch.Tensor):
+            raise ValueError(
+                "Skip connection residual add expects tensor hidden states as first positional arg. "
+                f"Invalid batch index {batch_idx}."
+            )
+
+        out = model_args[0]
+        if out.shape != residual.shape:
+            raise ValueError(
+                "Skip connection residual add received mismatched tensor shapes: "
+                f"output={tuple(out.shape)} residual={tuple(residual.shape)} at batch {batch_idx}."
+            )
+
+        updated_outputs.append(
+            {
+                "__ts_args__": (out + residual,),
+                "__ts_kwargs__": {},
+                "__ts_label__": label,
+            }
+        )
+
+    return updated_outputs
 
 
 def _attach_position_embeddings_if_configured(

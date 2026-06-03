@@ -11,9 +11,15 @@ QWEN2_5_VL_C_INDEXING = {
 
         # HF model structure specifics
         'path_list': {
+            'norm1': [],
             'attn': ['qkv', 'proj'],
+            'norm2': [],
             'mlp': ['gate_proj', 'up_proj', 'down_proj'],
         },
+        'skip_connections': [
+            ['norm1', 'attn'],
+            ['norm2', 'mlp'],
+        ],
         'calibration_groups': [
             ['mlp.gate_proj', 'mlp.up_proj'],
         ],
@@ -40,6 +46,10 @@ QWEN2_5_VL_C_INDEXING = {
             'post_attention_layernorm': [],
             'mlp': ['gate_proj', 'up_proj', 'down_proj'],
         },
+        'skip_connections': [
+            ['input_layernorm', 'self_attn'],
+            ['post_attention_layernorm', 'mlp'],
+        ],
         'calibration_groups': [
             ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
             ['mlp.gate_proj', 'mlp.up_proj'],

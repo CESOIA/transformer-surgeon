@@ -9,9 +9,15 @@ QWEN2_VL_C_INDEXING = {
         'config_attr': 'vision_config',
         'num_blocks_attr': 'depth',
         'path_list': {
+            'norm1': [],
             'attn': ['qkv', 'proj'],
+            'norm2': [],
             'mlp': ['fc1', 'fc2'],
         },
+        'skip_connections': [
+            ['norm1', 'attn'],
+            ['norm2', 'mlp'],
+        ],
         'calibration_groups': [],
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'qkv_paths': ["attn.qkv"],  # Paths that represent QKV concatenated layers
@@ -22,9 +28,15 @@ QWEN2_VL_C_INDEXING = {
         'config_attr': 'text_config',
         'num_blocks_attr': 'num_hidden_layers',
         'path_list': {
+            'input_layernorm': [],
             'self_attn': ['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+            'post_attention_layernorm': [],
             'mlp': ['gate_proj', 'up_proj', 'down_proj'],
         },
+        'skip_connections': [
+            ['input_layernorm', 'self_attn'],
+            ['post_attention_layernorm', 'mlp'],
+        ],
         'calibration_groups': [
             ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
             ['mlp.gate_proj', 'mlp.up_proj'],
