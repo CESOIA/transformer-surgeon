@@ -7,6 +7,8 @@ execution and dispatches raw data to summary runtimes.
 
 from __future__ import annotations
 
+from pathlib import Path
+from urllib.parse import quote
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -30,12 +32,15 @@ def run_compression_calibration(
     calibration_data,
     target_stages,
     shifted_model=None,
+    shifted_calibration_data=None,
     loss_fn=None,
     max_batches: Optional[int] = None,
     device: Optional[Union[str, torch.device]] = None,
     offload_to_cpu: bool = False,
     verbose: bool = False,
     show_progress: bool = True,
+    summary_dump_dir: Optional[Union[str, Path]] = None,
+    summary_dump_names: Optional[Tuple[str, ...]] = None,
 ):
     """
     Run calibration by routing raw data through summary runtimes.
@@ -60,6 +65,11 @@ def run_compression_calibration(
             "Calibration data must be a torch.utils.data.DataLoader. "
             f"Got {type(calibration_data)}."
         )
+    if shifted_calibration_data is not None and not isinstance(shifted_calibration_data, DataLoader):
+        raise TypeError(
+            "shifted_calibration_data must be a torch.utils.data.DataLoader when provided. "
+            f"Got {type(shifted_calibration_data)}."
+        )
 
     if len(target_stages) == 0:
         if verbose:
@@ -77,6 +87,13 @@ def run_compression_calibration(
     was_training = model.training
     shifted_was_training = shifted_model.training if shifted_model is not None else None
     calibrated_schemes = set()
+
+    summary_dump_root = None
+    if summary_dump_dir is not None:
+        summary_dump_root = Path(summary_dump_dir)
+        summary_dump_root.mkdir(parents=True, exist_ok=True)
+
+    selected_summary_dump_names = set(summary_dump_names) if summary_dump_names is not None else None
 
     total_stages = len(target_stages)
     for stage_idx, targets in enumerate(target_stages, start=1):
@@ -207,9 +224,21 @@ def run_compression_calibration(
             if requires_shifted_model:
                 shifted_model.eval()
 
+            shifted_data_iter = iter(shifted_calibration_data) if shifted_calibration_data is not None else None
+
             for batch_id, batch in enumerate(calibration_data):
                 if max_batches is not None and batch_id >= max_batches:
                     break
+
+                shifted_batch = batch
+                if shifted_data_iter is not None:
+                    try:
+                        shifted_batch = next(shifted_data_iter)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "shifted_calibration_data has fewer batches than calibration_data. "
+                            f"Missing shifted batch at index {batch_id}."
+                        ) from exc
 
                 # Reset per-batch runtime cache so each update uses only current-batch raw values.
                 for runtimes in runtimes_by_scheme.values():
@@ -227,8 +256,18 @@ def run_compression_calibration(
                 shifted_model_args = model_args
                 shifted_model_kwargs = model_kwargs
                 if requires_shifted_model and shifted_device is not None:
-                    shifted_model_args = tuple(move_to_device(model_args, shifted_device))
-                    shifted_model_kwargs = dict(move_to_device(model_kwargs, shifted_device))
+                    if shifted_calibration_data is not None:
+                        shifted_args, shifted_kwargs, _ = normalize_calibration_batch(
+                            shifted_batch,
+                            batch_id=batch_id,
+                        )
+                        shifted_args = tuple(move_to_device(shifted_args, shifted_device))
+                        shifted_kwargs = dict(move_to_device(shifted_kwargs, shifted_device))
+                        shifted_model_args = shifted_args
+                        shifted_model_kwargs = shifted_kwargs
+                    else:
+                        shifted_model_args = tuple(move_to_device(model_args, shifted_device))
+                        shifted_model_kwargs = dict(move_to_device(model_kwargs, shifted_device))
 
                 if requires_backward:
                     # Backward path: run forward, compute user-provided loss, backprop, then pull post-backward raw values.
@@ -289,6 +328,35 @@ def run_compression_calibration(
                     )
                 # Finalization hook allows summaries to post-process at end of all batches.
                 runtime.summary.finalize_store(scheme.calibration_data)
+
+                if summary_dump_root is None:
+                    continue
+
+                summary_name = runtime.summary.name
+                if selected_summary_dump_names is not None and summary_name not in selected_summary_dump_names:
+                    continue
+
+                if summary_name not in scheme.calibration_data:
+                    continue
+
+                scheme_path = getattr(scheme, "debug_full_path", scheme.path)
+                encoded_path = quote(str(scheme_path), safe="")
+                out_dir = summary_dump_root / summary_name
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_file = out_dir / f"{encoded_path}.pt"
+
+                summary_value = scheme.calibration_data[summary_name]
+                if isinstance(summary_value, torch.Tensor):
+                    summary_value = summary_value.detach().cpu()
+
+                torch.save(
+                    {
+                        "scheme_path": scheme_path,
+                        "summary_name": summary_name,
+                        "value": summary_value,
+                    },
+                    out_file,
+                )
 
         if verbose:
             print(

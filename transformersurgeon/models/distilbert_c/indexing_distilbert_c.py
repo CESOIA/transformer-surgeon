@@ -21,6 +21,10 @@ DISTILBERT_C_INDEXING = {
             "ffn": ["lin1", "lin2"],
             "output_layer_norm": [],
         },
+        "skip_connections": [
+            ["attention", "attention"],
+            ["ffn", "ffn"],
+        ],
         "calibration_groups": [
             ["attention.q_lin", "attention.k_lin", "attention.v_lin"],
         ],
