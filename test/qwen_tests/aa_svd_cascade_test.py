@@ -51,46 +51,6 @@ def build_dialog_collate_fn(tokenizer, max_length=1024):
         )
 
     return collate
-##########################
-
-
-### SANITY CHECK ###
-def set_min_rank_for_all_lrd_layers(manager):
-    updated = 0
-    for scheme in manager.iter_filtered(criteria="all"):
-        module = scheme.get_module()
-        if not hasattr(module, "weight"):
-            continue
-        min_dim = min(module.weight.shape)
-        expected_rank = 64 #min_dim - 1  # Rank must be < min dimension for LRD
-        scheme.set("lrd", "rank", expected_rank, verbose=False)
-        updated += 1
-    return updated
-
-
-def set_ranks_for_selected_linear_layers(manager, ranks_by_layer: Dict[str, int] = None):
-    """
-    Set different LRD ranks for specific linear layer names.
-
-    If `ranks_by_layer` is None, the mapping below is used and can be edited manually.
-     Example keys: 'self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj',
-                 'mlp.up_proj', 'mlp.gate_proj', 'mlp.down_proj'.
-    """
-    if ranks_by_layer is None:
-        ranks_by_layer = {
-            "mlp.up_proj": 497,
-            "mlp.gate_proj": 497,
-            "mlp.down_proj": 497
-        }
-
-    updated = 0
-    for layer_name, rank in ranks_by_layer.items():
-        manager.set("lrd", "rank", rank, criteria=layer_name, verbose=False)
-        updated += 1
-    
-    return updated * 28
-##########################
-
 
 ### TEST CONFIGURATION ###
 hard_mode = True
@@ -115,7 +75,7 @@ model_name = "Qwen/Qwen2-0.5B-Instruct"
 
 # Local export configuration
 default_export_root = Path(__file__).resolve().parent / "artifacts"
-export_repo_id = "qwen2-0.5b-instruct-svd-llm-v2-local"
+export_repo_id = "qwen2-0.5b-instruct-aa-svd"
 export_root = Path(sys.argv[2]) if len(sys.argv) > 2 else default_export_root
 
 # Device
@@ -148,9 +108,8 @@ calibration_loader = DataLoader(
 
 manager = Qwen2CompressionSchemesManager(model)
 manager.set("lrd", "method", "svd-llm-v2", verbose=True)
-count = set_min_rank_for_all_lrd_layers(manager)
-count = set_ranks_for_selected_linear_layers(manager, None)
-print(f"Configured LRD rank for {count} candidate schemes to min(n, m).")
+manager.set("lrd", "rank", 64, criterion=["mlp"], verbose=True)
+manager.set("lrd", "rank", 128, criterion=["mlp"], verbose=True)
 
 manager.set_calibration_mode(
     mode="cascade",
@@ -220,3 +179,4 @@ for i, message in enumerate(messages):
 
     print("Output:", output[0])
     print("-" * 40)
+
