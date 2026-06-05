@@ -46,7 +46,7 @@ def attention(query, key, value, attn_mask=None):
         scores = scores + attn_mask # Add large negative values for masking
 
     # Softmax
-    scores = torch.nn.functional.softmax(scores.to(torch.float32), dim=-1)
+    scores = torch.nn.functional.softmax(scores, dim=-1)
 
     # Project the values over the scores
     attn_output = torch.matmul(scores.to(dtype), value)  # (kv_head_num, group_size, seq_length, head_dim)
