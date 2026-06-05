@@ -51,7 +51,7 @@ inputs = tokenizer(
     return_tensors="pt",
 ).to(device)
 
-input_ids = inputs["input_ids"]
+input_ids = inputs["input_ids"][0] # Remove batch dimension
 
 # Logits to token sampling function
 def logits_to_input_id(logits, temperature=1.0):
@@ -72,39 +72,41 @@ temperature = 0.2
 # Initialize embeddings sequence
 inputs_embeds = embedding(input_ids)
 
-# Prefill phase
-output_embed = decoder(
-    inputs_embeds,
-    last_pos=inputs_embeds.size(1),
+# Prefill phase - perform decode iteratively (TEMP)
+for i in range(inputs_embeds.size(0)):
+    output_embeds = decoder(
+        inputs_embeds[i:i+1],
+        pos_id = torch.tensor([i]),
     )
+
 # Extract logits from output embed
-logits = final_layer(output_embed[:, -1, :])
+logits = final_layer(output_embeds[-1])
 # Sample next token from logits
 output_id = logits_to_input_id(logits, temperature=temperature)
 # Concatenate to the sequence
-output_ids = torch.cat([input_ids, output_id], dim=1)
+output_ids = torch.cat([input_ids, output_id], dim=0)
 # Get next input embeddings
 inputs_embeds = embedding(output_id)
 
 with torch.no_grad():
 
-    start_context_len = output_ids.size(1)
+    start_context_len = output_ids.size(0)
     for i in tqdm.tqdm(range(start_context_len, max_context_len), "Generating"):
-        last_pos = output_ids.size(1) + 1
+        pos_id = torch.tensor([output_ids.size(0)])
 
         output_embed = decoder(
-            inputs_embeds[:, -1:, :],
-            last_pos=last_pos,
+            inputs_embeds[-1:, :],
+            pos_id=pos_id,
             )
         
         # Extract logits from output embed
-        logits = final_layer(output_embed[:, -1, :])
+        logits = final_layer(output_embed[-1, :])
         
         # Sample next token from logits
         output_id = logits_to_input_id(logits, temperature=temperature)        
 
         # Append to sequence
-        output_ids = torch.cat([output_ids, output_id], dim=1)
+        output_ids = torch.cat([output_ids, output_id], dim=0)
 
         # Get next input embeddings
         inputs_embeds = embedding(output_id)

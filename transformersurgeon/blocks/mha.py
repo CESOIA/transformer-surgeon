@@ -4,31 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 from .rope import apply_rope_multihead
-from . import LinearCompressed
-
-def attention_mask(
-    q_seq_length,
-    kv_seq_length,          # effective KV length (current cache_len)
-    device="cpu",
-    kv_alloc_length=None,   # kept for API compatibility; static width is required
-    mask_value=-1e6,
-):
-    # Static export requires a fixed KV width.
-    kv_width = kv_seq_length if kv_alloc_length is None else kv_alloc_length
-
-    i = torch.arange(q_seq_length, device=device).view(1, q_seq_length, 1)
-    j = torch.arange(kv_width, device=device).view(1, 1, kv_width)
-
-    # Align each query row to absolute position based on effective cache length.
-    q_abs_pos = i + (kv_seq_length - q_seq_length)
-
-    # Standard causal future mask
-    future = j > q_abs_pos
-
-    # In static mode, also mask slots not written yet (j >= kv_seq_length)
-    not_filled = j >= kv_seq_length
-
-    return (future | not_filled).to(torch.float32) * mask_value
+from . import LinearCompressed  
 
 def attention(query, key, value, attn_mask=None):
     """
@@ -48,8 +24,10 @@ def attention(query, key, value, attn_mask=None):
     group_size = q_head_num // kv_head_num
 
     # expand key, value for possible GQA
-    key   = key.repeat_interleave(group_size, dim=1)    # (seq_length, q_head_num, head_dim)
-    value = value.repeat_interleave(group_size, dim=1)  # (seq_length, q_head_num, head_dim)
+    # key   = key.repeat_interleave(group_size, dim=1)    # (seq_length, q_head_num, head_dim)
+    # value = value.repeat_interleave(group_size, dim=1)  # (seq_length, q_head_num, head_dim)
+    key   = key.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
+    value   = value.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
 
     dtype = query.dtype
 
@@ -253,16 +231,21 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
 class MHACausal(MHABase): # Causal MHA with caching for decoder use
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._init_kvcache(
-            max_cache_length=kwargs.get("max_cache_len", 2048)
-        )
 
-    def _init_kvcache(self, max_cache_length):
-        # Initialize key and value caches as buffers (not parameters, not persistent)
-        self.register_buffer("key_cache", torch.zeros(max_cache_length, self.kv_num_heads, self.head_dim), persistent=False)
-        self.register_buffer("value_cache", torch.zeros(max_cache_length, self.kv_num_heads, self.head_dim), persistent=False)
+        # Initialize key and value caches
+        self.max_cache_length=kwargs.get("max_cache_len", 2048)
+        self.register_buffer(
+            "key_cache",
+            torch.zeros(self.max_cache_length, self.kv_num_heads, self.head_dim), persistent=False
+        )
+        self.register_buffer(
+            "value_cache",
+            torch.zeros(self.max_cache_length, self.kv_num_heads, self.head_dim), persistent=False
+        )
+        # Store the penalty value as a proper 1-element tensor buffer
+        self.register_buffer('mask_penalty', torch.tensor(-10000.0, dtype=torch.float32), persistent=True)     
         
-    def forward(self, x, last_pos, attn_mask=None, rope=None):
+    def forward(self, x, pos_id, pos_id_list, rope=None):
         """
         Forward pass of the causal Multi-Head Attention with caching.
         
@@ -280,21 +263,26 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         
         # Apply RoPE
         if rope is not None:
-            cos, sin = rope
+            cos = rope[0][pos_id]
+            sin = rope[1][pos_id]
             q = apply_rope_multihead(q, cos, sin)
             k = apply_rope_multihead(k, cos, sin)
 
         # Update key and value caches in-place
         with torch.no_grad():
-            last_pos_tensor = torch.as_tensor(last_pos, device=x.device)
-            indexes = torch.arange(-in_seq_len, 0, device=x.device) + last_pos_tensor
-            self.key_cache.index_copy_(0, indexes, k)
-            self.value_cache.index_copy_(0, indexes, v)
+            write_index = torch.clamp(pos_id, 0, self.max_cache_length-1).long()
+            self.key_cache.index_copy_(0, write_index, k)
+            self.value_cache.index_copy_(0, write_index, v)
 
         # Static path always attends over fixed-size caches, with masking handling valid range.
         key_cache = self.key_cache
         value_cache = self.value_cache
 
+        # On-the-fly attention mask
+        q_pos, k_pos = pos_id_list
+        attn_mask = torch.where((q_pos < k_pos), self.mask_penalty, torch.zeros_like(self.mask_penalty))[pos_id].unsqueeze(0) # (1, max_cache_len)
+
+        # Call mha operation (SDPA or custom attention)
         if self.use_sdpa:
             q = q.transpose(0, 1) # (num_heads, in_seq_len, head_dim)
             k = key_cache.transpose(0, 1) # (kv_num_heads, last_pos, head_dim)

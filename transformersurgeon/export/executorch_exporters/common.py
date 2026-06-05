@@ -55,14 +55,16 @@ class LLMWrapper(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        last_pos_tensor: torch.LongTensor,
+        input_id: torch.LongTensor,
+        pos_id: torch.LongTensor,
     ) -> torch.Tensor:
-        last_pos = last_pos_tensor
-        hidden = self.decoder(self.embedding(input_ids), last_pos=last_pos)
+        hidden = self.decoder(
+            self.embedding(input_id),
+            pos_id=pos_id
+        )
         logits = self.final_layer(hidden[-1, :])
         return logits
-
+    
 
 def build_wrapper(
     components: Any,
@@ -221,7 +223,30 @@ def run_simple_inference_stats(
 
     runtime = Runtime.get()
     program = runtime.load_program(pte_path)
-    method = program.load_method("forward")
+    method_names_attr = getattr(program, "method_names", None)
+    if callable(method_names_attr):
+        method_names = list(method_names_attr())
+    elif method_names_attr is None:
+        method_names = []
+    else:
+        method_names = list(method_names_attr)
+
+    if "forward" in method_names:
+        method_name = "forward"
+    elif method_names:
+        method_name = method_names[0]
+        warnings.warn(
+            "'forward' method is not available in exported program; "
+            f"using '{method_name}' instead from method_names={method_names}",
+            stacklevel=2,
+        )
+    else:
+        raise RuntimeError(
+            "Exported program has no runnable methods. "
+            f"pte_path='{pte_path}'"
+        )
+
+    method = program.load_method(method_name)
     y_et = method.execute(list(inference_inputs))[0]
     if not isinstance(y_et, torch.Tensor):
         y_et = torch.tensor(y_et)

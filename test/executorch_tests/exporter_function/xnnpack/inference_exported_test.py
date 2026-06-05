@@ -94,8 +94,8 @@ def main():
 
     logits = None
     # Prefill by decode-iteration: feed each prompt token with its position.
-    for effective_len in range(1, output_ids.size(0) + 1):
-        logits = _execute_static(output_ids[effective_len - 1 : effective_len], effective_len)
+    for effective_len in range(output_ids.size(0)):
+        logits = _execute_static(output_ids[effective_len : effective_len+1], effective_len)
 
     for _ in range(args.max_new_tokens):
         if logits is None:

@@ -63,8 +63,8 @@ def precompute_rope_inv_freqs(
 
 def precompute_rope_cos_sin_half(
         inv_freq : torch.Tensor,  # (rotated_dim//2,)
-        seq_len : int, 
-        position : int
+        seq_len : torch.LongTensor, # (1,)
+        start_pos : torch.LongTensor, # (1,)
         ):
     """
     Precompute the cosine and sine values for RoPE.
@@ -72,8 +72,8 @@ def precompute_rope_cos_sin_half(
 
     Args:
         inv_freq: Precomputed inverse frequencies (from precompute_rope_inv_freqs)
-        seq_len: Length of the input sequence
-        position: Specific starting position for the rope sequence
+        seq_len: RoPE sequence length
+        start_pos: Specific starting position for the rope sequence
 
     Returns:
         cos: Cosine values for RoPE (half-size)
@@ -84,8 +84,7 @@ def precompute_rope_cos_sin_half(
     # position = torch.as_tensor(position, device=device, dtype=dtype)
     
     # Broadcast cos and sin to match x's shape
-    position = torch.as_tensor(position, device=device, dtype=dtype)
-    t = torch.arange(seq_len, device=device, dtype=dtype) + position
+    t = torch.arange(seq_len, device=device, dtype=dtype) + start_pos
 
     angles = t.unsqueeze(-1) * inv_freq.unsqueeze(0)  # (seq_len, rotated_dim//2)
     angles = angles.unsqueeze(1)         # (seq_len, 1, rotated_dim//2)
@@ -139,7 +138,7 @@ def precompute_mrope_cos_sin_half(
     return cos, sin
 
 def apply_rope_multihead(
-        x : torch.Tensor,          # (num_heads, seq_len, head_dim)
+        x : torch.Tensor,          # (seq_len, num_heads, head_dim)
         cos : torch.Tensor,        # Precomputed half-size cosine values for RoPE (seq_len, 1, rotated_dim//2)
         sin : torch.Tensor,        # Precomputed half-size sine values for RoPE (seq_len, 1, rotated_dim//2)
         ):
@@ -147,7 +146,7 @@ def apply_rope_multihead(
     Apply the rotation to the input tensor x (query or key) using precomputed cosine and sine values.
 
     Args:
-        x: Input tensor of shape (num_heads, seq_len, head_dim)
+        x: Input tensor of shape (seq_len, num_heads, head_dim)
         cos: Precomputed half-size cosine values for RoPE
         sin: Precomputed half-size sine values for RoPE
         rotated_dim: Size of the portion of the head_dim to be rotated (sum of section_dims)
@@ -162,7 +161,7 @@ def apply_rope_multihead(
     sin = sin.to(torch.float32)
 
     # Split in 2 chunks for the "real" and "imaginary" parts
-    x_real, x_imag = torch.chunk(x, 2, dim=-1)  # Each of shape (num_heads, seq_len, head_dim//2)
+    x_real, x_imag = torch.chunk(x, 2, dim=-1)  # Each of shape (seq_len, num_heads, head_dim//2)
 
     # Apply rotation
     y_real = x_real * cos - x_imag * sin
