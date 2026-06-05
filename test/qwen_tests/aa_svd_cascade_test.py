@@ -107,9 +107,9 @@ calibration_loader = DataLoader(
 )
 
 manager = Qwen2CompressionSchemesManager(model)
-manager.set("lrd", "method", "svd-llm-v2", verbose=True)
-manager.set("lrd", "rank", 64, criterion=["mlp"], verbose=True)
-manager.set("lrd", "rank", 128, criterion=["mlp"], verbose=True)
+manager.set("lrd", "method", "aa-svd", verbose=True)
+manager.set("lrd", "rank", 64, criteria=["attn"], verbose=True)
+manager.set("lrd", "rank", 496, criteria=["mlp"], verbose=True)
 
 manager.set_calibration_mode(
     mode="cascade",
