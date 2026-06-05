@@ -9,7 +9,7 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         dtype = x.dtype
         # Convert to float for stability
-        x = x.to(torch.float32)
+        # x = x.to(torch.float32)
         # Evaluate variance
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         # Normalize with variance
