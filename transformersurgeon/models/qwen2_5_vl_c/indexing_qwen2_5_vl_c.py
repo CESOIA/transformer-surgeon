@@ -20,9 +20,10 @@ QWEN2_5_VL_C_INDEXING = {
             ['norm1', 'attn'],
             ['norm2', 'mlp'],
         ],
-        'calibration_groups': [
-            ['mlp.gate_proj', 'mlp.up_proj'],
-        ],
+        'calibration_groups': {
+            'attn': [['qkv'], ['proj']],
+            'mlp': [['gate_proj', 'up_proj'], ['down_proj']],
+        },
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'preprocessing': "model.visual.patch_embed",
         'final_layer': "model.visual.merger",
@@ -50,10 +51,10 @@ QWEN2_5_VL_C_INDEXING = {
             ['input_layernorm', 'self_attn'],
             ['post_attention_layernorm', 'mlp'],
         ],
-        'calibration_groups': [
-            ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
-            ['mlp.gate_proj', 'mlp.up_proj'],
-        ],
+        'calibration_groups': {
+            'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
+            'mlp': [['gate_proj', 'up_proj'], ['down_proj']],
+        },
         'path_template': "model.language_model.layers.{block_index}.{path}",
         'extra_layers': ["model.language_model.norm"],
         'preprocessing': "model.language_model.embed_tokens",

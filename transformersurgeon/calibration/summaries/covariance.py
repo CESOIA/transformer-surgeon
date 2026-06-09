@@ -53,7 +53,7 @@ class CovarianceSummary(_BaseCovarianceSummary):
     def _compute_batch_sum_and_tokens(
         self, raw_data: Mapping[str, torch.Tensor]
     ) -> tuple[torch.Tensor, int]:
-        activation = raw_data["activation"]
+        activation = raw_data["activation"].float()
         batch_tokens = activation.size(0)
         # Keep unnormalized X^T X for the incoming batch.
         batch_cov_sum = activation.transpose(0, 1) @ activation
@@ -70,7 +70,7 @@ class ShiftedCovarianceSummary(_BaseCovarianceSummary):
     def _compute_batch_sum_and_tokens(
         self, raw_data: Mapping[str, torch.Tensor]
     ) -> tuple[torch.Tensor, int]:
-        activation_shifted = raw_data["activation_shifted"]
+        activation_shifted = raw_data["activation_shifted"].float()
         batch_tokens = activation_shifted.size(0)
         batch_cov_sum = activation_shifted.transpose(0, 1) @ activation_shifted
         return batch_cov_sum, batch_tokens
@@ -86,8 +86,8 @@ class CrossCovarianceSummary(_BaseCovarianceSummary):
     def _compute_batch_sum_and_tokens(
         self, raw_data: Mapping[str, torch.Tensor]
     ) -> tuple[torch.Tensor, int]:
-        activation = raw_data["activation"]
-        activation_shifted = raw_data["activation_shifted"]
+        activation = raw_data["activation"].float()
+        activation_shifted = raw_data["activation_shifted"].float()
         if activation.size(0) != activation_shifted.size(0):
             raise ValueError(
                 "Cross covariance calibration received activation batches with different token counts: "
