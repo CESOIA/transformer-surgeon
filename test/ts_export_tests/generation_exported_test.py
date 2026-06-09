@@ -76,7 +76,7 @@ inputs_embeds = embedding(input_ids)
 for i in range(inputs_embeds.size(0)):
     output_embeds = decoder(
         inputs_embeds[i:i+1],
-        pos_id = torch.tensor([i]),
+        pos_id = torch.tensor([i], device=device),
     )
 
 # Extract logits from output embed
@@ -92,7 +92,7 @@ with torch.no_grad():
 
     start_context_len = output_ids.size(0)
     for i in tqdm.tqdm(range(start_context_len, max_context_len), "Generating"):
-        pos_id = torch.tensor([output_ids.size(0)])
+        pos_id = torch.tensor([output_ids.size(0)], device=device)
 
         output_embed = decoder(
             inputs_embeds[-1:, :],
