@@ -156,9 +156,6 @@ def apply_rope_multihead(
     """
     # Convert to float32 for numerical stability during rotation
     dtype = x.dtype
-    x = x.to(torch.float32)
-    cos = cos.to(torch.float32)
-    sin = sin.to(torch.float32)
 
     # Split in 2 chunks for the "real" and "imaginary" parts
     x_real, x_imag = torch.chunk(x, 2, dim=-1)  # Each of shape (seq_len, num_heads, head_dim//2)

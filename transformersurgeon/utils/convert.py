@@ -217,11 +217,16 @@ def convert_for_export(model, options=None, verbose=False):
             for old_path, new_path in zip(source_paths, layer_matching):
                 old_path = indexing['path_template'].format(block_index=i, path=old_path)
                 new_path = path_template.format(i=i, path=new_path)
-                if verbose:
-                    print("Transfering parameters:", old_path, "->", new_path)
                 old_layer = get_submodule(model, old_path)
                 new_layer = get_submodule(new_model, new_path)
                 new_layer.load_state_dict(old_layer.state_dict())
+                if verbose:
+                    print("Transfering parameters:", old_path, "->", new_path)
+                    for pname, param in old_layer.named_parameters():
+                        print(f"  {pname}: {param.shape}, dtype={param.dtype}, device={param.device}")
+                    print("   -->")
+                    for pname, param in new_layer.named_parameters():
+                        print(f"  {pname}: {param.shape}, dtype={param.dtype}, device={param.device}")
 
         # Handle extra layers if any
         if 'extra_layers' in indexing:

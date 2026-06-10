@@ -55,16 +55,14 @@ class LLMWrapper(nn.Module):
 
     def forward(
         self,
-        input_id: torch.LongTensor,
-        pos_id: torch.LongTensor,
+        input_ids: torch.LongTensor,
+        pos_id_tensor: torch.LongTensor,
     ) -> torch.Tensor:
-        hidden = self.decoder(
-            self.embedding(input_id),
-            pos_id=pos_id
-        )
+        pos_id = pos_id_tensor
+        hidden = self.decoder(self.embedding(input_ids), pos_id=pos_id)
         logits = self.final_layer(hidden[-1, :])
         return logits
-    
+
 
 def build_wrapper(
     components: Any,

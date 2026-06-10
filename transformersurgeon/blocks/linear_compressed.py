@@ -30,11 +30,12 @@ class LinearCompressed(nn.Linear):
             return
         
         self.skip = False
-        super().__init__(in_features=in_features,
-                            out_features=out_features,
-                            bias=bias,
-                            device=device,
-                            dtype=dtype)
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype)
         self.weight_2 = None # Placeholder for the second weight matrix in low-rank decomposition
 
         self.init_lrd(rank)

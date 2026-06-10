@@ -55,6 +55,18 @@ def parse_args():
         help="Enable online_prepare in QNN compiler spec (recommended off for host emulator)",
     )
     parser.add_argument(
+        "--fp16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use FP16 mode on HTP (--fp16 / --no-fp16, default: enabled)",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Number of graph shards for the decoder (1 = no sharding, >1 enables multi-context)",
+    )
+    parser.add_argument(
         "--max-sequence-length",
         type=int,
         default=1024,
@@ -169,6 +181,8 @@ def _write_aten_diagnostics_log(
         f"precision={args.precision}",
         f"soc_model={args.soc_model}",
         f"online_prepare={args.online_prepare}",
+        f"fp16={args.fp16}",
+        f"num_shards={args.num_shards}",
         f"max_sequence_length={args.max_sequence_length}",
         f"output_path={output_path}",
         "",
@@ -236,7 +250,7 @@ def main():
 
     output_path = os.path.join(
         args.out_dir,
-        f"export_{args.mode}_{args.backend}_{args.precision}.pte",
+        f"export_{args.mode}_{args.backend}_{args.precision}_s{args.num_shards}.pte",
     )
     log_path = _resolve_log_path(args)
 
@@ -246,6 +260,8 @@ def main():
         precision=args.precision,
         soc_model=args.soc_model,
         is_online_prepare=args.online_prepare,
+        use_fp16=args.fp16,
+        num_shards=args.num_shards,
         max_seq_len=args.max_sequence_length,
         convert_options={"use_sdpa": False},
         verbose=args.verbose,

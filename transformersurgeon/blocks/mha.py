@@ -62,6 +62,7 @@ class MHABase(torch.nn.Module):
             kv_num_heads=None,
             use_sdpa=False,
             compression_config=None,
+            dtype=None,
             **kwargs,
             ):
         super().__init__()
@@ -73,6 +74,7 @@ class MHABase(torch.nn.Module):
         self.kv_num_heads = num_heads if kv_num_heads is None else kv_num_heads
         self.use_sdpa = use_sdpa
         self.kv_out_dim = self.kv_num_heads * self.head_dim
+        self.dtype = dtype
 
         # Setup compression configuration
         if compression_config is None:
@@ -107,22 +109,26 @@ class MHABase(torch.nn.Module):
             embed_dim,
             embed_dim,
             bias=bias_required["q_proj"],
-            rank=q_lrd_rank)
+            rank=q_lrd_rank,
+            dtype=dtype)
         self.k_proj = LinearCompressed(
             embed_dim,
             self.kv_out_dim,
             bias=bias_required["k_proj"],
-            rank=k_lrd_rank)
+            rank=k_lrd_rank,
+            dtype=dtype)
         self.v_proj = LinearCompressed(
             embed_dim,
             self.kv_out_dim,
             bias=bias_required["v_proj"],
-            rank=v_lrd_rank)
+            rank=v_lrd_rank,
+            dtype=dtype)
         self.out_proj = LinearCompressed(
             embed_dim,
             embed_dim,
             bias=bias_required["out_proj"],
-            rank=out_lrd_rank)
+            rank=out_lrd_rank,
+            dtype=dtype)
 
 class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
     def __init__(self, *args, **kwargs):
@@ -234,24 +240,33 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         # Initialize key and value caches
         self.max_cache_length=kwargs.get("max_cache_len", 2048)
+
         self.register_buffer(
             "key_cache",
-            torch.zeros(self.max_cache_length, self.kv_num_heads, self.head_dim), persistent=False
+            torch.zeros(
+                self.max_cache_length,
+                self.kv_num_heads,
+                self.head_dim,
+                dtype=self.dtype),
+            persistent=False
         )
         self.register_buffer(
             "value_cache",
-            torch.zeros(self.max_cache_length, self.kv_num_heads, self.head_dim), persistent=False
-        )
-        # Store the penalty value as a proper 1-element tensor buffer
-        self.register_buffer('mask_penalty', torch.tensor(-10000.0, dtype=torch.float32), persistent=True)     
+            torch.zeros(
+                self.max_cache_length,
+                self.kv_num_heads,
+                self.head_dim,
+                dtype=self.dtype),
+            persistent=False
+        )  
         
-    def forward(self, x, pos_id, pos_id_list, rope=None):
+    def forward(self, x, pos_id, pos_id_list, mask_penalty, rope=None):
         """
         Forward pass of the causal Multi-Head Attention with caching.
         
         Args:
             x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
-            last_pos (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
+            pos_id (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
             rope (tuple, optional): Tuple of (cos, sin) tensors for RoPE application.
         """
         in_seq_len, embed_dim = x.size()
@@ -280,13 +295,13 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         # On-the-fly attention mask
         q_pos, k_pos = pos_id_list
-        attn_mask = torch.where((q_pos < k_pos), self.mask_penalty, torch.zeros_like(self.mask_penalty))[pos_id].unsqueeze(0) # (1, max_cache_len)
+        attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pos_id].unsqueeze(0) # (1, max_cache_len)
 
         # Call mha operation (SDPA or custom attention)
         if self.use_sdpa:
             q = q.transpose(0, 1) # (num_heads, in_seq_len, head_dim)
-            k = key_cache.transpose(0, 1) # (kv_num_heads, last_pos, head_dim)
-            v = value_cache.transpose(0, 1) # (kv_num_heads, last_pos, head_dim)
+            k = key_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
+            v = value_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
             attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
         else:
             attn_output = attention(q, key_cache, value_cache, attn_mask)

@@ -58,6 +58,13 @@ def parse_args():
         action="store_true",
         help="Print simple inference error statistics",
     )
+    parser.add_argument(
+        "--base-dtype",
+        type=str,
+        default="float16",
+        choices=["float16", "bfloat16", "float32"],
+        help="Base dtype for export (affects quantization and some export decisions)",
+    )
     return parser.parse_args()
 
 
@@ -65,10 +72,16 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
+    dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[args.base_dtype]
+
     print(f"Loading model: {args.model_name}")
     model = Qwen2ForCausalLMCompress.from_pretrained(
         args.model_name,
-        torch_dtype=torch.float32,
+        torch_dtype=dtype,
     )
     model.eval()
 

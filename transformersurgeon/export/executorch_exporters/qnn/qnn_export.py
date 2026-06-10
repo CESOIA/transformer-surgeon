@@ -134,7 +134,9 @@ def _canonicalize_pow_tensor_scalar(graph_module: torch.fx.GraphModule) -> int:
 @dataclass
 class QNNExportConfig(ExecutorchExporterConfig):
     soc_model: str = "SM8650"
-    is_online_prepare: bool = True
+    is_online_prepare: bool = False
+    use_fp16: bool = True
+    num_shards: int = 1
 
 
 def _resolve_qcom_chipset(soc_model: Any):
@@ -222,18 +224,100 @@ def export_with_qnn(
     from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 
     backend_options = generate_htp_compiler_spec(
-        use_fp16=(quant_plan.global_precision == "full"),
+        use_fp16=config.use_fp16,
+        use_multi_contexts=(config.num_shards > 1),
     )
     compiler_spec = generate_qnn_executorch_compiler_spec(
         soc_model=_resolve_qcom_chipset(config.soc_model),
         backend_options=backend_options,
         online_prepare=config.is_online_prepare,
     )
+
+    edge_kwargs: dict = {}
+    if config.num_shards > 1:
+        # llama.fallback.default marks shard boundaries — must be excluded from
+        # QNN partitions so the partitioner treats it as a natural split point.
+        edge_kwargs["skip_node_op_set"] = {"llama.fallback.default"}
+
+        import re as _re
+        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_capture_program_passes
+        from executorch.backends.qualcomm._passes.utils import get_passes_dependency_for_capture_program
+        from executorch.backends.qualcomm.utils.constants import (
+            QCOM_PASS_ACTIVATE_KEY,
+            QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
+            QCOM_QUANT_ATTRS,
+        )
+        from executorch.exir.dialects._ops import ops as exir_ops
+        from executorch.exir.pass_base import ExportPass, PassResult
+        from executorch.extension.llm.custom_ops import model_sharding  # noqa: F401 — registers llama.fallback op
+
+        try:
+            n_layers = len(wrapper.decoder.blocks)
+        except AttributeError:
+            raise RuntimeError(
+                "num_shards > 1 requires wrapper.decoder.blocks (TransformerDecoder with a 'blocks' ModuleList)"
+            )
+
+        shard_size = n_layers // config.num_shards
+        shard_layers = list(range(0, n_layers, shard_size))
+        print(f"  Graph sharding: {config.num_shards} shards, layer boundaries at {shard_layers}")
+
+        _pattern = _re.compile(r"blocks\.(\d+)")
+        _shard_layers = shard_layers
+        _QCOM_QUANT_ATTRS = QCOM_QUANT_ATTRS
+
+        class SplitGraphBlocks(ExportPass):
+            def __init__(self, shard_layers):
+                super().__init__()
+                self.shard_layers = shard_layers
+
+            def _insert_fallback_op(self, graph_module):
+                prev_node = None
+                prev_layer = None
+                for node in graph_module.graph.nodes:
+                    if node.op != "call_function" or "nn_module_stack" not in node.meta:
+                        continue
+                    module_values_list = list(node.meta["nn_module_stack"].values())
+                    full_qualified_name = module_values_list[-1][0]
+                    match = _pattern.search(full_qualified_name)
+                    if match is None:
+                        continue
+                    cur_layer = int(match.group(1))
+                    if cur_layer in self.shard_layers and prev_layer == cur_layer - 1:
+                        with graph_module.graph.inserting_after(prev_node):
+                            users = list(prev_node.users.keys())
+                            inserted_node = graph_module.graph.create_node(
+                                "call_function",
+                                exir_ops.edge.llama.fallback.default,
+                                (prev_node,),
+                            )
+                            inserted_node.meta["val"] = prev_node.meta["val"]
+                            if prev_node.meta.get(_QCOM_QUANT_ATTRS, None):
+                                inserted_node.meta[_QCOM_QUANT_ATTRS] = prev_node.meta[_QCOM_QUANT_ATTRS]
+                            for user in users:
+                                user.replace_input_with(prev_node, inserted_node)
+                    prev_layer = cur_layer
+                    prev_node = node
+
+            def call(self, graph_module):
+                self._insert_fallback_op(graph_module)
+                graph_module.recompile()
+                return PassResult(graph_module, True)
+
+        passes_job = get_capture_program_passes()
+        dep_table = get_passes_dependency_for_capture_program()
+        passes_job[SplitGraphBlocks] = {
+            QCOM_PASS_ACTIVATE_KEY: True,
+            QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY: {"shard_layers": _shard_layers},
+        }
+        edge_kwargs["passes_job"] = passes_job
+        edge_kwargs["dep_table"] = dep_table
+
     edge = to_edge_transform_and_lower_to_qnn(
         model_for_edge,
         example_inputs,
         compiler_spec,
-        # skip_node_op_set={"aten.add.Tensor", "aten.index_put.default"},
+        **edge_kwargs,
     )
 
     executorch_config = ExecutorchBackendConfig(

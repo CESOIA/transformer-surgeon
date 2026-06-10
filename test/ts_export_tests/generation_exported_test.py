@@ -13,7 +13,7 @@ MODEL_NAME = "Qwen/Qwen2-0.5B-Instruct"
 
 tokenizer = Qwen2TokenizerFast.from_pretrained(MODEL_NAME)
 # model = Qwen2_5_VLForConditionalGenerationCompress.from_pretrained(MODEL_NAME)
-model = Qwen2ForCausalLMCompress.from_pretrained(MODEL_NAME)
+model = Qwen2ForCausalLMCompress.from_pretrained(MODEL_NAME, dtype=torch.float16)
 
 # Extract language backbone only
 embedding = model.get_input_embeddings()
@@ -30,7 +30,7 @@ decoder = converted_models['text']
 
 # Set device and data type
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-data_type = torch.float32
+data_type = torch.float16
 
 # Put all modules on the same device
 embedding = embedding.to(device, dtype=data_type)
@@ -43,7 +43,7 @@ template = (
     "<|im_start|>user\n{instruction}\n<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
-prompt = """Tell me a story."""
+prompt = """Tell me one short fact about France."""
 
 # Tokenize inputs (string to input_ids)
 inputs = tokenizer(
@@ -67,7 +67,7 @@ def logits_to_input_id(logits, temperature=1.0):
     return torch.multinomial(probs, num_samples=1)
 
 # Decode loop
-temperature = 0.2
+temperature = 0.0
 
 # Initialize embeddings sequence
 inputs_embeds = embedding(input_ids)
@@ -92,7 +92,7 @@ with torch.no_grad():
 
     start_context_len = output_ids.size(0)
     for i in tqdm.tqdm(range(start_context_len, max_context_len), "Generating"):
-        pos_id = torch.tensor([output_ids.size(0)])
+        pos_id = torch.tensor([output_ids.size(0) - 1])
 
         output_embed = decoder(
             inputs_embeds[-1:, :],

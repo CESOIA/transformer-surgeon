@@ -31,6 +31,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.norm_type = config.norm_type
         self.use_sdpa = config.use_sdpa
         self.max_cache_len = config.max_cache_len
+        self.dtype = config.dtype
 
         # Extract configuration (optional)
         self.kv_num_heads = getattr(config, "num_key_value_heads", None)
@@ -52,8 +53,8 @@ class TransformerDecoderBlock(torch.nn.Module):
 
         # Instantiate normalization modules
         if self.norm_type == "rmsnorm":
-            self.norm_in = RMSNorm(self.embed_dim)
-            self.norm_out = RMSNorm(self.embed_dim)
+            self.norm_in = RMSNorm(self.embed_dim, dtype=self.dtype)
+            self.norm_out = RMSNorm(self.embed_dim, dtype=self.dtype)
         else:
             raise ValueError(f"Unsupported norm type: {self.norm_type}")
 
@@ -66,7 +67,8 @@ class TransformerDecoderBlock(torch.nn.Module):
                 kv_num_heads=self.kv_num_heads,
                 compression_config=self.compression_config["attn"],
                 use_sdpa=self.use_sdpa,
-                max_cache_len=self.max_cache_len,)
+                max_cache_len=self.max_cache_len,
+                dtype=self.dtype)
         else:
             raise ValueError(f"Unsupported MHA type: {self.mha_type}")
 
@@ -77,14 +79,16 @@ class TransformerDecoderBlock(torch.nn.Module):
                 self.mlp_hidden_dim,
                 bias_required=self.bias_required["mlp"],
                 activation=self.mlp_activation,
-                compression_config=self.compression_config["mlp"])
+                compression_config=self.compression_config["mlp"],
+                dtype=self.dtype)
         elif self.mlp_type == "mlp":
             self.mlp = MLP(
                 self.embed_dim,
                 self.mlp_hidden_dim,
                 bias_required=self.bias_required["mlp"],
                 activation=self.mlp_activation,
-                compression_config=self.compression_config["mlp"])
+                compression_config=self.compression_config["mlp"],
+                dtype=self.dtype)
         else:
             raise ValueError(f"Unsupported MLP type: {self.mlp_type}")
 
@@ -96,6 +100,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             x,
             pos_id,
             pos_id_list,
+            mask_penalty,
             rope=None,
     ):
         """
@@ -118,6 +123,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             x, 
             pos_id=pos_id,
             pos_id_list=pos_id_list,
+            mask_penalty=mask_penalty,
             rope=rope,
             )
         x = self.atomic_sum(x, residual) # join skip connection
@@ -140,10 +146,11 @@ class TransformerDecoder(torch.nn.Module):
         self.config = config
 
         self.depth = config.num_hidden_layers
+        self.dtype = config.dtype
         self.blocks = torch.nn.ModuleList(
             [TransformerDecoderBlock(config, block_index=i) for i in range(self.depth)]
             )
-        self.norm = RMSNorm(config.hidden_size)
+        self.norm = RMSNorm(config.hidden_size, self.dtype)
         head_dim = config.hidden_size // config.num_attention_heads
 
         self.max_cache_len = config.max_cache_len
@@ -164,8 +171,11 @@ class TransformerDecoder(torch.nn.Module):
             self.max_cache_len,
             start_pos=0,
         )
-        self.register_buffer("rope_cos", rope[0], persistent=True)
-        self.register_buffer("rope_sin", rope[1], persistent=True)
+        self.register_buffer("rope_cos", rope[0].to(config.dtype), persistent=True)
+        self.register_buffer("rope_sin", rope[1].to(config.dtype), persistent=True)
+
+        # Store the penalty value as a proper 1-element tensor buffer
+        self.register_buffer('mask_penalty', torch.tensor(-10000.0, dtype=config.dtype), persistent=True)
 
 
     def forward(
@@ -185,12 +195,12 @@ class TransformerDecoder(torch.nn.Module):
         """
         # Decode
         for block in self.blocks:
-
             # Inference (prefill or decode)
             x = block(
                 x,               # (in_seq_len, embed_dim)
                 pos_id=pos_id,   # (1,)
                 pos_id_list=(self.q_pos, self.k_pos),
+                mask_penalty=self.mask_penalty,
                 rope=(self.rope_cos, self.rope_sin),
             )
             # x is output embeddings: (1, embed_dim)

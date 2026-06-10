@@ -17,7 +17,8 @@ class MLP(torch.nn.Module):
             hidden_dim,
             bias_required=None,
             activation='gelu',
-            compression_config=None
+            compression_config=None,
+            dtype=None
             ):
         """
         Standard MLP block with two linear layers and an activation in between.
@@ -57,7 +58,8 @@ class MLP(torch.nn.Module):
             embed_dim,
             hidden_dim,
             bias=bias_required["up_proj"],
-            rank=up_proj_lrd_rank)
+            rank=up_proj_lrd_rank,
+            dtype=dtype)
         
         self.activation = activation_map[activation]()
 
@@ -65,7 +67,8 @@ class MLP(torch.nn.Module):
             hidden_dim,
             embed_dim,
             bias=bias_required["down_proj"],
-            rank=down_proj_lrd_rank)
+            rank=down_proj_lrd_rank,
+            dtype=dtype)
 
     def forward(self, x):
         """
@@ -89,7 +92,8 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
             hidden_dim,
             bias_required=None,
             activation='gelu',
-            compression_config=None
+            compression_config=None,
+            dtype=None
             ):
         """
         Gated MLP block with two linear layers for gating and one for output projection.
@@ -133,13 +137,15 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
             embed_dim,
             hidden_dim,
             bias=bias_required["up_proj"],
-            rank=up_proj_lrd_rank)
+            rank=up_proj_lrd_rank,
+            dtype=dtype)
         
         self.gate_proj = LinearCompressed(
             embed_dim,
             hidden_dim,
             bias=bias_required["gate_proj"],
-            rank=gate_proj_lrd_rank)
+            rank=gate_proj_lrd_rank,
+            dtype=dtype)
         
         self.activation = activation_map[activation]()
 
@@ -147,7 +153,8 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
             hidden_dim,
             embed_dim,
             bias=bias_required["down_proj"],
-            rank=down_proj_lrd_rank)
+            rank=down_proj_lrd_rank,
+            dtype=dtype)
 
     def forward(self, x):
         """
