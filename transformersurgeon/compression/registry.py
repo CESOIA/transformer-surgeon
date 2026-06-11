@@ -21,6 +21,7 @@ from .quantization import (
     validate_precision,
     validate_sparse_method,
     validate_quantization_eps,
+    validate_quantization_granularity,
 )
 
 COMPRESSOR_DICT = {
@@ -51,6 +52,7 @@ COMPRESSION_REGISTRY = {
         "sparsity": dict(default=0.0, validator=validate_unstructured_pruning_ratio),
         "sparse_method": dict(default="magnitude", validator=validate_sparse_method,),
         "eps": dict(default=1e-6, validator=validate_quantization_eps),
+        "granularity": dict(default="per_tensor", validator=validate_quantization_granularity),
     }
 }
 

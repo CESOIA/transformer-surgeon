@@ -345,7 +345,7 @@ class CompressionSchemesManager:
                 if not callable(needs_calibration_fn):
                     continue
                 needs_calibration = needs_calibration_fn()
-                if needs_calibration is False or needs_calibration is None:
+                if not needs_calibration:
                     continue
 
                 summary_names = needs_calibration
