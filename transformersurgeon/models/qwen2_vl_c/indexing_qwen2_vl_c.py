@@ -18,7 +18,10 @@ QWEN2_VL_C_INDEXING = {
             ['norm1', 'attn'],
             ['norm2', 'mlp'],
         ],
-        'calibration_groups': [],
+        'calibration_groups': {
+            'attn': [['qkv'], ['proj']],
+            'mlp': [['fc1'], ['fc2']],
+        },
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'qkv_paths': ["attn.qkv"],  # Paths that represent QKV concatenated layers
         'pruning_supported': [],
@@ -37,10 +40,10 @@ QWEN2_VL_C_INDEXING = {
             ['input_layernorm', 'self_attn'],
             ['post_attention_layernorm', 'mlp'],
         ],
-        'calibration_groups': [
-            ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
-            ['mlp.gate_proj', 'mlp.up_proj'],
-        ],
+        'calibration_groups': {
+            'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
+            'mlp': [['gate_proj', 'up_proj'], ['down_proj']],
+        },
         'path_template': "model.language_model.layers.{block_index}.{path}",
         'position_embeddings_source': "model.language_model.rotary_emb",
         'position_embeddings_targets': ["self_attn"],

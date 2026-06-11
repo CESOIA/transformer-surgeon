@@ -42,24 +42,39 @@ class SummaryRuntime:
     """Tracks per-batch pending raw inputs for one summary instance."""
 
     summary: CalibrationSummary
-    pending_raw: Dict[str, torch.Tensor] = field(default_factory=dict)
+    pending_raw: Dict[str, list[torch.Tensor]] = field(default_factory=dict)
     num_updates: int = 0
     state: Dict[str, int] = field(default_factory=dict)
 
     def reset_batch(self) -> None:
-        # Clear any partial payload from previous batch before new raw emissions arrive.
+        # Clear queues between batches; leftovers indicate stream pairing mismatch.
+        leftovers = {
+            raw_name: len(queue)
+            for raw_name, queue in self.pending_raw.items()
+            if len(queue) > 0
+        }
+        if len(leftovers) > 0:
+            raise RuntimeError(
+                "Calibration raw stream mismatch: unpaired raw payloads remained at batch boundary "
+                f"for summary {self.summary.name}: {leftovers}."
+            )
         self.pending_raw.clear()
 
     def on_raw(self, calibration_store: dict, raw_name: str, raw_value: torch.Tensor) -> None:
         # Ignore raw streams unrelated to this summary.
         if raw_name not in self.summary.required_raw_data:
             return
-        self.pending_raw[raw_name] = raw_value
-        # Update only when we have a complete payload for this summary.
-        if all(name in self.pending_raw for name in self.summary.required_raw_data):
-            self.summary.update_runtime(self, calibration_store, self.pending_raw)
+
+        self.pending_raw.setdefault(raw_name, []).append(raw_value)
+
+        # Update while complete FIFO payloads are available across required streams.
+        while all(len(self.pending_raw.get(name, [])) > 0 for name in self.summary.required_raw_data):
+            payload = {
+                name: self.pending_raw[name].pop(0)
+                for name in self.summary.required_raw_data
+            }
+            self.summary.update_runtime(self, calibration_store, payload)
             self.num_updates += 1
-            self.pending_raw.clear()
 
 
 def unique_summaries(summary_names: Iterable[str]) -> Tuple[str, ...]:

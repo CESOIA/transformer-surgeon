@@ -62,18 +62,42 @@ class CompressionSchemesManager:
         groups = []
         for _, block_indexing in self.indexing.items():
             block_groups = block_indexing.get("calibration_groups", [])
-            if not isinstance(block_groups, list):
-                raise TypeError(
-                    "Indexing field 'calibration_groups' must be a list of groups. "
-                    f"Got {type(block_groups)}."
-                )
-            for idx, group in enumerate(block_groups):
-                if not isinstance(group, list):
-                    raise TypeError(
-                        "Each 'calibration_groups' entry must be a list compatible with iter_filtered criteria. "
-                        f"Invalid group at index {idx}: {type(group)}."
-                    )
-            groups.extend(deepcopy(block_groups))
+
+            # Structured format by subblock:
+            #   {
+            #     'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
+            #     'mlp': [['down_proj'], ['gate_proj', 'up_proj']],
+            #   }
+            if isinstance(block_groups, dict):
+                for subblock_name, subblock_groups in block_groups.items():
+                    if not isinstance(subblock_groups, list):
+                        raise TypeError(
+                            "Each 'calibration_groups' dict value must be a list of layer groups. "
+                            f"Invalid value type for key '{subblock_name}': {type(subblock_groups)}."
+                        )
+
+                    for group_idx, group_layers in enumerate(subblock_groups):
+                        if not isinstance(group_layers, list):
+                            raise TypeError(
+                                "Each layer group in 'calibration_groups' dict must be a list of layer names. "
+                                f"Invalid group at key '{subblock_name}' index {group_idx}: {type(group_layers)}."
+                            )
+
+                        normalized_group = []
+                        for layer_name in group_layers:
+                            layer_name = str(layer_name)
+                            if "." in layer_name or not str(subblock_name):
+                                normalized_group.append(layer_name)
+                            else:
+                                normalized_group.append(f"{subblock_name}.{layer_name}")
+
+                        groups.append(normalized_group)
+                continue
+
+            raise TypeError(
+                "Indexing field 'calibration_groups' must be a list or a dict. "
+                f"Got {type(block_groups)}."
+            )
         return groups
 
     def set(self, compression, property, value, criteria=None, verbose=False):

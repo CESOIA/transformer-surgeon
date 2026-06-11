@@ -25,9 +25,10 @@ DISTILBERT_C_INDEXING = {
             ["attention", "attention"],
             ["ffn", "ffn"],
         ],
-        "calibration_groups": [
-            ["attention.q_lin", "attention.k_lin", "attention.v_lin"],
-        ],
+        "calibration_groups": {
+            "attention": [["q_lin", "k_lin", "v_lin"], ["out_lin"]],
+            "ffn": [["lin1"], ["lin2"]],
+        },
         "path_template": "distilbert.transformer.layer.{block_index}.{path}",
         "qkv_paths": [
             "attention.q_lin",
