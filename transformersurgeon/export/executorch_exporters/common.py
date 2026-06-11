@@ -9,18 +9,30 @@ import torch.nn as nn
 from ..config import BackendExportConfig
 
 
+# Standard DNN quantization notation used across all backends.
+# Keys: precision identifier used in configs and CLI args.
+# weight_bits=None / activation_bits=None means that dimension is not quantized.
+SUPPORTED_QUANT_CONFIGS: dict[str, dict] = {
+    "full":  {"weight_bits": None, "activation_bits": None, "description": "No quantization (FP32)"},
+    "w4":    {"weight_bits": 4,    "activation_bits": None, "description": "4-bit weight-only"},
+    "w8":    {"weight_bits": 8,    "activation_bits": None, "description": "8-bit weight-only"},
+    "a8w8":  {"weight_bits": 8,    "activation_bits": 8,    "description": "8-bit activations + 8-bit weights"},
+    "a8w4":  {"weight_bits": 4,    "activation_bits": 8,    "description": "8-bit activations + 4-bit weights"},
+}
+
+
 @dataclass
 class QuantizationPlan:
     """Quantization plan placeholder for future mixed-precision support."""
 
-    global_precision: str = "int4"
+    global_precision: str = "w4"
     layer_precisions: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def build(
         cls,
         model_config: Any | None,
-        requested_precision: str = "int4",
+        requested_precision: str = "w4",
     ) -> "QuantizationPlan":
         _ = model_config
         # TODO: implement per-layer precision logic based on model_config and requested_precision
@@ -40,7 +52,7 @@ class ExecuTorchExportResult:
 class ExecutorchExporterConfig(BackendExportConfig, ABC):
     """Abstract base config shared by backend-specific exporters."""
 
-    precision: str = "int4"
+    precision: str = "w4"
     dynamic_shapes: dict[str, Any] | None = None
 
 
@@ -110,20 +122,20 @@ def build_quantizer(precision: str):
         get_symmetric_quantization_config,
     )
 
-    if precision == "int4":
+    if precision == "w4":
         qconfig = get_symmetric_quantization_config(
             is_per_channel=True,
             is_dynamic=True,
             weight_qmin=-8,
             weight_qmax=7,
         )
-    elif precision == "int8":
+    elif precision == "w8":
         qconfig = get_symmetric_quantization_config(
             is_per_channel=True,
             is_dynamic=True,
         )
     else:
-        raise ValueError(f"Unsupported precision '{precision}'. Use 'int4' or 'int8'.")
+        raise ValueError(f"Unsupported precision '{precision}' for XNNPACK. Use 'w4' or 'w8'.")
 
     return XNNPACKQuantizer().set_global(qconfig)
 
@@ -139,6 +151,9 @@ def dequant_from_exported_state_dict(state_dict: dict[str, torch.Tensor]) -> lis
         scale_key = f"_scale_{suffix}"
         zp_key = f"_zero_point_{suffix}"
         if scale_key not in state_dict:
+            continue
+
+        if int_w.ndim != 2:
             continue
 
         scale = state_dict[scale_key].float()
@@ -353,10 +368,11 @@ def resolve_components_and_wrapper(
     wrapper.eval()
 
     quant_plan = QuantizationPlan.build(model_config, requested_precision=config.precision)
-    if quant_plan.global_precision not in {"int4", "int8", "full"}:
+    if quant_plan.global_precision not in SUPPORTED_QUANT_CONFIGS:
+        valid = ", ".join(f"'{k}'" for k in SUPPORTED_QUANT_CONFIGS)
         raise ValueError(
             f"Unsupported precision '{quant_plan.global_precision}'. "
-            "Use 'int4', 'int8', or 'full'."
+            f"Supported values: {valid}."
         )
     if quant_plan.layer_precisions:
         warnings.warn(

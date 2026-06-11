@@ -155,7 +155,7 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
             attn_output = attention(q, k, v)
         
         # Concatenate heads and project output
-        attn_output = attn_output.transpose(0, 1).view(seq_length, embed_dim).contiguous()
+        attn_output = attn_output.transpose(0, 1).reshape(seq_length, embed_dim)
         output = self.out_proj(attn_output)
         
         return output

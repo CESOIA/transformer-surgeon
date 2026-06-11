@@ -13,6 +13,14 @@ from ..common import (
     resolve_components_and_wrapper,
 )
 
+# Backend-supported quantization configs (subset of common.SUPPORTED_QUANT_CONFIGS).
+# "a8w8" / "a8w4" will be added when activation quantization is implemented.
+QNN_SUPPORTED_QUANT_CONFIGS: dict[str, str] = {
+    "full": "No quantization (FP32)",
+    "w8":   "8-bit weight-only (QuantDtype.use_16a8w, fp16 activations, per-channel linear weights)",
+    "w4":   "4-bit weight-only (QuantDtype.use_16a4w, fp16 activations, per-channel linear weights)",
+}
+
 
 def _is_wrap_with_set_grad_enabled(target: Any) -> bool:
     target_name = getattr(target, "__name__", "")
@@ -192,15 +200,25 @@ def export_with_qnn(
     exported_for_mismatch = None
 
     if quant_plan.global_precision != "full":
-        if quant_plan.global_precision != "int8":
+        if quant_plan.global_precision not in QNN_SUPPORTED_QUANT_CONFIGS:
+            supported = ", ".join(f"'{k}'" for k in QNN_SUPPORTED_QUANT_CONFIGS)
             raise ValueError(
-                "QNN exporter currently supports precision='full' or precision='int8'."
+                f"QNN exporter supports: {supported}. "
+                f"Got '{quant_plan.global_precision}'."
             )
 
-        from executorch.backends.qualcomm.quantizer.quantizer import QnnQuantizer
+        from executorch.backends.qualcomm.quantizer.quantizer import QnnQuantizer, QuantDtype
         from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 
+        _quant_dtype = {
+            "w8": QuantDtype.use_16a8w,
+            "w4": QuantDtype.use_16a4w,
+        }[quant_plan.global_precision]
         quantizer = QnnQuantizer()
+        quantizer.set_default_quant_config(
+            _quant_dtype,
+            is_linear_per_channel=True,
+        )
         prepared = prepare_pt2e(sanitized_module, quantizer)
 
         with torch.no_grad():
