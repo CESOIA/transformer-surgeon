@@ -58,29 +58,13 @@ class Quantizer(Compressor):
         self.config["eps"] = eps
         self.config["granularity"] = granularity
 
-        # Hard-path preconditions: validate and import before iterating parameters.
+        # Hard-path: use torchao's native quantize_() API, bypassing soft-quant.
         if hard:
-            try:
-                from torchao.quantization import Int8Tensor
-            except ImportError as exc:
-                raise ImportError(
-                    "torchao is required for hard quantization. "
-                    "Install it with: pip install torchao"
-                ) from exc
+            _apply_torchao_hard_quantization(module, precision, granularity)
+            return
 
-            if isinstance(precision, int) and precision > 8:
-                raise ValueError(
-                    f"Hard quantization requires precision ≤ 8 (int8 storage); got {precision}."
-                )
-
-            if precision != 8:
-                warnings.warn(
-                    f"Precision {precision!r} is not natively supported by standard torchao; "
-                    "using custom Int8Tensor wrapper."
-                )
-
-        # Single loop: quantize once, then branch on soft vs. hard.
-        if precision and (hard or not soft_applied):
+        # Soft-path: fake-quant via dequantize.
+        if precision and not soft_applied:
             for name, param in module.named_parameters():
                 if name not in ["weight", "weight_2"]:
                     continue
@@ -89,34 +73,21 @@ class Quantizer(Compressor):
                     param.data, precision, eps, granularity
                 )
 
-                if hard:
-                    flat_scale = scale.to(torch.float32).reshape(-1)
-                    scale_shape = (len(flat_scale), 1)
-                    int8_weight = Int8Tensor(
-                        qdata=qdata,
-                        scale=flat_scale.reshape(scale_shape),
-                        block_size=list(param.data.shape),
-                        dtype=param.data.dtype,
-                        zero_point=torch.zeros(scale_shape, dtype=torch.int8),
-                    )
-                    setattr(module, name, nn.Parameter(int8_weight, requires_grad=False))
-
-                else:
-                    qweight = dequantize_fn(qdata, scale)
-                    if sparsity > 0.0:
-                        if sparse_method == "magnitude":
-                            mask = SPARSITY_FUNCTIONS[sparse_method](
-                                param, pruning_ratio=sparsity
-                            )
-                        elif sparse_method == "random":
-                            mask = SPARSITY_FUNCTIONS[sparse_method](
-                                param, pruning_ratio=sparsity
-                            )
-                        else:
-                            raise ValueError(f"Unsupported sparsity method '{sparse_method}'.")
-                        param.data.copy_(qweight * mask + param.data * (~mask))
+                qweight = dequantize_fn(qdata, scale)
+                if sparsity > 0.0:
+                    if sparse_method == "magnitude":
+                        mask = SPARSITY_FUNCTIONS[sparse_method](
+                            param, pruning_ratio=sparsity
+                        )
+                    elif sparse_method == "random":
+                        mask = SPARSITY_FUNCTIONS[sparse_method](
+                            param, pruning_ratio=sparsity
+                        )
                     else:
-                        param.data.copy_(qweight)
+                        raise ValueError(f"Unsupported sparsity method '{sparse_method}'.")
+                    param.data.copy_(qweight * mask + param.data * (~mask))
+                else:
+                    param.data.copy_(qweight)
 
     def restore(self, module):
         # N.B. module argument is not used but required for API consistency with other compressors
@@ -134,6 +105,62 @@ class Quantizer(Compressor):
             f"Quantizer(method='{self.method}', precision={self.precision}, "
             f"sparsity={self.sparsity}, sparse_method='{self.sparse_method}')"
         )
+
+
+def _apply_torchao_hard_quantization(module, precision, granularity: str) -> None:
+    """Apply torchao native weight-only quantization to *module* in-place."""
+    try:
+        from torchao.quantization import (
+            quantize_,
+            Int4WeightOnlyConfig,
+            Int8WeightOnlyConfig,
+            IntxWeightOnlyConfig,
+        )
+        from torchao.quantization.granularity import PerRow, PerTensor, PerAxis
+    except ImportError as exc:
+        raise ImportError(
+            "torchao is required for hard quantization. "
+            "Install it with: pip install torchao"
+        ) from exc
+
+    ao_granularity_row = PerRow()        # per-channel (output dim)
+    ao_granularity_tensor = PerTensor()
+    ao_granularity_axis = PerAxis(axis=0)  # used by IntxWeightOnlyConfig
+
+    per_channel = granularity == "per_channel"
+
+    if precision == "binary":
+        raise ValueError(
+            "Hard quantization does not support 'binary' precision. "
+            "Use soft quantization (hard=False) for binary."
+        )
+
+    if isinstance(precision, int) and precision > 8:
+        raise ValueError(
+            f"Hard quantization requires precision ≤ 8; got {precision}."
+        )
+
+    if precision == 8:
+        config = Int8WeightOnlyConfig(
+            granularity=ao_granularity_row if per_channel else ao_granularity_tensor
+        )
+    elif precision == 4:
+        # Int4WeightOnlyConfig uses group_size-based granularity internally;
+        # per_channel / per_tensor distinction is not exposed. CUDA-only — silently
+        # no-ops on CPU (torchao behavior).
+        config = Int4WeightOnlyConfig()
+    elif isinstance(precision, int) and 2 <= precision <= 7:
+        # IntxWeightOnlyConfig supports arbitrary sub-byte widths but only
+        # PerAxis / PerGroup granularities (not PerRow / PerTensor).
+        torch_dtype = getattr(torch, f"int{precision}")
+        config = IntxWeightOnlyConfig(
+            weight_dtype=torch_dtype,
+            granularity=ao_granularity_axis,
+        )
+    else:
+        raise ValueError(f"Unsupported precision for hard quantization: {precision!r}.")
+
+    quantize_(module, config)
 
 
 ### CONFIGURATION VALIDATORS ###
