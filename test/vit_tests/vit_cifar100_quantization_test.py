@@ -12,6 +12,7 @@ from transformersurgeon import (
     ViTCompressionSchemesManager,
     ViTForImageClassificationCompress,
 )
+from transformersurgeon.blocks import LinearCompressed
 
 # ---------------------------
 # CLI configuration
@@ -163,18 +164,24 @@ class ViTCifar100QuantizationTest(unittest.TestCase):
                 msg=f"Non-finite weights in {scheme.path} after quantization.",
             )
 
+    def _linear_compressed_schemes(self):
+        """Yield (path, module) for every LinearCompressed scheme."""
+        for scheme in self.manager.iter_filtered(criteria="all"):
+            module = scheme.get_module()
+            if isinstance(module, LinearCompressed):
+                yield scheme.path, module
+
     # ------------------------------------------------------------------
     # Activation quantization: hook and attribute checks
     # ------------------------------------------------------------------
 
     @unittest.skipUnless(_activation_quant_enabled, "activation quantization not enabled")
     def test_activation_hooks_registered(self):
-        """Every quantized layer must have exactly one activation fake-quant pre-hook."""
-        missing = []
-        for scheme in self.manager.iter_filtered(criteria="all"):
-            module = scheme.get_module()
-            if not hasattr(module, "_act_quant_hook_handle"):
-                missing.append(scheme.path)
+        """Every LinearCompressed layer must have an activation fake-quant pre-hook."""
+        missing = [
+            path for path, module in self._linear_compressed_schemes()
+            if not hasattr(module, "_act_quant_hook_handle")
+        ]
         self.assertEqual(
             missing, [],
             msg=f"Missing _act_quant_hook_handle on {len(missing)} module(s): {missing[:5]}",
@@ -182,10 +189,8 @@ class ViTCifar100QuantizationTest(unittest.TestCase):
 
     @unittest.skipUnless(_activation_quant_enabled, "activation quantization not enabled")
     def test_activation_quant_attributes_stored(self):
-        """scale, zero_point, precision, scheme must be stored on every quantized layer."""
-        for scheme in self.manager.iter_filtered(criteria="all"):
-            module = scheme.get_module()
-            path = scheme.path
+        """scale, zero_point, precision, scheme must be stored on every LinearCompressed layer."""
+        for path, module in self._linear_compressed_schemes():
             for attr in ("_act_quant_scale", "_act_quant_zero_point",
                          "_act_quant_precision", "_act_quant_scheme"):
                 self.assertTrue(
@@ -195,10 +200,8 @@ class ViTCifar100QuantizationTest(unittest.TestCase):
 
     @unittest.skipUnless(_activation_quant_enabled, "activation quantization not enabled")
     def test_activation_quant_scale_positive(self):
-        """Scale must be a positive finite scalar on every quantized layer."""
-        for scheme in self.manager.iter_filtered(criteria="all"):
-            module = scheme.get_module()
-            path = scheme.path
+        """Scale must be a positive finite tensor on every LinearCompressed layer."""
+        for path, module in self._linear_compressed_schemes():
             scale = module._act_quant_scale
             self.assertIsInstance(scale, torch.Tensor, msg=f"{path}: scale is not a Tensor.")
             self.assertTrue(
@@ -212,10 +215,8 @@ class ViTCifar100QuantizationTest(unittest.TestCase):
 
     @unittest.skipUnless(_activation_quant_enabled, "activation quantization not enabled")
     def test_activation_quant_config_matches_args(self):
-        """Stored precision and scheme must match the CLI arguments on every layer."""
-        for scheme in self.manager.iter_filtered(criteria="all"):
-            module = scheme.get_module()
-            path = scheme.path
+        """Stored precision and scheme must match the CLI arguments on every LinearCompressed layer."""
+        for path, module in self._linear_compressed_schemes():
             self.assertEqual(
                 module._act_quant_precision, args.precision_activation,
                 msg=f"{path}: _act_quant_precision mismatch.",
@@ -227,17 +228,14 @@ class ViTCifar100QuantizationTest(unittest.TestCase):
 
     @unittest.skipUnless(_activation_quant_enabled, "activation quantization not enabled")
     def test_activation_quant_zero_point_range(self):
-        """zero_point must lie in the valid quantization range."""
-        for scheme in self.manager.iter_filtered(criteria="all"):
-            module = scheme.get_module()
-            path = scheme.path
+        """zero_point must lie in the valid quantization range for every LinearCompressed layer."""
+        for path, module in self._linear_compressed_schemes():
             zp = module._act_quant_zero_point
             scheme_name = module._act_quant_scheme
             precision = module._act_quant_precision
             if scheme_name == "symmetric":
-                expected_zp = 0
                 self.assertTrue(
-                    (zp == expected_zp).all(),
+                    (zp == 0).all(),
                     msg=f"{path}: symmetric zero_point must be 0, got {zp}.",
                 )
             else:
