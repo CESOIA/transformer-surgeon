@@ -1,16 +1,18 @@
-import warnings
 import torch
 import torch.nn as nn
 from typing import Union
 
 from .abstract import Compressor
-from .quantization_methods import METHOD_FUNCTIONS
+from .quantization_methods import METHOD_FUNCTIONS, ACT_METHOD_FUNCTIONS
 from .unstructured_pruning_methods import METHOD_FUNCTIONS as SPARSITY_FUNCTIONS
 from .unstructured_pruning import validate_unstructured_pruning_ratio
 
 
 VALID_METHODS = ["vanilla"]
+VALID_ACT_METHODS = ["maxmin"]
 VALID_SPARSE_METHODS = ["magnitude", "random"]
+VALID_ACTIVATION_SCHEMES = ["symmetric", "asymmetric"]
+VALID_GRANULARITIES = ["per_tensor", "per_channel"]
 CALIBRATED_METHOD_DICT = {}
 
 
@@ -23,79 +25,134 @@ class Quantizer(Compressor):
         self.sparse_method = self.config["sparse_method"]
         self.eps = self.config["eps"]
         self.granularity = self.config["granularity"]
+        self.precision_activation = self.config["precision_activation"]
+        self.method_activation = self.config["method_activation"]
+        self.scheme_activation = self.config["scheme_activation"]
         self.calibration_store = None
 
     def set_calibration_store(self, calibration_data):
         self.calibration_store = calibration_data
 
     def needs_calibration(self):
-        if not self._to_compress():
-            return ()
-        return CALIBRATED_METHOD_DICT.get(self.method, ())
+        summaries = list(CALIBRATED_METHOD_DICT.get(self.method, ()))
+        if self.precision_activation != "full":
+            if "activation_range" not in summaries:
+                summaries.append("activation_range")
+        return tuple(summaries)
 
     def apply(self, module, hard=False, soft_applied=False):
-        if not self._to_compress():
-            return
+        precision_activation = self.precision_activation
+        method_activation = self.method_activation
+        scheme_activation = self.scheme_activation
+        validate_precision(precision_activation)
+        validate_activation_method(method_activation)
+        validate_activation_scheme(scheme_activation)
+        self.config["precision_activation"] = precision_activation
+        self.config["method_activation"] = method_activation
+        self.config["scheme_activation"] = scheme_activation
 
-        method = self.method
-        precision = self.precision
-        sparsity = self.sparsity
-        sparse_method = self.sparse_method
-        eps = self.eps
-        granularity = self.granularity
+        if self._to_compress():
+            method = self.method
+            precision = self.precision
+            sparsity = self.sparsity
+            sparse_method = self.sparse_method
+            eps = self.eps
+            granularity = self.granularity
 
-        validate_quantization_method(method)
-        validate_precision(precision)
-        validate_unstructured_pruning_ratio(sparsity)
-        validate_sparse_method(sparse_method)
-        validate_quantization_eps(eps)
-        validate_quantization_granularity(granularity)
+            validate_quantization_method(method)
+            validate_precision(precision)
+            validate_unstructured_pruning_ratio(sparsity)
+            validate_sparse_method(sparse_method)
+            validate_quantization_eps(eps)
+            validate_quantization_granularity(granularity)
 
-        self.config["method"] = method
-        self.config["precision"] = precision
-        self.config["sparsity"] = sparsity
-        self.config["sparse_method"] = sparse_method
-        self.config["eps"] = eps
-        self.config["granularity"] = granularity
+            self.config["method"] = method
+            self.config["precision"] = precision
+            self.config["sparsity"] = sparsity
+            self.config["sparse_method"] = sparse_method
+            self.config["eps"] = eps
+            self.config["granularity"] = granularity
 
-        # Hard-path: use torchao's native quantize_() API, bypassing soft-quant.
-        if hard:
-            _apply_torchao_hard_quantization(module, precision, granularity)
-            return
+            # Hard-path: use torchao's native quantize_() API, bypassing soft-quant.
+            if hard:
+                _apply_torchao_hard_quantization(module, precision, granularity)
+            elif not soft_applied:
+                # Soft-path: fake-quant via dequantize.
+                for name, param in module.named_parameters():
+                    if name not in ["weight", "weight_2"]:
+                        continue
 
-        # Soft-path: fake-quant via dequantize.
-        if precision and not soft_applied:
-            for name, param in module.named_parameters():
-                if name not in ["weight", "weight_2"]:
-                    continue
+                    qdata, scale, dequantize_fn = METHOD_FUNCTIONS[method](
+                        param.data, precision, eps, granularity
+                    )
 
-                qdata, scale, dequantize_fn = METHOD_FUNCTIONS[method](
-                    param.data, precision, eps, granularity
-                )
-
-                qweight = dequantize_fn(qdata, scale)
-                if sparsity > 0.0:
-                    if sparse_method == "magnitude":
-                        mask = SPARSITY_FUNCTIONS[sparse_method](
-                            param, pruning_ratio=sparsity
-                        )
-                    elif sparse_method == "random":
-                        mask = SPARSITY_FUNCTIONS[sparse_method](
-                            param, pruning_ratio=sparsity
-                        )
+                    qweight = dequantize_fn(qdata, scale)
+                    if sparsity > 0.0:
+                        if sparse_method == "magnitude":
+                            mask = SPARSITY_FUNCTIONS[sparse_method](
+                                param, pruning_ratio=sparsity
+                            )
+                        elif sparse_method == "random":
+                            mask = SPARSITY_FUNCTIONS[sparse_method](
+                                param, pruning_ratio=sparsity
+                            )
+                        else:
+                            raise ValueError(f"Unsupported sparsity method '{sparse_method}'.")
+                        param.data.copy_(qweight * mask + param.data * (~mask))
                     else:
-                        raise ValueError(f"Unsupported sparsity method '{sparse_method}'.")
-                    param.data.copy_(qweight * mask + param.data * (~mask))
-                else:
-                    param.data.copy_(qweight)
+                        param.data.copy_(qweight)
+
+        # Activation fake-quant emulation via forward pre-hook.
+        if precision_activation != "full":
+            if self.calibration_store is None or "activation_range" not in self.calibration_store:
+                raise RuntimeError(
+                    "Activation quantization requires calibration data. "
+                    "Run run_compression_calibration() before calling apply()."
+                )
+            act_range = self.calibration_store["activation_range"]
+            act_min = act_range["min"].float()
+            act_max = act_range["max"].float()
+
+            scale, zero_point = ACT_METHOD_FUNCTIONS[method_activation](
+                act_min, act_max, precision_activation, scheme_activation
+            )
+
+            module._act_quant_scale = scale
+            module._act_quant_zero_point = zero_point
+            module._act_quant_precision = precision_activation
+            module._act_quant_method = method_activation
+            module._act_quant_scheme = scheme_activation
+
+            # Remove any previously registered hook before adding a new one.
+            if hasattr(module, "_act_quant_hook_handle"):
+                module._act_quant_hook_handle.remove()
+
+            module._act_quant_hook_handle = module.register_forward_pre_hook(
+                _make_activation_fake_quant_hook(scale, zero_point, precision_activation, scheme_activation)
+            )
 
     def restore(self, module):
-        # N.B. module argument is not used but required for API consistency with other compressors
         self.config["method"] = "vanilla"
         self.config["precision"] = "full"
         self.config["sparsity"] = 0.0
         self.config["sparse_method"] = "magnitude"
         self.config["granularity"] = "per_tensor"
+        self.config["precision_activation"] = "full"
+        self.config["method_activation"] = "maxmin"
+        self.config["scheme_activation"] = "asymmetric"
+
+        if hasattr(module, "_act_quant_hook_handle"):
+            module._act_quant_hook_handle.remove()
+            del module._act_quant_hook_handle
+        for attr in (
+            "_act_quant_scale",
+            "_act_quant_zero_point",
+            "_act_quant_precision",
+            "_act_quant_method",
+            "_act_quant_scheme",
+        ):
+            if hasattr(module, attr):
+                delattr(module, attr)
 
     def _to_compress(self):
         return self.precision != "full"
@@ -103,8 +160,36 @@ class Quantizer(Compressor):
     def __repr__(self):
         return (
             f"Quantizer(method='{self.method}', precision={self.precision}, "
-            f"sparsity={self.sparsity}, sparse_method='{self.sparse_method}')"
+            f"sparsity={self.sparsity}, sparse_method='{self.sparse_method}', "
+            f"method_activation='{self.method_activation}', precision_activation={self.precision_activation}, "
+            f"scheme_activation='{self.scheme_activation}')"
         )
+
+
+def _make_activation_fake_quant_hook(
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    precision: int,
+    scheme: str,
+):
+    """Return a forward pre-hook that fake-quantizes the input activation."""
+    if scheme == "symmetric":
+        qmax = 2 ** (precision - 1) - 1
+        qmin = -qmax
+    else:
+        qmax = 2 ** precision - 1
+        qmin = 0
+
+    zp = zero_point.float()
+    s = scale.float()
+
+    def hook(_, inputs):
+        x = inputs[0]
+        xq = torch.clamp(torch.round(x / s) + zp, qmin, qmax)
+        x_fq = (xq - zp) * s
+        return (x_fq.to(x.dtype),) + inputs[1:]
+
+    return hook
 
 
 def _apply_torchao_hard_quantization(module, precision, granularity: str) -> None:
@@ -170,6 +255,11 @@ def validate_quantization_method(method: str) -> None:
         raise ValueError(f"Quantization method must be one of {VALID_METHODS}, but got '{method}'.")
 
 
+def validate_activation_method(method: str) -> None:
+    if method not in VALID_ACT_METHODS:
+        raise ValueError(f"Activation quantization method must be one of {VALID_ACT_METHODS}, but got '{method}'.")
+
+
 def validate_precision(precision: Union[str, int]) -> None:
     if isinstance(precision, str):
         if precision not in ["full", "binary"]:
@@ -196,18 +286,24 @@ def validate_quantization_eps(eps: float) -> None:
     if eps <= 0:
         raise ValueError(f"Quantization eps must be positive, but got {eps}.")
 
-VALID_GRANULARITIES = ["per_tensor", "per_channel"]
-
 def validate_quantization_granularity(granularity: str) -> None:
     if granularity not in VALID_GRANULARITIES:
         raise ValueError(
             f"Quantization granularity must be one of {VALID_GRANULARITIES}, but got '{granularity}'."
         )
 
+def validate_activation_scheme(scheme: str) -> None:
+    if scheme not in VALID_ACTIVATION_SCHEMES:
+        raise ValueError(
+            f"Activation scheme must be one of {VALID_ACTIVATION_SCHEMES}, but got '{scheme}'."
+        )
+
 __all__ = [
     "Quantizer",
     "validate_quantization_method",
+    "validate_activation_method",
     "validate_precision",
     "validate_sparse_method",
     "validate_quantization_granularity",
+    "validate_activation_scheme",
 ]
