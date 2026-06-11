@@ -39,8 +39,8 @@ def parse_args():
         "--precision",
         type=str,
         default="full",
-        choices=["full", "int8"],
-        help="Global quant precision",
+        choices=["full", "w8"],
+        help="Global quant precision (w8 = 8-bit weight-only)",
     )
     parser.add_argument(
         "--soc-model",

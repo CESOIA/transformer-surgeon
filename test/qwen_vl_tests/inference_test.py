@@ -1,12 +1,15 @@
+import sys
+from pathlib import Path
 import torch
 from PIL import Image
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from test_messages import messages
 from qwen_vl_utils import process_vision_info
-import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test_data"))
+from test_messages import messages
 
 ### TEST CONFIGURATION ###
 model_type = "qwen2_5_vl_c" 

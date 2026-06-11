@@ -106,10 +106,10 @@ def main():
 
         manager = DistilBertCompressionSchemesManager(model)
 
-        manager.set_pruning_ratio_all(args.pruning_ratio, verbose=VERBOSE)
-        manager.set_pruning_mode_all(args.pruning_mode, verbose=VERBOSE)
+        manager.set("pruning", "ratio", args.pruning_ratio, verbose=VERBOSE)
+        manager.set("pruning", "mode", args.pruning_mode, verbose=VERBOSE)
 
-        manager.apply_all(hard=False, verbose=VERBOSE)
+        manager.apply(hard=False, verbose=VERBOSE)
         manager.update_config()
 
     dataloader = build_dataloader(args.task, tokenizer, args.batch_size)
