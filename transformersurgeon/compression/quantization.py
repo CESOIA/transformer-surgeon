@@ -101,6 +101,7 @@ class Quantizer(Compressor):
                         param.data.copy_(qweight * mask + param.data * (~mask))
                     else:
                         param.data.copy_(qweight)
+                module._soft_quant_precision = precision
 
         # Activation fake-quant emulation via forward pre-hook.
         if precision_activation != "full":
@@ -150,6 +151,8 @@ class Quantizer(Compressor):
             "_act_quant_precision",
             "_act_quant_method",
             "_act_quant_scheme",
+            "_soft_quant_precision",
+            "_torchao_precision",
         ):
             if hasattr(module, attr):
                 delattr(module, attr)
@@ -246,6 +249,19 @@ def _apply_torchao_hard_quantization(module, precision, granularity: str) -> Non
         raise ValueError(f"Unsupported precision for hard quantization: {precision!r}.")
 
     quantize_(module, config)
+
+    try:
+        from torchao.dtypes import AffineQuantizedTensor
+    except ImportError:
+        AffineQuantizedTensor = None
+
+    for m in module.modules():
+        if (
+            isinstance(m, nn.Linear)
+            and AffineQuantizedTensor is not None
+            and isinstance(m.weight, AffineQuantizedTensor)
+        ):
+            m._torchao_precision = precision
 
 
 ### CONFIGURATION VALIDATORS ###

@@ -1,11 +1,55 @@
 import warnings
 import copy
 
+import torch.nn as nn
+
 from ..blocks import TransformerDecoder
 from ..blocks.encoder import TransformerEncoder
 from ..blocks.indexing import CUSTOM_DECODER_INDEXING, CUSTOM_ENCODER_INDEXING
 from ..blocks.config import CustomDecoderConfigCompress, CustomEncoderConfigCompress
 from .utils import get_submodule, flatten_index_paths
+
+
+def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> None:
+    """Copy old_layer's state dict into new_layer, dequantizing AffineQuantizedTensors first.
+
+    If a weight in old_layer is a torchao AffineQuantizedTensor, the float dequantized
+    value is copied instead, and _torchao_precision is propagated to new_layer so that
+    the export pipeline can still detect and re-quantize it correctly.
+    """
+    try:
+        from torchao.dtypes import AffineQuantizedTensor
+    except ImportError:
+        AffineQuantizedTensor = None
+
+    if AffineQuantizedTensor is None:
+        new_layer.load_state_dict(old_layer.state_dict())
+        return
+
+    # Build a plain float state dict, dequantizing any quantized weights.
+    plain_state = {}
+    for key, value in old_layer.state_dict().items():
+        if isinstance(value, AffineQuantizedTensor):
+            plain_state[key] = value.dequantize()
+        else:
+            plain_state[key] = value
+    new_layer.load_state_dict(plain_state)
+
+    # Propagate compression metadata to new_layer's child modules.
+    new_modules = dict(new_layer.named_modules())
+    for name, old_submod in old_layer.named_modules():
+        if not isinstance(old_submod, nn.Linear):
+            continue
+        if not hasattr(old_submod, '_torchao_precision'):
+            continue
+        new_submod = new_modules.get(name)
+        if new_submod is None:
+            continue
+        new_submod._torchao_precision = old_submod._torchao_precision
+        # Stash the scale so extract_layer_quant_info can find it after dequantization.
+        if isinstance(old_submod.weight, AffineQuantizedTensor):
+            new_submod._torchao_scale = old_submod.weight.tensor_impl.scale.detach().clone()
+            new_submod._torchao_per_channel = new_submod._torchao_scale.numel() > 1
 
 
 def _flatten_layer_matching(indexing, source_paths):
@@ -219,7 +263,7 @@ def convert_for_export(model, options=None, verbose=False):
                 new_path = path_template.format(i=i, path=new_path)
                 old_layer = get_submodule(model, old_path)
                 new_layer = get_submodule(new_model, new_path)
-                new_layer.load_state_dict(old_layer.state_dict())
+                _load_state_dict_dequantized(old_layer, new_layer)
                 if verbose:
                     print("Transfering parameters:", old_path, "->", new_path)
                     for pname, param in old_layer.named_parameters():
@@ -238,7 +282,7 @@ def convert_for_export(model, options=None, verbose=False):
                     print("Transfering extra layer parameters:", old_path, "->", new_path)
                 old_layer = get_submodule(model, old_path)
                 new_layer = get_submodule(new_model, new_path)
-                new_layer.load_state_dict(old_layer.state_dict())
+                _load_state_dict_dequantized(old_layer, new_layer)
 
         # Attach converted indexing so manager can be used directly on converted graph.
         new_model.indexing = converted_indexing

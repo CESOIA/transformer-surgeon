@@ -73,6 +73,12 @@ def export_to_backend(
         convert_options=config.convert_options,
         verbose=config.verbose,
     )
+
+    if getattr(config, "float_type", None) is not None:
+        embedding = embedding.to(config.float_type)
+        decoder = decoder.to(config.float_type)
+        final_layer = final_layer.to(config.float_type)
+
     normalized_model_or_graph = {
         "embedding": embedding,
         "decoder": decoder,
