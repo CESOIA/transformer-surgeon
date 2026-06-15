@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument(
         "--pte-path",
         type=str,
-        default="artifacts/export_hf_xnnpack_full.pte",
+        default="artifacts/export_hf_xnnpack_auto.pte",
         help="Path to exported .pte file",
     )
     parser.add_argument(
