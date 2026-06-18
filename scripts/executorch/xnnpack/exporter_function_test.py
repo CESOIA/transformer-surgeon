@@ -1,7 +1,11 @@
 import argparse
 import os
+import random
 
 import torch
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
@@ -93,18 +97,80 @@ def parse_args():
         choices=["per_channel", "per_tensor"],
         help="Weight quantization granularity for MLP layers",
     )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Enable static activation quantization calibrated on WikiText-2 (requires --quant-mlp)",
+    )
+    parser.add_argument(
+        "--act-precision",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Integer bit-width for activation quantization (used with --calibrate)",
+    )
+    parser.add_argument(
+        "--num-calibration-samples",
+        type=int,
+        default=128,
+        help="Number of WikiText-2 token chunks to use for activation calibration",
+    )
+    parser.add_argument(
+        "--calibration-seq-len",
+        type=int,
+        default=512,
+        help="Sequence length of each calibration chunk",
+    )
     return parser.parse_args()
 
 
-def quantize_mlp_with_manager(model, args):
-    """Instantiate a compression manager and apply quantization to MLP layers only."""
+def _build_pte_stem(args: argparse.Namespace) -> str:
+    if args.quant_mlp:
+        act_tag = f"_a{args.act_precision}" if args.calibrate else ""
+        return f"qwen2_{args.backend}_w{args.quant_precision}{act_tag}_{args.quant_mode}"
+    return f"qwen2_{args.backend}_full"
+
+
+def _build_wikitext_calibration_loader(
+    tokenizer,
+    num_samples: int = 128,
+    seq_len: int = 512,
+    seed: int = 42,
+) -> DataLoader:
+    raw = load_dataset(
+        "EleutherAI/wikitext_document_level",
+        "wikitext-2-raw-v1",
+        split="train",
+    )
+    texts = [t for t in raw["page"] if isinstance(t, str) and len(t) > 0]
+    corpus = "\n\n".join(texts)
+
+    token_ids = tokenizer(corpus, truncation=False, padding=False,
+                          return_attention_mask=False)["input_ids"]
+
+    max_samples = len(token_ids) // seq_len
+    actual = min(num_samples, max_samples)
+
+    rng = random.Random(seed)
+    examples = []
+    for _ in range(actual):
+        start = rng.randint(0, len(token_ids) - seq_len - 1)
+        examples.append({
+            "input_ids": torch.tensor(token_ids[start:start + seq_len], dtype=torch.long),
+            "attention_mask": torch.ones(seq_len, dtype=torch.long),
+        })
+
+    return DataLoader(examples, batch_size=1, shuffle=False)
+
+
+def quantize_mlp_with_manager(model, args, calibration_loader=None):
+    act_info = f", activation=a{args.act_precision}" if calibration_loader is not None else ""
     print(
         f"Quantizing MLP layers: precision=w{args.quant_precision}, "
-        f"mode={args.quant_mode}, granularity={args.granularity}"
+        f"mode={args.quant_mode}, granularity={args.granularity}{act_info}"
     )
     manager = Qwen2CompressionSchemesManager(model)
 
-    # Set quantization parameters for the mlp subblock only.
     criteria = ["mlp"]
     manager.set("quantization", "precision", args.quant_precision, criteria=criteria)
     manager.set("quantization", "method", "vanilla", criteria=criteria)
@@ -112,6 +178,10 @@ def quantize_mlp_with_manager(model, args):
     manager.set("quantization", "sparsity", 0.0, criteria=criteria)
     manager.set("quantization", "sparse_method", "magnitude", criteria=criteria)
     manager.set("quantization", "eps", 1e-6, criteria=criteria)
+
+    if calibration_loader is not None:
+        manager.set("quantization", "precision_activation", args.act_precision, criteria=criteria)
+        manager.set_calibration_data(calibration_loader)
 
     hard = args.quant_mode == "hard"
     manager.apply(hard=hard, criteria=criteria, verbose=args.verbose)
@@ -135,7 +205,16 @@ def main():
 
     # --- Optional MLP quantization via manager ---
     if args.quant_mlp:
-        quantize_mlp_with_manager(model, args)
+        calibration_loader = None
+        if args.calibrate:
+            print(f"Building WikiText-2 calibration loader ({args.num_calibration_samples} samples, seq_len={args.calibration_seq_len})")
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+            calibration_loader = _build_wikitext_calibration_loader(
+                tokenizer,
+                num_samples=args.num_calibration_samples,
+                seq_len=args.calibration_seq_len,
+            )
+        quantize_mlp_with_manager(model, args, calibration_loader=calibration_loader)
 
     if args.mode == "hf":
         model_input = model
@@ -152,11 +231,7 @@ def main():
             "config": model.config,
         }
 
-    quant_tag = f"mlpq{args.quant_precision}{args.quant_mode}" if args.quant_mlp else "auto"
-    output_path = os.path.join(
-        args.out_dir,
-        f"export_{args.mode}_{args.backend}_{quant_tag}.pte",
-    )
+    output_path = os.path.join(args.out_dir, f"{_build_pte_stem(args)}.pte")
 
     # None = preserve each component's existing dtype (enables mixed float precision).
     export_float_type = _DTYPE_MAP[args.float_type] if args.float_type else None

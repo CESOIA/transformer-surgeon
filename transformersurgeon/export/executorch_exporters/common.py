@@ -57,11 +57,12 @@ _PRECISION_TO_QRANGE: dict[int, dict[str, int]] = {
     8: {"weight_qmin": -127, "weight_qmax": 127},
 }
 
-# Denominator for converting a per-channel scale back to observer min/max.
-# Derived from (weight_qmax - weight_qmin) / 2 for symmetric quantization.
+# Denominator for converting a per-channel torchao scale back to observer min/max,
+# chosen to match the PT2E observer's own formula: (weight_qmax - weight_qmin) / 2.
+# Injection sets max_abs = scale * denom so the observer reproduces pt2e_scale = scale exactly.
 _PRECISION_TO_EFFECTIVE_DENOM: dict[int, float] = {
-    4: 7.5,
-    8: 127.0,
+    4: 7.5,   # (7 - (-8)) / 2
+    8: 127.0, # (127 - (-127)) / 2
 }
 
 # Human-readable precision identifiers shared across backends and CLI args.
@@ -320,10 +321,10 @@ def build_quantizer(precision: str):
 
     if precision == "w4":
         qconfig = get_symmetric_quantization_config(
-            is_per_channel=True, is_dynamic=True, weight_qmin=-8, weight_qmax=7,
+            is_per_channel=True, is_dynamic=False, weight_qmin=-8, weight_qmax=7,
         )
     elif precision == "w8":
-        qconfig = get_symmetric_quantization_config(is_per_channel=True, is_dynamic=True)
+        qconfig = get_symmetric_quantization_config(is_per_channel=True, is_dynamic=False)
     else:
         raise ValueError(f"Unsupported precision '{precision}' for XNNPACK. Use 'w4' or 'w8'.")
 
@@ -355,7 +356,7 @@ def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
             )
             continue
 
-        is_dynamic = info["act_scale"] is None  # False → static (act + weight), True → weight-only
+        is_dynamic = info["act_scale"] is None  # True → weight-only (fp activations); False → static (calibrated activations)
         qconfig = get_symmetric_quantization_config(
             is_per_channel=info["per_channel"],
             is_dynamic=is_dynamic,
@@ -370,29 +371,80 @@ def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
 # PT2E observer scale injection
 # ---------------------------------------------------------------------------
 
+def _layer_names_from_observer(
+    obs_node: torch.fx.Node,
+    layer_info: dict[str, dict[str, Any]],
+    stop_at_first: bool = False,
+    _diagnosed: list | None = None,
+) -> list[str]:
+    """Walk downstream from an observer node and collect layer names from all reachable
+    linear ops via nn_module_stack metadata.
+
+    stop_at_first=True returns after the first linear found (weight observers always
+    feed exactly one linear). stop_at_first=False collects all reachable linears,
+    needed for activation observers shared by multiple projections (e.g. gate+up).
+    """
+    _linear_targets = {
+        getattr(torch.ops.aten.linear, 'default', None),
+        getattr(torch.ops.aten.mm, 'default', None),
+        getattr(torch.ops.aten.addmm, 'default', None),
+    } - {None}
+
+    found: list[str] = []
+    visited: set[torch.fx.Node] = {obs_node}
+    frontier = list(obs_node.users)
+
+    for depth in range(6):
+        next_frontier: list[torch.fx.Node] = []
+        for n in frontier:
+            if n in visited:
+                continue
+            visited.add(n)
+            if n.op == 'call_function' and n.target in _linear_targets:
+                stack = n.meta.get('nn_module_stack', {})
+                if _diagnosed is not None and not _diagnosed:
+                    _diagnosed.append({
+                        'obs_node': obs_node.name,
+                        'linear_node': n.name,
+                        'linear_target': str(n.target),
+                        'depth': depth,
+                        'stack_keys': list(stack.keys()),
+                        'stack_values': [(str(v) if not isinstance(v, tuple) else v) for v in stack.values()],
+                    })
+                for _, (qname, _type) in reversed(list(stack.items())):
+                    if qname in layer_info:
+                        found.append(qname)
+                        break
+                if stop_at_first and found:
+                    return found
+                # Don't descend past the linear node.
+            else:
+                next_frontier.extend(n.users)
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    return found
+
+
 def inject_scales_into_pt2e_observers(
     prepared_model: nn.Module,
     layer_info: dict[str, dict[str, Any]],
 ) -> int:
-    """Bypass calibration for hard-quantised layers by injecting known scales.
+    """Inject pre-computed scales into PT2E observer modules.
 
-    After prepare_pt2e + calibration forward pass, PT2E has populated every
-    observer with statistics from the (dequantised) float weights.  For hard-
-    quantised layers we override those statistics with the exact torchao scales
-    so that convert_pt2e reproduces the original quantisation without error.
-    Soft-quantised layers keep the calibration-derived values.
-
-    Also injects stored activation calibration values into the paired
-    activation observers for layers that have act_scale set.
+    Identifies each observer by tracing downstream to the nearest linear op and
+    reading the layer name from nn_module_stack (avoids torch.export's flattened
+    attribute naming). Weight observers (input is a get_attr) receive torchao
+    scales for hard-quantised layers. Activation observers receive the scales
+    computed by the transformer-surgeon calibration manager.
 
     Returns the total number of observer modules overridden.
     """
-    try:
-        from torch.ao.quantization.observer import PerChannelMinMaxObserver, MinMaxObserver
-        _observer_types = (PerChannelMinMaxObserver, MinMaxObserver)
-    except ImportError:
-        warnings.warn("Could not import PT2E observer types; scale injection skipped.", stacklevel=2)
-        return 0
+    # Duck-type observer detection: every PT2E observer implements calculate_qparams,
+    # regardless of whether it comes from torchao or torch.ao.quantization.
+    def _is_observer(m: nn.Module) -> bool:
+        return callable(getattr(m, 'calculate_qparams', None))
 
     hard_layers = {k for k, v in layer_info.items() if v["hard"] and v["scale"] is not None}
     act_layers  = {k for k, v in layer_info.items() if v.get("act_scale") is not None}
@@ -402,99 +454,84 @@ def inject_scales_into_pt2e_observers(
     overridden   = 0
     matched_hard = set()
     matched_act  = set()
+    _diag: list = []
 
     for node in prepared_model.graph.nodes:
         if node.op != 'call_module':
             continue
 
-        # We only care about observer modules.
         try:
             submod = prepared_model.get_submodule(node.target)
         except AttributeError:
             continue
-        if not isinstance(submod, _observer_types):
+        if not _is_observer(submod):
             continue
 
-        # Weight observers have a get_attr node (the weight tensor) as their input.
-        weight_node = node.args[0] if node.args else None
-        if weight_node is None or weight_node.op != 'get_attr':
-            continue
+        input_node = node.args[0] if node.args else None
+        is_weight_obs = input_node is not None and input_node.op == 'get_attr'
 
-        # Strip ".weight" suffix to recover the layer path (e.g. "decoder.blocks.0.mlp.gate_proj").
-        parts = weight_node.target.split('.')
-        if parts[-1] != 'weight':
-            continue
-        layer_name = '.'.join(parts[:-1])
-
-        info = layer_info.get(layer_name)
-        if info is None:
-            continue
-
-        # Override weight observer min/max with exact torchao scales.
-        if layer_name in hard_layers:
-            overridden += _inject_weight_observer(submod, info)
-            matched_hard.add(layer_name)
-
-        # Find and override the paired activation observer for this layer.
-        # The activation observer feeds into the same downstream op as the weight observer.
-        if layer_name in act_layers and layer_name not in matched_act:
-            if _inject_paired_act_observer(node, prepared_model, submod, info, _observer_types):
+        if is_weight_obs:
+            names = _layer_names_from_observer(node, layer_info, stop_at_first=True, _diagnosed=_diag)
+            if names and names[0] in hard_layers:
+                _inject_weight_observer(submod, layer_info[names[0]])
                 overridden += 1
-                matched_act.add(layer_name)
+                matched_hard.add(names[0])
+        else:
+            # Activation observer may be shared across multiple linears (e.g. gate+up in gated MLP).
+            names = _layer_names_from_observer(node, layer_info, stop_at_first=False, _diagnosed=_diag)
+            injected = False
+            for lname in names:
+                if lname in act_layers and lname not in matched_act:
+                    if not injected:
+                        _inject_act_observer(submod, layer_info[lname])
+                        overridden += 1
+                        injected = True
+                    matched_act.add(lname)
 
-    _warn_unmatched(hard_layers - matched_hard, "weight")
-    _warn_unmatched(act_layers  - matched_act,  "activation")
+    unmatched_hard = hard_layers - matched_hard
+    if unmatched_hard:
+        if _diag:
+            import pprint
+            print("[inject_scales diagnostic] first observer→linear sample:")
+            pprint.pprint(_diag[0])
+        raise RuntimeError(
+            f"Could not inject weight scales into PT2E observers for layers: {sorted(unmatched_hard)}. "
+            "The observer graph structure may have changed — check _layer_name_from_observer."
+        )
+    unmatched_act = act_layers - matched_act
+    if unmatched_act:
+        raise RuntimeError(
+            f"Could not inject activation scales into PT2E observers for layers: {sorted(unmatched_act)}. "
+            "The observer graph structure may have changed — check _layer_name_from_observer."
+        )
 
     return overridden
 
 
-def _inject_weight_observer(observer: nn.Module, info: dict) -> int:
-    """Set observer min/max from stored torchao scale. Returns 1 on success, 0 on skip."""
-    denom = _PRECISION_TO_EFFECTIVE_DENOM.get(info["precision"])
-    if denom is None:
-        return 0
+def _inject_weight_observer(observer: nn.Module, info: dict) -> None:
+    """Patch observer.calculate_qparams to return the exact torchao scale.
 
-    # Symmetric quantization: min = -scale * denom, max = scale * denom.
-    # Setting these values causes convert_pt2e to reproduce the exact same scale.
-    max_abs = info["scale"].reshape(-1).float() * denom
-    if not info["per_channel"]:
-        max_abs = max_abs.squeeze()
-
-    observer.min_vals = -max_abs
-    observer.max_vals = max_abs
-    return 1
-
-
-def _inject_paired_act_observer(
-    weight_obs_node: torch.fx.Node,
-    prepared_model: nn.Module,
-    weight_obs_submod: nn.Module,
-    info: dict,
-    observer_types: tuple,
-) -> bool:
-    """Find the activation observer paired to weight_obs_node and inject calibration values.
-
-    The pairing heuristic: both the weight observer and the activation observer
-    feed into the same downstream op (the quantised linear computation).
-
-    Returns True if the activation observer was found and updated.
+    Setting min_val/max_val and relying on calculate_qparams to recover the
+    scale via (max_val - min_val) / (qmax - qmin) loses precision for some
+    float16 scales due to floating-point rounding in the multiply-divide
+    round-trip.  Directly overriding calculate_qparams avoids this entirely.
     """
-    for downstream_op in weight_obs_node.users:
-        for arg in downstream_op.args:
-            if not isinstance(arg, torch.fx.Node) or arg is weight_obs_node:
-                continue
-            if arg.op != 'call_module':
-                continue
-            try:
-                act_submod = prepared_model.get_submodule(arg.target)
-            except AttributeError:
-                continue
-            if not isinstance(act_submod, observer_types):
-                continue
-            # Found the activation observer — inject stored calibration values.
-            _inject_act_observer(act_submod, info)
-            return True
-    return False
+    if info["precision"] not in _PRECISION_TO_EFFECTIVE_DENOM:
+        return
+    qrange = _PRECISION_TO_QRANGE[info["precision"]]
+    scale = info["scale"].reshape(-1).float()
+    zero_point = torch.zeros(scale.shape, dtype=torch.int32)
+    if not info["per_channel"]:
+        scale = scale.squeeze()
+        zero_point = zero_point.squeeze()
+
+    _scale_ref = scale
+    _zp_ref = zero_point
+
+    def _patched_calculate_qparams():
+        return _scale_ref, _zp_ref
+
+    observer.calculate_qparams = _patched_calculate_qparams
 
 
 def _inject_act_observer(observer: nn.Module, info: dict) -> None:
@@ -518,29 +555,17 @@ def _inject_act_observer(observer: nn.Module, info: dict) -> None:
     min_val = (qmin - zp) * s
     max_val = (qmax - zp) * s
 
-    # PerChannelMinMaxObserver uses min_vals/max_vals; MinMaxObserver uses min_val/max_val.
-    if hasattr(observer, 'min_vals'):
-        observer.min_vals = min_val
-        observer.max_vals = max_val
-    else:
-        observer.min_val = min_val
-        observer.max_val = max_val
-
-
-def _warn_unmatched(unmatched: set[str], kind: str) -> None:
-    if unmatched:
-        warnings.warn(
-            f"Could not match PT2E {kind} observers for layers: {sorted(unmatched)}. "
-            "Calibration-derived values will be used instead.",
-            stacklevel=3,
-        )
+    observer.min_val = min_val
+    observer.max_val = max_val
 
 
 # ---------------------------------------------------------------------------
 # Post-export checks
 # ---------------------------------------------------------------------------
 
-def dequant_from_exported_state_dict(state_dict: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+def dequant_from_exported_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> list[torch.Tensor]:
     """Reconstruct dequantized weight tensors from a PT2E exported state dict.
 
     PT2E stores quantised weights as _frozen_paramN (int8) alongside
@@ -576,6 +601,14 @@ def find_weight_mismatches(
     matches and whose absolute error exceeds eps.  Shape-based matching is
     approximate but sufficient for a sanity check.
     """
+    # Detect the model's native dtype from regular (non-quantized) float parameters.
+    # This determines the precision at which torchao dequantizes INT4 weights.
+    compare_dtype = torch.float32
+    for _, tensor in wrapper.state_dict().items():
+        if tensor.ndim >= 2 and type(tensor) is torch.Tensor and tensor.is_floating_point():
+            compare_dtype = tensor.dtype
+            break
+
     original_candidates = [
         (name, tensor.detach().float())
         for name, tensor in wrapper.state_dict().items()
@@ -593,16 +626,23 @@ def find_weight_mismatches(
         if not same_shape:
             continue
 
-        # Pick the original weight with the smallest absolute error (best match by shape).
+        # Compare at the model's native dtype so torchao float16/float32 dequantization
+        # and our float32 reconstruction are evaluated at the same precision.
+        dq_cmp = dq.to(compare_dtype).float()
         best_name, best_max, best_mean = None, None, None
         for name, t in same_shape:
-            err      = (t - dq).abs()
+            err      = (t.to(compare_dtype).float() - dq_cmp).abs()
             max_err  = float(err.max().item())
             mean_err = float(err.mean().item())
             if best_max is None or max_err < best_max:
                 best_name, best_max, best_mean = name, max_err, mean_err
 
-        if best_max is not None and best_max > eps:
+        # Use mean_abs_err to detect systematic scale injection failures.
+        # max_abs_err catches at most a few boundary elements off by 1 quant step
+        # (e.g. torchao INT8 uses qmin=-128 while XNNPACK uses qmin=-127), which
+        # results in mean≈0 even when max≈1 step.  A real scale error affects
+        # most elements and produces a large mean.
+        if best_mean is not None and best_mean > eps:
             mismatches.append({
                 "matched_weight": best_name,
                 "max_abs_err":    best_max,
@@ -699,10 +739,10 @@ def finalize_export_result(
         )
 
     if mismatches:
-        worst = max(mismatches, key=lambda x: x["max_abs_err"])
+        worst = max(mismatches, key=lambda x: x["mean_abs_err"])
         warnings.warn(
             f"Weight mismatch above eps: count={len(mismatches)}, "
-            f"worst={worst['matched_weight']} max_abs_err={worst['max_abs_err']:.6g} "
+            f"worst={worst['matched_weight']} mean_abs_err={worst['mean_abs_err']:.6g} "
             f"(eps={weight_mismatch_eps:.6g})",
             stacklevel=2,
         )
