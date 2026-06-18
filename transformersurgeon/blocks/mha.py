@@ -23,35 +23,79 @@ def attention(query, key, value, attn_mask=None):
     _, kv_head_num,       _ = key.size()
     group_size = q_head_num // kv_head_num
 
+    dtype = query.dtype
+    scale = 1.0 / math.sqrt(head_dim)
+
+    # -------------------------------------------------------------------------
+    # CURRENT PATH: materialize GQA expansion before matmul.
+    # Avoids this block if switching to einsum or broadcasting alternatives below.
+    # -------------------------------------------------------------------------
     # expand key, value for possible GQA
     # key   = key.repeat_interleave(group_size, dim=1)    # (seq_length, q_head_num, head_dim)
     # value = value.repeat_interleave(group_size, dim=1)  # (seq_length, q_head_num, head_dim)
     key   = key.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
-    value   = value.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
-
-    dtype = query.dtype
+    value = value.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
 
     # Swap head and sequence dimensions for attention computation
-    query = query.transpose(0, 1)
-    key   = key.transpose(0, 1)
-    value = value.transpose(0, 1)
+    query = query.transpose(0, 1)                        # (q_head_num, seq_len, head_dim)
+    key   = key.transpose(0, 1)                          # (q_head_num, kv_len, head_dim)
+    value = value.transpose(0, 1)                        # (q_head_num, kv_len, head_dim)
 
-    # Scaled QK^T
-    scale = 1.0 / math.sqrt(head_dim)
-    scores = torch.matmul(query, key.transpose(-2, -1))*scale
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale  # (q_head_num, seq_len, kv_len)
 
-    # Generate negative causal mask
     if attn_mask is not None:
-        # Mask the future positions
-        scores = scores + attn_mask # Add large negative values for masking
+        scores = scores + attn_mask
 
-    # Softmax
     scores = torch.nn.functional.softmax(scores, dim=-1)
 
-    # Project the values over the scores
-    attn_output = torch.matmul(scores.to(dtype), value)  # (kv_head_num, group_size, seq_length, head_dim)
+    attn_output = torch.matmul(scores.to(dtype), value)  # (q_head_num, seq_len, head_dim)
+    # -------------------------------------------------------------------------
+    # END CURRENT PATH
+    # -------------------------------------------------------------------------
 
-    return attn_output.to(dtype)
+    # -------------------------------------------------------------------------
+    # ALTERNATIVE 1 — einsum GQA (no KV materialization).
+    # To use: comment out the CURRENT PATH block above and uncomment this block.
+    # -------------------------------------------------------------------------
+    # query = query.transpose(0, 1).reshape(kv_head_num, group_size, -1, head_dim)  # (kv_heads, group, seq, head_dim)
+    # key   = key.transpose(0, 1)    # (kv_heads, kv_len, head_dim)
+    # value = value.transpose(0, 1)  # (kv_heads, kv_len, head_dim)
+    #
+    # scores = torch.einsum("hgsd,hkd->hgsk", query, key) * scale  # (kv_heads, group, seq, kv_len)
+    #
+    # if attn_mask is not None:
+    #     scores = scores + attn_mask.unsqueeze(1)  # broadcast over group dim
+    #
+    # scores = torch.nn.functional.softmax(scores, dim=-1)
+    #
+    # attn_output = torch.einsum("hgsk,hkd->hgsd", scores.to(dtype), value)  # (kv_heads, group, seq, head_dim)
+    # attn_output = attn_output.reshape(q_head_num, -1, head_dim)  # (q_heads, seq, head_dim)
+    # -------------------------------------------------------------------------
+    # END ALTERNATIVE 1
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # ALTERNATIVE 2 — broadcasting GQA (expand without reshape, avoids copy).
+    # To use: comment out the CURRENT PATH block above and uncomment this block.
+    # -------------------------------------------------------------------------
+    # query = query.transpose(0, 1).reshape(kv_head_num, group_size, -1, head_dim)  # (kv_heads, group, seq, head_dim)
+    # key   = key.transpose(0, 1).unsqueeze(1)    # (kv_heads, 1, kv_len, head_dim)
+    # value = value.transpose(0, 1).unsqueeze(1)  # (kv_heads, 1, kv_len, head_dim)
+    #
+    # scores = torch.matmul(query, key.transpose(-2, -1)) * scale  # (kv_heads, group, seq, kv_len) via broadcast
+    #
+    # if attn_mask is not None:
+    #     scores = scores + attn_mask.unsqueeze(1)  # broadcast over group dim
+    #
+    # scores = torch.nn.functional.softmax(scores, dim=-1)
+    #
+    # attn_output = torch.matmul(scores.to(dtype), value)   # (kv_heads, group, seq, head_dim) via broadcast
+    # attn_output = attn_output.reshape(q_head_num, -1, head_dim)  # (q_heads, seq, head_dim)
+    # -------------------------------------------------------------------------
+    # END ALTERNATIVE 2
+    # -------------------------------------------------------------------------
+
+    return attn_output.to(dtype)  # (seq_len, q_head_num, head_dim)
 
 class MHABase(torch.nn.Module):
     def __init__(
