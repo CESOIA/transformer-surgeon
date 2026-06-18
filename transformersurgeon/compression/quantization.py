@@ -118,8 +118,8 @@ class Quantizer(Compressor):
                 act_min, act_max, precision_activation, scheme_activation
             )
 
-            module._act_quant_scale = scale
-            module._act_quant_zero_point = zero_point
+            module.register_buffer("_act_quant_scale", scale)
+            module.register_buffer("_act_quant_zero_point", zero_point)
             module._act_quant_precision = precision_activation
             module._act_quant_method = method_activation
             module._act_quant_scheme = scheme_activation
@@ -195,12 +195,25 @@ def _make_activation_fake_quant_hook(
     return hook
 
 
+def _extract_aqt_scale(w: torch.Tensor) -> torch.Tensor | None:
+    """Extract the quantization scale from any torchao quantized weight tensor.
+
+    Tries multiple attribute paths to handle old AffineQuantizedTensor (tensor_impl.scale)
+    and new-style subclasses (direct .scale attribute).
+    """
+    if hasattr(w, 'tensor_impl') and hasattr(w.tensor_impl, 'scale'):
+        return w.tensor_impl.scale.detach().clone()
+    scale = getattr(w, 'scale', None)
+    if isinstance(scale, torch.Tensor):
+        return scale.detach().clone()
+    return None
+
+
 def _apply_torchao_hard_quantization(module, precision, granularity: str) -> None:
     """Apply torchao native weight-only quantization to *module* in-place."""
     try:
         from torchao.quantization import (
             quantize_,
-            Int4WeightOnlyConfig,
             Int8WeightOnlyConfig,
             IntxWeightOnlyConfig,
         )
@@ -232,14 +245,9 @@ def _apply_torchao_hard_quantization(module, precision, granularity: str) -> Non
         config = Int8WeightOnlyConfig(
             granularity=ao_granularity_row if per_channel else ao_granularity_tensor
         )
-    elif precision == 4:
-        # Int4WeightOnlyConfig uses group_size-based granularity internally;
-        # per_channel / per_tensor distinction is not exposed. CUDA-only — silently
-        # no-ops on CPU (torchao behavior).
-        config = Int4WeightOnlyConfig()
     elif isinstance(precision, int) and 2 <= precision <= 7:
-        # IntxWeightOnlyConfig supports arbitrary sub-byte widths but only
-        # PerAxis / PerGroup granularities (not PerRow / PerTensor).
+        # IntxWeightOnlyConfig handles any sub-byte width (1–7 bits) including int4,
+        # using a generic AffineQuantizedTensor path that does not require mslk.
         torch_dtype = getattr(torch, f"int{precision}")
         config = IntxWeightOnlyConfig(
             weight_dtype=torch_dtype,
@@ -250,18 +258,21 @@ def _apply_torchao_hard_quantization(module, precision, granularity: str) -> Non
 
     quantize_(module, config)
 
-    try:
-        from torchao.dtypes import AffineQuantizedTensor
-    except ImportError:
-        AffineQuantizedTensor = None
-
     for m in module.modules():
-        if (
-            isinstance(m, nn.Linear)
-            and AffineQuantizedTensor is not None
-            and isinstance(m.weight, AffineQuantizedTensor)
-        ):
-            m._torchao_precision = precision
+        if not isinstance(m, nn.Linear):
+            continue
+        w = m.weight
+        # Detect any torchao quantized weight: old AffineQuantizedTensor or new-style
+        # subclasses (e.g. IntxWeightOnly) which don't inherit from AffineQuantizedTensor.
+        if type(w) is torch.Tensor:
+            continue
+        if not isinstance(w, torch.Tensor):
+            continue
+        m._torchao_precision = precision
+        scale = _extract_aqt_scale(w)
+        if scale is not None:
+            m.register_buffer("_torchao_scale", scale)
+            m._torchao_per_channel = scale.numel() > 1
 
 
 ### CONFIGURATION VALIDATORS ###

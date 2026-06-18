@@ -1,6 +1,7 @@
 import warnings
 import copy
 
+import torch
 import torch.nn as nn
 
 from ..blocks import TransformerDecoder
@@ -10,45 +11,88 @@ from ..blocks.config import CustomDecoderConfigCompress, CustomEncoderConfigComp
 from .utils import get_submodule, flatten_index_paths
 
 
-def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> None:
-    """Copy old_layer's state dict into new_layer, dequantizing AffineQuantizedTensors first.
+_QUANT_BUFFER_SUFFIXES = ("_act_quant_scale", "_act_quant_zero_point", "_torchao_scale")
+_QUANT_PLAIN_ATTRS = (
+    "_torchao_precision", "_torchao_per_channel", "_soft_quant_precision",
+    "_act_quant_precision", "_act_quant_method", "_act_quant_scheme",
+)
 
-    If a weight in old_layer is a torchao AffineQuantizedTensor, the float dequantized
-    value is copied instead, and _torchao_precision is propagated to new_layer so that
-    the export pipeline can still detect and re-quantize it correctly.
+
+def _extract_aqt_scale(w: torch.Tensor) -> torch.Tensor | None:
+    """Extract the quantization scale from any torchao quantized weight tensor.
+
+    Tries multiple attribute paths to handle both the old AffineQuantizedTensor
+    layout (tensor_impl.scale) and new-style subclasses (direct .scale attribute).
     """
-    try:
-        from torchao.dtypes import AffineQuantizedTensor
-    except ImportError:
-        AffineQuantizedTensor = None
+    if hasattr(w, 'tensor_impl') and hasattr(w.tensor_impl, 'scale'):
+        return w.tensor_impl.scale.detach().clone()
+    scale = getattr(w, 'scale', None)
+    if isinstance(scale, torch.Tensor):
+        return scale.detach().clone()
+    return None
 
-    if AffineQuantizedTensor is None:
-        new_layer.load_state_dict(old_layer.state_dict())
-        return
 
-    # Build a plain float state dict, dequantizing any quantized weights.
+def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> None:
+    """Copy old_layer's state dict into new_layer, dequantizing quantized tensors first.
+
+    Handles dynamic quantization buffers (_act_quant_scale, _act_quant_zero_point,
+    _torchao_scale) that Quantizer.apply() registers on submodules: these appear in
+    old_layer's state_dict but not in a freshly-created new_layer, so they are
+    pre-registered before load_state_dict is called. Non-tensor quant attributes
+    (_torchao_precision, _act_quant_precision, etc.) are copied explicitly afterwards.
+    """
+    # Build a plain (float/int) state dict. Use duck-typing: any torch.Tensor subclass
+    # with .dequantize() is treated as quantized (handles both old AffineQuantizedTensor
+    # and new-style IntxWeightOnly tensors from IntxWeightOnlyConfig).
     plain_state = {}
     for key, value in old_layer.state_dict().items():
-        if isinstance(value, AffineQuantizedTensor):
+        if (
+            isinstance(value, torch.Tensor)
+            and type(value) is not torch.Tensor
+            and hasattr(value, 'dequantize')
+        ):
             plain_state[key] = value.dequantize()
         else:
             plain_state[key] = value
+
+    # Pre-register dynamic quantization buffers on the matching new_layer submodules
+    # so that load_state_dict below can fill them in.
+    new_modules = dict(new_layer.named_modules())
+    for key, tensor in plain_state.items():
+        if any(key.endswith(s) for s in _QUANT_BUFFER_SUFFIXES):
+            parent_path, buf_name = key.rsplit(".", 1) if "." in key else ("", key)
+            parent_mod = new_modules.get(parent_path)
+            if parent_mod is not None and buf_name not in parent_mod._buffers:
+                parent_mod.register_buffer(buf_name, torch.empty_like(tensor))
+
     new_layer.load_state_dict(plain_state)
 
-    # Propagate compression metadata to new_layer's child modules.
-    new_modules = dict(new_layer.named_modules())
+    # Propagate non-tensor compression metadata (plain attributes not in state_dict).
     for name, old_submod in old_layer.named_modules():
         if not isinstance(old_submod, nn.Linear):
-            continue
-        if not hasattr(old_submod, '_torchao_precision'):
             continue
         new_submod = new_modules.get(name)
         if new_submod is None:
             continue
-        new_submod._torchao_precision = old_submod._torchao_precision
-        # Stash the scale so extract_layer_quant_info can find it after dequantization.
-        if isinstance(old_submod.weight, AffineQuantizedTensor):
-            new_submod._torchao_scale = old_submod.weight.tensor_impl.scale.detach().clone()
+
+        for attr in _QUANT_PLAIN_ATTRS:
+            if hasattr(old_submod, attr):
+                setattr(new_submod, attr, getattr(old_submod, attr))
+
+        # Fallback: if the weight is still a live quantized tensor and the scale was
+        # not already stashed into the state dict, extract and register it now.
+        w_old = old_submod.weight
+        if (
+            "_torchao_scale" not in new_submod._buffers
+            and isinstance(w_old, torch.Tensor)
+            and type(w_old) is not torch.Tensor
+        ):
+            scale = _extract_aqt_scale(w_old)
+            if scale is not None:
+                new_submod.register_buffer("_torchao_scale", scale)
+
+        # Derive _torchao_per_channel from the scale buffer (authoritative source).
+        if "_torchao_scale" in new_submod._buffers:
             new_submod._torchao_per_channel = new_submod._torchao_scale.numel() > 1
 
 
