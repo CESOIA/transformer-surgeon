@@ -172,7 +172,16 @@ class Quantizer(Compressor):
         self.config["precision_activation"] = "full"
         self.config["method_activation"] = "maxmin"
         self.config["scheme_activation"] = "asymmetric"
+        self.strip_runtime_state(module)
 
+    def strip_runtime_state(self, module):
+        """Remove activation hooks and quantization buffers from *module*.
+
+        Unlike restore(), this does NOT reset the compressor config — it only
+        removes the runtime artifacts added by apply() so that the module's
+        state_dict is clean for serialization.  Used by
+        manager.prepare_for_save() before model.save_pretrained().
+        """
         if hasattr(module, "_act_quant_hook_handle"):
             module._act_quant_hook_handle.remove()
             del module._act_quant_hook_handle
@@ -192,6 +201,8 @@ class Quantizer(Compressor):
             "_act_out_quant_scheme",
             "_soft_quant_precision",
             "_torchao_precision",
+            "_torchao_per_channel",
+            "_torchao_scale",
         ):
             if hasattr(module, attr):
                 delattr(module, attr)

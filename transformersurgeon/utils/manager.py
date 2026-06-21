@@ -396,7 +396,7 @@ class CompressionSchemesManager:
                     )
 
                 for summary_name in compressor_summary_names:
-                    if summary_name not in required_summaries:
+                    if summary_name not in required_summaries and summary_name not in scheme.calibration_data:
                         required_summaries.append(summary_name)
 
             if len(required_summaries) > 0:
@@ -455,6 +455,72 @@ class CompressionSchemesManager:
                 stages.append(stage)
 
         return stages
+
+    def save_state(self, path: str) -> None:
+        """Persist per-scheme calibration data to *path* (torch.save format).
+
+        Saves the computed activation statistics (min/max ranges, covariances,
+        etc.) for every scheme so they can be restored later without re-running
+        the calibration forward passes.  Call this BEFORE prepare_for_save().
+
+        Typical save workflow::
+
+            manager.save_state("checkpoint/compression_state.pt")
+            manager.prepare_for_save()
+            model.save_pretrained("checkpoint")
+        """
+        state = {scheme.path: dict(scheme.calibration_data) for scheme in self}
+        torch.save(state, path)
+
+    def load_state(self, path: str) -> None:
+        """Restore per-scheme calibration data previously saved with save_state().
+
+        After this call, manager.apply() will find the required summaries
+        already populated in scheme.calibration_data and skip the calibration
+        forward pass entirely — no DataLoader is needed.
+
+        Typical reload workflow::
+
+            model = Qwen2ForCausalLMCompress.from_pretrained("checkpoint")
+            manager = Qwen2CompressionSchemesManager(model)
+            manager.load_state("checkpoint/compression_state.pt")
+            manager.apply(hard=True, criteria=["mlp"])
+        """
+        state = torch.load(path, weights_only=False)
+        for scheme in self:
+            saved = state.get(scheme.path)
+            if saved:
+                scheme.calibration_data.update(saved)
+
+    def prepare_for_save(self, criteria=None) -> None:
+        """Strip runtime quantization artifacts from module state dicts.
+
+        Removes activation-quant hooks, registered buffers (_act_quant_scale,
+        _act_out_quant_scale, _torchao_scale, …) and dequantizes any torchao
+        AffineQuantizedTensor weights to plain float so that save_pretrained
+        can serialize them.  The compression config is preserved in model.config
+        and round-trips through save_pretrained/from_pretrained automatically.
+
+        Unlike restore(), this works after hard (non-reversible) quantization
+        and does NOT reset the compressor config.
+        Call save_state() first so the calibration data is not lost.
+        """
+        from ..compression.quantization import Quantizer
+        import torch.nn as nn
+
+        for scheme in self.iter_filtered(criteria=criteria):
+            module = scheme.get_compression_module()
+
+            # Dequantize torchao AffineQuantizedTensor weights to plain float.
+            # save_pretrained cannot serialize subclassed tensors.
+            if isinstance(module, nn.Linear):
+                w = module.weight
+                if type(w) is not torch.Tensor and hasattr(w, 'dequantize'):
+                    module.weight = nn.Parameter(w.dequantize(), requires_grad=False)
+
+            for compressor in scheme.compressors.values():
+                if isinstance(compressor, Quantizer):
+                    compressor.strip_runtime_state(module)
 
     def restore(self, topology=False, criteria=None, verbose=False):
         """
