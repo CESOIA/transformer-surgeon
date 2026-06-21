@@ -1,0 +1,60 @@
+site_name: TransformerSurgeon
+site_description: HuggingFace model compression and export framework
+repo_url: https://github.com/CESOIA/transformer-surgeon
+repo_name: transformer-surgeon
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - toc.integrate
+    - search.suggest
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            show_if_no_docstring: false
+            members_order: source
+
+nav:
+  - Home: index.md
+  - Concepts: concepts.md
+  - Examples:
+    - Basic LRD: examples/01_basic_lrd.md
+    - Calibrated LRD (SVD-LLM-v2): examples/02_calibrated_lrd_svd_llm_v2.md
+    - HF Export Roundtrip: examples/03_hf_export_roundtrip.md
+  - API Reference:
+    - Compression:
+      - Compressor (ABC): api/compression/abstract.md
+      - LRDer: api/compression/lrd.md
+      - Registry: api/compression/registry.md
+    - Calibration:
+      - RawDataCollector (ABC): api/calibration/raw_data_base.md
+      - ActivationCollector: api/calibration/activation.md
+      - CalibrationSummary (ABC): api/calibration/summaries_base.md
+      - Covariance Summaries: api/calibration/covariance.md
+    - Manager:
+      - CompressionSchemesManager: api/utils/manager.md
+      - CompressionScheme: api/utils/scheme.md
+    - Blocks:
+      - LinearCompressed: api/blocks/linear_compressed.md
+      - VCONBlock: api/blocks/vcon_block.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - toc:
+      permalink: true
