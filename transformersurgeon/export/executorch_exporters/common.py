@@ -287,11 +287,12 @@ def _extract_weight_quant_info(
 
 
 def _extract_act_quant_info(module: nn.Linear, info: dict) -> None:
-    """Populate activation quantization keys in *info* and remove the fake-quant hook.
+    """Populate activation quantization keys in *info* and remove the fake-quant hooks.
 
-    If the module has no stored activation calibration the key act_scale is set
-    to None and no other act_* keys are added.
+    Extracts both input-side and output-side activation calibration.  If a side
+    has no stored calibration its *_scale key is set to None.
     """
+    # Input activation (pre-linear).
     if hasattr(module, '_act_quant_scale'):
         info["act_scale"]      = module._act_quant_scale.detach().clone()
         info["act_zero_point"] = module._act_quant_zero_point.detach().clone()
@@ -303,6 +304,18 @@ def _extract_act_quant_info(module: nn.Linear, info: dict) -> None:
             del module._act_quant_hook_handle
     else:
         info["act_scale"] = None
+
+    # Output activation (post-linear).
+    if hasattr(module, '_act_out_quant_scale'):
+        info["act_out_scale"]      = module._act_out_quant_scale.detach().clone()
+        info["act_out_zero_point"] = module._act_out_quant_zero_point.detach().clone()
+        info["act_out_precision"]  = module._act_out_quant_precision
+        info["act_out_scheme"]     = module._act_out_quant_scheme
+        if hasattr(module, '_act_out_quant_hook_handle'):
+            module._act_out_quant_hook_handle.remove()
+            del module._act_out_quant_hook_handle
+    else:
+        info["act_out_scale"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +344,42 @@ def build_quantizer(precision: str):
     return XNNPACKQuantizer().set_global(qconfig)
 
 
+class _LinearOnlyQuantizer:
+    """Thin wrapper around XNNPACKQuantizer that restricts annotation to
+    linear (and linear_relu) patterns only.
+
+    The default XNNPACKQuantizer also annotates cat/add/mul patterns, but
+    their annotators ignore the per-module filter_fn (a known limitation of
+    the upstream implementation).  This causes attention ops (ROPE sub/add,
+    KV-cache cat) to receive observers whose calibration data is degenerate
+    (all-negative outputs → zp=127 → clips all positive activations to 0).
+    By restricting to linear patterns only we avoid annotating non-linear ops
+    in unrelated modules while still enabling INT8 weight+activation fusion
+    for the targeted MLP projections.
+    """
+
+    def __init__(self, base: "XNNPACKQuantizer"):
+        self._base = base
+        # Monkey-patch SUPPORTED_PATTERNS to linear-only for the duration of annotate()
+        from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import QuantPattern, LINEAR_TARGETS
+        self._linear_only_patterns = [
+            QuantPattern("linear", True, False, LINEAR_TARGETS),
+            QuantPattern("linear_relu", False, False, LINEAR_TARGETS),
+        ]
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def annotate(self, model):
+        original = self._base.__class__.SUPPORTED_PATTERNS
+        self._base.__class__.SUPPORTED_PATTERNS = self._linear_only_patterns
+        try:
+            result = self._base.annotate(model)
+        finally:
+            self._base.__class__.SUPPORTED_PATTERNS = original
+        return result
+
+
 def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
     """Build a per-module XNNPACKQuantizer driven by compression metadata.
 
@@ -345,7 +394,7 @@ def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
         get_symmetric_quantization_config,
     )
 
-    quantizer = XNNPACKQuantizer()
+    base = XNNPACKQuantizer()
     for layer_name, info in layer_info.items():
         qrange = _PRECISION_TO_QRANGE.get(info["precision"])
         if qrange is None:
@@ -362,9 +411,9 @@ def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
             is_dynamic=is_dynamic,
             **qrange,
         )
-        quantizer.set_module_name(layer_name, qconfig)
+        base.set_module_name(layer_name, qconfig)
 
-    return quantizer
+    return _LinearOnlyQuantizer(base)
 
 
 # ---------------------------------------------------------------------------
@@ -427,17 +476,50 @@ def _layer_names_from_observer(
     return found
 
 
+def _layer_names_from_output_observer(
+    obs_node: torch.fx.Node,
+    layer_info: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Check if an observer's direct predecessor is a linear and return the layer name.
+
+    Output observers sit immediately downstream of the linear op in the PT2E graph:
+      linear → [output_obs] → ...
+    We only check the direct predecessor (depth 0) to avoid false positives: a
+    deeper upstream walk from an input observer could reach the *previous* layer's
+    linear through layer-norm or element-wise ops.  Returns the matching layer name
+    in a list, or an empty list if the direct predecessor is not a known linear.
+    """
+    _linear_targets = {
+        getattr(torch.ops.aten.linear, 'default', None),
+        getattr(torch.ops.aten.mm, 'default', None),
+        getattr(torch.ops.aten.addmm, 'default', None),
+    } - {None}
+
+    input_node = obs_node.args[0] if obs_node.args else None
+    if input_node is None or not isinstance(input_node, torch.fx.Node):
+        return []
+
+    if input_node.op == 'call_function' and input_node.target in _linear_targets:
+        stack = input_node.meta.get('nn_module_stack', {})
+        for _, (qname, _type) in reversed(list(stack.items())):
+            if qname in layer_info:
+                return [qname]
+
+    return []  # direct predecessor is not a known linear → input observer
+
+
 def inject_scales_into_pt2e_observers(
     prepared_model: nn.Module,
     layer_info: dict[str, dict[str, Any]],
 ) -> int:
     """Inject pre-computed scales into PT2E observer modules.
 
-    Identifies each observer by tracing downstream to the nearest linear op and
-    reading the layer name from nn_module_stack (avoids torch.export's flattened
-    attribute naming). Weight observers (input is a get_attr) receive torchao
-    scales for hard-quantised layers. Activation observers receive the scales
-    computed by the transformer-surgeon calibration manager.
+    Identifies each observer by tracing downstream (input observers) or upstream
+    (output observers) to the nearest linear op and reading the layer name from
+    nn_module_stack.  Weight observers (input is a get_attr) receive torchao
+    scales for hard-quantised layers.  Input activation observers receive the
+    input-side scales computed by the transformer-surgeon calibration manager.
+    Output activation observers receive the output-side scales.
 
     Returns the total number of observer modules overridden.
     """
@@ -446,14 +528,16 @@ def inject_scales_into_pt2e_observers(
     def _is_observer(m: nn.Module) -> bool:
         return callable(getattr(m, 'calculate_qparams', None))
 
-    hard_layers = {k for k, v in layer_info.items() if v["hard"] and v["scale"] is not None}
-    act_layers  = {k for k, v in layer_info.items() if v.get("act_scale") is not None}
-    if not hard_layers and not act_layers:
+    hard_layers    = {k for k, v in layer_info.items() if v["hard"] and v["scale"] is not None}
+    act_layers     = {k for k, v in layer_info.items() if v.get("act_scale") is not None}
+    act_out_layers = {k for k, v in layer_info.items() if v.get("act_out_scale") is not None}
+    if not hard_layers and not act_layers and not act_out_layers:
         return 0
 
-    overridden   = 0
-    matched_hard = set()
-    matched_act  = set()
+    overridden       = 0
+    matched_hard     = set()
+    matched_act      = set()
+    matched_act_out  = set()
     _diag: list = []
 
     for node in prepared_model.graph.nodes:
@@ -477,16 +561,27 @@ def inject_scales_into_pt2e_observers(
                 overridden += 1
                 matched_hard.add(names[0])
         else:
-            # Activation observer may be shared across multiple linears (e.g. gate+up in gated MLP).
-            names = _layer_names_from_observer(node, layer_info, stop_at_first=False, _diagnosed=_diag)
-            injected = False
-            for lname in names:
-                if lname in act_layers and lname not in matched_act:
-                    if not injected:
-                        _inject_act_observer(submod, layer_info[lname])
-                        overridden += 1
-                        injected = True
-                    matched_act.add(lname)
+            # Check if this is an output observer (linear is immediately upstream).
+            out_names = _layer_names_from_output_observer(node, layer_info)
+            if out_names:
+                # Output activation observer: inject output-side scale.
+                lname = out_names[0]
+                if lname in act_out_layers and lname not in matched_act_out:
+                    _inject_act_observer(submod, layer_info[lname], use_out=True)
+                    overridden += 1
+                    matched_act_out.add(lname)
+            else:
+                # Input activation observer: may be shared across multiple linears
+                # (e.g. gate_proj and up_proj share the same input in gated MLP).
+                names = _layer_names_from_observer(node, layer_info, stop_at_first=False, _diagnosed=_diag)
+                injected = False
+                for lname in names:
+                    if lname in act_layers and lname not in matched_act:
+                        if not injected:
+                            _inject_act_observer(submod, layer_info[lname])
+                            overridden += 1
+                            injected = True
+                        matched_act.add(lname)
 
     unmatched_hard = hard_layers - matched_hard
     if unmatched_hard:
@@ -503,6 +598,12 @@ def inject_scales_into_pt2e_observers(
         raise RuntimeError(
             f"Could not inject activation scales into PT2E observers for layers: {sorted(unmatched_act)}. "
             "The observer graph structure may have changed — check _layer_name_from_observer."
+        )
+    unmatched_act_out = act_out_layers - matched_act_out
+    if unmatched_act_out:
+        raise RuntimeError(
+            f"Could not inject output activation scales into PT2E observers for layers: {sorted(unmatched_act_out)}. "
+            "The observer graph structure may have changed — check _layer_names_from_output_observer."
         )
 
     return overridden
@@ -534,29 +635,90 @@ def _inject_weight_observer(observer: nn.Module, info: dict) -> None:
     observer.calculate_qparams = _patched_calculate_qparams
 
 
-def _inject_act_observer(observer: nn.Module, info: dict) -> None:
-    """Set observer min/max from stored activation scale and zero_point.
+def _inject_act_observer(observer: nn.Module, info: dict, use_out: bool = False) -> None:
+    """Patch observer.calculate_qparams to return exact calibrated activation scale/zp.
 
-    Recovers the original observed min/max range using:
-        min_val = (qmin - zero_point) * scale
-        max_val = (qmax - zero_point) * scale
-    This causes convert_pt2e to reproduce the same scale and zero_point.
+    HistogramObserver derives its qparams from an internal histogram built during
+    the PT2E calibration pass, and ignores min_val / max_val attributes entirely.
+    We must override calculate_qparams directly — the same approach used for weight
+    observers — to guarantee the exported scale matches transformer-surgeon calibration.
+
+    The calibration stores scale/zp in the unsigned convention [0, qmax_unsigned].
+    XNNPACK activation observers use signed int8 [-128, 127].  For the 8-bit case
+    both ranges span 255 levels so the scale is identical; only the zero_point
+    reference frame shifts: zp_signed = zp_unsigned + obs_qmin.  For other widths
+    we recompute both from the recovered float [act_min, act_max] range.
+
+    use_out=True selects the output-side calibration (act_out_*) for output observers.
     """
-    s  = info["act_scale"].float().squeeze()
-    zp = info["act_zero_point"].float().squeeze()
+    key = "act_out" if use_out else "act"
+    s  = info[f"{key}_scale"].float().squeeze()
+    zp = info[f"{key}_zero_point"].float().squeeze()
 
-    if info["act_scheme"] == "symmetric":
-        qmax = float(2 ** (info["act_precision"] - 1) - 1)
-        qmin = -qmax
+    scheme    = info[f"{key}_scheme"]
+    precision = info[f"{key}_precision"]
+
+    if scheme == "symmetric":
+        our_qmax = float(2 ** (precision - 1) - 1)
+        our_qmin = -our_qmax
     else:
-        qmax = float(2 ** info["act_precision"] - 1)
-        qmin = 0.0
+        our_qmax = float(2 ** precision - 1)
+        our_qmin = 0.0
 
-    min_val = (qmin - zp) * s
-    max_val = (qmax - zp) * s
+    # Recover the calibrated float activation range.
+    act_min_f = float((our_qmin - zp) * s)
+    act_max_f = float((our_qmax - zp) * s)
 
-    observer.min_val = min_val
-    observer.max_val = max_val
+    # Clip extreme asymmetric outliers. With per-tensor asymmetric INT8, a single
+    # rare token can push act_max to 100-150× |act_min| (observed: act_max=2016 in
+    # Qwen2-0.5B layer 2 down_proj with 32-sample WikiText calibration). This yields
+    # scale≈8, leaving only 3-4 effective INT8 levels for typical ±20 activations.
+    # Cap the positive side to 10× the negative side when asymmetry exceeds that ratio.
+    _act_min_abs = abs(act_min_f)
+    _MAX_ASYMMETRY = 10.0
+    _clipped = _act_min_abs > 0 and act_max_f > _act_min_abs * _MAX_ASYMMETRY
+    if _clipped:
+        act_max_f = _act_min_abs * _MAX_ASYMMETRY
+
+    # Read the observer's native quantization range (may differ from ours).
+    obs_qmin = float(getattr(observer, 'quant_min', our_qmin))
+    obs_qmax = float(getattr(observer, 'quant_max', our_qmax))
+    our_range = our_qmax - our_qmin
+    obs_range = obs_qmax - obs_qmin
+
+    if _clipped:
+        # Clipping changed the range: recompute scale from the new float bounds.
+        float_range = act_max_f - act_min_f
+        obs_scale = torch.tensor(max(float_range / obs_range, 1e-8), dtype=torch.float32)
+        obs_zp = torch.clamp(
+            torch.round(torch.tensor(obs_qmin - act_min_f / obs_scale.item())),
+            obs_qmin, obs_qmax,
+        ).to(torch.int32)
+    else:
+        # No clipping: derive obs_scale from surgeon scale directly to avoid a
+        # float64 round-trip (act_min_f / act_max_f are Python floats) that could
+        # shift obs_scale by ~1e-7, which cascades over 24 layers.
+        if obs_range != our_range:
+            obs_scale = (s * our_range / obs_range).clamp(min=1e-8)
+        else:
+            obs_scale = s.clamp(min=1e-8)
+        obs_zp = torch.clamp(
+            torch.round(obs_qmin - torch.tensor(act_min_f) / obs_scale),
+            obs_qmin, obs_qmax,
+        ).to(torch.int32)
+
+    # Patch calculate_qparams directly — HistogramObserver ignores min_val/max_val.
+    _s_ref  = obs_scale.reshape(1)
+    _zp_ref = obs_zp.reshape(1)
+
+    def _patched_calculate_qparams():
+        return _s_ref, _zp_ref
+
+    observer.calculate_qparams = _patched_calculate_qparams
+
+    # Also set min_val/max_val for MinMaxObserver-style observers that use them.
+    observer.min_val = torch.tensor(act_min_f)
+    observer.max_val = torch.tensor(act_max_f)
 
 
 # ---------------------------------------------------------------------------

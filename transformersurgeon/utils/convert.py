@@ -11,10 +11,15 @@ from ..blocks.config import CustomDecoderConfigCompress, CustomEncoderConfigComp
 from .utils import get_submodule, flatten_index_paths
 
 
-_QUANT_BUFFER_SUFFIXES = ("_act_quant_scale", "_act_quant_zero_point", "_torchao_scale")
+_QUANT_BUFFER_SUFFIXES = (
+    "_act_quant_scale", "_act_quant_zero_point",
+    "_act_out_quant_scale", "_act_out_quant_zero_point",
+    "_torchao_scale",
+)
 _QUANT_PLAIN_ATTRS = (
     "_torchao_precision", "_torchao_per_channel", "_soft_quant_precision",
     "_act_quant_precision", "_act_quant_method", "_act_quant_scheme",
+    "_act_out_quant_precision", "_act_out_quant_method", "_act_out_quant_scheme",
 )
 
 

@@ -38,6 +38,8 @@ class Quantizer(Compressor):
         if self.precision_activation != "full":
             if "activation_range" not in summaries:
                 summaries.append("activation_range")
+            if "output_activation_range" not in summaries:
+                summaries.append("output_activation_range")
         return tuple(summaries)
 
     def apply(self, module, hard=False, soft_applied=False):
@@ -103,7 +105,7 @@ class Quantizer(Compressor):
                         param.data.copy_(qweight)
                 module._soft_quant_precision = precision
 
-        # Activation fake-quant emulation via forward pre-hook.
+        # Input activation fake-quant emulation via forward pre-hook.
         if precision_activation != "full":
             if self.calibration_store is None or "activation_range" not in self.calibration_store:
                 raise RuntimeError(
@@ -132,6 +134,35 @@ class Quantizer(Compressor):
                 _make_activation_fake_quant_hook(scale, zero_point, precision_activation, scheme_activation)
             )
 
+        # Output activation fake-quant emulation via forward post-hook.
+        if precision_activation != "full":
+            if self.calibration_store is None or "output_activation_range" not in self.calibration_store:
+                raise RuntimeError(
+                    "Output activation quantization requires calibration data. "
+                    "Run run_compression_calibration() before calling apply()."
+                )
+            out_range = self.calibration_store["output_activation_range"]
+            out_min = out_range["min"].float()
+            out_max = out_range["max"].float()
+
+            out_scale, out_zero_point = ACT_METHOD_FUNCTIONS[method_activation](
+                out_min, out_max, precision_activation, scheme_activation
+            )
+
+            module.register_buffer("_act_out_quant_scale", out_scale)
+            module.register_buffer("_act_out_quant_zero_point", out_zero_point)
+            module._act_out_quant_precision = precision_activation
+            module._act_out_quant_method = method_activation
+            module._act_out_quant_scheme = scheme_activation
+
+            # Remove any previously registered hook before adding a new one.
+            if hasattr(module, "_act_out_quant_hook_handle"):
+                module._act_out_quant_hook_handle.remove()
+
+            module._act_out_quant_hook_handle = module.register_forward_hook(
+                _make_output_activation_fake_quant_hook(out_scale, out_zero_point, precision_activation, scheme_activation)
+            )
+
     def restore(self, module):
         self.config["method"] = "vanilla"
         self.config["precision"] = "full"
@@ -145,12 +176,20 @@ class Quantizer(Compressor):
         if hasattr(module, "_act_quant_hook_handle"):
             module._act_quant_hook_handle.remove()
             del module._act_quant_hook_handle
+        if hasattr(module, "_act_out_quant_hook_handle"):
+            module._act_out_quant_hook_handle.remove()
+            del module._act_out_quant_hook_handle
         for attr in (
             "_act_quant_scale",
             "_act_quant_zero_point",
             "_act_quant_precision",
             "_act_quant_method",
             "_act_quant_scheme",
+            "_act_out_quant_scale",
+            "_act_out_quant_zero_point",
+            "_act_out_quant_precision",
+            "_act_out_quant_method",
+            "_act_out_quant_scheme",
             "_soft_quant_precision",
             "_torchao_precision",
         ):
@@ -191,6 +230,31 @@ def _make_activation_fake_quant_hook(
         xq = torch.clamp(torch.round(x / s) + zp, qmin, qmax)
         x_fq = (xq - zp) * s
         return (x_fq.to(x.dtype),) + inputs[1:]
+
+    return hook
+
+
+def _make_output_activation_fake_quant_hook(
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    precision: int,
+    scheme: str,
+):
+    """Return a forward post-hook that fake-quantizes the output activation."""
+    if scheme == "symmetric":
+        qmax = 2 ** (precision - 1) - 1
+        qmin = -qmax
+    else:
+        qmax = 2 ** precision - 1
+        qmin = 0
+
+    zp = zero_point.float()
+    s = scale.float()
+
+    def hook(_, inputs, output):
+        xq = torch.clamp(torch.round(output / s) + zp, qmin, qmax)
+        x_fq = (xq - zp) * s
+        return x_fq.to(output.dtype)
 
     return hook
 
