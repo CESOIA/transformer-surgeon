@@ -105,7 +105,7 @@ def apply_a8w8(model, tokenizer, num_cal_samples: int, cal_seq_len: int, seed: i
     criteria = ["mlp"]
 
     manager.set("quantization", "precision", 8, criteria=criteria)
-    manager.set("quantization", "method", "vanilla", criteria=criteria)
+    manager.set("quantization", "method", "gptq", criteria=criteria)
     manager.set("quantization", "granularity", "per_channel", criteria=criteria)
     manager.set("quantization", "sparsity", 0.0, criteria=criteria)
     manager.set("quantization", "sparse_method", "magnitude", criteria=criteria)

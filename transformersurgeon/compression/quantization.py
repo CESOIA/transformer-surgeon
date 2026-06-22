@@ -8,12 +8,14 @@ from .unstructured_pruning_methods import METHOD_FUNCTIONS as SPARSITY_FUNCTIONS
 from .unstructured_pruning import validate_unstructured_pruning_ratio
 
 
-VALID_METHODS = ["vanilla"]
+VALID_METHODS = ["vanilla", "gptq"]
 VALID_ACT_METHODS = ["maxmin"]
 VALID_SPARSE_METHODS = ["magnitude", "random"]
 VALID_ACTIVATION_SCHEMES = ["symmetric", "asymmetric"]
 VALID_GRANULARITIES = ["per_tensor", "per_channel"]
-CALIBRATED_METHOD_DICT = {}
+CALIBRATED_METHOD_DICT = {
+    "gptq": ("covariance",),
+}
 
 
 class Quantizer(Compressor):
@@ -84,8 +86,13 @@ class Quantizer(Compressor):
                     if name not in ["weight", "weight_2"]:
                         continue
 
+                    calibration_kwargs = {}
+                    if method in CALIBRATED_METHOD_DICT and self.calibration_store:
+                        for key in CALIBRATED_METHOD_DICT[method]:
+                            if key in self.calibration_store:
+                                calibration_kwargs[key] = self.calibration_store[key]
                     qdata, scale, dequantize_fn = METHOD_FUNCTIONS[method](
-                        param.data, precision, eps, granularity
+                        param.data, precision, eps, granularity, **calibration_kwargs
                     )
 
                     qweight = dequantize_fn(qdata, scale)
