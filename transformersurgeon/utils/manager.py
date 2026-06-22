@@ -5,11 +5,14 @@ manager.py
 Provides the CompressionSchemesManager class for managing multiple compression schemes in transformer models.
 """
 
+import logging
 import torch
 from torch.utils.data import DataLoader
 from transformers import PretrainedConfig
 from typing import Any, Callable, Dict, List, Optional, Union
 from copy import deepcopy
+
+logger = logging.getLogger(__name__)
 from ..calibration import run_compression_calibration
 from .scheme import CompressionScheme
 from .utils import flatten_index_paths
@@ -503,10 +506,33 @@ class CompressionSchemesManager:
 
         Unlike restore(), this works after hard (non-reversible) quantization
         and does NOT reset the compressor config.
-        Call save_state() first so the calibration data is not lost.
+
+        Recommended export workflow::
+
+            manager.apply(hard=True)                              # finalize compression
+            manager.save_state("checkpoint/compression_state.pt") # persist calibration
+            manager.prepare_for_save()                            # strip runtime artifacts
+            model.save_pretrained("checkpoint")
+
+        Note on pruning: ``weight_mask`` buffers are kept in the state dict by
+        default so they round-trip through save/load. Call
+        ``manager.remove_masks()`` before saving if they are not needed.
         """
         from ..compression.quantization import Quantizer
         import torch.nn as nn
+
+        soft_only = [
+            scheme.path for scheme in self.iter_filtered(criteria=criteria)
+            if scheme.soft_applied and not scheme.hard_applied
+        ]
+        if soft_only:
+            logger.warning(
+                "Saving with soft compression (not hard) on: %s. "
+                "For quantization, call manager.apply(hard=True) first to use "
+                "torchao acceleration. For pruning, hard and soft are currently "
+                "equivalent (in-place zeroing).",
+                soft_only,
+            )
 
         for scheme in self.iter_filtered(criteria=criteria):
             module = scheme.get_compression_module()
@@ -533,6 +559,42 @@ class CompressionSchemesManager:
         """
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.restore(topology=topology, verbose=verbose)
+
+    def reapply_masks(self, criteria=None):
+        """Re-apply pruning masks to all filtered schemes after an optimizer step.
+
+        Call this inside the fine-tuning loop immediately after
+        ``optimizer.step()`` to prevent mask drift when training with soft
+        pruning (STE style). Pruned weights receive non-zero gradients during
+        the backward pass and drift away from zero; this method zeroes them
+        back using the stored ``weight_mask`` buffers.
+
+        Example::
+
+            for batch in dataloader:
+                loss = model(**batch).loss
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                manager.reapply_masks()
+
+        Args:
+            criteria: Optional filter (same format as ``apply()``).
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            scheme.reapply_masks()
+
+    def remove_masks(self, criteria=None):
+        """Remove ``weight_mask`` buffers from all filtered scheme modules.
+
+        Use before recomputing compression with different settings, or before
+        saving a deployment model where the mask buffers are not needed.
+
+        Args:
+            criteria: Optional filter (same format as ``apply()``).
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            scheme.remove_masks()
 
     def _generate_schemes(self):
         """

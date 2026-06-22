@@ -100,8 +100,43 @@ class Compressor(ABC):
         call ``module.cancel_lrd()``. If ``_to_compress()`` returns ``False``
         the module was never modified, so restore should be a no-op.
 
+        Note for pruning compressors: do **not** remove the ``weight_mask``
+        buffer here. The mask survives restoration intentionally so it can be
+        re-applied to fresh weights without recomputing it (e.g. for STE
+        fine-tuning workflows). Use ``remove_mask`` to explicitly drop it.
+
         Args:
             module: The ``LinearCompressed`` instance to restore.
+        """
+        pass
+
+    def reapply_mask(self, module):
+        """Re-apply the stored pruning mask to the module weights.
+
+        Called after ``optimizer.step()`` in pruning-aware fine-tuning loops
+        to prevent mask drift. Because the gradient of ``F.linear`` w.r.t.
+        its weight argument does not depend on the weight values, pruned
+        positions receive non-zero gradient updates (STE behaviour) and drift
+        away from zero after each optimizer step. This method zeroes them back.
+
+        Default: no-op. Override in pruning compressors.
+
+        Args:
+            module: The ``LinearCompressed`` instance whose mask to re-apply.
+        """
+        pass
+
+    def remove_mask(self, module):
+        """Remove the ``weight_mask`` buffer from the module.
+
+        Use when you need a completely clean state, e.g. before recomputing
+        compression with different settings, or before saving a deployment
+        model where the mask buffer is not needed.
+
+        Default: no-op. Override in pruning compressors.
+
+        Args:
+            module: The ``LinearCompressed`` instance from which to remove the mask.
         """
         pass
 

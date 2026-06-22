@@ -1,7 +1,10 @@
+import logging
 import torch
 
 from .abstract import Compressor
 from .unstructured_pruning_methods import METHOD_FUNCTIONS
+
+logger = logging.getLogger(__name__)
 
 
 VALID_METHODS = ["magnitude", "gradient", "random"]
@@ -72,18 +75,50 @@ class UnstructuredPruner(Compressor):
             else:
                 raise ValueError(f"Unsupported pruning method '{method}'.")
 
-            # Apply the pruning mask to the module
+            # Register mask as a module buffer so it survives restore() and is
+            # included in state_dict(). The mask is 2-D (same shape as weight):
+            # 1 = keep element, 0 = prune element.
+            module.register_buffer('weight_mask', mask)
+
+            # Apply the pruning mask to the module in-place.
+            # Zeroed elements still receive non-zero gradients during backward
+            # (dL/dW = x^T @ dL/dy has no dependence on W), giving STE behaviour.
             with torch.no_grad():
                 module.weight.mul_(mask.to(module.weight.dtype))
 
         if hard:
-            raise Warning("Currently, there is no support for sparse operators. Parameters are masked in-place, so hard pruning is effectively the same as soft pruning.")
+            # TODO: convert to sparse tensor representation for hardware acceleration.
+            # Hard unstructured pruning is currently identical to soft: weights are
+            # zeroed in-place and the mask buffer is registered on the module.
+            logger.warning(
+                "Hard unstructured pruning for '%s' has no sparse-operator backend. "
+                "Falling back to in-place zeroing, same as soft pruning.",
+                getattr(module, 'name', repr(module)),
+            )
 
     def restore(self, module):
-        # N.B. module argument is not used but required for API consistency with other compressors
+        # Reset config only. The weight_mask buffer is intentionally left on
+        # the module so the same mask can be re-applied after restoration.
+        # Call remove_mask() to explicitly drop it.
         self.config["ratio"] = 0.0
         self.config["method"] = "magnitude"
         self.config["granularity"] = "layer"
+
+    def reapply_mask(self, module):
+        """Re-zero pruned elements using the stored weight_mask buffer.
+
+        Call after optimizer.step() in STE fine-tuning loops to prevent mask
+        drift.
+        """
+        mask = module._buffers.get('weight_mask')
+        if mask is None:
+            return
+        with torch.no_grad():
+            module.weight.mul_(mask.to(module.weight.dtype))
+
+    def remove_mask(self, module):
+        """Drop the weight_mask buffer from the module."""
+        module._buffers.pop('weight_mask', None)
 
     def _to_compress(self):
         return self.ratio > 0.0

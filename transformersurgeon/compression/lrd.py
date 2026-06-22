@@ -84,7 +84,10 @@ class LRDer(Compressor):
                 module.weight_2[:rank, :].copy_(V_r)
 
         if hard:
-            pass # LRD implementation is "hard" by nature
+            # The two-matmul topology (weight @ weight_2) is already the efficient
+            # deployed form. Soft and hard LRD are structurally identical — this
+            # no-op is intentional.
+            pass
 
     def restore(self, module):
         if module.rank == "full":

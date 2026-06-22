@@ -1,7 +1,10 @@
+import logging
 import torch
 
 from .abstract import Compressor
 from .structured_pruning_methods import METHOD_FUNCTIONS
+
+logger = logging.getLogger(__name__)
 
 
 VALID_METHODS = ["magnitude", "gradient", "random"]
@@ -62,7 +65,14 @@ class StructuredPruner(Compressor):
             else:
                 raise ValueError(f"Unsupported structured pruning method '{method}'.")
 
-            # Apply the pruning mask to the weights and biases (if present) in-place
+            # Register mask as a module buffer so it survives restore() and is
+            # included in state_dict(). The mask is 1-D over the output dimension:
+            # 1 = keep row, 0 = prune row.
+            module.register_buffer('weight_mask', prune_mask)
+
+            # Apply the pruning mask to the weights and biases (if present) in-place.
+            # Zeroed rows still receive non-zero gradients during the backward pass
+            # (dL/dW = x^T @ dL/dy has no dependence on W), giving STE behaviour.
             with torch.no_grad():
                 dtype = module.weight.dtype
                 module.weight.mul_(prune_mask.unsqueeze(1).to(dtype))
@@ -70,12 +80,43 @@ class StructuredPruner(Compressor):
                     module.bias.mul_(prune_mask.to(dtype))
 
         if hard:
-            raise Warning("Hard structured pruning is not implemented yet. Currently, parameters are masked in-place, so hard pruning is effectively the same as soft pruning.")
+            # TODO: actual row removal (requires adjacent-layer coordination).
+            # Hard structured pruning is currently identical to soft: weights are
+            # zeroed in-place and the mask buffer is registered on the module.
+            logger.warning(
+                "Hard structured pruning for '%s' is not yet implemented as actual "
+                "row removal (requires adjacent-layer coordination). Falling back to "
+                "in-place zeroing, same as soft pruning.",
+                getattr(module, 'name', repr(module)),
+            )
 
     def restore(self, module):
-        # N.B. module argument is not used but required for API consistency with other compressors
+        # Reset config only. The weight_mask buffer is intentionally left on
+        # the module so the same mask can be re-applied after restoration
+        # (e.g. to start STE fine-tuning from fresh weights). Call
+        # remove_mask() to explicitly drop it.
         self.config["ratio"] = 0.0
         self.config["method"] = "magnitude"
+
+    def reapply_mask(self, module):
+        """Re-zero pruned rows using the stored weight_mask buffer.
+
+        Call after optimizer.step() in STE fine-tuning loops to prevent mask
+        drift (pruned positions receive non-zero gradient updates and must be
+        zeroed back after each parameter update).
+        """
+        mask = module._buffers.get('weight_mask')
+        if mask is None:
+            return
+        with torch.no_grad():
+            dtype = module.weight.dtype
+            module.weight.mul_(mask.unsqueeze(1).to(dtype))
+            if module.bias is not None:
+                module.bias.mul_(mask.to(dtype))
+
+    def remove_mask(self, module):
+        """Drop the weight_mask buffer from the module."""
+        module._buffers.pop('weight_mask', None)
 
     def _to_compress(self):
         return self.ratio > 0.0

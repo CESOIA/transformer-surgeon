@@ -470,6 +470,35 @@ class CompressionScheme:
         # Reset the soft application flag
         self.soft_applied = False 
 
+    def reapply_masks(self):
+        """Re-apply pruning masks to the module after an optimizer step.
+
+        In STE-style fine-tuning, pruned weights receive non-zero gradient
+        updates (because dL/dW is independent of W for linear layers) and
+        drift away from zero after each optimizer step. Call this method to
+        zero them back.
+
+        No-op if compression has not been soft-applied, or has been hard-applied.
+        """
+        if not self.soft_applied or self.hard_applied:
+            return
+        module = self.get_compression_module()
+        for compressor in self.compressors.values():
+            compressor.reapply_mask(module)
+
+    def remove_masks(self):
+        """Remove weight_mask buffers from the module.
+
+        Drops the persistent mask buffers registered by pruning compressors.
+        Use before recomputing compression with different settings, or before
+        saving a deployment model where the mask buffers are not needed.
+        """
+        if not self._is_to_compress():
+            return
+        module = self.get_compression_module()
+        for compressor in self.compressors.values():
+            compressor.remove_mask(module)
+
     def __repr__(self):
         string = f"CompressionScheme(name={self.name}, block_id={self.block_id}, path={self.path}, applied=(soft={self.soft_applied}, hard={self.hard_applied}))\n"
         for comp_name, compressor in self.compressors.items():
