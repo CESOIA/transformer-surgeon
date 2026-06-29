@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.fx
+import torch.nn as nn
 from torch.export import export as torch_export
 
 from ..common import (
@@ -11,15 +13,10 @@ from ..common import (
     ExecuTorchExportResult,
     finalize_export_result,
     resolve_components_and_wrapper,
+    extract_layer_quant_info,
+    inject_scales_into_pt2e_observers,
+    calibrate_pt2e_observers,
 )
-
-# Backend-supported quantization configs (subset of common.SUPPORTED_QUANT_CONFIGS).
-# "a8w8" / "a8w4" will be added when activation quantization is implemented.
-QNN_SUPPORTED_QUANT_CONFIGS: dict[str, str] = {
-    "full": "No quantization (FP32)",
-    "w8":   "8-bit weight-only (QuantDtype.use_16a8w, fp16 activations, per-channel linear weights)",
-    "w4":   "4-bit weight-only (QuantDtype.use_16a4w, fp16 activations, per-channel linear weights)",
-}
 
 
 def _is_wrap_with_set_grad_enabled(target: Any) -> bool:
@@ -181,10 +178,14 @@ def export_with_qnn(
 ) -> ExecuTorchExportResult:
     os.makedirs(os.path.dirname(config.output_path) or ".", exist_ok=True)
 
-    wrapper, _, example_inputs, quant_plan = resolve_components_and_wrapper(
+    wrapper, model_config, example_inputs = resolve_components_and_wrapper(
         model_or_graph,
         config=config,
     )
+
+    # Detect per-layer compression metadata (hard / soft quantized layers).
+    # Quantization is driven entirely by model metadata.
+    layer_info = extract_layer_quant_info(wrapper)
 
     with torch.inference_mode():
         exported = torch_export(
@@ -199,30 +200,81 @@ def export_with_qnn(
     model_for_edge = sanitized_module
     exported_for_mismatch = None
 
-    if quant_plan.global_precision != "full":
-        if quant_plan.global_precision not in QNN_SUPPORTED_QUANT_CONFIGS:
-            supported = ", ".join(f"'{k}'" for k in QNN_SUPPORTED_QUANT_CONFIGS)
-            raise ValueError(
-                f"QNN exporter supports: {supported}. "
-                f"Got '{quant_plan.global_precision}'."
-            )
-
-        from executorch.backends.qualcomm.quantizer.quantizer import QnnQuantizer, QuantDtype
+    if layer_info:
+        from executorch.backends.qualcomm.quantizer.quantizer import (
+            QnnQuantizer,
+            QuantDtype,
+            ModuleQConfig,
+        )
+        from executorch.backends.qualcomm.serialization.qc_schema import (
+            QcomChipset,
+            QnnExecuTorchBackendType,
+        )
         from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 
-        _quant_dtype = {
-            "w8": QuantDtype.use_16a8w,
-            "w4": QuantDtype.use_16a4w,
-        }[quant_plan.global_precision]
-        quantizer = QnnQuantizer()
-        quantizer.set_default_quant_config(
-            _quant_dtype,
-            is_linear_per_channel=True,
-        )
+        _PREC_TO_QDTYPE = {
+            4: QuantDtype.use_16a4w,
+            8: QuantDtype.use_16a8w,
+        }
+
+        class _MixedPrecisionQnnQuantizer(QnnQuantizer):
+            """QnnQuantizer that applies per-layer precision inferred from model metadata.
+
+            Layers present in layer_info are annotated with their precision (4-bit or
+            8-bit weights, 16-bit activations).  All other layers are left as float —
+            they are excluded from annotation by returning None from _get_quant_config.
+            """
+
+            def __init__(self, layer_info_: dict, soc_model_: Any) -> None:
+                super().__init__(
+                    backend=QnnExecuTorchBackendType.kHtpBackend,
+                    soc_model=soc_model_,
+                )
+                self._layer_qdtype: dict[str, QuantDtype] = {}
+                for name, info in layer_info_.items():
+                    qdtype = _PREC_TO_QDTYPE.get(info["precision"])
+                    if qdtype is not None:
+                        self._layer_qdtype[name] = qdtype
+
+                self._qdtype_config: dict[QuantDtype, ModuleQConfig] = {}
+                for qdtype in set(self._layer_qdtype.values()):
+                    self._qdtype_config[qdtype] = ModuleQConfig(
+                        quant_dtype=qdtype,
+                        is_linear_per_channel=True,
+                    )
+
+            def _get_quant_config(self, node: torch.fx.Node):
+                stack = node.meta.get("nn_module_stack", {})
+                matched_qdtype = None
+                # Iterate from innermost to outermost to find the most specific match.
+                for _, (qname, _) in reversed(list(stack.items())):
+                    if qname in self._layer_qdtype:
+                        matched_qdtype = self._layer_qdtype[qname]
+                        break
+
+                if matched_qdtype is None:
+                    return None  # layer stays float
+
+                config = self._qdtype_config[matched_qdtype]
+                op = node.target
+                if isinstance(op, str):
+                    return None
+
+                if op in config.use_per_channel_weight_quant_ops:
+                    ch_axis = config.use_per_channel_weight_quant_ops[op]
+                    return config.per_channel_quant_config_list[ch_axis]
+
+                if op in self.quant_ops:
+                    return config.quant_config
+
+                return None
+
+        chipset = _resolve_qcom_chipset(config.soc_model)
+        quantizer = _MixedPrecisionQnnQuantizer(layer_info, chipset)
         prepared = prepare_pt2e(sanitized_module, quantizer)
 
-        with torch.no_grad():
-            prepared(*example_inputs)
+        calibrate_pt2e_observers(prepared, model_config, config)
+        inject_scales_into_pt2e_observers(prepared, layer_info)
 
         converted = convert_pt2e(prepared)
         with torch.inference_mode():
@@ -348,10 +400,12 @@ def export_with_qnn(
     with open(config.output_path, "wb") as f:
         f.write(et_program.buffer)
 
+    result_precision = "mixed" if layer_info else "full"
+
     return finalize_export_result(
         pte_path=config.output_path,
         backend="qnn",
-        precision=quant_plan.global_precision,
+        precision=result_precision,
         wrapper=wrapper,
         example_inputs=example_inputs,
         exported_for_mismatch=exported_for_mismatch,

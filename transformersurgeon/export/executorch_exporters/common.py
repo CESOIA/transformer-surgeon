@@ -93,9 +93,6 @@ class ExecuTorchExportResult:
 class ExecutorchExporterConfig(BackendExportConfig, ABC):
     """Abstract base config shared by all backend-specific exporters."""
 
-    # "full" is the default — quantization is inferred from model metadata,
-    # not forced from config.  Set a value only for legacy global-precision flows.
-    precision: str = "full"
     dynamic_shapes: dict[str, Any] | None = None
 
 
@@ -332,28 +329,6 @@ def _extract_act_quant_info(module: nn.Linear, info: dict) -> None:
 # ---------------------------------------------------------------------------
 # PT2E quantizer construction
 # ---------------------------------------------------------------------------
-
-def build_quantizer(precision: str):
-    """Build a global XNNPACKQuantizer for a single precision level.
-
-    Used by backends that do not have per-layer compression metadata.
-    """
-    from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
-        XNNPACKQuantizer,
-        get_symmetric_quantization_config,
-    )
-
-    if precision == "w4":
-        qconfig = get_symmetric_quantization_config(
-            is_per_channel=True, is_dynamic=False, weight_qmin=-8, weight_qmax=7,
-        )
-    elif precision == "w8":
-        qconfig = get_symmetric_quantization_config(is_per_channel=True, is_dynamic=False)
-    else:
-        raise ValueError(f"Unsupported precision '{precision}' for XNNPACK. Use 'w4' or 'w8'.")
-
-    return XNNPACKQuantizer().set_global(qconfig)
-
 
 class _LinearOnlyQuantizer:
     """Thin wrapper around XNNPACKQuantizer that restricts annotation to
@@ -730,6 +705,68 @@ def _inject_act_observer(observer: nn.Module, info: dict, use_out: bool = False)
     # Also set min_val/max_val for MinMaxObserver-style observers that use them.
     observer.min_val = torch.tensor(act_min_f)
     observer.max_val = torch.tensor(act_max_f)
+
+
+# ---------------------------------------------------------------------------
+# PT2E calibration
+# ---------------------------------------------------------------------------
+
+_CAL_SENTENCES = [
+    "The Eiffel Tower is located in Paris, France, and was built in 1889.",
+    "Machine learning models learn patterns from large datasets to make predictions.",
+    "The quick brown fox jumps over the lazy dog near the riverbank.",
+    "Scientists discovered a new species of deep-sea fish in the Pacific Ocean.",
+    "Python is widely used for data science, machine learning, and automation tasks.",
+    "The capital of Japan is Tokyo, which is one of the most populous cities on Earth.",
+    "Quantum computers use quantum mechanical phenomena to perform complex calculations.",
+    "The human brain contains approximately 86 billion neurons connected by synapses.",
+    "Climate change is caused by greenhouse gas emissions from fossil fuels and deforestation.",
+    "The Great Wall of China stretches over 13,000 miles across northern China.",
+    "Artificial intelligence is transforming industries from healthcare to finance.",
+    "Water covers approximately 71 percent of the Earth's surface.",
+    "The speed of light in a vacuum is approximately 299,792 kilometers per second.",
+    "Shakespeare wrote 37 plays and 154 sonnets during his lifetime.",
+    "The Amazon rainforest produces 20 percent of the world's oxygen supply.",
+    "Photosynthesis converts sunlight into chemical energy stored in glucose molecules.",
+]
+
+
+def calibrate_pt2e_observers(prepared: nn.Module, model_config: Any | None, config: Any) -> None:
+    """Run real-text calibration passes through the prepared PT2E model.
+
+    Random token calibration leaves output activation observers with degenerate
+    histograms because the distribution of gate_proj / up_proj outputs with
+    uniformly-random token IDs is very different from real text.  Tokenizing a
+    small set of fixed sentences produces realistic activation distributions for
+    all observers.  Falls back to random passes if the tokenizer cannot be loaded.
+    """
+    model_name = getattr(model_config, '_name_or_path', None) if model_config else None
+    vocab_size = int(getattr(model_config, 'vocab_size', 32000)) if model_config else 32000
+    max_pos = max(1, min(512, getattr(config, 'max_seq_len', 512)))
+
+    token_batches: list[list[int]] = []
+    if model_name:
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(model_name)
+            for sent in _CAL_SENTENCES:
+                ids = tok.encode(sent, add_special_tokens=True)
+                token_batches.append(ids)
+        except Exception:
+            pass
+
+    with torch.no_grad():
+        if token_batches:
+            for ids in token_batches:
+                for token_id in ids:
+                    inp = torch.tensor([token_id], dtype=torch.long)
+                    pos = torch.tensor([1], dtype=torch.long)
+                    prepared(inp, pos)
+        else:
+            for _ in range(32):
+                rand_ids = torch.randint(0, vocab_size, (1,), dtype=torch.long)
+                rand_pos = torch.randint(1, max_pos + 1, (1,), dtype=torch.long)
+                prepared(rand_ids, rand_pos)
 
 
 # ---------------------------------------------------------------------------
