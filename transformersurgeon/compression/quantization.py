@@ -83,7 +83,7 @@ class Quantizer(Compressor):
             elif not soft_applied:
                 # Soft-path: fake-quant via dequantize.
                 for name, param in module.named_parameters():
-                    if name not in ["weight", "weight_2"]:
+                    if name not in ["weight", "linear_V.weight"]:
                         continue
 
                     calibration_kwargs = {}
@@ -91,6 +91,20 @@ class Quantizer(Compressor):
                         for key in CALIBRATED_METHOD_DICT[method]:
                             if key in self.calibration_store:
                                 calibration_kwargs[key] = self.calibration_store[key]
+
+                    # When quantizing the U factor (weight) of an LRD-decomposed layer,
+                    # the effective input to U is h = V·x, not x itself.
+                    # The correct Hessian is C_U = V @ E[x^Tx] @ V^T, derived from
+                    # the single calibration pass covariance and the already-computed V.
+                    if (
+                        name == "weight"
+                        and isinstance(getattr(module, "rank", "full"), int)
+                        and "covariance" in calibration_kwargs
+                    ):
+                        V = module.linear_V.weight.data.float()
+                        C = calibration_kwargs["covariance"].float()
+                        calibration_kwargs = {**calibration_kwargs, "covariance": V @ C @ V.T}
+
                     qdata, scale, dequantize_fn = METHOD_FUNCTIONS[method](
                         param.data, precision, eps, granularity, **calibration_kwargs
                     )

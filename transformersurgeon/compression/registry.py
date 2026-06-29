@@ -33,6 +33,11 @@ COMPRESSOR_DICT = {
     "quantization": Quantizer
 }
 
+# Canonical order in which compressors are applied to a module.
+# lrd first (changes weight shape), then pruning (masks the result),
+# then quantization (must see the final float weights).
+APPLICATION_ORDER = ["lrd", "structured_pruning", "unstructured_pruning", "quantization"]
+
 COMPRESSION_REGISTRY = {
     "structured_pruning": {
         "ratio": dict(default=0.0, validator=validate_structured_pruning_ratio),
@@ -64,4 +69,5 @@ COMPRESSION_REGISTRY = {
 __all__ = [
     "COMPRESSION_REGISTRY",
     "COMPRESSOR_DICT",
+    "APPLICATION_ORDER",
 ]

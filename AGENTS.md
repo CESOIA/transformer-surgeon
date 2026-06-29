@@ -184,7 +184,7 @@ Things the codebase silently relies on. Breaking these causes silent wrong behav
 
 - **Don't instantiate `CompressionScheme` directly.** The manager builds schemes from indexing metadata. Direct instantiation bypasses path resolution and calibration group assignment.
 
-- **Don't assume `module.weight.shape` is `[out_features, in_features]` after LRD.** After `init_lrd(rank)`, `weight` becomes `[out_features, rank]` and `weight_2` is `[rank, in_features]`. Check `module.rank != "full"` or `module.weight_2 is not None` before accessing weight shape.
+- **Don't assume `module.weight.shape` is `[out_features, in_features]` after LRD.** After `init_lrd(rank)`, `weight` becomes `[out_features, rank]` and `module.linear_V.weight` is `[rank, in_features]`. Check `module.rank != "full"` or `module.linear_V is not None` before accessing weight shape.
 
 - **Don't call `hard=True` then `restore()`.** Hard apply is irreversible. `restore()` will appear to succeed but produce wrong shapes or no-op silently.
 

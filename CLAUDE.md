@@ -20,7 +20,7 @@ manager.restore()                                   # undo
 - `Compressor.apply()` always receives a `LinearCompressed`, never a plain `nn.Linear`
 - `manager.set()` is purely declarative; the model is only touched during `manager.apply()`
 - `manager.prepare_for_save()` must be called before `export_to_hf()` when applying manually
-- After LRD, `module.weight` shape changes to `[out, rank]` and `module.weight_2` is `[rank, in]`
+- After LRD, `module.weight` shape changes to `[out, rank]` and `module.linear_V.weight` is `[rank, in]`
 - Don't instantiate `CompressionScheme` directly — the manager builds schemes from indexing metadata
 - Don't put model-specific logic in `CompressionSchemesManager` — it belongs in `indexing_*.py`
 

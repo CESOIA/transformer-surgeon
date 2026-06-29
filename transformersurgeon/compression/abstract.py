@@ -71,7 +71,7 @@ class Compressor(ABC):
         Three-way behavior controlled by the flag combination:
 
         * ``hard=False`` (default) — reversible (soft) compression. The
-          module's topology may change (e.g., ``init_lrd`` adds ``weight_2``),
+          module's topology may change (e.g., ``init_lrd`` adds ``linear_V``),
           but ``restore`` can fully undo it.
         * ``hard=True, soft_applied=False`` — apply compression directly in
           its final, irreversible form (topology change is permanent).
@@ -95,9 +95,9 @@ class Compressor(ABC):
         """Reverse the compression applied by ``apply``.
 
         The implementation must return ``module`` to its pre-``apply`` weight
-        shape and remove any auxiliary parameters (e.g., ``weight_2`` for LRD).
-        For LRD specifically: reconstruct ``weight = weight @ weight_2``, then
-        call ``module.cancel_lrd()``. If ``_to_compress()`` returns ``False``
+        shape and remove any auxiliary parameters (e.g., ``linear_V`` for LRD).
+        For LRD specifically: reconstruct ``weight = weight @ linear_V.weight``,
+        then call ``module.cancel_lrd()``. If ``_to_compress()`` returns ``False``
         the module was never modified, so restore should be a no-op.
 
         Note for pruning compressors: do **not** remove the ``weight_mask``
