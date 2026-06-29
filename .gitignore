@@ -250,3 +250,6 @@ experiments/
 
 # HF transformers github repository
 transformers/
+
+# LLMS agent instructions
+!llms.txt
