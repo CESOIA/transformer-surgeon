@@ -1,28 +1,32 @@
 """
 Test: Qwen2-0.5B float16 with random per-layer mixed compression → XNNPACK export.
 
-Each indexed linear layer is randomly assigned exactly one compression type:
-  - "full"   : no compression (float16 throughout)
-  - "int8"   : per-channel int8 weight-only quantization (torchao hard)
-  - "int4"   : per-channel int4 weight-only quantization (disabled by default;
-               enable with ALLOW_INT4=True only when the runtime supports it)
-  - "lrd_N"  : SVD low-rank decomposition to rank N ∈ {32, 64, 128}
+Each indexed linear layer is randomly assigned one compression label:
+  - "full"        : no compression (float16 throughout)
+  - "int8"        : per-channel int8 weight-only quantization (torchao hard)
+  - "int4"        : per-channel int4 weight-only quantization (disabled by default;
+                    enable with ALLOW_INT4=True only when the runtime supports it)
+  - "lrd_N"       : SVD low-rank decomposition to rank N ∈ {32, 64, 128}
+  - "lrd_N+int8"  : LRD (rank N) combined with int8 quantization on the same layer
+  - "lrd_N+int4"  : LRD (rank N) combined with int4 quantization (when ALLOW_INT4)
 
-LRD and quantization are kept mutually exclusive per layer.
+Combined labels apply quantization first (on the HF model), then LRD after
+conversion, exercising the joint LRD + torchao path in _load_state_dict_dequantized.
 
 Quantization is applied to the HF model before convert_for_export, which
 transfers dequantized weights and scale/precision metadata to the converted
 TransformerDecoder.  LRD is applied directly to the converted decoder's
-LinearCompressed layers after conversion (bypassing the HF model), since
-convert_for_export does not currently support LRD weight_2 transfer.
+LinearCompressed layers after conversion.
 
 Pipeline:
   1.  Load Qwen2-0.5B in float16.
-  2.  Randomly assign one compression type per linear layer.
-  3.  Apply int8/int4 quantization (torchao hard) to selected HF model layers.
+  2.  Randomly assign one compression label per linear layer.
+  3.  Apply int8/int4 quantization (torchao hard) to any layer whose label
+      contains "int8" or "int4" (standalone or combined).
   4.  Convert the HF model to export-ready components (embedding, decoder,
       final_layer) via convert_for_export.
-  5.  Apply SVD LRD to selected converted-decoder layers.
+  5.  Apply SVD LRD to any converted-decoder layer whose label contains "lrd_"
+      (standalone or combined).
   6.  Generate and store a random single-token input (input_ids, pos_ids).
   7.  Run torch inference on the LLMWrapper → store reference output tensor.
   8.  Export to XNNPACK via export_to_backend → produces .pte file.
@@ -30,8 +34,9 @@ Pipeline:
   10. Assert that the ET output matches the torch reference within tolerance.
 
 Goal: verify the torch HF → ExecuTorch pipeline is functionally correct for
-a real Qwen2-0.5B model under mixed per-layer compression.  Meaningful NLP
-output is not expected; only output tensor equivalence is checked.
+a real Qwen2-0.5B model under mixed per-layer compression, including the
+combined LRD + quantization case.  Meaningful NLP output is not expected;
+only output tensor equivalence is checked.
 
 Run:
     python -m pytest test_pretrained_quant_export.py -v
@@ -127,7 +132,11 @@ def _build_hf_to_conv_map(num_blocks: int) -> dict[str, str]:
 
 
 def _compression_options(module: nn.Linear, allow_int4: bool) -> list[str]:
-    """Return all compression labels valid for this module's weight shape."""
+    """Return all compression labels valid for this module's weight shape.
+
+    Includes combined labels (lrd_N+intM) that apply both techniques to the
+    same layer: quantization on the HF model, LRD on the converted decoder.
+    """
     opts = ["full", "int8"]
     if allow_int4:
         opts.append("int4")
@@ -135,6 +144,9 @@ def _compression_options(module: nn.Linear, allow_int4: bool) -> list[str]:
     for r in _LRD_RANK_CANDIDATES:
         if r < max_rank:
             opts.append(f"lrd_{r}")
+            opts.append(f"lrd_{r}+int8")
+            if allow_int4:
+                opts.append(f"lrd_{r}+int4")
     return opts
 
 
@@ -157,8 +169,8 @@ def _apply_lrd(module: LinearCompressed, rank: int) -> None:
         dtype = module.weight.dtype
         US_r, V_r = _LRD_SVD["svd"](module.weight.detach().float(), rank)
         module.init_lrd(rank)
-        module.weight[:, :rank].copy_(US_r.to(dtype))
-        module.weight_2[:rank, :].copy_(V_r.to(dtype))
+        module.weight.data.copy_(US_r.to(dtype))
+        module.linear_V.weight.data.copy_(V_r.to(dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +216,15 @@ class TestQwen2XNNPACKExport(unittest.TestCase):
 
         cls.compression_assignments = assignments
 
-        # 3. Apply quantization directly to selected HF model layers
+        # 3. Apply quantization to any layer whose label contains "int8"/"int4"
+        #    (standalone labels like "int8" and combined ones like "lrd_64+int8")
         for hf_path, label in assignments.items():
-            if not label.startswith("int"):
+            if "int8" in label:
+                prec = 8
+            elif "int4" in label:
+                prec = 4
+            else:
                 continue
-            prec = int(label[3:])
             _apply_quant(get_submodule(cls.model, hf_path), prec)
 
         # 4. Convert HF model → export-ready (embedding, decoder, final_layer).
@@ -219,11 +235,13 @@ class TestQwen2XNNPACKExport(unittest.TestCase):
         embedding = cls.model.get_input_embeddings()
         final_layer = cls.model.lm_head
 
-        # 5. Apply LRD to converted-decoder layers assigned lrd_N
+        # 5. Apply LRD to any converted-decoder layer whose label contains "lrd_"
+        #    (standalone labels like "lrd_64" and combined ones like "lrd_64+int8")
         for hf_path, label in assignments.items():
-            if not label.startswith("lrd_"):
+            if "lrd_" not in label:
                 continue
-            rank = int(label[4:])
+            lrd_token = next(p for p in label.split("+") if p.startswith("lrd_"))
+            rank = int(lrd_token[4:])
             conv_path = hf_to_conv.get(hf_path)
             if conv_path is None:
                 continue
@@ -370,6 +388,20 @@ class TestQwen2XNNPACKExport(unittest.TestCase):
             len(non_trivial),
             0,
             "Random seed produced no compressed layers — check the seed or options.",
+        )
+
+    def test_combined_compression_assigned(self):
+        """At least one layer received the combined LRD + quantization label."""
+        combined = [
+            v
+            for v in self.compression_assignments.values()
+            if "lrd_" in v and ("int8" in v or "int4" in v)
+        ]
+        self.assertGreater(
+            len(combined),
+            0,
+            "Random seed produced no combined (LRD + quant) layers — "
+            "increase the pool size or adjust the seed.",
         )
 
     @classmethod

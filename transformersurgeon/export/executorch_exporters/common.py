@@ -249,6 +249,17 @@ def _extract_weight_quant_info(
 
     if has_torchao_tag and (is_live_aqt or has_stashed_scale):
         # Hard-quantised layer.
+        #
+        # If LRD was applied after quantization, the stashed scale belongs to
+        # the original full weight W[out, in].  After LRD the layer holds two
+        # factors: weight[out, rank] and linear_V.weight[rank, in].  PT2E's
+        # quantizer would scope both under the same qconfig and try to apply
+        # the out-channel scale to linear_V.weight, causing a shape mismatch.
+        # Skip such layers — their weights are already dequantised floats and
+        # the old scale is no longer valid for the decomposed factors.
+        if getattr(module, 'linear_V', None) is not None:
+            return None
+
         if is_live_aqt:
             # Weight is still a torchao AffineQuantizedTensor (direct model pass).
             # Dequantise in-place so torch.export sees a clean float parameter.
