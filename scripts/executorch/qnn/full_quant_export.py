@@ -1,3 +1,14 @@
+"""Export a full-size (no LRD) Qwen2 model to QNN with every attention/MLP
+linear layer quantized to int8 or int4, and an independent toggle for
+static activation quantization.
+
+Unlike exporter_function_test.py (which optionally quantizes just the MLP
+projections), this script always quantizes every indexed linear layer
+(q/k/v/o_proj + gate/up/down_proj) via Qwen2CompressionSchemesManager,
+criteria=["self_attn", "mlp"]. lm_head and embed_tokens are not reachable
+through the manager (see AGENTS.md) and are left unquantized.
+"""
+
 import argparse
 import os
 import random
@@ -25,9 +36,17 @@ _DTYPE_MAP = {
     "float32": torch.float32,
 }
 
+# All linear layers the compression manager can reach (no LRD applied).
+_QUANT_CRITERIA = ["self_attn", "mlp"]
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Test library ExecuTorch QNN exporter function")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Export a full-size (no LRD) Qwen2 model to QNN with all "
+            "attention/MLP linear layers quantized to int8 or int4."
+        )
+    )
     parser.add_argument(
         "--model-name",
         type=str,
@@ -94,18 +113,13 @@ def parse_args():
         action="store_true",
         help="Print simple inference error statistics",
     )
-    # --- MLP quantization via manager ---
+    # --- Weight quantization (always applied to all attn+mlp layers) ---
     parser.add_argument(
-        "--quant-mlp",
-        action="store_true",
-        help="Quantize MLP layers using Qwen2CompressionSchemesManager before export",
-    )
-    parser.add_argument(
-        "--quant-precision",
+        "--precision",
         type=int,
         default=8,
         choices=[4, 8],
-        help="Integer bit-width for MLP quantization (4 or 8)",
+        help="Integer bit-width for weight quantization of every attn/mlp linear layer (4 or 8)",
     )
     parser.add_argument(
         "--quant-mode",
@@ -119,19 +133,43 @@ def parse_args():
         type=str,
         default="per_channel",
         choices=["per_channel", "per_tensor"],
-        help="Weight quantization granularity for MLP layers",
+        help="Weight quantization granularity",
     )
     parser.add_argument(
-        "--calibrate",
+        "--quant-method",
+        type=str,
+        default="vanilla",
+        choices=["vanilla", "gptq"],
+        help="Weight quantization method",
+    )
+    # --- Activation quantization toggle (independent of weight precision) ---
+    parser.add_argument(
+        "--quantize-activations",
         action="store_true",
-        help="Enable static activation quantization calibrated on WikiText-2 (requires --quant-mlp)",
+        help=(
+            "Enable static activation quantization, calibrated on WikiText-2. "
+            "Off by default: weights are quantized but activations stay float."
+        ),
     )
     parser.add_argument(
         "--act-precision",
         type=int,
         default=8,
         choices=[4, 8],
-        help="Integer bit-width for activation quantization (used with --calibrate)",
+        help="Integer bit-width for activation quantization (used with --quantize-activations)",
+    )
+    parser.add_argument(
+        "--act-method",
+        type=str,
+        default="maxmin",
+        help="Activation quantization observer method (used with --quantize-activations)",
+    )
+    parser.add_argument(
+        "--act-scheme",
+        type=str,
+        default="symmetric",
+        choices=["symmetric", "asymmetric"],
+        help="Activation quantization scheme (used with --quantize-activations)",
     )
     parser.add_argument(
         "--num-calibration-samples",
@@ -182,15 +220,12 @@ def _qairt_version() -> str:
 
 
 def _build_pte_stem(args: argparse.Namespace) -> str:
-    parts = [f"qwen2_qnn_{args.soc_model.lower()}_qairt{_qairt_version()}"]
-    if args.quant_mlp:
-        act_tag = f"_a{args.act_precision}" if args.calibrate else ""
-        # "hard" is the mandatory quant mode for export, so it carries no
-        # information in the file name; only tag the non-default "soft" mode.
-        mode_tag = "" if args.quant_mode == "hard" else f"_{args.quant_mode}"
-        parts.append(f"w{args.quant_precision}{act_tag}{mode_tag}")
-    else:
-        parts.append("full")
+    parts = [f"qwen2_qnn_{args.soc_model.lower()}_qairt{_qairt_version()}", "full"]
+    act_tag = f"_a{args.act_precision}" if args.quantize_activations else ""
+    # "hard" is the mandatory quant mode for export, so it carries no
+    # information in the file name; only tag the non-default "soft" mode.
+    mode_tag = "" if args.quant_mode == "hard" else f"_{args.quant_mode}"
+    parts.append(f"w{args.precision}{act_tag}{mode_tag}")
     if args.num_shards > 1:
         parts.append(f"s{args.num_shards}")
     if not args.fp16:
@@ -230,29 +265,35 @@ def _build_wikitext_calibration_loader(
     return DataLoader(examples, batch_size=1, shuffle=False)
 
 
-def quantize_mlp_with_manager(model, args, calibration_loader=None):
-    act_info = f", activation=a{args.act_precision}" if calibration_loader is not None else ""
+def quantize_all_layers_with_manager(model, args, calibration_loader=None):
+    act_info = (
+        f", activation=w{args.act_precision} ({args.act_method}/{args.act_scheme})"
+        if calibration_loader is not None
+        else ", activation=float (disabled)"
+    )
     print(
-        f"Quantizing MLP layers: precision=w{args.quant_precision}, "
-        f"mode={args.quant_mode}, granularity={args.granularity}{act_info}"
+        f"Quantizing all attn+mlp layers: precision=w{args.precision}, "
+        f"mode={args.quant_mode}, granularity={args.granularity}, "
+        f"method={args.quant_method}{act_info}"
     )
     manager = Qwen2CompressionSchemesManager(model)
 
-    criteria = ["mlp"]
-    manager.set("quantization", "precision", args.quant_precision, criteria=criteria)
-    manager.set("quantization", "method", "vanilla", criteria=criteria)
-    manager.set("quantization", "granularity", args.granularity, criteria=criteria)
-    manager.set("quantization", "sparsity", 0.0, criteria=criteria)
-    manager.set("quantization", "sparse_method", "magnitude", criteria=criteria)
-    manager.set("quantization", "eps", 1e-6, criteria=criteria)
+    manager.set("quantization", "precision", args.precision, criteria=_QUANT_CRITERIA)
+    manager.set("quantization", "method", args.quant_method, criteria=_QUANT_CRITERIA)
+    manager.set("quantization", "granularity", args.granularity, criteria=_QUANT_CRITERIA)
+    manager.set("quantization", "sparsity", 0.0, criteria=_QUANT_CRITERIA)
+    manager.set("quantization", "sparse_method", "magnitude", criteria=_QUANT_CRITERIA)
+    manager.set("quantization", "eps", 1e-6, criteria=_QUANT_CRITERIA)
 
     if calibration_loader is not None:
-        manager.set("quantization", "precision_activation", args.act_precision, criteria=criteria)
+        manager.set("quantization", "precision_activation", args.act_precision, criteria=_QUANT_CRITERIA)
+        manager.set("quantization", "method_activation", args.act_method, criteria=_QUANT_CRITERIA)
+        manager.set("quantization", "scheme_activation", args.act_scheme, criteria=_QUANT_CRITERIA)
         manager.set_calibration_data(calibration_loader)
 
     hard = args.quant_mode == "hard"
-    manager.apply(hard=hard, criteria=criteria, verbose=args.verbose)
-    print("MLP quantization applied.")
+    manager.apply(hard=hard, criteria=_QUANT_CRITERIA, verbose=args.verbose)
+    print("Quantization applied to all attn+mlp layers.")
     return model
 
 
@@ -279,8 +320,9 @@ def _write_aten_diagnostics_log(
         f"online_prepare={args.online_prepare}",
         f"fp16={args.fp16}",
         f"num_shards={args.num_shards}",
-        f"quant_mlp={args.quant_mlp}",
-        f"quant_precision={args.quant_precision}",
+        f"precision={args.precision}",
+        f"quantize_activations={args.quantize_activations}",
+        f"act_precision={args.act_precision if args.quantize_activations else None}",
         f"max_sequence_length={args.max_sequence_length}",
         f"stem={stem}",
         f"output_path={output_path}",
@@ -317,18 +359,20 @@ def main():
     )
     model.eval()
 
-    # --- Optional MLP quantization via manager ---
-    if args.quant_mlp:
-        calibration_loader = None
-        if args.calibrate:
-            print(f"Building WikiText-2 calibration loader ({args.num_calibration_samples} samples, seq_len={args.calibration_seq_len})")
-            tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-            calibration_loader = _build_wikitext_calibration_loader(
-                tokenizer,
-                num_samples=args.num_calibration_samples,
-                seq_len=args.calibration_seq_len,
-            )
-        quantize_mlp_with_manager(model, args, calibration_loader=calibration_loader)
+    # --- Weight quantization (always) + optional activation quantization ---
+    calibration_loader = None
+    if args.quantize_activations:
+        print(
+            f"Building WikiText-2 calibration loader "
+            f"({args.num_calibration_samples} samples, seq_len={args.calibration_seq_len})"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        calibration_loader = _build_wikitext_calibration_loader(
+            tokenizer,
+            num_samples=args.num_calibration_samples,
+            seq_len=args.calibration_seq_len,
+        )
+    quantize_all_layers_with_manager(model, args, calibration_loader=calibration_loader)
 
     if args.mode == "hf":
         model_input = model
