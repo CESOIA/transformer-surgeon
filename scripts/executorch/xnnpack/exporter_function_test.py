@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 
@@ -133,6 +134,27 @@ def parse_args():
     return parser.parse_args()
 
 
+def _write_cache_metadata(output_path: str, model_config, args: argparse.Namespace) -> str:
+    """Write a JSON sidecar with the KV-cache geometry next to the exported .pte.
+
+    inference_exported_test.py needs num_layers/kv_num_heads/head_dim/max_cache_len
+    to build the io_* cache tensors; without this file those have to be typed in
+    by hand (and get out of sync with whatever model/--max-sequence-length the
+    engine was actually exported with).
+    """
+    meta = {
+        "cache_impl": args.cache_impl,
+        "num_layers": int(model_config.num_hidden_layers),
+        "kv_num_heads": int(model_config.num_key_value_heads),
+        "head_dim": int(model_config.hidden_size // model_config.num_attention_heads),
+        "max_cache_len": int(args.max_sequence_length),
+    }
+    meta_path = os.path.splitext(output_path)[0] + ".cache_meta.json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta_path
+
+
 def _build_pte_stem(args: argparse.Namespace) -> str:
     if args.quant_mlp:
         act_tag = f"_a{args.act_precision}" if args.calibrate else ""
@@ -225,12 +247,18 @@ def main():
             )
         quantize_mlp_with_manager(model, args, calibration_loader=calibration_loader)
 
+    convert_options = {
+        "use_sdpa": False,
+        "cache_impl": args.cache_impl,
+        "max_cache_len": args.max_sequence_length,
+    }
+
     if args.mode == "hf":
         model_input = model
     else:
         converted = convert_for_export(
             model,
-            options={"use_sdpa": False, "cache_impl": args.cache_impl},
+            options=convert_options,
             verbose=False,
         )
         model_input = {
@@ -250,7 +278,7 @@ def main():
         backend=args.backend,
         float_type=export_float_type,
         max_seq_len=args.max_sequence_length,
-        convert_options={"use_sdpa": False, "cache_impl": args.cache_impl},
+        convert_options=convert_options,
         verbose=args.verbose,
     )
 
@@ -259,8 +287,11 @@ def main():
         config=export_config,
     )
 
+    meta_path = _write_cache_metadata(result.pte_path, model.config, args)
+
     print("\nExport result:")
     print(f"  pte_path         : {result.pte_path}")
+    print(f"  cache_meta_path  : {meta_path}")
     print(f"  backend          : {result.backend}")
     print(f"  precision        : {result.precision}")
     print(f"  mismatch_count   : {len(result.weight_mismatches)}")

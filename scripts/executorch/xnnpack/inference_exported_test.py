@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 
@@ -46,20 +47,32 @@ def parse_args():
     parser.add_argument(
         "--cache-impl",
         type=str,
-        default="mutable",
+        default=None,
         choices=["mutable", "io_scatter", "io_concat"],
         help="KV-cache implementation the .pte was exported with. io_* modes thread "
-             "the cache through graph I/O; the geometry args below are then required.",
+             "the cache through graph I/O; the geometry args below are then required. "
+             "Defaults to the value in <pte-path stem>.cache_meta.json if that sidecar "
+             "(written by exporter_function_test.py) exists next to --pte-path, else "
+             "'mutable'.",
     )
     parser.add_argument("--num-layers", type=int, default=None,
-                        help="Decoder layers (required for io_* cache modes).")
+                        help="Decoder layers (required for io_* cache modes; falls back to cache_meta.json).")
     parser.add_argument("--kv-num-heads", type=int, default=None,
-                        help="KV heads per layer (required for io_* cache modes).")
+                        help="KV heads per layer (required for io_* cache modes; falls back to cache_meta.json).")
     parser.add_argument("--head-dim", type=int, default=None,
-                        help="Head dimension (required for io_* cache modes).")
+                        help="Head dimension (required for io_* cache modes; falls back to cache_meta.json).")
     parser.add_argument("--max-cache-len", type=int, default=None,
-                        help="Fixed cache length (required for io_* cache modes).")
+                        help="Fixed cache length (required for io_* cache modes; falls back to cache_meta.json).")
     return parser.parse_args()
+
+
+def _load_cache_metadata(pte_path: str) -> dict | None:
+    """Load the geometry sidecar written by exporter_function_test.py, if present."""
+    meta_path = os.path.splitext(pte_path)[0] + ".cache_meta.json"
+    if not os.path.isfile(meta_path):
+        return None
+    with open(meta_path) as f:
+        return json.load(f)
 
 
 def logits_to_next_id(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -78,6 +91,23 @@ def main():
         raise FileNotFoundError(
             f"PTE file not found at '{args.pte_path}'. Run exporter_function_test.py first."
         )
+
+    meta = _load_cache_metadata(args.pte_path)
+    if meta is not None:
+        meta_path = os.path.splitext(args.pte_path)[0] + ".cache_meta.json"
+        print(f"Loaded KV-cache geometry from {meta_path}")
+        if args.cache_impl is None:
+            args.cache_impl = meta.get("cache_impl", "mutable")
+        if args.num_layers is None:
+            args.num_layers = meta.get("num_layers")
+        if args.kv_num_heads is None:
+            args.kv_num_heads = meta.get("kv_num_heads")
+        if args.head_dim is None:
+            args.head_dim = meta.get("head_dim")
+        if args.max_cache_len is None:
+            args.max_cache_len = meta.get("max_cache_len")
+    if args.cache_impl is None:
+        args.cache_impl = "mutable"
 
     runtime = Runtime.get()
     program = runtime.load_program(args.pte_path)

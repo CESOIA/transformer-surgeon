@@ -107,6 +107,22 @@ def _compile_tensorrt(exported_program: Any, example_inputs: tuple[Any, ...], *,
 def _save_tensorrt(trt_module: Any, output_path: str, example_inputs: tuple[Any, ...], *, output_format: str) -> None:
     import torch_tensorrt
 
+    # io_* cache modes append a list[Tensor] per cache (key_caches, value_caches)
+    # to example_inputs. torch_tensorrt.save's default retrace=True path requires
+    # arg_inputs to be a flat Sequence[Tensor | Input] (it validates every element
+    # individually and errors on nested lists) even though the compiled module's
+    # own forward signature — and torch.export itself — accept the nested pytree
+    # just fine (dynamo.compile's arg_inputs typing is looser and traces correctly).
+    # retrace=False (the "legacy exporter": pure graph surgery on the already-
+    # compiled module, no re-tracing) has no such restriction and doesn't consume
+    # arg_inputs at all, so it works unchanged for both flat and nested contracts.
+    has_nested_inputs = any(isinstance(x, (list, tuple)) for x in example_inputs)
+    if has_nested_inputs:
+        torch_tensorrt.save(
+            trt_module, output_path, output_format=output_format, retrace=False
+        )
+        return
+
     try:
         torch_tensorrt.save(
             trt_module, output_path, arg_inputs=list(example_inputs), output_format=output_format
