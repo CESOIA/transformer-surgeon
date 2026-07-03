@@ -5,11 +5,14 @@ manager.py
 Provides the CompressionSchemesManager class for managing multiple compression schemes in transformer models.
 """
 
+import logging
 import torch
 from torch.utils.data import DataLoader
 from transformers import PretrainedConfig
 from typing import Any, Callable, Dict, List, Optional, Union
 from copy import deepcopy
+
+logger = logging.getLogger(__name__)
 from ..calibration import run_compression_calibration
 from .scheme import CompressionScheme
 from .utils import flatten_index_paths
@@ -62,18 +65,42 @@ class CompressionSchemesManager:
         groups = []
         for _, block_indexing in self.indexing.items():
             block_groups = block_indexing.get("calibration_groups", [])
-            if not isinstance(block_groups, list):
-                raise TypeError(
-                    "Indexing field 'calibration_groups' must be a list of groups. "
-                    f"Got {type(block_groups)}."
-                )
-            for idx, group in enumerate(block_groups):
-                if not isinstance(group, list):
-                    raise TypeError(
-                        "Each 'calibration_groups' entry must be a list compatible with iter_filtered criteria. "
-                        f"Invalid group at index {idx}: {type(group)}."
-                    )
-            groups.extend(deepcopy(block_groups))
+
+            # Structured format by subblock:
+            #   {
+            #     'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
+            #     'mlp': [['down_proj'], ['gate_proj', 'up_proj']],
+            #   }
+            if isinstance(block_groups, dict):
+                for subblock_name, subblock_groups in block_groups.items():
+                    if not isinstance(subblock_groups, list):
+                        raise TypeError(
+                            "Each 'calibration_groups' dict value must be a list of layer groups. "
+                            f"Invalid value type for key '{subblock_name}': {type(subblock_groups)}."
+                        )
+
+                    for group_idx, group_layers in enumerate(subblock_groups):
+                        if not isinstance(group_layers, list):
+                            raise TypeError(
+                                "Each layer group in 'calibration_groups' dict must be a list of layer names. "
+                                f"Invalid group at key '{subblock_name}' index {group_idx}: {type(group_layers)}."
+                            )
+
+                        normalized_group = []
+                        for layer_name in group_layers:
+                            layer_name = str(layer_name)
+                            if "." in layer_name or not str(subblock_name):
+                                normalized_group.append(layer_name)
+                            else:
+                                normalized_group.append(f"{subblock_name}.{layer_name}")
+
+                        groups.append(normalized_group)
+                continue
+
+            raise TypeError(
+                "Indexing field 'calibration_groups' must be a list or a dict. "
+                f"Got {type(block_groups)}."
+            )
         return groups
 
     def set(self, compression, property, value, criteria=None, verbose=False):
@@ -345,7 +372,7 @@ class CompressionSchemesManager:
                 if not callable(needs_calibration_fn):
                     continue
                 needs_calibration = needs_calibration_fn()
-                if needs_calibration is False or needs_calibration is None:
+                if not needs_calibration:
                     continue
 
                 summary_names = needs_calibration
@@ -372,7 +399,7 @@ class CompressionSchemesManager:
                     )
 
                 for summary_name in compressor_summary_names:
-                    if summary_name not in required_summaries:
+                    if summary_name not in required_summaries and summary_name not in scheme.calibration_data:
                         required_summaries.append(summary_name)
 
             if len(required_summaries) > 0:
@@ -432,6 +459,95 @@ class CompressionSchemesManager:
 
         return stages
 
+    def save_state(self, path: str) -> None:
+        """Persist per-scheme calibration data to *path* (torch.save format).
+
+        Saves the computed activation statistics (min/max ranges, covariances,
+        etc.) for every scheme so they can be restored later without re-running
+        the calibration forward passes.  Call this BEFORE prepare_for_save().
+
+        Typical save workflow::
+
+            manager.save_state("checkpoint/compression_state.pt")
+            manager.prepare_for_save()
+            model.save_pretrained("checkpoint")
+        """
+        state = {scheme.path: dict(scheme.calibration_data) for scheme in self}
+        torch.save(state, path)
+
+    def load_state(self, path: str) -> None:
+        """Restore per-scheme calibration data previously saved with save_state().
+
+        After this call, manager.apply() will find the required summaries
+        already populated in scheme.calibration_data and skip the calibration
+        forward pass entirely — no DataLoader is needed.
+
+        Typical reload workflow::
+
+            model = Qwen2ForCausalLMCompress.from_pretrained("checkpoint")
+            manager = Qwen2CompressionSchemesManager(model)
+            manager.load_state("checkpoint/compression_state.pt")
+            manager.apply(hard=True, criteria=["mlp"])
+        """
+        state = torch.load(path, weights_only=False)
+        for scheme in self:
+            saved = state.get(scheme.path)
+            if saved:
+                scheme.calibration_data.update(saved)
+
+    def prepare_for_save(self, criteria=None) -> None:
+        """Strip runtime quantization artifacts from module state dicts.
+
+        Removes activation-quant hooks, registered buffers (_act_quant_scale,
+        _act_out_quant_scale, _torchao_scale, …) and dequantizes any torchao
+        AffineQuantizedTensor weights to plain float so that save_pretrained
+        can serialize them.  The compression config is preserved in model.config
+        and round-trips through save_pretrained/from_pretrained automatically.
+
+        Unlike restore(), this works after hard (non-reversible) quantization
+        and does NOT reset the compressor config.
+
+        Recommended export workflow::
+
+            manager.apply(hard=True)                              # finalize compression
+            manager.save_state("checkpoint/compression_state.pt") # persist calibration
+            manager.prepare_for_save()                            # strip runtime artifacts
+            model.save_pretrained("checkpoint")
+
+        Note on pruning: ``weight_mask`` buffers are kept in the state dict by
+        default so they round-trip through save/load. Call
+        ``manager.remove_masks()`` before saving if they are not needed.
+        """
+        from ..compression.quantization import Quantizer
+        import torch.nn as nn
+
+        soft_only = [
+            scheme.path for scheme in self.iter_filtered(criteria=criteria)
+            if scheme.soft_applied and not scheme.hard_applied
+        ]
+        if soft_only:
+            logger.warning(
+                "Saving with soft compression (not hard) on: %s. "
+                "For quantization, call manager.apply(hard=True) first to use "
+                "torchao acceleration. For pruning, hard and soft are currently "
+                "equivalent (in-place zeroing).",
+                soft_only,
+            )
+
+        for scheme in self.iter_filtered(criteria=criteria):
+            module = scheme.get_compression_module()
+
+            # Dequantize torchao AffineQuantizedTensor weights to plain float.
+            # save_pretrained cannot serialize subclassed tensors.
+            if isinstance(module, nn.Linear):
+                w = module.weight
+                if type(w) is not torch.Tensor and hasattr(w, 'dequantize'):
+                    module.weight = nn.Parameter(w.dequantize(), requires_grad=False)
+
+            for compressor in scheme.compressors.values():
+                if isinstance(compressor, Quantizer):
+                    compressor.strip_runtime_state(module)
+
     def restore(self, topology=False, criteria=None, verbose=False):
         """
         Restores filtered modules to their original state by removing pruning and LRD.
@@ -443,6 +559,42 @@ class CompressionSchemesManager:
         """
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.restore(topology=topology, verbose=verbose)
+
+    def reapply_masks(self, criteria=None):
+        """Re-apply pruning masks to all filtered schemes after an optimizer step.
+
+        Call this inside the fine-tuning loop immediately after
+        ``optimizer.step()`` to prevent mask drift when training with soft
+        pruning (STE style). Pruned weights receive non-zero gradients during
+        the backward pass and drift away from zero; this method zeroes them
+        back using the stored ``weight_mask`` buffers.
+
+        Example::
+
+            for batch in dataloader:
+                loss = model(**batch).loss
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                manager.reapply_masks()
+
+        Args:
+            criteria: Optional filter (same format as ``apply()``).
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            scheme.reapply_masks()
+
+    def remove_masks(self, criteria=None):
+        """Remove ``weight_mask`` buffers from all filtered scheme modules.
+
+        Use before recomputing compression with different settings, or before
+        saving a deployment model where the mask buffers are not needed.
+
+        Args:
+            criteria: Optional filter (same format as ``apply()``).
+        """
+        for scheme in self.iter_filtered(criteria=criteria):
+            scheme.remove_masks()
 
     def _generate_schemes(self):
         """

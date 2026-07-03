@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .activation_range import ActivationRangeSummary, OutputActivationRangeSummary
 from .covariance import CovarianceSummary, CrossCovarianceSummary, ShiftedCovarianceSummary
 from .weight_grad import WeightGradSummary
 
@@ -15,6 +16,10 @@ SUMMARY_REGISTRY = {
     "cross_covariance": CrossCovarianceSummary(),
     # Running weight-gradient average, used by gradient-based pruning methods.
     "weight_grad": WeightGradSummary(),
+    # Running min/max of input activations, used by static activation fake-quant.
+    "activation_range": ActivationRangeSummary(),
+    # Running min/max of output activations, used by output-side static fake-quant.
+    "output_activation_range": OutputActivationRangeSummary(),
 }
 SUPPORTED_SUMMARIES = tuple(SUMMARY_REGISTRY.keys())
 

@@ -48,8 +48,6 @@ def apply_cascade(
         return
 
     selected_by_block = {}
-    for scheme in selected_schemes:
-        selected_by_block.setdefault(scheme.block_name, []).append(scheme)
 
     for block_name, block_indexing in manager.indexing.items():
         if not block_indexing.get("no_cascade_calibration", False):

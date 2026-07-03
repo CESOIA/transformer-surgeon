@@ -196,6 +196,7 @@ Thumbs.db
 *.safetensors
 checkpoints/
 models/
+results*/
 !transformersurgeon/models/
 *.bin
 
@@ -250,3 +251,6 @@ experiments/
 
 # HF transformers github repository
 transformers/
+
+# LLMS agent instructions
+!llms.txt

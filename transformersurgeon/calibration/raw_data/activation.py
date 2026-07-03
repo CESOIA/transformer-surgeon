@@ -53,3 +53,35 @@ class ShiftedActivationCollector(ActivationCollector):
 
     def __init__(self, *, offload_to_cpu: bool = False):
         super().__init__(offload_to_cpu=offload_to_cpu, raw_name=self.name)
+
+
+class OutputActivationCollector(RawDataCollector):
+    """Collects the OUTPUT tensor of a module (post-linear activations).
+
+    Mirrors ActivationCollector but captures the module's return value rather
+    than inputs[0].  Used by OutputActivationRangeSummary to calibrate the
+    output-side quantization observer required by XNNPACK's fused INT8 kernel.
+    """
+
+    name = "output_activation"
+
+    def __init__(self, *, offload_to_cpu: bool = False):
+        self.offload_to_cpu = offload_to_cpu
+
+    def build_forward_hook(self, *, emit_raw: Callable[[str, torch.Tensor], None]):
+        def _hook(module, inputs, output):
+            act = output.detach()
+            out_features = getattr(module, "out_features", act.size(-1))
+            if act.size(-1) != out_features:
+                raise ValueError(
+                    f"Output activation last dimension is {act.size(-1)}, expected {out_features}."
+                )
+            if act.dim() == 1:
+                act = act.reshape(1, -1)
+            else:
+                act = act.reshape(-1, act.size(-1))
+            if self.offload_to_cpu:
+                act = act.cpu()
+            emit_raw(self.name, act.float())
+
+        return _hook

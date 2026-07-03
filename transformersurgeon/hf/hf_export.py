@@ -20,6 +20,7 @@ def _infer_auto_map(model: PreTrainedModel):
 def export_to_hf(
         model: PreTrainedModel,
         repo_id: str,
+        manager=None,
         base_model: str = None,
         readme: str = None,
         out_dir = None,
@@ -28,7 +29,21 @@ def export_to_hf(
         private = False,
         exist_ok = False,
 ):
-    # Setup output directory 
+    """Export a (compressed) model to a local directory and optionally to the Hub.
+
+    Args:
+        manager: Optional ``CompressionSchemesManager``. When provided, calls
+            ``manager.apply(hard=True)`` followed by ``manager.prepare_for_save()``
+            before serializing the model, which finalizes quantization (torchao)
+            and strips runtime artifacts. If omitted you must call those methods
+            yourself before calling this function.
+    """
+    # Finalize compression if a manager is supplied
+    if manager is not None:
+        manager.apply(hard=True)
+        manager.prepare_for_save()
+
+    # Setup output directory
     out_dir = os.path.join(out_dir or "", f"{repo_id.split('/')[-1]}")
     os.makedirs(out_dir, exist_ok=True)
 

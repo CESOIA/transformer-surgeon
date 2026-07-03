@@ -4,31 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 from .rope import apply_rope_multihead
-from . import LinearCompressed
-
-def attention_mask(
-    q_seq_length,
-    kv_seq_length,          # effective KV length (current cache_len)
-    device="cpu",
-    kv_alloc_length=None,   # kept for API compatibility; static width is required
-    mask_value=-1e6,
-):
-    # Static export requires a fixed KV width.
-    kv_width = kv_seq_length if kv_alloc_length is None else kv_alloc_length
-
-    i = torch.arange(q_seq_length, device=device).view(1, q_seq_length, 1)
-    j = torch.arange(kv_width, device=device).view(1, 1, kv_width)
-
-    # Align each query row to absolute position based on effective cache length.
-    q_abs_pos = i + (kv_seq_length - q_seq_length)
-
-    # Standard causal future mask
-    future = j > q_abs_pos
-
-    # In static mode, also mask slots not written yet (j >= kv_seq_length)
-    not_filled = j >= kv_seq_length
-
-    return (future | not_filled).to(torch.float32) * mask_value
+from . import LinearCompressed  
 
 def attention(query, key, value, attn_mask=None):
     """
@@ -47,33 +23,79 @@ def attention(query, key, value, attn_mask=None):
     _, kv_head_num,       _ = key.size()
     group_size = q_head_num // kv_head_num
 
-    # expand key, value for possible GQA
-    key   = key.repeat_interleave(group_size, dim=1)    # (seq_length, q_head_num, head_dim)
-    value = value.repeat_interleave(group_size, dim=1)  # (seq_length, q_head_num, head_dim)
-
     dtype = query.dtype
+    scale = 1.0 / math.sqrt(head_dim)
+
+    # -------------------------------------------------------------------------
+    # CURRENT PATH: materialize GQA expansion before matmul.
+    # Avoids this block if switching to einsum or broadcasting alternatives below.
+    # -------------------------------------------------------------------------
+    # expand key, value for possible GQA
+    # key   = key.repeat_interleave(group_size, dim=1)    # (seq_length, q_head_num, head_dim)
+    # value = value.repeat_interleave(group_size, dim=1)  # (seq_length, q_head_num, head_dim)
+    key   = key.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
+    value = value.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
 
     # Swap head and sequence dimensions for attention computation
-    query = query.transpose(0, 1)
-    key   = key.transpose(0, 1)
-    value = value.transpose(0, 1)
+    query = query.transpose(0, 1)                        # (q_head_num, seq_len, head_dim)
+    key   = key.transpose(0, 1)                          # (q_head_num, kv_len, head_dim)
+    value = value.transpose(0, 1)                        # (q_head_num, kv_len, head_dim)
 
-    # Scaled QK^T
-    scale = 1.0 / math.sqrt(head_dim)
-    scores = torch.matmul(query, key.transpose(-2, -1))*scale
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale  # (q_head_num, seq_len, kv_len)
 
-    # Generate negative causal mask
     if attn_mask is not None:
-        # Mask the future positions
-        scores = scores + attn_mask # Add large negative values for masking
+        scores = scores + attn_mask
 
-    # Softmax
-    scores = torch.nn.functional.softmax(scores.to(torch.float32), dim=-1)
+    scores = torch.nn.functional.softmax(scores, dim=-1)
 
-    # Project the values over the scores
-    attn_output = torch.matmul(scores.to(dtype), value)  # (kv_head_num, group_size, seq_length, head_dim)
+    attn_output = torch.matmul(scores.to(dtype), value)  # (q_head_num, seq_len, head_dim)
+    # -------------------------------------------------------------------------
+    # END CURRENT PATH
+    # -------------------------------------------------------------------------
 
-    return attn_output.to(dtype)
+    # -------------------------------------------------------------------------
+    # ALTERNATIVE 1 — einsum GQA (no KV materialization).
+    # To use: comment out the CURRENT PATH block above and uncomment this block.
+    # -------------------------------------------------------------------------
+    # query = query.transpose(0, 1).reshape(kv_head_num, group_size, -1, head_dim)  # (kv_heads, group, seq, head_dim)
+    # key   = key.transpose(0, 1)    # (kv_heads, kv_len, head_dim)
+    # value = value.transpose(0, 1)  # (kv_heads, kv_len, head_dim)
+    #
+    # scores = torch.einsum("hgsd,hkd->hgsk", query, key) * scale  # (kv_heads, group, seq, kv_len)
+    #
+    # if attn_mask is not None:
+    #     scores = scores + attn_mask.unsqueeze(1)  # broadcast over group dim
+    #
+    # scores = torch.nn.functional.softmax(scores, dim=-1)
+    #
+    # attn_output = torch.einsum("hgsk,hkd->hgsd", scores.to(dtype), value)  # (kv_heads, group, seq, head_dim)
+    # attn_output = attn_output.reshape(q_head_num, -1, head_dim)  # (q_heads, seq, head_dim)
+    # -------------------------------------------------------------------------
+    # END ALTERNATIVE 1
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # ALTERNATIVE 2 — broadcasting GQA (expand without reshape, avoids copy).
+    # To use: comment out the CURRENT PATH block above and uncomment this block.
+    # -------------------------------------------------------------------------
+    # query = query.transpose(0, 1).reshape(kv_head_num, group_size, -1, head_dim)  # (kv_heads, group, seq, head_dim)
+    # key   = key.transpose(0, 1).unsqueeze(1)    # (kv_heads, 1, kv_len, head_dim)
+    # value = value.transpose(0, 1).unsqueeze(1)  # (kv_heads, 1, kv_len, head_dim)
+    #
+    # scores = torch.matmul(query, key.transpose(-2, -1)) * scale  # (kv_heads, group, seq, kv_len) via broadcast
+    #
+    # if attn_mask is not None:
+    #     scores = scores + attn_mask.unsqueeze(1)  # broadcast over group dim
+    #
+    # scores = torch.nn.functional.softmax(scores, dim=-1)
+    #
+    # attn_output = torch.matmul(scores.to(dtype), value)   # (kv_heads, group, seq, head_dim) via broadcast
+    # attn_output = attn_output.reshape(q_head_num, -1, head_dim)  # (q_heads, seq, head_dim)
+    # -------------------------------------------------------------------------
+    # END ALTERNATIVE 2
+    # -------------------------------------------------------------------------
+
+    return attn_output.to(dtype)  # (seq_len, q_head_num, head_dim)
 
 class MHABase(torch.nn.Module):
     def __init__(
@@ -84,6 +106,7 @@ class MHABase(torch.nn.Module):
             kv_num_heads=None,
             use_sdpa=False,
             compression_config=None,
+            dtype=None,
             **kwargs,
             ):
         super().__init__()
@@ -95,6 +118,7 @@ class MHABase(torch.nn.Module):
         self.kv_num_heads = num_heads if kv_num_heads is None else kv_num_heads
         self.use_sdpa = use_sdpa
         self.kv_out_dim = self.kv_num_heads * self.head_dim
+        self.dtype = dtype
 
         # Setup compression configuration
         if compression_config is None:
@@ -129,22 +153,26 @@ class MHABase(torch.nn.Module):
             embed_dim,
             embed_dim,
             bias=bias_required["q_proj"],
-            rank=q_lrd_rank)
+            rank=q_lrd_rank,
+            dtype=dtype)
         self.k_proj = LinearCompressed(
             embed_dim,
             self.kv_out_dim,
             bias=bias_required["k_proj"],
-            rank=k_lrd_rank)
+            rank=k_lrd_rank,
+            dtype=dtype)
         self.v_proj = LinearCompressed(
             embed_dim,
             self.kv_out_dim,
             bias=bias_required["v_proj"],
-            rank=v_lrd_rank)
+            rank=v_lrd_rank,
+            dtype=dtype)
         self.out_proj = LinearCompressed(
             embed_dim,
             embed_dim,
             bias=bias_required["out_proj"],
-            rank=out_lrd_rank)
+            rank=out_lrd_rank,
+            dtype=dtype)
 
 class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
     def __init__(self, *args, **kwargs):
@@ -171,7 +199,7 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
             attn_output = attention(q, k, v)
         
         # Concatenate heads and project output
-        attn_output = attn_output.transpose(0, 1).view(seq_length, embed_dim).contiguous()
+        attn_output = attn_output.transpose(0, 1).reshape(seq_length, embed_dim)
         output = self.out_proj(attn_output)
         
         return output
@@ -250,55 +278,140 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         
         return output
     
+CACHE_IMPLS = ("mutable", "io_scatter", "io_concat")
+
+
 class MHACausal(MHABase): # Causal MHA with caching for decoder use
+    """Causal multi-head attention over a fixed-size KV cache.
+
+    The cache write is selected by ``cache_impl`` (see ``CACHE_IMPLS``):
+
+    - ``"mutable"``   : in-place ``index_copy_`` on an internal buffer. The cache
+                        is module state (not graph I/O). QNN-only; the current
+                        default so existing exports/tests are unchanged.
+    - ``"io_scatter"``: functional ``index_put`` on a cache passed in as a
+                        forward argument and returned as output. Portable to
+                        QNN (ScatterNd) and TensorRT (ScatterND).
+    - ``"io_concat"`` : scatter-free functional write built from a positional
+                        mask + ``where`` (Concat/select family). Universal
+                        fallback for backends lacking an index_put converter.
+
+    All three produce an updated **fixed-size** ``(max_cache_len, kv_num_heads,
+    head_dim)`` cache and then run the identical mask + attention code, so the
+    three paths are numerically equivalent. The framework feeds one token at a
+    time (``in_seq_len == 1``); the writers assume that.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._init_kvcache(
-            max_cache_length=kwargs.get("max_cache_len", 2048)
+
+        self.cache_impl = kwargs.get("cache_impl", "mutable")
+        if self.cache_impl not in CACHE_IMPLS:
+            raise ValueError(
+                f"Unsupported cache_impl {self.cache_impl!r}; expected one of {CACHE_IMPLS}"
+            )
+
+        # Initialize key and value caches
+        self.max_cache_length=kwargs.get("max_cache_len", 2048)
+
+        # Buffers back the "mutable" path; harmless (and cheap) for io_* modes,
+        # where they also serve as the initial cache when none is passed in.
+        self.register_buffer(
+            "key_cache",
+            torch.zeros(
+                self.max_cache_length,
+                self.kv_num_heads,
+                self.head_dim,
+                dtype=self.dtype),
+            persistent=False
+        )
+        self.register_buffer(
+            "value_cache",
+            torch.zeros(
+                self.max_cache_length,
+                self.kv_num_heads,
+                self.head_dim,
+                dtype=self.dtype),
+            persistent=False
         )
 
-    def _init_kvcache(self, max_cache_length):
-        # Initialize key and value caches as buffers (not parameters, not persistent)
-        self.register_buffer("key_cache", torch.zeros(max_cache_length, self.kv_num_heads, self.head_dim), persistent=False)
-        self.register_buffer("value_cache", torch.zeros(max_cache_length, self.kv_num_heads, self.head_dim), persistent=False)
-        
-    def forward(self, x, last_pos, attn_mask=None, rope=None):
+    def _write_mutable(self, k, v, write_index, key_cache, value_cache):
+        """In-place write on the internal buffers (QNN peak path)."""
+        with torch.no_grad():
+            self.key_cache.index_copy_(0, write_index, k)
+            self.value_cache.index_copy_(0, write_index, v)
+        return self.key_cache, self.value_cache
+
+    def _write_scatter(self, k, v, write_index, key_cache, value_cache):
+        """Functional scatter -> updated fixed-size cache (aten.index_put)."""
+        key_cache = key_cache.index_put((write_index,), k)
+        value_cache = value_cache.index_put((write_index,), v)
+        return key_cache, value_cache
+
+    def _write_concat(self, k, v, write_index, key_cache, value_cache):
+        """Scatter-free write: positional one-hot mask + where (in_seq_len==1)."""
+        idx = torch.arange(self.max_cache_length, device=k.device)
+        sel = (idx == write_index).view(self.max_cache_length, 1, 1)  # (L,1,1)
+        k_row = k.reshape(1, self.kv_num_heads, self.head_dim)
+        v_row = v.reshape(1, self.kv_num_heads, self.head_dim)
+        key_cache = torch.where(sel, k_row, key_cache)
+        value_cache = torch.where(sel, v_row, value_cache)
+        return key_cache, value_cache
+
+    def forward(self, x, pos_id, pos_id_list, mask_penalty,
+                key_cache=None, value_cache=None, rope=None):
         """
         Forward pass of the causal Multi-Head Attention with caching.
-        
+
         Args:
             x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
-            last_pos (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
+            pos_id (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
+            key_cache/value_cache (torch.Tensor, optional): Incoming fixed-size
+                caches for the ``io_*`` modes. If omitted, the internal buffers
+                are used as the initial cache.
             rope (tuple, optional): Tuple of (cos, sin) tensors for RoPE application.
+
+        Returns:
+            output (mutable mode) or (output, key_cache, value_cache) (io modes).
         """
         in_seq_len, embed_dim = x.size()
+
+        # Fall back to internal buffers when caches are not threaded in.
+        if key_cache is None:
+            key_cache = self.key_cache
+        if value_cache is None:
+            value_cache = self.value_cache
 
         # Project inputs to Q, K, V
         q = self.q_proj(x).view(in_seq_len, self.num_heads, self.head_dim) # (in_seq_len, num_heads, head_dim)
         k = self.k_proj(x).view(in_seq_len, self.kv_num_heads, self.head_dim) # (in_seq_len, kv_num_heads, head_dim)
         v = self.v_proj(x).view(in_seq_len, self.kv_num_heads, self.head_dim) # (in_seq_len, kv_num_heads, head_dim)
-        
+
         # Apply RoPE
         if rope is not None:
-            cos, sin = rope
+            cos = rope[0][pos_id]
+            sin = rope[1][pos_id]
             q = apply_rope_multihead(q, cos, sin)
             k = apply_rope_multihead(k, cos, sin)
 
-        # Update key and value caches in-place
-        with torch.no_grad():
-            last_pos_tensor = torch.as_tensor(last_pos, device=x.device)
-            indexes = torch.arange(-in_seq_len, 0, device=x.device) + last_pos_tensor
-            self.key_cache.index_copy_(0, indexes, k)
-            self.value_cache.index_copy_(0, indexes, v)
+        # Write new K/V into the fixed-size cache (mechanism per cache_impl).
+        write_index = torch.clamp(pos_id, 0, self.max_cache_length-1).long()
+        if self.cache_impl == "mutable":
+            key_cache, value_cache = self._write_mutable(k, v, write_index, key_cache, value_cache)
+        elif self.cache_impl == "io_scatter":
+            key_cache, value_cache = self._write_scatter(k, v, write_index, key_cache, value_cache)
+        else:  # io_concat
+            key_cache, value_cache = self._write_concat(k, v, write_index, key_cache, value_cache)
 
-        # Static path always attends over fixed-size caches, with masking handling valid range.
-        key_cache = self.key_cache
-        value_cache = self.value_cache
+        # On-the-fly attention mask
+        q_pos, k_pos = pos_id_list
+        attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pos_id].unsqueeze(0) # (1, max_cache_len)
 
+        # Call mha operation (SDPA or custom attention)
         if self.use_sdpa:
             q = q.transpose(0, 1) # (num_heads, in_seq_len, head_dim)
-            k = key_cache.transpose(0, 1) # (kv_num_heads, last_pos, head_dim)
-            v = value_cache.transpose(0, 1) # (kv_num_heads, last_pos, head_dim)
+            k = key_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
+            v = value_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
             attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
         else:
             attn_output = attention(q, key_cache, value_cache, attn_mask)
@@ -306,12 +419,14 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # Concatenate heads and project output
         attn_output = attn_output.transpose(0, 1).reshape(in_seq_len, embed_dim)
         output = self.out_proj(attn_output)
-        
-        return output
-    
+
+        if self.cache_impl == "mutable":
+            return output
+        return output, key_cache, value_cache
+
 __all__ = [
-    "attention_mask",
     "MHAEncoder",
     "MHACausal",
-    "MHAEncoderFusedProj"
+    "MHAEncoderFusedProj",
+    "CACHE_IMPLS",
     ]

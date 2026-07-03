@@ -1,239 +1,214 @@
+"""
+ExecuTorch-specific export utilities.
+
+The backend-agnostic machinery (model wrapper, per-layer quant-metadata
+extraction, PT2E scale injection / calibration, weight-mismatch checks and the
+result container) lives one level up in ``transformersurgeon.export.common`` and
+is shared with every backend.  This module re-exports those names for backward
+compatibility and adds the parts that genuinely depend on ExecuTorch:
+
+  * ExecuTorchExportResult  – result with a ``pte_path`` alias
+  * ExecutorchExporterConfig – exporter config base (adds dynamic_shapes)
+  * build_quantizer_from_layer_info / _LinearOnlyQuantizer – XNNPACK PT2E quantizer
+  * run_simple_inference_stats – error stats via the ExecuTorch runtime
+  * finalize_export_result – ExecuTorch-flavoured wrapper over the generic one
+"""
+
 import warnings
-from abc import ABC
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.fx
 import torch.nn as nn
 
-from ..config import BackendExportConfig
+# Re-export the backend-agnostic helpers so existing
+# `from ...common import <name>` imports keep working.
+from ..common import (  # noqa: F401
+    SUPPORTED_QUANT_CONFIGS,
+    _PRECISION_TO_QRANGE,
+    _PRECISION_TO_EFFECTIVE_DENOM,
+    BackendExportResult,
+    ExporterConfig,
+    LLMWrapper,
+    build_wrapper,
+    build_example_inputs,
+    resolve_components_and_wrapper,
+    extract_layer_quant_info,
+    inject_scales_into_pt2e_observers,
+    calibrate_pt2e_observers,
+    dequant_from_exported_state_dict,
+    find_weight_mismatches,
+    finalize_export_result as _finalize_export_result,
+)
+
+
+# ---------------------------------------------------------------------------
+# ExecuTorch-flavoured data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecuTorchExportResult(BackendExportResult):
+    """Backend result with a ``pte_path`` alias for the on-disk ``.pte`` file."""
+
+    @property
+    def pte_path(self) -> str:
+        return self.output_path
 
 
 @dataclass
-class QuantizationPlan:
-    """Quantization plan placeholder for future mixed-precision support."""
-
-    global_precision: str = "int4"
-    layer_precisions: dict[str, str] = field(default_factory=dict)
-
-    @classmethod
-    def build(
-        cls,
-        model_config: Any | None,
-        requested_precision: str = "int4",
-    ) -> "QuantizationPlan":
-        _ = model_config
-        # TODO: implement per-layer precision logic based on model_config and requested_precision
-        return cls(global_precision=requested_precision, layer_precisions={})
+class ExecutorchExporterConfig(ExporterConfig):
+    """Abstract base config shared by all ExecuTorch backend exporters."""
 
 
-@dataclass
-class ExecuTorchExportResult:
-    pte_path: str
-    backend: str
-    precision: str
-    weight_mismatches: list[dict[str, Any]]
-    inference_stats: dict[str, float] | None = None
+# ---------------------------------------------------------------------------
+# XNNPACK PT2E quantizer construction
+# ---------------------------------------------------------------------------
+
+class _LinearOnlyQuantizer:
+    """Thin wrapper around XNNPACKQuantizer that restricts annotation to
+    linear (and linear_relu) patterns only.
+
+    The default XNNPACKQuantizer also annotates cat/add/mul patterns, but
+    their annotators ignore the per-module filter_fn (a known limitation of
+    the upstream implementation).  This causes attention ops (ROPE sub/add,
+    KV-cache cat) to receive observers whose calibration data is degenerate
+    (all-negative outputs → zp=127 → clips all positive activations to 0).
+    By restricting to linear patterns only we avoid annotating non-linear ops
+    in unrelated modules while still enabling INT8 weight+activation fusion
+    for the targeted MLP projections.
+    """
+
+    def __init__(self, base: "XNNPACKQuantizer"):
+        self._base = base
+        # Monkey-patch SUPPORTED_PATTERNS to linear-only for the duration of annotate()
+        from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import QuantPattern, LINEAR_TARGETS
+        self._linear_only_patterns = [
+            QuantPattern("linear", True, False, LINEAR_TARGETS),
+            QuantPattern("linear_relu", False, False, LINEAR_TARGETS),
+        ]
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def annotate(self, model):
+        original = self._base.__class__.SUPPORTED_PATTERNS
+        self._base.__class__.SUPPORTED_PATTERNS = self._linear_only_patterns
+        try:
+            result = self._base.annotate(model)
+        finally:
+            self._base.__class__.SUPPORTED_PATTERNS = original
+        return result
 
 
-@dataclass
-class ExecutorchExporterConfig(BackendExportConfig, ABC):
-    """Abstract base config shared by backend-specific exporters."""
+def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
+    """Build a per-module XNNPACKQuantizer driven by compression metadata.
 
-    precision: str = "int4"
-    dynamic_shapes: dict[str, Any] | None = None
+    Each layer in layer_info gets its own qconfig; layers absent from
+    layer_info are not quantised (they remain float).
 
-
-class LLMWrapper(nn.Module):
-    """Static export wrapper for decode with fixed seq_len=1."""
-
-    def __init__(self, embedding: nn.Module, decoder: nn.Module, final_layer: nn.Module):
-        super().__init__()
-        self.embedding = embedding
-        self.decoder = decoder
-        self.final_layer = final_layer
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        last_pos_tensor: torch.LongTensor,
-    ) -> torch.Tensor:
-        last_pos = last_pos_tensor
-        hidden = self.decoder(self.embedding(input_ids), last_pos=last_pos)
-        logits = self.final_layer(hidden[-1, :])
-        return logits
-
-
-def build_wrapper(
-    components: Any,
-    *,
-    model_config: Any | None,
-) -> nn.Module:
-    if isinstance(components, dict):
-        embedding = components["embedding"]
-        decoder = components["decoder"]
-        final_layer = components["final_layer"]
-    elif isinstance(components, (tuple, list)) and len(components) == 3:
-        embedding, decoder, final_layer = components
-    else:
-        raise TypeError(
-            "Default wrapper builder expects dict {embedding, decoder, final_layer} "
-            "or tuple/list (embedding, decoder, final_layer)."
-        )
-
-    return LLMWrapper(embedding, decoder, final_layer)
-
-
-def build_example_inputs(
-    model_config: Any | None,
-    *,
-    config: Any,
-) -> tuple[Any, ...]:
-    vocab_size = int(getattr(model_config, "vocab_size", 100)) if model_config is not None else 100
-    example_input_ids = torch.randint(0, vocab_size, (1,), dtype=torch.long)
-    example_cache_len_tensor = torch.tensor([1], dtype=torch.long)
-
-    max_seq_len = getattr(config, "max_seq_len", None)
-    if isinstance(max_seq_len, int) and max_seq_len > 0:
-        cache_len_value = int(example_cache_len_tensor.reshape(-1)[0].item())
-        if cache_len_value > max_seq_len:
-            raise ValueError(
-                f"example_cache_len_tensor value ({cache_len_value}) exceeds max_seq_len ({max_seq_len})."
-            )
-
-    return (example_input_ids, example_cache_len_tensor)
-
-
-def build_quantizer(precision: str):
+    Layers with stored activation calibration data use static quantization
+    (is_dynamic=False); others use dynamic weight-only (is_dynamic=True).
+    """
     from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
         XNNPACKQuantizer,
         get_symmetric_quantization_config,
     )
 
-    if precision == "int4":
-        qconfig = get_symmetric_quantization_config(
-            is_per_channel=True,
-            is_dynamic=True,
-            weight_qmin=-8,
-            weight_qmax=7,
-        )
-    elif precision == "int8":
-        qconfig = get_symmetric_quantization_config(
-            is_per_channel=True,
-            is_dynamic=True,
-        )
-    else:
-        raise ValueError(f"Unsupported precision '{precision}'. Use 'int4' or 'int8'.")
-
-    return XNNPACKQuantizer().set_global(qconfig)
-
-
-def dequant_from_exported_state_dict(state_dict: dict[str, torch.Tensor]) -> list[torch.Tensor]:
-    """Extract all dequantized frozen params from PT2E exported state dict."""
-    dequantized = []
-    for key, int_w in state_dict.items():
-        if not key.startswith("_frozen_param"):
-            continue
-
-        suffix = key.replace("_frozen_param", "")
-        scale_key = f"_scale_{suffix}"
-        zp_key = f"_zero_point_{suffix}"
-        if scale_key not in state_dict:
-            continue
-
-        scale = state_dict[scale_key].float()
-        zp = state_dict.get(zp_key)
-        if zp is None:
-            zp = torch.zeros_like(scale, dtype=torch.float32)
-        else:
-            zp = zp.float()
-
-        dq = (int_w.float() - zp.unsqueeze(1)) * scale.unsqueeze(1)
-        dequantized.append(dq)
-
-    return dequantized
-
-
-def find_weight_mismatches(
-    wrapper: nn.Module,
-    quantized_exported,
-    eps: float,
-) -> list[dict[str, Any]]:
-    """Best-effort match of exported dequantized tensors against original weights."""
-    # Restrict matching to float 2D tensors to compare exported linear-like weights.
-    original_candidates: list[tuple[str, torch.Tensor]] = []
-    for name, tensor in wrapper.state_dict().items():
-        if tensor.ndim == 2 and tensor.is_floating_point():
-            original_candidates.append((name, tensor.detach().float()))
-
-    exported_state_dict_attr = getattr(quantized_exported, "state_dict", None)
-    exported_state_dict = (
-        exported_state_dict_attr()
-        if callable(exported_state_dict_attr)
-        else exported_state_dict_attr
-    )
-    if not isinstance(exported_state_dict, dict):
-        raise TypeError("exported object does not expose a dict-like state_dict")
-    dequantized = dequant_from_exported_state_dict(exported_state_dict)
-
-    mismatches = []
-    for idx, dq in enumerate(dequantized):
-        same_shape = [(n, t) for n, t in original_candidates if list(t.shape) == list(dq.shape)]
-        if not same_shape:
-            continue
-
-        best = None
-        best_max = None
-        best_mean = None
-        for name, t in same_shape:
-            err = (t - dq).abs()
-            max_err = float(err.max().item())
-            mean_err = float(err.mean().item())
-            if best_max is None or max_err < best_max:
-                best = name
-                best_max = max_err
-                best_mean = mean_err
-
-        if best_max is not None and best_max > eps:
-            mismatches.append(
-                {
-                    "exported_index": idx,
-                    "matched_weight": best,
-                    "max_abs_err": best_max,
-                    "mean_abs_err": best_mean,
-                    "eps": eps,
-                }
+    base = XNNPACKQuantizer()
+    for layer_name, info in layer_info.items():
+        qrange = _PRECISION_TO_QRANGE.get(info["precision"])
+        if qrange is None:
+            warnings.warn(
+                f"Unsupported compression precision {info['precision']} for "
+                f"layer '{layer_name}'; skipping — layer will remain float.",
+                stacklevel=2,
             )
+            continue
 
-    return mismatches
+        is_dynamic = info["act_scale"] is None  # True → weight-only (fp activations); False → static (calibrated activations)
+        qconfig = get_symmetric_quantization_config(
+            is_per_channel=info["per_channel"],
+            is_dynamic=is_dynamic,
+            **qrange,
+        )
+        base.set_module_name(layer_name, qconfig)
 
+    return _LinearOnlyQuantizer(base)
+
+
+# ---------------------------------------------------------------------------
+# ExecuTorch-runtime inference stats + finalize wrapper
+# ---------------------------------------------------------------------------
 
 def run_simple_inference_stats(
     wrapper: nn.Module,
     pte_path: str,
     inference_inputs: tuple[Any, ...],
-) -> dict[str, float]:
-    from executorch.runtime import Runtime
+) -> dict[str, float] | None:
+    """Run one forward pass through both the float wrapper and the exported program
+    and return absolute/MSE error statistics.  Returns None if the ExecuTorch
+    runtime is not installed.
+    """
+    try:
+        from executorch.runtime import Runtime
+    except (ImportError, ModuleNotFoundError) as e:
+        warnings.warn(
+            f"ExecuTorch runtime not available; skipping inference stats. ({e})",
+            stacklevel=2,
+        )
+        return None
 
     wrapper.eval()
     with torch.no_grad():
         y_ref = wrapper(*inference_inputs)
+    # io cache modes return (logits, new_key_caches, new_value_caches); compare logits.
+    if isinstance(y_ref, (tuple, list)):
+        y_ref = y_ref[0]
 
+    # Load and run the exported program.
     runtime = Runtime.get()
     program = runtime.load_program(pte_path)
-    method = program.load_method("forward")
-    y_et = method.execute(list(inference_inputs))[0]
+    method_names = _get_method_names(program)
+    if "forward" in method_names:
+        method_name = "forward"
+    elif method_names:
+        method_name = method_names[0]
+        warnings.warn(
+            f"'forward' not found in exported program; using '{method_name}' instead.",
+            stacklevel=2,
+        )
+    else:
+        raise RuntimeError(f"Exported program has no runnable methods. pte_path='{pte_path}'")
+
+    # The exported program takes flat tensor inputs; io modes pass the KV caches
+    # as nested lists, so flatten them into the runtime argument list.
+    flat_inputs: list[Any] = []
+    for arg in inference_inputs:
+        if isinstance(arg, (list, tuple)):
+            flat_inputs.extend(arg)
+        else:
+            flat_inputs.append(arg)
+
+    y_et = program.load_method(method_name).execute(flat_inputs)[0]
     if not isinstance(y_et, torch.Tensor):
         y_et = torch.tensor(y_et)
 
     err = (y_ref - y_et).abs()
     mse = ((y_ref - y_et) ** 2).mean()
     return {
-        "max_abs_err": float(err.max().item()),
+        "max_abs_err":  float(err.max().item()),
         "mean_abs_err": float(err.mean().item()),
-        "mse": float(mse.item()),
-        "rmse": float(torch.sqrt(mse).item()),
+        "mse":          float(mse.item()),
+        "rmse":         float(torch.sqrt(mse).item()),
     }
+
+
+def _get_method_names(program: Any) -> list[str]:
+    attr = getattr(program, "method_names", None)
+    if callable(attr):
+        return list(attr())
+    return list(attr) if attr is not None else []
 
 
 def finalize_export_result(
@@ -248,104 +223,17 @@ def finalize_export_result(
     weight_mismatch_eps: float,
     verbose: bool,
 ) -> ExecuTorchExportResult:
-    """Run backend-agnostic post-export checks and build the final result."""
-    mismatches: list[dict[str, Any]] = []
-    if run_weight_mismatch_check and exported_for_mismatch is not None:
-        try:
-            mismatches = find_weight_mismatches(
-                wrapper,
-                exported_for_mismatch,
-                eps=weight_mismatch_eps,
-            )
-        except Exception as exc:
-            warnings.warn(
-                f"Weight mismatch check skipped due to extractor incompatibility: {exc}",
-                stacklevel=2,
-            )
-    elif run_weight_mismatch_check and precision == "full":
-        warnings.warn(
-            "Weight mismatch check is skipped for precision='full' (no quantized frozen params).",
-            stacklevel=2,
-        )
-
-    if mismatches:
-        worst = max(mismatches, key=lambda x: x["max_abs_err"])
-        warnings.warn(
-            "Weight mismatch above eps after export: "
-            f"count={len(mismatches)} "
-            f"worst_weight={worst['matched_weight']} "
-            f"worst_max_abs_err={worst['max_abs_err']:.6g} "
-            f"(eps={weight_mismatch_eps:.6g})",
-            stacklevel=2,
-        )
-
-    stats = None
-    if verbose:
-        stats = run_simple_inference_stats(
-            wrapper,
-            pte_path,
-            example_inputs,
-        )
-        print("[ExecuTorch export] Simple inference error statistics")
-        print(f"  max_abs_err : {stats['max_abs_err']:.8f}")
-        print(f"  mean_abs_err: {stats['mean_abs_err']:.8f}")
-        print(f"  mse         : {stats['mse']:.10f}")
-        print(f"  rmse        : {stats['rmse']:.8f}")
-
-    return ExecuTorchExportResult(
-        pte_path=pte_path,
+    """ExecuTorch-flavoured finalize: runs the generic checks and computes
+    inference stats through the ExecuTorch runtime."""
+    return _finalize_export_result(
+        output_path=pte_path,
         backend=backend,
         precision=precision,
-        weight_mismatches=mismatches,
-        inference_stats=stats,
+        wrapper=wrapper,
+        exported_for_mismatch=exported_for_mismatch,
+        run_weight_mismatch_check=run_weight_mismatch_check,
+        weight_mismatch_eps=weight_mismatch_eps,
+        verbose=verbose,
+        inference_stats_fn=lambda: run_simple_inference_stats(wrapper, pte_path, example_inputs),
+        result_cls=ExecuTorchExportResult,
     )
-
-
-def resolve_components_and_wrapper(
-    model_or_graph: Any,
-    *,
-    config: Any,
-) -> tuple[nn.Module, Any | None, tuple[Any, ...], QuantizationPlan]:
-    if isinstance(model_or_graph, dict):
-        components = {
-            "embedding": model_or_graph["embedding"],
-            "decoder": model_or_graph["decoder"],
-            "final_layer": model_or_graph["final_layer"],
-        }
-        model_config = model_or_graph.get("config")
-    elif isinstance(model_or_graph, (tuple, list)) and len(model_or_graph) == 3:
-        components = model_or_graph
-        model_config = None
-    else:
-        raise TypeError(
-            "Unsupported model input at backend layer. "
-            "Pass export-ready components {embedding, decoder, final_layer} "
-            "or call export_to_backend for full-model conversion."
-        )
-
-    wrapper = build_wrapper(
-        components,
-        model_config=model_config,
-    )
-    wrapper.eval()
-
-    quant_plan = QuantizationPlan.build(model_config, requested_precision=config.precision)
-    if quant_plan.global_precision not in {"int4", "int8", "full"}:
-        raise ValueError(
-            f"Unsupported precision '{quant_plan.global_precision}'. "
-            "Use 'int4', 'int8', or 'full'."
-        )
-    if quant_plan.layer_precisions:
-        warnings.warn(
-            "Per-layer precision overrides are not implemented yet; using global precision only.",
-            stacklevel=2,
-        )
-
-    example_inputs = build_example_inputs(model_config, config=config)
-    if config.dynamic_shapes is not None:
-        warnings.warn(
-            "dynamic_shapes is ignored; exporter now uses static seq_len=1 contract.",
-            stacklevel=2,
-        )
-
-    return wrapper, model_config, example_inputs, quant_plan

@@ -1,0 +1,24 @@
+# transformer-surgeon
+
+> PyTorch/HuggingFace library for compressing transformer models (LLMs, vision models) via low-rank decomposition, structured/unstructured pruning, and quantization. Compression is reversible by default. Models remain fully HuggingFace-compatible after compression.
+
+## Docs
+
+- [README](README.md): Installation, quick-start examples, manager API overview, VCON workflow, soft vs hard apply
+- [Core Concepts](docs/concepts.md): Three-layer architecture (Compressor / CompressionScheme / Manager), LinearCompressed internals, calibration pipeline (standard and cascade), VCON design, export backends, extension guide
+- [Agent Guide](AGENTS.md): File map, test commands, coding invariants, anti-patterns, compression parameter reference, export backends, extension recipes — read this before making code changes
+- [Framework Structure](FRAMEWORK_STRUCTURE.md): Package layout and internal wiring for contributors
+
+## Export
+
+- `transformersurgeon.export.export_to_backend(model, config)`: backend-agnostic export to `xnnpack`/`qnn` (ExecuTorch, `.pte`) or `tensorrt` (TensorRT engine/exported program, needs the `tensorrt` extra + CUDA). Mixed-precision export is driven entirely by per-layer compression metadata already on the model — see `export/common.py` and the Export Backends section of [AGENTS.md](AGENTS.md).
+
+## Examples
+
+- [Basic LRD](examples/01_basic_lrd.py): Low-rank decomposition on a Qwen2 model in ~20 lines
+- [Calibrated LRD (SVD-LLM-v2)](examples/02_calibrated_lrd_svd_llm_v2.py): Calibration-aware factorization with a DataLoader
+- [HF Export Roundtrip](examples/03_hf_export_roundtrip.py): Compress, hard-apply, push to HuggingFace Hub, reload
+
+## Optional
+
+- [Test Suite](test/): Executable usage patterns organized by model family and feature; more concrete than examples for edge cases

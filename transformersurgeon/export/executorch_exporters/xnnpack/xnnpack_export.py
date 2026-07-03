@@ -10,13 +10,17 @@ from ..common import (
     ExecuTorchExportResult,
     finalize_export_result,
     resolve_components_and_wrapper,
-    build_quantizer,
+    build_quantizer_from_layer_info,
+    extract_layer_quant_info,
+    inject_scales_into_pt2e_observers,
+    calibrate_pt2e_observers,
 )
 
 
 @dataclass
 class XNNPACKExportConfig(ExecutorchExporterConfig):
     pass
+
 
 def export_with_xnnpack(
     model_or_graph: Any,
@@ -25,10 +29,14 @@ def export_with_xnnpack(
 ) -> ExecuTorchExportResult:
     os.makedirs(os.path.dirname(config.output_path) or ".", exist_ok=True)
 
-    wrapper, _, example_inputs, quant_plan = resolve_components_and_wrapper(
+    wrapper, model_config, example_inputs = resolve_components_and_wrapper(
         model_or_graph,
         config=config,
     )
+
+    # Detect per-layer compression metadata (hard / soft quantized layers).
+    # Quantization is driven entirely by model metadata — config.precision is not consulted.
+    layer_info = extract_layer_quant_info(wrapper)
 
     exported = torch_export(
         wrapper,
@@ -37,20 +45,24 @@ def export_with_xnnpack(
     export_for_edge = exported
     exported_for_mismatch = None
 
-    if quant_plan.global_precision != "full":
+    if layer_info:
         from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 
-        quantizer = build_quantizer(quant_plan.global_precision)
+        quantizer = build_quantizer_from_layer_info(layer_info)
         prepared = prepare_pt2e(exported.module(), quantizer)
 
-        with torch.no_grad():
-            prepared(*example_inputs)
+        # Calibration pass: run multiple forward passes with real text so that all
+        # observers (including output-activation observers on gate/up/down projections)
+        # collect representative statistics.  Random-token passes leave output observers
+        # with degenerate histograms (gate/up outputs are mostly negative for random
+        # tokens → zp=127 → clips all positive activations to 0).
+        calibrate_pt2e_observers(prepared, model_config, config, example_inputs=example_inputs)
+
+        # Override observer results for hard-quantized layers with exact surgeon scales.
+        inject_scales_into_pt2e_observers(prepared, layer_info)
 
         converted = convert_pt2e(prepared)
-        quantized_exported = torch_export(
-            converted,
-            example_inputs,
-        )
+        quantized_exported = torch_export(converted, example_inputs)
         export_for_edge = quantized_exported
         exported_for_mismatch = quantized_exported
 
@@ -67,10 +79,13 @@ def export_with_xnnpack(
     with open(config.output_path, "wb") as f:
         f.write(et_program.buffer)
 
+    # Summarize precision from layer metadata for the result object.
+    result_precision = "mixed" if layer_info else "full"
+
     return finalize_export_result(
         pte_path=config.output_path,
         backend="xnnpack",
-        precision=quant_plan.global_precision,
+        precision=result_precision,
         wrapper=wrapper,
         example_inputs=example_inputs,
         exported_for_mismatch=exported_for_mismatch,

@@ -18,9 +18,12 @@ from .lrd import (
 from .quantization import (
     Quantizer,
     validate_quantization_method,
+    validate_activation_method,
     validate_precision,
     validate_sparse_method,
     validate_quantization_eps,
+    validate_quantization_granularity,
+    validate_activation_scheme,
 )
 
 COMPRESSOR_DICT = {
@@ -29,6 +32,11 @@ COMPRESSOR_DICT = {
     "lrd": LRDer,
     "quantization": Quantizer
 }
+
+# Canonical order in which compressors are applied to a module.
+# lrd first (changes weight shape), then pruning (masks the result),
+# then quantization (must see the final float weights).
+APPLICATION_ORDER = ["lrd", "structured_pruning", "unstructured_pruning", "quantization"]
 
 COMPRESSION_REGISTRY = {
     "structured_pruning": {
@@ -51,10 +59,15 @@ COMPRESSION_REGISTRY = {
         "sparsity": dict(default=0.0, validator=validate_unstructured_pruning_ratio),
         "sparse_method": dict(default="magnitude", validator=validate_sparse_method,),
         "eps": dict(default=1e-6, validator=validate_quantization_eps),
+        "granularity": dict(default="per_tensor", validator=validate_quantization_granularity),
+        "precision_activation": dict(default="full", validator=validate_precision),
+        "method_activation": dict(default="maxmin", validator=validate_activation_method),
+        "scheme_activation": dict(default="asymmetric", validator=validate_activation_scheme),
     }
 }
 
 __all__ = [
     "COMPRESSION_REGISTRY",
     "COMPRESSOR_DICT",
+    "APPLICATION_ORDER",
 ]

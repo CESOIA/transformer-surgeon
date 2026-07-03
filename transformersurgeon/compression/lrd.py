@@ -81,10 +81,13 @@ class LRDer(Compressor):
                 # Apply the low-rank decomposition to the module
                 module.init_lrd(rank)
                 module.weight[:, :rank].copy_(US_r)
-                module.weight_2[:rank, :].copy_(V_r)
+                module.linear_V.weight.data.copy_(V_r)
 
         if hard:
-            pass # LRD implementation is "hard" by nature
+            # The two-matmul topology (weight @ weight_2) is already the efficient
+            # deployed form. Soft and hard LRD are structurally identical — this
+            # no-op is intentional.
+            pass
 
     def restore(self, module):
         if module.rank == "full":
@@ -93,11 +96,11 @@ class LRDer(Compressor):
         if not self._to_compress():
             self.config["rank"] = "full"
 
-        if not hasattr(module, "weight_2"):
-            raise AttributeError("Module does not have 'weight_2' attribute required for LRD restoration.")
+        if not hasattr(module, "linear_V") or module.linear_V is None:
+            raise AttributeError("Module does not have 'linear_V' attribute required for LRD restoration.")
 
         with torch.no_grad():
-            restored_weight = module.weight.detach() @ module.weight_2.detach()
+            restored_weight = module.weight.detach() @ module.linear_V.weight.detach()
             module.cancel_lrd()
             module.weight.copy_(restored_weight)
 

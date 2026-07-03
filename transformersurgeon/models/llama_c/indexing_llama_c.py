@@ -25,10 +25,10 @@ LLAMA_C_INDEXING = {
             ['input_layernorm', 'self_attn'],
             ['post_attention_layernorm', 'mlp'],
         ],
-        'calibration_groups': [
-            ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
-            ['mlp.gate_proj', 'mlp.up_proj'],
-        ],
+        'calibration_groups': {
+            'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
+            'mlp': [['gate_proj', 'up_proj'], ['down_proj']],
+        },
         'path_template': "model.layers.{block_index}.{path}",
         'extra_layers': ["model.norm"],
         'preprocessing': "model.embed_tokens",

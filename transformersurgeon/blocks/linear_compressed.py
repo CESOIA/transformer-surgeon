@@ -30,33 +30,30 @@ class LinearCompressed(nn.Linear):
             return
         
         self.skip = False
-        super().__init__(in_features=in_features,
-                            out_features=out_features,
-                            bias=bias,
-                            device=device,
-                            dtype=dtype)
-        self.weight_2 = None # Placeholder for the second weight matrix in low-rank decomposition
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype)
+        self.linear_V = None # Placeholder for the V factor (in→rank) in low-rank decomposition
 
         self.init_lrd(rank)
 
     def init_lrd(self, rank):
-        # Set rank and initialize weight_2 for low-rank decomposition if needed
+        # Set rank and initialize linear_V for low-rank decomposition if needed
         self.rank = "full" if rank is None else rank
         if isinstance(rank, int):
-            shape_change = False
             device = self.weight.device
             dtype = self.weight.dtype
 
-            # Initialize weight_2 for low-rank decomposition
-            if self.weight_2 is None or self.weight_2.shape[0] != rank:
+            # Initialize linear_V (V factor: in→rank) as a proper nn.Linear so that
+            # torchao's quantize_() can discover and quantize it alongside self.weight.
+            if self.linear_V is None or self.linear_V.out_features != rank:
+                self.linear_V = nn.Linear(self.in_features, rank, bias=False,
+                                          device=device, dtype=dtype)
 
-                self.weight_2 = Parameter(
-                    torch.empty([self.rank, self.in_features], device=device, dtype=dtype),
-                    requires_grad=True)
-
-                torch.nn.init.kaiming_uniform_(self.weight_2, a=math.sqrt(5))
-
-            # Adjust weight shape for low-rank decomposition if necessary
+            # Adjust weight (U·S factor) shape for low-rank decomposition if necessary
             if self.weight.shape[1] != self.rank:
 
                 self.weight = Parameter(
@@ -68,10 +65,10 @@ class LinearCompressed(nn.Linear):
         self.rank = "full"
         device = self.weight.device
         dtype = self.weight.dtype
-        
-        # Remove weight_2 if it exists
-        if self.weight_2 is not None:
-            self.weight_2 = None
+
+        # Remove linear_V if it exists
+        if self.linear_V is not None:
+            self.linear_V = None
 
         # Revert weight to original shape if it was changed for low-rank decomposition
         if self.weight.shape[1] != self.in_features:
@@ -98,12 +95,9 @@ class LinearCompressed(nn.Linear):
         
         # LRD logic
         if isinstance(self.rank, int):
-            weight = self.weight[:, :self.rank]
-            x = F.linear(x, self.weight_2[:self.rank, :])
-        else:
-            weight = self.weight
+            x = self.linear_V(x)  # V factor: [*, rank]
 
-        y = F.linear(x, weight, self.bias)
+        y = F.linear(x, self.weight, self.bias)
 
         if restore_shape is not None:
             y = y.reshape(*restore_shape, y.shape[-1])

@@ -1,3 +1,4 @@
+import torch
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -14,6 +15,7 @@ class BackendExportConfig:
     check_ir_validity: bool = True
     verbose: bool = False
     allow_backend_fallback: bool = False
+    float_type: torch.dtype | None = None  # None = preserve each component's existing dtype
 
     @classmethod
     def from_kwargs(

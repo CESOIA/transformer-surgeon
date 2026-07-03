@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .activation import ActivationCollector, ShiftedActivationCollector
+from .activation import ActivationCollector, ShiftedActivationCollector, OutputActivationCollector
 from .weight_grad import WeightGradCollector
 
 
@@ -11,6 +11,8 @@ RAW_DATA_REGISTRY = {
     "activation": ActivationCollector,
     # Activation stream collected from the shifted model.
     "activation_shifted": ShiftedActivationCollector,
+    # Output activation stream used by output-side activation quantization.
+    "output_activation": OutputActivationCollector,
     # Weight-gradient stream used by gradient-aware pruning methods.
     "weight_grad": WeightGradCollector,
 }

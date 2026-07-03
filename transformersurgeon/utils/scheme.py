@@ -12,7 +12,8 @@ from ..blocks import VCONBlock
 from ..compression import (
     COMPRESSOR_DICT,
     COMPRESSION_REGISTRY,
-) 
+    APPLICATION_ORDER,
+)
 from .utils import get_submodule
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
@@ -82,6 +83,8 @@ class CompressionScheme:
                     raise ValueError(f"Unsupported compression type '{comp_name}' in configuration.")
                 self.compressors[comp_name] = compressor_class(comp_config)
 
+        self._sort_compressors()
+
         # Check if the module exists in the model
         if self.model is not None:
             self.get_module()
@@ -142,7 +145,20 @@ class CompressionScheme:
             setattr(compressor, compression_property, value)
         else:
             raise ValueError(f"Compressor '{compression_name}' does not have property '{compression_property}'.")
+
+        self._sort_compressors()
     
+    def _sort_compressors(self):
+        """Re-order self.compressors to match APPLICATION_ORDER.
+
+        Any compressor type not listed in APPLICATION_ORDER is appended after
+        the known ones in their original relative order, so future additions
+        to the registry degrade gracefully rather than raising an error.
+        """
+        known = {name: self.compressors[name] for name in APPLICATION_ORDER if name in self.compressors}
+        unknown = {name: comp for name, comp in self.compressors.items() if name not in APPLICATION_ORDER}
+        self.compressors = {**known, **unknown}
+
     def set_module(self, new_module):
         """
         Sets a new module at the position specified by the compression scheme.
@@ -241,8 +257,12 @@ class CompressionScheme:
         if src_param is not None:
             module_copy = module_copy.to(device=src_param.device)
         with torch.no_grad():
-            for name, param in module.named_parameters(recurse=False):
-                getattr(module_copy, name).copy_(param.detach().clone())
+            for name, param in module.named_parameters(recurse=True):
+                *path, leaf = name.split('.')
+                target = module_copy
+                for step in path:
+                    target = getattr(target, step)
+                getattr(target, leaf).copy_(param.detach().clone())
             for name, buf in module.named_buffers(recurse=False):
                 setattr(module_copy, name, buf.clone())
             # Copy other attributes except parameters, buffers, and methods
@@ -469,6 +489,35 @@ class CompressionScheme:
         self._weight_original = None
         # Reset the soft application flag
         self.soft_applied = False 
+
+    def reapply_masks(self):
+        """Re-apply pruning masks to the module after an optimizer step.
+
+        In STE-style fine-tuning, pruned weights receive non-zero gradient
+        updates (because dL/dW is independent of W for linear layers) and
+        drift away from zero after each optimizer step. Call this method to
+        zero them back.
+
+        No-op if compression has not been soft-applied, or has been hard-applied.
+        """
+        if not self.soft_applied or self.hard_applied:
+            return
+        module = self.get_compression_module()
+        for compressor in self.compressors.values():
+            compressor.reapply_mask(module)
+
+    def remove_masks(self):
+        """Remove weight_mask buffers from the module.
+
+        Drops the persistent mask buffers registered by pruning compressors.
+        Use before recomputing compression with different settings, or before
+        saving a deployment model where the mask buffers are not needed.
+        """
+        if not self._is_to_compress():
+            return
+        module = self.get_compression_module()
+        for compressor in self.compressors.values():
+            compressor.remove_mask(module)
 
     def __repr__(self):
         string = f"CompressionScheme(name={self.name}, block_id={self.block_id}, path={self.path}, applied=(soft={self.soft_applied}, hard={self.hard_applied}))\n"

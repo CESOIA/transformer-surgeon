@@ -26,9 +26,10 @@ VIT_C_INDEXING = {
             ['layernorm_before', 'attention'],
             ['layernorm_after', 'mlp'],
         ],
-        'calibration_groups': [
-            ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
-        ],
+        'calibration_groups': {
+            'attention': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
+            'mlp': [['fc1'], ['fc2']],
+        },
         'path_template': "vit.layers.{block_index}.{path}",
         'qkv_paths': [],
         'preprocessing': "vit.embeddings",

@@ -139,8 +139,6 @@ def run_compression_calibration(
         if requires_shifted_model:
             for scheme in module_by_scheme:
                 shifted_module = get_submodule(shifted_model, scheme.path)
-                if hasattr(shifted_module, "block_b"):
-                    shifted_module = shifted_module.block_b
                 shifted_module_by_scheme[scheme] = shifted_module
 
         # Global execution mode flags drive forward-only vs forward+backward calibration.
