@@ -56,7 +56,7 @@ def export_with_xnnpack(
         # collect representative statistics.  Random-token passes leave output observers
         # with degenerate histograms (gate/up outputs are mostly negative for random
         # tokens → zp=127 → clips all positive activations to 0).
-        calibrate_pt2e_observers(prepared, model_config, config)
+        calibrate_pt2e_observers(prepared, model_config, config, example_inputs=example_inputs)
 
         # Override observer results for hard-quantized layers with exact surgeon scales.
         inject_scales_into_pt2e_observers(prepared, layer_info)

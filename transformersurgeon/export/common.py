@@ -117,23 +117,61 @@ class ExporterConfig(BackendExportConfig, ABC):
 # Model wrapper
 # ---------------------------------------------------------------------------
 
+def build_zero_caches(decoder: nn.Module) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Build per-block zero KV caches for the ``io_*`` cache implementations.
+
+    Introspects each block's attention module for its (possibly per-layer)
+    cache geometry, so heterogeneous shapes work without re-plumbing.
+    Returns ``([], [])`` for the mutable path (no cache I/O).
+    """
+    if getattr(decoder, "cache_impl", "mutable") == "mutable":
+        return [], []
+    key_caches, value_caches = [], []
+    for block in decoder.blocks:
+        attn = block.attn
+        shape = (attn.max_cache_length, attn.kv_num_heads, attn.head_dim)
+        key_caches.append(torch.zeros(shape, dtype=attn.dtype))
+        value_caches.append(torch.zeros(shape, dtype=attn.dtype))
+    return key_caches, value_caches
+
+
 class LLMWrapper(nn.Module):
     """Thin wrapper that presents the three model components under a fixed
-    forward signature that torch.export can trace with a single token input."""
+    forward signature that torch.export can trace with a single token input.
+
+    The signature depends on the decoder's ``cache_impl``:
+      - ``mutable``: ``forward(input_ids, pos_id)`` -> ``logits`` (KV cache is
+        internal module state; unchanged legacy contract).
+      - ``io_*``: ``forward(input_ids, pos_id, key_caches, value_caches)`` ->
+        ``(logits, new_key_caches, new_value_caches)`` (KV cache is graph I/O).
+    """
 
     def __init__(self, embedding: nn.Module, decoder: nn.Module, final_layer: nn.Module):
         super().__init__()
         self.embedding = embedding
         self.decoder = decoder
         self.final_layer = final_layer
+        self.cache_impl = getattr(decoder, "cache_impl", "mutable")
 
     def forward(
         self,
         input_ids: torch.LongTensor,
         pos_id_tensor: torch.LongTensor,
-    ) -> torch.Tensor:
-        hidden = self.decoder(self.embedding(input_ids), pos_id=pos_id_tensor)
-        return self.final_layer(hidden[-1, :])
+        key_caches: list[torch.Tensor] | None = None,
+        value_caches: list[torch.Tensor] | None = None,
+    ):
+        if self.cache_impl == "mutable":
+            hidden = self.decoder(self.embedding(input_ids), pos_id=pos_id_tensor)
+            return self.final_layer(hidden[-1, :])
+
+        hidden, new_key_caches, new_value_caches = self.decoder(
+            self.embedding(input_ids),
+            pos_id=pos_id_tensor,
+            key_caches=key_caches,
+            value_caches=value_caches,
+        )
+        logits = self.final_layer(hidden[-1, :])
+        return logits, new_key_caches, new_value_caches
 
 
 def build_wrapper(components: Any, *, model_config: Any | None) -> nn.Module:
@@ -194,6 +232,12 @@ def resolve_components_and_wrapper(
     wrapper.eval()
 
     example_inputs = build_example_inputs(model_config, config=config)
+    # For io_* cache modes, the KV cache is explicit graph I/O: append per-block
+    # zero caches to the example inputs so torch.export traces the full contract.
+    if getattr(wrapper, "cache_impl", "mutable") != "mutable":
+        key_caches, value_caches = build_zero_caches(wrapper.decoder)
+        example_inputs = (*example_inputs, key_caches, value_caches)
+
     if getattr(config, "dynamic_shapes", None) is not None:
         warnings.warn(
             "dynamic_shapes is ignored; exporter uses a static seq_len=1 contract.",
@@ -672,7 +716,12 @@ _CAL_SENTENCES = [
 ]
 
 
-def calibrate_pt2e_observers(prepared: nn.Module, model_config: Any | None, config: Any) -> None:
+def calibrate_pt2e_observers(
+    prepared: nn.Module,
+    model_config: Any | None,
+    config: Any,
+    example_inputs: tuple[Any, ...] | None = None,
+) -> None:
     """Run real-text calibration passes through the prepared PT2E model.
 
     Random token calibration leaves output activation observers with degenerate
@@ -680,10 +729,21 @@ def calibrate_pt2e_observers(prepared: nn.Module, model_config: Any | None, conf
     uniformly-random token IDs is very different from real text.  Tokenizing a
     small set of fixed sentences produces realistic activation distributions for
     all observers.  Falls back to random passes if the tokenizer cannot be loaded.
+
+    For ``io_*`` cache modes the prepared graph also takes KV caches; we detect
+    this from ``example_inputs`` (len > 2) and pass fresh zero caches per step.
     """
     model_name = getattr(model_config, '_name_or_path', None) if model_config else None
     vocab_size = int(getattr(model_config, 'vocab_size', 32000)) if model_config else 32000
     max_pos = max(1, min(512, getattr(config, 'max_seq_len', 512)))
+
+    # io cache template (empty tuple for mutable / legacy contract).
+    cache_template: tuple[Any, ...] = ()
+    if example_inputs is not None and len(example_inputs) > 2:
+        cache_template = tuple(example_inputs[2:])
+
+    def _fresh_caches() -> tuple[Any, ...]:
+        return tuple([t.clone() for t in group] for group in cache_template)
 
     token_batches: list[list[int]] = []
     if model_name:
@@ -702,12 +762,12 @@ def calibrate_pt2e_observers(prepared: nn.Module, model_config: Any | None, conf
                 for token_id in ids:
                     inp = torch.tensor([token_id], dtype=torch.long)
                     pos = torch.tensor([1], dtype=torch.long)
-                    prepared(inp, pos)
+                    prepared(inp, pos, *_fresh_caches())
         else:
             for _ in range(32):
                 rand_ids = torch.randint(0, vocab_size, (1,), dtype=torch.long)
                 rand_pos = torch.randint(1, max_pos + 1, (1,), dtype=torch.long)
-                prepared(rand_ids, rand_pos)
+                prepared(rand_ids, rand_pos, *_fresh_caches())
 
 
 # ---------------------------------------------------------------------------

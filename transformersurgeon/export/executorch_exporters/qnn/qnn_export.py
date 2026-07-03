@@ -331,7 +331,7 @@ def export_with_qnn(
 
         prepared = prepare_pt2e(sanitized_module, quantizer)
 
-        calibrate_pt2e_observers(prepared, model_config, config)
+        calibrate_pt2e_observers(prepared, model_config, config, example_inputs=example_inputs)
         inject_scales_into_pt2e_observers(prepared, layer_info)
 
         converted = convert_pt2e(prepared)

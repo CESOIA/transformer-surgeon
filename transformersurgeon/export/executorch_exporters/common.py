@@ -162,6 +162,9 @@ def run_simple_inference_stats(
     wrapper.eval()
     with torch.no_grad():
         y_ref = wrapper(*inference_inputs)
+    # io cache modes return (logits, new_key_caches, new_value_caches); compare logits.
+    if isinstance(y_ref, (tuple, list)):
+        y_ref = y_ref[0]
 
     # Load and run the exported program.
     runtime = Runtime.get()
@@ -178,7 +181,16 @@ def run_simple_inference_stats(
     else:
         raise RuntimeError(f"Exported program has no runnable methods. pte_path='{pte_path}'")
 
-    y_et = program.load_method(method_name).execute(list(inference_inputs))[0]
+    # The exported program takes flat tensor inputs; io modes pass the KV caches
+    # as nested lists, so flatten them into the runtime argument list.
+    flat_inputs: list[Any] = []
+    for arg in inference_inputs:
+        if isinstance(arg, (list, tuple)):
+            flat_inputs.extend(arg)
+        else:
+            flat_inputs.append(arg)
+
+    y_et = program.load_method(method_name).execute(flat_inputs)[0]
     if not isinstance(y_et, torch.Tensor):
         y_et = torch.tensor(y_et)
 

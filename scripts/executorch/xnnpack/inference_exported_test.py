@@ -43,6 +43,22 @@ def parse_args():
         default=0.0,
         help="Sampling temperature. <= 0 uses greedy decoding.",
     )
+    parser.add_argument(
+        "--cache-impl",
+        type=str,
+        default="mutable",
+        choices=["mutable", "io_scatter", "io_concat"],
+        help="KV-cache implementation the .pte was exported with. io_* modes thread "
+             "the cache through graph I/O; the geometry args below are then required.",
+    )
+    parser.add_argument("--num-layers", type=int, default=None,
+                        help="Decoder layers (required for io_* cache modes).")
+    parser.add_argument("--kv-num-heads", type=int, default=None,
+                        help="KV heads per layer (required for io_* cache modes).")
+    parser.add_argument("--head-dim", type=int, default=None,
+                        help="Head dimension (required for io_* cache modes).")
+    parser.add_argument("--max-cache-len", type=int, default=None,
+                        help="Fixed cache length (required for io_* cache modes).")
     return parser.parse_args()
 
 
@@ -82,15 +98,49 @@ def main():
     output_ids = input_ids[0].clone()
     generated_tokens = 0
 
+    # For io_* modes, the KV cache is explicit graph I/O: host holds it and feeds
+    # the returned cache back each step. Initialize zero caches from geometry.
+    io_mode = args.cache_impl != "mutable"
+    kv_state = None
+    num_layers = args.num_layers
+    if io_mode:
+        missing = [n for n, v in (
+            ("--num-layers", args.num_layers),
+            ("--kv-num-heads", args.kv_num_heads),
+            ("--head-dim", args.head_dim),
+            ("--max-cache-len", args.max_cache_len),
+        ) if v is None]
+        if missing:
+            raise ValueError(f"cache_impl={args.cache_impl} requires geometry args: {', '.join(missing)}")
+        shape = (args.max_cache_len, args.kv_num_heads, args.head_dim)
+        key_caches = [torch.zeros(shape, dtype=torch.float32) for _ in range(num_layers)]
+        value_caches = [torch.zeros(shape, dtype=torch.float32) for _ in range(num_layers)]
+        kv_state = (key_caches, value_caches)
+
     t_start = time.perf_counter()
 
     def _execute_static(next_input_ids: torch.Tensor, effective_len: int) -> torch.Tensor:
+        nonlocal kv_state
         # Static wrapper expects a 1-based effective KV length for the current token.
         effective_len_tensor = torch.tensor([effective_len], dtype=torch.long)
-        out = method.execute([next_input_ids, effective_len_tensor])[0]
-        if not isinstance(out, torch.Tensor):
-            out = torch.tensor(out)
-        return out
+        if not io_mode:
+            out = method.execute([next_input_ids, effective_len_tensor])[0]
+            if not isinstance(out, torch.Tensor):
+                out = torch.tensor(out)
+            return out
+
+        # io mode: flatten caches into the argument list, read updated caches back.
+        key_caches, value_caches = kv_state
+        outputs = method.execute(
+            [next_input_ids, effective_len_tensor, *key_caches, *value_caches]
+        )
+        logits = outputs[0]
+        new_key_caches = list(outputs[1:1 + num_layers])
+        new_value_caches = list(outputs[1 + num_layers:1 + 2 * num_layers])
+        kv_state = (new_key_caches, new_value_caches)
+        if not isinstance(logits, torch.Tensor):
+            logits = torch.tensor(logits)
+        return logits
 
     logits = None
     # Prefill by decode-iteration: feed each prompt token with its position.

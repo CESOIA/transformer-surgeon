@@ -31,6 +31,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.norm_type = config.norm_type
         self.use_sdpa = config.use_sdpa
         self.max_cache_len = config.max_cache_len
+        self.cache_impl = getattr(config, "cache_impl", "mutable")
         self.dtype = config.dtype
 
         # Extract configuration (optional)
@@ -68,6 +69,7 @@ class TransformerDecoderBlock(torch.nn.Module):
                 compression_config=self.compression_config["attn"],
                 use_sdpa=self.use_sdpa,
                 max_cache_len=self.max_cache_len,
+                cache_impl=self.cache_impl,
                 dtype=self.dtype)
         else:
             raise ValueError(f"Unsupported MHA type: {self.mha_type}")
@@ -101,6 +103,8 @@ class TransformerDecoderBlock(torch.nn.Module):
             pos_id,
             pos_id_list,
             mask_penalty,
+            key_cache=None,
+            value_cache=None,
             rope=None,
     ):
         """
@@ -108,30 +112,41 @@ class TransformerDecoderBlock(torch.nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
-            cache_len (int, optional): Effective sequence length seen by attention.
-            attn_mask (torch.Tensor, optional): Attention mask for causal decoding.
+            pos_id (torch.LongTensor): Current position id, shape (1,).
+            pos_id_list (tuple): Precomputed (q_pos, k_pos) index grids for masking.
+            mask_penalty (torch.Tensor): Additive penalty applied to masked positions.
+            key_cache/value_cache (torch.Tensor, optional): Incoming fixed-size KV
+                caches for the ``io_*`` cache implementations (ignored by ``mutable``).
             rope (tuple(torch.Tensor, torch.Tensor), optional): Precomputed RoPE cos/sin tensors.
 
         Returns:
-            torch.Tensor: Output tensor of shape (seq_len, embed_dim).
-            torch.Tensor: Updated key cache of shape (num_heads, total_seq_len+1, head_dim).
-            torch.Tensor: Updated value cache of shape (num_heads, total_seq_len+1, head_dim).
+            mutable mode: output embeddings (seq_len, embed_dim).
+            io modes: (output, updated_key_cache, updated_value_cache).
         """
         residual = x            # start skip connection
         x = self.norm_in(x)     # norm layer
-        x = self.attn(          # multihead self attention
-            x, 
+        attn_out = self.attn(   # multihead self attention
+            x,
             pos_id=pos_id,
             pos_id_list=pos_id_list,
             mask_penalty=mask_penalty,
+            key_cache=key_cache,
+            value_cache=value_cache,
             rope=rope,
             )
+        if self.cache_impl == "mutable":
+            x = attn_out
+            key_cache_out = value_cache_out = None
+        else:
+            x, key_cache_out, value_cache_out = attn_out
         x = self.atomic_sum(x, residual) # join skip connection
         residual = x                     # start skip connection
         x = self.norm_out(x)             # norm layer
         x = self.mlp(x)                  # mlp block
         x = self.atomic_sum(x, residual) # join skip connection
-        return x
+        if self.cache_impl == "mutable":
+            return x
+        return x, key_cache_out, value_cache_out
         
 
 class TransformerDecoder(torch.nn.Module):
@@ -154,6 +169,7 @@ class TransformerDecoder(torch.nn.Module):
         head_dim = config.hidden_size // config.num_attention_heads
 
         self.max_cache_len = config.max_cache_len
+        self.cache_impl = getattr(config, "cache_impl", "mutable")
 
         # Precompute position ids useful for attention mask generation
         q_pos = torch.arange(self.max_cache_len, dtype=torch.long)[:, None] # (max_cache_len, 1)
@@ -182,6 +198,8 @@ class TransformerDecoder(torch.nn.Module):
             self,
             x : torch.Tensor,  # (in_seq_len, embed_dim)
             pos_id : torch.LongTensor,  # (1,)
+            key_caches=None,   # io modes: List[Tensor], one per block
+            value_caches=None,
     ):
         """
         Forward pass of the Transformer Decoder.
@@ -189,25 +207,46 @@ class TransformerDecoder(torch.nn.Module):
         Args:
             x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
             pos_id (torch.LongTensor): Current position id tensor of shape (1,).
+            key_caches/value_caches (List[torch.Tensor], optional): Per-block
+                incoming KV caches for the ``io_*`` implementations. If omitted,
+                each block falls back to its internal buffer.
 
         Returns:
-            torch.Tensor: Output tensor of shape (in_seq_len, embed_dim).
+            mutable mode: output tensor (in_seq_len, embed_dim).
+            io modes: (output, new_key_caches, new_value_caches) where the caches
+                are per-block Lists of length ``depth``.
         """
         # Decode
-        for block in self.blocks:
-            # Inference (prefill or decode)
-            x = block(
-                x,               # (in_seq_len, embed_dim)
-                pos_id=pos_id,   # (1,)
+        if self.cache_impl == "mutable":
+            for block in self.blocks:
+                x = block(
+                    x,               # (in_seq_len, embed_dim)
+                    pos_id=pos_id,   # (1,)
+                    pos_id_list=(self.q_pos, self.k_pos),
+                    mask_penalty=self.mask_penalty,
+                    rope=(self.rope_cos, self.rope_sin),
+                )
+            x = self.norm(x)
+            return x
+
+        # io modes: thread per-block caches in and out.
+        new_key_caches, new_value_caches = [], []
+        for i, block in enumerate(self.blocks):
+            kc = key_caches[i] if key_caches is not None else None
+            vc = value_caches[i] if value_caches is not None else None
+            x, kc_out, vc_out = block(
+                x,
+                pos_id=pos_id,
                 pos_id_list=(self.q_pos, self.k_pos),
                 mask_penalty=self.mask_penalty,
+                key_cache=kc,
+                value_cache=vc,
                 rope=(self.rope_cos, self.rope_sin),
             )
-            # x is output embeddings: (1, embed_dim)
+            new_key_caches.append(kc_out)
+            new_value_caches.append(vc_out)
 
-        # Final normalization
         x = self.norm(x) # (1, embed_dim)
-
-        return x
+        return x, new_key_caches, new_value_caches
     
 __all__ = ["TransformerDecoder",]

@@ -121,15 +121,26 @@ def _run_trt_inference_stats(
     Returns None if the TensorRT module cannot be executed here (e.g. no CUDA
     device available), matching the ExecuTorch runtime-absent behaviour.
     """
+    def _to_device(x, device):
+        # inference_inputs may contain nested KV-cache lists in io_* modes.
+        if isinstance(x, torch.Tensor):
+            return x.to(device)
+        if isinstance(x, (list, tuple)):
+            return type(x)(_to_device(e, device) for e in x)
+        return x
+
     try:
         wrapper.eval()
         with torch.no_grad():
             y_ref = wrapper(*inference_inputs)
+        # io cache modes return (logits, new_key_caches, new_value_caches).
+        if isinstance(y_ref, (tuple, list)):
+            y_ref = y_ref[0]
 
         device = next((p.device for p in getattr(trt_module, "parameters", lambda: [])()), None)
         trt_inputs = inference_inputs
         if device is not None and device.type == "cuda":
-            trt_inputs = tuple(t.to(device) for t in inference_inputs)
+            trt_inputs = tuple(_to_device(t, device) for t in inference_inputs)
 
         y_trt = trt_module(*trt_inputs)
         if isinstance(y_trt, (tuple, list)):
@@ -186,7 +197,7 @@ def export_with_tensorrt(
 
         # Calibration pass with real text so activation observers collect
         # representative statistics (see common.calibrate_pt2e_observers).
-        calibrate_pt2e_observers(prepared, model_config, config)
+        calibrate_pt2e_observers(prepared, model_config, config, example_inputs=example_inputs)
 
         # Override observer results with exact surgeon scales (hard weights +
         # calibrated activations).

@@ -278,13 +278,44 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         
         return output
     
+CACHE_IMPLS = ("mutable", "io_scatter", "io_concat")
+
+
 class MHACausal(MHABase): # Causal MHA with caching for decoder use
+    """Causal multi-head attention over a fixed-size KV cache.
+
+    The cache write is selected by ``cache_impl`` (see ``CACHE_IMPLS``):
+
+    - ``"mutable"``   : in-place ``index_copy_`` on an internal buffer. The cache
+                        is module state (not graph I/O). QNN-only; the current
+                        default so existing exports/tests are unchanged.
+    - ``"io_scatter"``: functional ``index_put`` on a cache passed in as a
+                        forward argument and returned as output. Portable to
+                        QNN (ScatterNd) and TensorRT (ScatterND).
+    - ``"io_concat"`` : scatter-free functional write built from a positional
+                        mask + ``where`` (Concat/select family). Universal
+                        fallback for backends lacking an index_put converter.
+
+    All three produce an updated **fixed-size** ``(max_cache_len, kv_num_heads,
+    head_dim)`` cache and then run the identical mask + attention code, so the
+    three paths are numerically equivalent. The framework feeds one token at a
+    time (``in_seq_len == 1``); the writers assume that.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        self.cache_impl = kwargs.get("cache_impl", "mutable")
+        if self.cache_impl not in CACHE_IMPLS:
+            raise ValueError(
+                f"Unsupported cache_impl {self.cache_impl!r}; expected one of {CACHE_IMPLS}"
+            )
 
         # Initialize key and value caches
         self.max_cache_length=kwargs.get("max_cache_len", 2048)
 
+        # Buffers back the "mutable" path; harmless (and cheap) for io_* modes,
+        # where they also serve as the initial cache when none is passed in.
         self.register_buffer(
             "key_cache",
             torch.zeros(
@@ -302,24 +333,60 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                 self.head_dim,
                 dtype=self.dtype),
             persistent=False
-        )  
-        
-    def forward(self, x, pos_id, pos_id_list, mask_penalty, rope=None):
+        )
+
+    def _write_mutable(self, k, v, write_index, key_cache, value_cache):
+        """In-place write on the internal buffers (QNN peak path)."""
+        with torch.no_grad():
+            self.key_cache.index_copy_(0, write_index, k)
+            self.value_cache.index_copy_(0, write_index, v)
+        return self.key_cache, self.value_cache
+
+    def _write_scatter(self, k, v, write_index, key_cache, value_cache):
+        """Functional scatter -> updated fixed-size cache (aten.index_put)."""
+        key_cache = key_cache.index_put((write_index,), k)
+        value_cache = value_cache.index_put((write_index,), v)
+        return key_cache, value_cache
+
+    def _write_concat(self, k, v, write_index, key_cache, value_cache):
+        """Scatter-free write: positional one-hot mask + where (in_seq_len==1)."""
+        idx = torch.arange(self.max_cache_length, device=k.device)
+        sel = (idx == write_index).view(self.max_cache_length, 1, 1)  # (L,1,1)
+        k_row = k.reshape(1, self.kv_num_heads, self.head_dim)
+        v_row = v.reshape(1, self.kv_num_heads, self.head_dim)
+        key_cache = torch.where(sel, k_row, key_cache)
+        value_cache = torch.where(sel, v_row, value_cache)
+        return key_cache, value_cache
+
+    def forward(self, x, pos_id, pos_id_list, mask_penalty,
+                key_cache=None, value_cache=None, rope=None):
         """
         Forward pass of the causal Multi-Head Attention with caching.
-        
+
         Args:
             x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
             pos_id (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
+            key_cache/value_cache (torch.Tensor, optional): Incoming fixed-size
+                caches for the ``io_*`` modes. If omitted, the internal buffers
+                are used as the initial cache.
             rope (tuple, optional): Tuple of (cos, sin) tensors for RoPE application.
+
+        Returns:
+            output (mutable mode) or (output, key_cache, value_cache) (io modes).
         """
         in_seq_len, embed_dim = x.size()
+
+        # Fall back to internal buffers when caches are not threaded in.
+        if key_cache is None:
+            key_cache = self.key_cache
+        if value_cache is None:
+            value_cache = self.value_cache
 
         # Project inputs to Q, K, V
         q = self.q_proj(x).view(in_seq_len, self.num_heads, self.head_dim) # (in_seq_len, num_heads, head_dim)
         k = self.k_proj(x).view(in_seq_len, self.kv_num_heads, self.head_dim) # (in_seq_len, kv_num_heads, head_dim)
         v = self.v_proj(x).view(in_seq_len, self.kv_num_heads, self.head_dim) # (in_seq_len, kv_num_heads, head_dim)
-        
+
         # Apply RoPE
         if rope is not None:
             cos = rope[0][pos_id]
@@ -327,15 +394,14 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             q = apply_rope_multihead(q, cos, sin)
             k = apply_rope_multihead(k, cos, sin)
 
-        # Update key and value caches in-place
-        with torch.no_grad():
-            write_index = torch.clamp(pos_id, 0, self.max_cache_length-1).long()
-            self.key_cache.index_copy_(0, write_index, k)
-            self.value_cache.index_copy_(0, write_index, v)
-
-        # Static path always attends over fixed-size caches, with masking handling valid range.
-        key_cache = self.key_cache
-        value_cache = self.value_cache
+        # Write new K/V into the fixed-size cache (mechanism per cache_impl).
+        write_index = torch.clamp(pos_id, 0, self.max_cache_length-1).long()
+        if self.cache_impl == "mutable":
+            key_cache, value_cache = self._write_mutable(k, v, write_index, key_cache, value_cache)
+        elif self.cache_impl == "io_scatter":
+            key_cache, value_cache = self._write_scatter(k, v, write_index, key_cache, value_cache)
+        else:  # io_concat
+            key_cache, value_cache = self._write_concat(k, v, write_index, key_cache, value_cache)
 
         # On-the-fly attention mask
         q_pos, k_pos = pos_id_list
@@ -353,12 +419,14 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # Concatenate heads and project output
         attn_output = attn_output.transpose(0, 1).reshape(in_seq_len, embed_dim)
         output = self.out_proj(attn_output)
-        
-        return output
-    
+
+        if self.cache_impl == "mutable":
+            return output
+        return output, key_cache, value_cache
+
 __all__ = [
-    "attention_mask",
     "MHAEncoder",
     "MHACausal",
-    "MHAEncoderFusedProj"
+    "MHAEncoderFusedProj",
+    "CACHE_IMPLS",
     ]
