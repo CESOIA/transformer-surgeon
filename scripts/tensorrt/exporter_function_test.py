@@ -20,10 +20,18 @@ combinations of quantization and low-rank decomposition in a single engine)
 rather than a single fixed scheme. Pass --full-only to skip randomization
 entirely and export the unmodified model, as a baseline.
 
+--cache-impl selects how the KV cache is threaded through the exported graph:
+"mutable" (default) keeps it as internal module state; "io_scatter" and
+"io_concat" expose it as explicit inout graph buffers (fed in and returned
+each step) via aten.index_put / positional-mask-where respectively, which is
+what a functional runtime like TensorRT requires instead of in-place buffer
+mutation.
+
 Requires a CUDA device and the ``torch_tensorrt`` package.
 """
 
 import argparse
+import json
 import os
 import random
 
@@ -81,7 +89,38 @@ def parse_args():
     parser.add_argument("--use-fp16", action="store_true", default=True, help="Allow FP16 kernels for un-quantized ops")
     parser.add_argument("--output-format", type=str, default="exported_program", choices=["exported_program", "torchscript"])
     parser.add_argument("--verbose", action="store_true", help="Print in-process float-vs-TensorRT inference stats")
+    parser.add_argument(
+        "--cache-impl",
+        type=str,
+        default="mutable",
+        choices=["mutable", "io_scatter", "io_concat"],
+        help="KV-cache implementation for the exported decoder. 'mutable' keeps the "
+             "cache as internal graph state (module buffers); 'io_scatter'/'io_concat' "
+             "expose it as explicit graph I/O (portable inout buffers, e.g. ScatterND "
+             "on TensorRT).",
+    )
     return parser.parse_args()
+
+
+def _write_cache_metadata(output_path: str, model_config, args: argparse.Namespace) -> str:
+    """Write a JSON sidecar with the KV-cache geometry next to the exported engine.
+
+    inference_exported_test.py needs num_layers/kv_num_heads/head_dim/max_cache_len
+    to build the io_* cache tensors; without this file those have to be typed in
+    by hand (and get out of sync with whatever model/--max-sequence-length the
+    engine was actually exported with).
+    """
+    meta = {
+        "cache_impl": args.cache_impl,
+        "num_layers": int(model_config.num_hidden_layers),
+        "kv_num_heads": int(model_config.num_key_value_heads),
+        "head_dim": int(model_config.hidden_size // model_config.num_attention_heads),
+        "max_cache_len": int(args.max_sequence_length),
+    }
+    meta_path = os.path.splitext(output_path)[0] + ".cache_meta.json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta_path
 
 
 def _build_hf_to_conv_map(num_blocks: int) -> dict[str, str]:
@@ -222,12 +261,21 @@ def main():
         assignments = assign_random_compression(model, rng, args.allow_int4)
         stem = f"qwen2_tensorrt_random_seed{args.seed}"
 
+    if args.cache_impl != "mutable":
+        stem += f"_{args.cache_impl}"
+
     summarize_assignments(assignments)
+    print(f"KV-cache implementation: {args.cache_impl}")
 
     if not args.full_only:
         apply_quantization(model, assignments)
 
-    converted = convert_for_export(model, options={"use_sdpa": False}, verbose=False)
+    convert_options = {
+        "use_sdpa": False,
+        "cache_impl": args.cache_impl,
+        "max_cache_len": args.max_sequence_length,
+    }
+    converted = convert_for_export(model, options=convert_options, verbose=False)
     decoder = converted["text"]
     embedding = model.get_input_embeddings()
     final_layer = model.lm_head
@@ -241,7 +289,7 @@ def main():
         output_path=output_path,
         backend="tensorrt",
         max_seq_len=args.max_sequence_length,
-        convert_options={"use_sdpa": False},
+        convert_options=convert_options,
         device=args.device,
         use_fp16=args.use_fp16,
         output_format=args.output_format,
@@ -258,8 +306,11 @@ def main():
         config=export_config,
     )
 
+    meta_path = _write_cache_metadata(result.engine_path, model.config, args)
+
     print("\nExport result:")
     print(f"  engine_path      : {result.engine_path}")
+    print(f"  cache_meta_path  : {meta_path}")
     print(f"  backend          : {result.backend}")
     print(f"  precision        : {result.precision}")
     print(f"  mismatch_count   : {len(result.weight_mismatches)}")
