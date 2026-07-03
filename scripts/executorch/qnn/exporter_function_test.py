@@ -145,6 +145,15 @@ def parse_args():
         default=512,
         help="Sequence length of each calibration chunk",
     )
+    parser.add_argument(
+        "--cache-impl",
+        type=str,
+        default="mutable",
+        choices=["mutable", "io_scatter", "io_concat"],
+        help="KV-cache implementation for the exported model. 'mutable' keeps the "
+             "cache as internal graph state (QNN peak); 'io_scatter'/'io_concat' "
+             "expose it as explicit graph I/O (portable to TensorRT etc.).",
+    )
     # --- ATen diagnostics (QNN-specific; helps debug unsupported ops) ---
     parser.add_argument(
         "--aten-log-file",
@@ -335,7 +344,7 @@ def main():
     else:
         converted = convert_for_export(
             model,
-            options={"use_sdpa": False},
+            options={"use_sdpa": False, "cache_impl": args.cache_impl},
             verbose=False,
         )
         model_input = {
@@ -359,7 +368,7 @@ def main():
         use_fp16=args.fp16,
         num_shards=args.num_shards,
         max_seq_len=args.max_sequence_length,
-        convert_options={"use_sdpa": False},
+        convert_options={"use_sdpa": False, "cache_impl": args.cache_impl},
         verbose=args.verbose,
     )
 

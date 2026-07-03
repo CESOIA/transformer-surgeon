@@ -54,6 +54,7 @@ from transformersurgeon.compression.quantization import Quantizer
 from transformersurgeon.compression.lrd_methods import METHOD_FUNCTIONS as _LRD_SVD
 from transformersurgeon.export import export_to_backend
 from transformersurgeon.export.executorch_exporters.common import LLMWrapper
+from transformersurgeon.export.common import build_zero_caches
 from transformersurgeon.export.executorch_exporters.qnn import QNNExportConfig
 from transformersurgeon.utils import convert_for_export
 from transformersurgeon.utils.utils import flatten_index_paths, get_submodule
@@ -164,7 +165,12 @@ def _apply_lrd(module: LinearCompressed, rank: int) -> None:
 
 class TestQwen2QNNExport(unittest.TestCase):
     """End-to-end export test: Qwen2-0.5B (float16), mixed per-layer
-    compression, QNN export.  HTP inference is skipped by default."""
+    compression, QNN export.  HTP inference is skipped by default.
+
+    Subclasses override ``CACHE_IMPL`` to cover the io_* cache contracts.
+    """
+
+    CACHE_IMPL = "mutable"
 
     @classmethod
     def setUpClass(cls):
@@ -212,7 +218,9 @@ class TestQwen2QNNExport(unittest.TestCase):
             _apply_quant(get_submodule(cls.model, hf_path), prec)
 
         # 4. Convert HF model → export-ready (embedding, decoder, final_layer)
-        converted = convert_for_export(cls.model, options={"use_sdpa": False})
+        converted = convert_for_export(
+            cls.model, options={"use_sdpa": False, "cache_impl": cls.CACHE_IMPL}
+        )
         decoder = converted["text"]
         embedding = cls.model.get_input_embeddings()
         final_layer = cls.model.lm_head
@@ -236,16 +244,25 @@ class TestQwen2QNNExport(unittest.TestCase):
         # 6. Build wrapper and generate/store a random single-token input
         cls.wrapper = LLMWrapper(embedding, decoder, final_layer)
         cls.wrapper.eval()
+        cls.is_io = cls.CACHE_IMPL != "mutable"
 
         vocab_size = cls.model.config.vocab_size
         cls.stored_input_ids = torch.randint(0, vocab_size, (1,), dtype=torch.long)
         cls.stored_pos_ids = torch.tensor([1], dtype=torch.long)
+        cls.stored_key_caches, cls.stored_value_caches = build_zero_caches(decoder)
 
         # 7. Store reference torch output (before export, which may mutate weights)
         with torch.no_grad():
-            cls.torch_output = cls.wrapper(
-                cls.stored_input_ids, cls.stored_pos_ids
-            ).detach()
+            if cls.is_io:
+                out = cls.wrapper(
+                    cls.stored_input_ids, cls.stored_pos_ids,
+                    cls.stored_key_caches, cls.stored_value_caches,
+                )
+                cls.torch_output = out[0].detach()
+            else:
+                cls.torch_output = cls.wrapper(
+                    cls.stored_input_ids, cls.stored_pos_ids
+                ).detach()
 
         # 8. Export to QNN
         cls.tmpdir = tempfile.mkdtemp()
@@ -256,7 +273,7 @@ class TestQwen2QNNExport(unittest.TestCase):
             backend="qnn",
             soc_model=SOC_MODEL,
             max_seq_len=MAX_SEQ_LEN,
-            convert_options={"use_sdpa": False},
+            convert_options={"use_sdpa": False, "cache_impl": cls.CACHE_IMPL},
             run_weight_mismatch_check=False,
             verbose=False,
         )
@@ -276,9 +293,14 @@ class TestQwen2QNNExport(unittest.TestCase):
             try:
                 from executorch.runtime import Runtime
                 program = Runtime.get().load_program(cls.pte_path)
-                out = program.load_method("forward").execute(
-                    [cls.stored_input_ids, cls.stored_pos_ids]
-                )
+                if cls.is_io:
+                    exec_inputs = [
+                        cls.stored_input_ids, cls.stored_pos_ids,
+                        *cls.stored_key_caches, *cls.stored_value_caches,
+                    ]
+                else:
+                    exec_inputs = [cls.stored_input_ids, cls.stored_pos_ids]
+                out = program.load_method("forward").execute(exec_inputs)
                 y = out[0]
                 cls.et_output = (
                     y if isinstance(y, torch.Tensor) else torch.tensor(y)
@@ -388,10 +410,30 @@ class TestQwen2QNNExport(unittest.TestCase):
             "increase the pool size or adjust the seed.",
         )
 
+    def test_export_io_contract(self):
+        """io modes expose the KV cache as explicit graph I/O; mutable does not."""
+        n_layers = len(self.wrapper.decoder.blocks)
+        if self.is_io:
+            self.assertEqual(len(self.stored_key_caches), n_layers)
+            self.assertEqual(len(self.stored_value_caches), n_layers)
+        else:
+            self.assertEqual(self.stored_key_caches, [])
+            self.assertEqual(self.stored_value_caches, [])
+
     @classmethod
     def tearDownClass(cls):
         import shutil
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+
+class TestQwen2QNNExportIOScatter(TestQwen2QNNExport):
+    """Same end-to-end pipeline with the functional index_put (io_scatter) cache."""
+    CACHE_IMPL = "io_scatter"
+
+
+class TestQwen2QNNExportIOConcat(TestQwen2QNNExport):
+    """Same end-to-end pipeline with the scatter-free (io_concat) cache."""
+    CACHE_IMPL = "io_concat"
 
 
 if __name__ == "__main__":
