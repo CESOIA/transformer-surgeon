@@ -1,23 +1,29 @@
 import argparse
-import collections
 import os
+import random
 import re
 import traceback
 from datetime import datetime
-from types import SimpleNamespace
-from typing import Any
 
 import torch
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2ForCausalLMCompress
-from transformersurgeon.export import export_to_executorch
-from transformersurgeon.export.executorch_exporters.common import build_example_inputs, build_wrapper
+from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
+from transformersurgeon.export import export_to_backend
 from transformersurgeon.export.executorch_exporters.qnn import QNNExportConfig
-from transformersurgeon.export.export import _resolve_model_components_for_export
 from transformersurgeon.utils import convert_for_export
 
 
 ATEN_PATTERN = re.compile(r"aten\.[A-Za-z0-9_\.]+")
+
+_DTYPE_MAP = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 
 def parse_args():
@@ -29,19 +35,13 @@ def parse_args():
         help="HF model identifier",
     )
     parser.add_argument(
-        "--backend",
+        "--float-type",
         type=str,
-        default="qnn",
-        choices=["qnn"],
-        help="Target backend for lowering",
+        default=None,
+        choices=["float16", "bfloat16", "float32"],
+        help="Cast all model components to this dtype before export. Default None preserves existing dtypes.",
     )
-    parser.add_argument(
-        "--precision",
-        type=str,
-        default="full",
-        choices=["full", "w8"],
-        help="Global quant precision (w8 = 8-bit weight-only)",
-    )
+    # --- QNN-specific ---
     parser.add_argument(
         "--soc-model",
         type=str,
@@ -52,7 +52,7 @@ def parse_args():
         "--online-prepare",
         action="store_true",
         default=False,
-        help="Enable online_prepare in QNN compiler spec (recommended off for host emulator)",
+        help="Enable online_prepare in QNN compiler spec (off by default; not supported on host emulator)",
     )
     parser.add_argument(
         "--fp16",
@@ -66,6 +66,7 @@ def parse_args():
         default=1,
         help="Number of graph shards for the decoder (1 = no sharding, >1 enables multi-context)",
     )
+    # --- Shared with xnnpack ---
     parser.add_argument(
         "--max-sequence-length",
         type=int,
@@ -93,80 +94,151 @@ def parse_args():
         action="store_true",
         help="Print simple inference error statistics",
     )
+    # --- MLP quantization via manager ---
+    parser.add_argument(
+        "--quant-mlp",
+        action="store_true",
+        help="Quantize MLP layers using Qwen2CompressionSchemesManager before export",
+    )
+    parser.add_argument(
+        "--quant-precision",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Integer bit-width for MLP quantization (4 or 8)",
+    )
+    parser.add_argument(
+        "--quant-mode",
+        type=str,
+        default="hard",
+        choices=["hard", "soft"],
+        help="hard: torchao native quantization; soft: fake-quant (reversible)",
+    )
+    parser.add_argument(
+        "--granularity",
+        type=str,
+        default="per_channel",
+        choices=["per_channel", "per_tensor"],
+        help="Weight quantization granularity for MLP layers",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Enable static activation quantization calibrated on WikiText-2 (requires --quant-mlp)",
+    )
+    parser.add_argument(
+        "--act-precision",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Integer bit-width for activation quantization (used with --calibrate)",
+    )
+    parser.add_argument(
+        "--num-calibration-samples",
+        type=int,
+        default=128,
+        help="Number of WikiText-2 token chunks to use for activation calibration",
+    )
+    parser.add_argument(
+        "--calibration-seq-len",
+        type=int,
+        default=512,
+        help="Sequence length of each calibration chunk",
+    )
+    # --- ATen diagnostics (QNN-specific; helps debug unsupported ops) ---
     parser.add_argument(
         "--aten-log-file",
         type=str,
         default=None,
         help=(
             "Optional diagnostics log path. If unset, writes to "
-            "<out-dir>/aten_op_problems_<mode>_<backend>_<precision>.log"
+            "<out-dir>/aten_op_problems_<stem>.log only on export failure."
         ),
     )
     return parser.parse_args()
+
+
+def _build_pte_stem(args: argparse.Namespace) -> str:
+    parts = [f"qwen2_qnn_{args.soc_model.lower()}"]
+    if args.quant_mlp:
+        act_tag = f"_a{args.act_precision}" if args.calibrate else ""
+        parts.append(f"w{args.quant_precision}{act_tag}_{args.quant_mode}")
+    else:
+        parts.append("full")
+    if args.num_shards > 1:
+        parts.append(f"s{args.num_shards}")
+    if not args.fp16:
+        parts.append("nofp16")
+    return "_".join(parts)
+
+
+def _build_wikitext_calibration_loader(
+    tokenizer,
+    num_samples: int = 128,
+    seq_len: int = 512,
+    seed: int = 42,
+) -> DataLoader:
+    raw = load_dataset(
+        "EleutherAI/wikitext_document_level",
+        "wikitext-2-raw-v1",
+        split="train",
+    )
+    texts = [t for t in raw["page"] if isinstance(t, str) and len(t) > 0]
+    corpus = "\n\n".join(texts)
+
+    token_ids = tokenizer(corpus, truncation=False, padding=False,
+                          return_attention_mask=False)["input_ids"]
+
+    max_samples = len(token_ids) // seq_len
+    actual = min(num_samples, max_samples)
+
+    rng = random.Random(seed)
+    examples = []
+    for _ in range(actual):
+        start = rng.randint(0, len(token_ids) - seq_len - 1)
+        examples.append({
+            "input_ids": torch.tensor(token_ids[start:start + seq_len], dtype=torch.long),
+            "attention_mask": torch.ones(seq_len, dtype=torch.long),
+        })
+
+    return DataLoader(examples, batch_size=1, shuffle=False)
+
+
+def quantize_mlp_with_manager(model, args, calibration_loader=None):
+    act_info = f", activation=a{args.act_precision}" if calibration_loader is not None else ""
+    print(
+        f"Quantizing MLP layers: precision=w{args.quant_precision}, "
+        f"mode={args.quant_mode}, granularity={args.granularity}{act_info}"
+    )
+    manager = Qwen2CompressionSchemesManager(model)
+
+    criteria = ["mlp"]
+    manager.set("quantization", "precision", args.quant_precision, criteria=criteria)
+    manager.set("quantization", "method", "vanilla", criteria=criteria)
+    manager.set("quantization", "granularity", args.granularity, criteria=criteria)
+    manager.set("quantization", "sparsity", 0.0, criteria=criteria)
+    manager.set("quantization", "sparse_method", "magnitude", criteria=criteria)
+    manager.set("quantization", "eps", 1e-6, criteria=criteria)
+
+    if calibration_loader is not None:
+        manager.set("quantization", "precision_activation", args.act_precision, criteria=criteria)
+        manager.set_calibration_data(calibration_loader)
+
+    hard = args.quant_mode == "hard"
+    manager.apply(hard=hard, criteria=criteria, verbose=args.verbose)
+    print("MLP quantization applied.")
+    return model
 
 
 def _extract_aten_ops_from_text(text: str) -> list[str]:
     return sorted(set(ATEN_PATTERN.findall(text)))
 
 
-def _collect_aten_inventory(
-    model_input: Any,
-    *,
-    convert_options: dict[str, Any],
-    max_seq_len: int,
-) -> tuple[collections.Counter[str], str | None]:
-    try:
-        embedding, decoder, final_layer, model_config = _resolve_model_components_for_export(
-            model_input,
-            convert_options=convert_options,
-            verbose=False,
-        )
-
-        wrapper = build_wrapper(
-            {
-                "embedding": embedding,
-                "decoder": decoder,
-                "final_layer": final_layer,
-            },
-            model_config=model_config,
-        )
-        wrapper.eval()
-
-        example_inputs = build_example_inputs(
-            model_config,
-            config=SimpleNamespace(max_seq_len=max_seq_len),
-        )
-        exported = torch.export.export(wrapper, example_inputs)
-        graph_module = exported.module()
-
-        counter: collections.Counter[str] = collections.Counter()
-        for node in graph_module.graph.nodes:
-            if node.op != "call_function":
-                continue
-            target_name = str(node.target)
-            if target_name.startswith("aten."):
-                counter[target_name] += 1
-
-        return counter, None
-    except Exception as exc:  # best-effort diagnostics only
-        return collections.Counter(), "".join(traceback.format_exception(exc))
-
-
-def _resolve_log_path(args: argparse.Namespace) -> str:
-    if args.aten_log_file:
-        return args.aten_log_file
-    return os.path.join(
-        args.out_dir,
-        f"aten_op_problems_{args.mode}_{args.backend}_{args.precision}.log",
-    )
-
-
 def _write_aten_diagnostics_log(
     *,
     log_path: str,
     args: argparse.Namespace,
-    aten_inventory: collections.Counter[str],
-    inventory_error: str | None,
+    stem: str,
     export_error: str | None,
     export_error_aten_ops: list[str],
     output_path: str,
@@ -177,35 +249,18 @@ def _write_aten_diagnostics_log(
         f"timestamp={datetime.now().isoformat(timespec='seconds')}",
         f"model_name={args.model_name}",
         f"mode={args.mode}",
-        f"backend={args.backend}",
-        f"precision={args.precision}",
         f"soc_model={args.soc_model}",
         f"online_prepare={args.online_prepare}",
         f"fp16={args.fp16}",
         f"num_shards={args.num_shards}",
+        f"quant_mlp={args.quant_mlp}",
+        f"quant_precision={args.quant_precision}",
         f"max_sequence_length={args.max_sequence_length}",
+        f"stem={stem}",
         f"output_path={output_path}",
         "",
-        "[graph_aten_inventory]",
+        "[export_exception_aten_ops]",
     ]
-
-    if inventory_error:
-        lines.append("status=failed")
-        lines.append("error=failed to collect FX graph inventory")
-        lines.append("")
-        lines.append("[graph_aten_inventory_traceback]")
-        lines.extend(inventory_error.rstrip().splitlines())
-    else:
-        lines.append("status=ok")
-        lines.append(f"unique_aten_ops={len(aten_inventory)}")
-        lines.append(f"total_aten_nodes={sum(aten_inventory.values())}")
-        lines.append("")
-        lines.append("[graph_aten_inventory_counts]")
-        for op_name, count in sorted(aten_inventory.items()):
-            lines.append(f"{op_name}={count}")
-
-    lines.append("")
-    lines.append("[export_exception_aten_ops]")
     if export_error:
         lines.append("status=failed")
         lines.append(f"unique_aten_ops_in_exception={len(export_error_aten_ops)}")
@@ -226,12 +281,28 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Load model in float16 by default; float_type cast (if any) happens inside export_to_backend.
+    load_dtype = _DTYPE_MAP.get(args.float_type, torch.float16) if args.float_type else torch.float16
+
     print(f"Loading model: {args.model_name}")
     model = Qwen2ForCausalLMCompress.from_pretrained(
         args.model_name,
-        torch_dtype=torch.float32,
+        torch_dtype=load_dtype,
     )
     model.eval()
+
+    # --- Optional MLP quantization via manager ---
+    if args.quant_mlp:
+        calibration_loader = None
+        if args.calibrate:
+            print(f"Building WikiText-2 calibration loader ({args.num_calibration_samples} samples, seq_len={args.calibration_seq_len})")
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+            calibration_loader = _build_wikitext_calibration_loader(
+                tokenizer,
+                num_samples=args.num_calibration_samples,
+                seq_len=args.calibration_seq_len,
+            )
+        quantize_mlp_with_manager(model, args, calibration_loader=calibration_loader)
 
     if args.mode == "hf":
         model_input = model
@@ -248,16 +319,15 @@ def main():
             "config": model.config,
         }
 
-    output_path = os.path.join(
-        args.out_dir,
-        f"export_{args.mode}_{args.backend}_{args.precision}_s{args.num_shards}.pte",
-    )
-    log_path = _resolve_log_path(args)
+    stem = _build_pte_stem(args)
+    output_path = os.path.join(args.out_dir, f"{stem}.pte")
+
+    export_float_type = _DTYPE_MAP[args.float_type] if args.float_type else None
 
     export_config = QNNExportConfig(
         output_path=output_path,
-        backend=args.backend,
-        precision=args.precision,
+        backend="qnn",
+        float_type=export_float_type,
         soc_model=args.soc_model,
         is_online_prepare=args.online_prepare,
         use_fp16=args.fp16,
@@ -267,16 +337,11 @@ def main():
         verbose=args.verbose,
     )
 
-    aten_inventory, inventory_error = _collect_aten_inventory(
-        model_input,
-        convert_options={"use_sdpa": False},
-        max_seq_len=args.max_sequence_length,
-    )
     export_error = None
     export_error_aten_ops: list[str] = []
     result = None
     try:
-        result = export_to_executorch(
+        result = export_to_backend(
             model_input,
             config=export_config,
         )
@@ -284,21 +349,26 @@ def main():
         export_error = "".join(traceback.format_exception(exc))
         export_error_aten_ops = _extract_aten_ops_from_text(export_error)
     finally:
-        _write_aten_diagnostics_log(
-            log_path=log_path,
-            args=args,
-            aten_inventory=aten_inventory,
-            inventory_error=inventory_error,
-            export_error=export_error,
-            export_error_aten_ops=export_error_aten_ops,
-            output_path=output_path,
+        # Only write the diagnostics log on failure, or always if --aten-log-file is set.
+        log_path = args.aten_log_file or (
+            os.path.join(args.out_dir, f"aten_op_problems_{stem}.log")
+            if export_error
+            else None
         )
-        print(f"ATen diagnostics log written to: {log_path}")
+        if log_path:
+            _write_aten_diagnostics_log(
+                log_path=log_path,
+                args=args,
+                stem=stem,
+                export_error=export_error,
+                export_error_aten_ops=export_error_aten_ops,
+                output_path=output_path,
+            )
+            print(f"ATen diagnostics log written to: {log_path}")
 
     if export_error is not None:
         raise RuntimeError(
-            "Export failed. See ATen diagnostics log for op details: "
-            f"{log_path}"
+            f"Export failed. See ATen diagnostics log for op details: {log_path}"
         )
 
     assert result is not None

@@ -98,6 +98,76 @@ def _decompose_wrap_with_set_grad_enabled(graph_module: torch.fx.GraphModule) ->
     return rewritten
 
 
+class _BreakQuantAttrsBeforeFp16Linear:
+    """
+    Edge-dialect pass injected into QnnPassManager's pipeline after LayoutTransform.
+
+    `AnnotateQuantAttrs` sets QCOM_QUANT_ATTRS on activation outputs that feed Q ops.
+    `FoldQDQ` then removes those Q/DQ ops, but the annotation remains.  When a
+    float16 (un-quantized) linear node follows a quantized layer, its input tensor
+    carries QCOM_QUANT_ATTRS.  QNN's define_node reads that attribute to infer a
+    quantized dtype (uint8/int8) for the input, making FC(quantized-input, fp16-weight)
+    invalid → rejected.
+
+    This pass inserts `edge._to_copy(x, dtype=float16)` before each float16 linear
+    whose input has QCOM_QUANT_ATTRS.  The cast node's output is clean float16 (no
+    QCOM_QUANT_ATTRS), so QNN sees FC(float16 input, float16 weight) → accepted.
+    QNN handles the cast itself as OpCast(uint8 → float16).
+    """
+
+    def __init__(self):
+        pass
+
+    def __call__(self, graph_module: torch.fx.GraphModule):
+        from executorch.backends.qualcomm.builders.node_visitor import dq_ops
+        from executorch.backends.qualcomm.utils.constants import QCOM_QUANT_ATTRS
+        from executorch.exir.dialects._ops import ops as exir_ops
+        from executorch.exir.pass_base import PassResult
+
+        linear_op = exir_ops.edge.aten.linear.default
+        _to_copy_op = exir_ops.edge.aten._to_copy.default
+
+        graph = graph_module.graph
+        modified = False
+
+        for node in list(graph.nodes):
+            if node.op != "call_function" or node.target != linear_op:
+                continue
+
+            # Quantized linears: weight comes from a dequantize bypass node.
+            # Those have QCOM_QUANT_ATTRS on the weight and QNN handles them via its
+            # quantized FC path.  Only float16 linears (plain fp16 weight param) need fixing.
+            weight = node.args[1] if len(node.args) > 1 else None
+            if isinstance(weight, torch.fx.Node) and weight.target in dq_ops:
+                continue
+
+            input_node = node.args[0]
+            if not isinstance(input_node, torch.fx.Node):
+                continue
+            if not input_node.meta.get(QCOM_QUANT_ATTRS):
+                continue
+
+            # Insert _to_copy to produce a clean float16 tensor without QCOM_QUANT_ATTRS.
+            with graph.inserting_before(node):
+                cast_node = graph.call_function(
+                    _to_copy_op,
+                    (input_node,),
+                    {"dtype": torch.float16},
+                )
+                cast_node.meta = {
+                    k: v for k, v in input_node.meta.items() if k != QCOM_QUANT_ATTRS
+                }
+
+            node.replace_input_with(input_node, cast_node)
+            modified = True
+
+        if modified:
+            graph.eliminate_dead_code()
+            graph_module.recompile()
+
+        return PassResult(graph_module, modified)
+
+
 def _canonicalize_pow_tensor_scalar(graph_module: torch.fx.GraphModule) -> int:
     from torchao.quantization.pt2e.utils import get_new_attr_name_with_prefix
 
@@ -212,65 +282,53 @@ def export_with_qnn(
         )
         from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 
+        # Map torchao precision → QNN QuantDtype.
+        # use_8a8w: int8 activations + int8 weights (int8 weight observer uses
+        # qmin=-127/qmax=127 symmetric, matching the torchao per-channel scale).
+        # use_16a4w: 16-bit activations + 4-bit weights.
         _PREC_TO_QDTYPE = {
             4: QuantDtype.use_16a4w,
-            8: QuantDtype.use_16a8w,
+            8: QuantDtype.use_8a8w,
         }
 
-        class _MixedPrecisionQnnQuantizer(QnnQuantizer):
-            """QnnQuantizer that applies per-layer precision inferred from model metadata.
-
-            Layers present in layer_info are annotated with their precision (4-bit or
-            8-bit weights, 16-bit activations).  All other layers are left as float —
-            they are excluded from annotation by returning None from _get_quant_config.
-            """
-
-            def __init__(self, layer_info_: dict, soc_model_: Any) -> None:
-                super().__init__(
-                    backend=QnnExecuTorchBackendType.kHtpBackend,
-                    soc_model=soc_model_,
-                )
-                self._layer_qdtype: dict[str, QuantDtype] = {}
-                for name, info in layer_info_.items():
-                    qdtype = _PREC_TO_QDTYPE.get(info["precision"])
-                    if qdtype is not None:
-                        self._layer_qdtype[name] = qdtype
-
-                self._qdtype_config: dict[QuantDtype, ModuleQConfig] = {}
-                for qdtype in set(self._layer_qdtype.values()):
-                    self._qdtype_config[qdtype] = ModuleQConfig(
-                        quant_dtype=qdtype,
-                        is_linear_per_channel=True,
-                    )
-
-            def _get_quant_config(self, node: torch.fx.Node):
+        def _make_layer_predicate(layer_names: frozenset) -> Any:
+            def _pred(node: torch.fx.Node) -> bool:
                 stack = node.meta.get("nn_module_stack", {})
-                matched_qdtype = None
-                # Iterate from innermost to outermost to find the most specific match.
                 for _, (qname, _) in reversed(list(stack.items())):
-                    if qname in self._layer_qdtype:
-                        matched_qdtype = self._layer_qdtype[qname]
-                        break
-
-                if matched_qdtype is None:
-                    return None  # layer stays float
-
-                config = self._qdtype_config[matched_qdtype]
-                op = node.target
-                if isinstance(op, str):
-                    return None
-
-                if op in config.use_per_channel_weight_quant_ops:
-                    ch_axis = config.use_per_channel_weight_quant_ops[op]
-                    return config.per_channel_quant_config_list[ch_axis]
-
-                if op in self.quant_ops:
-                    return config.quant_config
-
-                return None
+                    if qname in layer_names:
+                        return True
+                return False
+            return _pred
 
         chipset = _resolve_qcom_chipset(config.soc_model)
-        quantizer = _MixedPrecisionQnnQuantizer(layer_info, chipset)
+        quantizer = QnnQuantizer(
+            backend=QnnExecuTorchBackendType.kHtpBackend,
+            soc_model=chipset,
+        )
+
+        # Group layers by QuantDtype and build submodule_qconfig_list.
+        from collections import defaultdict as _defaultdict
+        _qdtype_to_layers: dict[QuantDtype, set] = _defaultdict(set)
+        for _name, _info in layer_info.items():
+            _qdtype = _PREC_TO_QDTYPE.get(_info["precision"])
+            if _qdtype is not None:
+                _qdtype_to_layers[_qdtype].add(_name)
+
+        _qconfig_list = []
+        for _qdtype, _layers in _qdtype_to_layers.items():
+            _qconfig = ModuleQConfig(quant_dtype=_qdtype, is_linear_per_channel=True)
+            _qconfig_list.append((_make_layer_predicate(frozenset(_layers)), _qconfig))
+
+        # Layers not matched by any predicate stay at the default_quant_config.
+        # Set the default to a sentinel that has empty use_per_channel_weight_quant_ops
+        # so _get_quant_config returns None (no annotation) for unmatched nodes.
+        _float_config = ModuleQConfig()
+        _float_config.use_per_channel_weight_quant_ops = {}
+        _float_config.quant_config = None
+        quantizer.default_quant_config = _float_config
+
+        quantizer.set_submodule_qconfig_list(_qconfig_list)
+
         prepared = prepare_pt2e(sanitized_module, quantizer)
 
         calibrate_pt2e_observers(prepared, model_config, config)
@@ -380,6 +438,38 @@ def export_with_qnn(
             QCOM_PASS_ACTIVATE_KEY: True,
             QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY: {"shard_layers": _shard_layers},
         }
+        edge_kwargs["passes_job"] = passes_job
+        edge_kwargs["dep_table"] = dep_table
+
+    # For mixed-precision models: AnnotateQuantAttrs sets QCOM_QUANT_ATTRS on activation
+    # tensors that feed Q ops; FoldQDQ then removes those Q/DQ ops but the annotation
+    # persists. Float16 linears that follow quantized layers see a "quantized-dtype" input
+    # which makes their FC op invalid for QNN. Inject an edge-dialect cast pass (after
+    # LayoutTransform, before TagQuantIO) to insert _to_copy(x, float16) in front of each
+    # affected float16 linear, giving QNN a clean float16 input.
+    if layer_info:
+        from executorch.backends.qualcomm._passes import LayoutTransform, TagQuantIO
+        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_capture_program_passes
+        from executorch.backends.qualcomm._passes.utils import get_passes_dependency_for_capture_program
+        from executorch.backends.qualcomm.utils.constants import (
+            QCOM_PASS_ACTIVATE_KEY,
+            QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
+        )
+
+        passes_job = edge_kwargs.get("passes_job", get_capture_program_passes())
+        dep_table = edge_kwargs.get("dep_table", get_passes_dependency_for_capture_program())
+
+        passes_job[_BreakQuantAttrsBeforeFp16Linear] = {
+            QCOM_PASS_ACTIVATE_KEY: True,
+            QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY: {},
+        }
+        # Run after LayoutTransform (which itself runs after FoldQDQ + AnnotateQuantAttrs).
+        dep_table[_BreakQuantAttrsBeforeFp16Linear] = [LayoutTransform]
+        # Ensure TagQuantIO (and thus ResolveDebugHandle) runs after our pass.
+        dep_table[TagQuantIO] = list(dep_table.get(TagQuantIO, [LayoutTransform])) + [
+            _BreakQuantAttrsBeforeFp16Linear
+        ]
+
         edge_kwargs["passes_job"] = passes_job
         edge_kwargs["dep_table"] = dep_table
 
