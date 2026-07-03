@@ -32,4 +32,10 @@ pytest test/bert_tests/ -v                 # small encoder models
 pytest test/distilbert_tests/ -v
 pytest test/qwen_tests/inference_test.py -v   # requires model download
 pytest test/hf_export_tests/ -v
+pytest test/executorch_tests/ -v           # ExecuTorch backend export (xnnpack/qnn)
+pytest test/tensorrt_tests/ -v             # TensorRT backend export (requires CUDA)
 ```
+
+## Backend export
+
+`export_to_backend(model, config)` lowers a model to `xnnpack`/`qnn` (ExecuTorch) or `tensorrt`. See [Export Backends in AGENTS.md](AGENTS.md#export-backends).

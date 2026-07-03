@@ -31,7 +31,7 @@ pip install -e .
 **Export**
 - `convert_for_export` — rewrite model to compact custom decoder/encoder graphs
 - `export_to_hf` — push compressed model to Hugging Face Hub
-- ExecuTorch export pipeline under `transformersurgeon.export`
+- `export_to_backend` — export to ExecuTorch (`xnnpack`, `qnn`) or `tensorrt` under `transformersurgeon.export`, with mixed-precision export driven by per-layer compression metadata
 
 ## 🤖 Supported Model Families
 
@@ -115,6 +115,21 @@ manager.set("lrd", "rank", 256, criteria=[[0, "attn.q_proj"]])
 manager.apply(hard=False)
 ```
 
+### Export to a deployment backend (ExecuTorch / TensorRT)
+
+`export_to_backend` lowers a model (compressed or not) to `xnnpack`/`qnn` (ExecuTorch `.pte`) or `tensorrt`, driving mixed-precision export entirely from each layer's compression metadata:
+
+```python
+from transformersurgeon.export import export_to_backend
+from transformersurgeon.export.tensorrt import TensorRTExportConfig
+
+config = TensorRTExportConfig(output_path="model.ep", backend="tensorrt", device="cuda:0")
+result = export_to_backend(model, config=config)
+print(result.engine_path)
+```
+
+> TensorRT requires `pip install -e ".[tensorrt]"` and a CUDA device. See `scripts/tensorrt/run_export.sh` for a CLI runner and `test/tensorrt_tests/` for end-to-end examples (same pattern as `scripts/executorch/` / `test/executorch_tests/` for `xnnpack`/`qnn`).
+
 ## 🎯 Filtering Layers with `criteria`
 
 The `criteria` argument selects which layers to target. It supports strings, block IDs, and nested logic:
@@ -181,9 +196,10 @@ These groups are consumed by `CompressionSchemesManager` exactly like previous u
 
 - [test/compression_tests/compression_test.py](test/compression_tests/compression_test.py) — manager basics and convert-then-compress flow
 - [test/qwen_tests/inference_test.py](test/qwen_tests/inference_test.py) — Qwen2 end-to-end
-- [test/llama_tests/svd_llm_v2_test.py](test/llama_tests/svd_llm_v2_test.py) — Llama calibrated LRD
-- [test/qwen_tests/svd_llm_v2_test.py](test/qwen_tests/svd_llm_v2_test.py) — calibrated LRD
+- [test/qwen_tests/test_calibration_compression.py](test/qwen_tests/test_calibration_compression.py) — calibrated LRD
 - [test/qwen_vl_tests/inference_test.py](test/qwen_vl_tests/inference_test.py) — vision-language
+- [test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py](test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py) — mixed-precision backend export (XNNPACK)
+- [test/tensorrt_tests/exporter_function/tensorrt/test_pretrained_quant_export.py](test/tensorrt_tests/exporter_function/tensorrt/test_pretrained_quant_export.py) — mixed-precision backend export (TensorRT)
 - [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package internals and extension guide
 
 ## License

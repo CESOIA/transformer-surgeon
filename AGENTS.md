@@ -39,13 +39,19 @@ pytest test/distilbert_tests/ -v
 
 # Causal LM tests — require model downloads
 pytest test/qwen_tests/inference_test.py -v
-pytest test/qwen_tests/svd_llm_v2_test.py -v
+pytest test/qwen_tests/test_calibration_compression.py -v
 
 # Vision-language
 pytest test/qwen_vl_tests/ -v
 
 # HuggingFace export roundtrip
 pytest test/hf_export_tests/ -v
+
+# Backend export (ExecuTorch XNNPACK/QNN) — requires executorch extra
+pytest test/executorch_tests/ -v
+
+# Backend export (TensorRT) — requires tensorrt extra + CUDA; skips otherwise
+pytest test/tensorrt_tests/ -v
 
 # Single file
 pytest test/compression_tests/compression_test.py::test_name -v
@@ -88,6 +94,35 @@ Where to look when you need to change something:
 | Change HuggingFace export | `hf/hf_export.py` |
 | Change export graph conversion | `utils/convert.py` |
 | Change what parameters are valid for a compression type | `compression/registry.py` → `COMPRESSION_REGISTRY` |
+| Change backend-export machinery shared by all backends (quant-metadata extraction, PT2E calibration, weight-mismatch checks) | `export/common.py` |
+| Add/change a backend exporter | `export/registry.py` → `EXPORT_ROUTINES`, plus the backend's own subpackage (`export/executorch_exporters/xnnpack/`, `export/executorch_exporters/qnn/`, `export/tensorrt/`) |
+
+---
+
+## Export Backends
+
+`transformersurgeon/export/` lowers a (possibly compressed) model to a deployment backend via `export_to_backend(model_or_graph, config)` (`export/export.py`). It dispatches through `EXPORT_ROUTINES` (`export/registry.py`) to one of:
+
+| Backend | Config class | Module | Output |
+|---|---|---|---|
+| `xnnpack` | `XNNPACKExportConfig` | `export/executorch_exporters/xnnpack/` | ExecuTorch `.pte` |
+| `qnn` | `QNNExportConfig` | `export/executorch_exporters/qnn/` | ExecuTorch `.pte` (Qualcomm NPU) |
+| `tensorrt` | `TensorRTExportConfig` | `export/tensorrt/` | TensorRT engine / exported program (`.engine_path`) |
+
+All three share the backend-agnostic machinery in `export/common.py`: `resolve_components_and_wrapper()` builds the model wrapper and example inputs, `extract_layer_quant_info()` reads per-layer compression metadata straight off the model (no separate quant config needed), and `inject_scales_into_pt2e_observers()` overrides PT2E-calibrated observers with the exact surgeon scales before `convert_pt2e()`. This is what makes **mixed-precision export** work: a model with some `LinearCompressed` layers hard-quantized to INT8/INT4 and others left float exports to a single engine/program with only the quantized layers getting Q/DQ ops.
+
+```python
+from transformersurgeon.export import export_to_backend
+from transformersurgeon.export.tensorrt import TensorRTExportConfig
+
+config = TensorRTExportConfig(output_path="model.pt2", backend="tensorrt", device="cuda:0")
+result = export_to_backend(model, config=config)   # model can be a full HF model or {embedding, decoder, final_layer}
+print(result.engine_path)
+```
+
+`export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)` — use `export_to_backend`.
+
+TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live under `test/tensorrt_tests/` (mirroring `test/executorch_tests/`); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
 
 ---
 

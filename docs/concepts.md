@@ -225,6 +225,42 @@ standard (non-VCON) module.
 
 ---
 
+## Export Backends
+
+`transformersurgeon.export.export_to_backend(model, config)` lowers a model to a deployment backend. It dispatches through `EXPORT_ROUTINES` (`export/registry.py`) to one of three registered backends:
+
+| Backend | Config class | Output |
+|---|---|---|
+| `xnnpack` | `XNNPACKExportConfig` | ExecuTorch `.pte` |
+| `qnn` | `QNNExportConfig` | ExecuTorch `.pte` (Qualcomm NPU) |
+| `tensorrt` | `TensorRTExportConfig` | TensorRT engine / exported program |
+
+All three backends share the machinery in `export/common.py` rather than each reimplementing it:
+
+1. `resolve_components_and_wrapper()` — normalizes the input (full HF model, `{embedding, decoder, final_layer}` dict, or tuple) into a wrapper module plus example inputs.
+2. `extract_layer_quant_info()` — reads per-layer compression metadata (hard-quantized weights, calibrated activation scales) directly off the model's `LinearCompressed` layers. There is no separate quantization config to author — a layer is quantized in the exported artifact if and only if it was already quantized on the model.
+3. `prepare_pt2e(...)` with a backend-specific `Quantizer` that annotates only the linear layers named in the compression metadata — everything else stays float.
+4. `calibrate_pt2e_observers()` — a calibration forward pass so activation observers collect representative statistics.
+5. `inject_scales_into_pt2e_observers()` — overrides the PT2E observers with the *exact* surgeon scales (no re-calibration drift), then `convert_pt2e()`.
+6. `finalize_export_result()` — runs the optional weight-mismatch check and packages a `BackendExportResult` (backend-specific subclasses add aliases like `.pte_path` or `.engine_path`).
+
+This is what makes **mixed-precision export** work: a model with some layers hard-quantized to INT8/INT4 and others left float exports to a single `.pte`/engine, with only the quantized layers getting Q/DQ ops.
+
+```python
+from transformersurgeon.export import export_to_backend
+from transformersurgeon.export.tensorrt import TensorRTExportConfig
+
+config = TensorRTExportConfig(output_path="model.ep", backend="tensorrt", device="cuda:0")
+result = export_to_backend(model, config=config)
+print(result.engine_path)
+```
+
+`export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)`.
+
+TensorRT is the newest backend. It needs the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests live under `test/tensorrt_tests/` and the CLI runner is `scripts/tensorrt/run_export.sh`, mirroring the ExecuTorch backends' `test/executorch_tests/` / `scripts/executorch/`.
+
+---
+
 ## Extending TransformerSurgeon
 
 ### New compression method
@@ -282,3 +318,19 @@ class NewModelCompressionSchemesManager(CompressionSchemesManager):
 
 Export the three classes from `models/newmodel_c/__init__.py` and add them to
 `models/__init__.py`. No changes to the manager or compression logic are needed.
+
+### New export backend
+
+1. Create `transformersurgeon/export/<backend>/` with a `<backend>_export.py` defining:
+   - A config dataclass extending `export.common.ExporterConfig` (which extends `BackendExportConfig`) with backend-specific fields.
+   - A result dataclass extending `export.common.BackendExportResult`, optionally adding a backend-flavoured alias property (see `TensorRTExportResult.engine_path`).
+   - An `export_with_<backend>(model_or_graph, *, config)` function that calls, in order: `resolve_components_and_wrapper`, `extract_layer_quant_info`, a backend-specific PT2E `Quantizer` (see below) via `prepare_pt2e`/`convert_pt2e`, `calibrate_pt2e_observers`, `inject_scales_into_pt2e_observers`, the backend's own compile/save step, then `finalize_export_result`.
+2. If the backend needs its own PT2E annotation logic, add a `quantizer.py` building a `torchao.quantization.pt2e.quantizer.Quantizer` subclass that annotates only `aten.linear` nodes named in the compression metadata (see `export/tensorrt/quantizer.py` for a minimal reference implementation with no ExecuTorch dependency).
+3. Register the backend in `transformersurgeon/export/registry.py`:
+   ```python
+   EXPORT_ROUTINES["<backend>"] = {
+       "export": export_with_<backend>,
+       "config_class": <Backend>ExportConfig,
+   }
+   ```
+4. Add tests under `test/<backend>_tests/` (or `test/executorch_tests/` if it's an ExecuTorch backend) mirroring `test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py`.

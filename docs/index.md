@@ -41,7 +41,7 @@ pip install -e .
 
 - `convert_for_export` — rewrite model to compact custom decoder/encoder graphs
 - `export_to_hf` — push compressed model to HuggingFace Hub
-- ExecuTorch export pipeline under `transformersurgeon.export`
+- `export_to_backend` — export to ExecuTorch (`xnnpack`, `qnn`) or `tensorrt` under `transformersurgeon.export`, with mixed-precision export driven by per-layer compression metadata
 
 ---
 

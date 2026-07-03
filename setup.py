@@ -9,9 +9,11 @@ setup(
     install_requires=[
         "torch>=2.9.0",
         "transformers>=5.9.0",
+        "torchao",
     ],
     extras_require={
         "executorch": ["executorch>=1.0.0"],
+        "tensorrt": ["torch-tensorrt"],
         "dev": ["pytest"],
     },
 )

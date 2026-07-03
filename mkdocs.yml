@@ -50,6 +50,14 @@ nav:
     - Blocks:
       - LinearCompressed: api/blocks/linear_compressed.md
       - VCONBlock: api/blocks/vcon_block.md
+    - Export:
+      - export_to_backend: api/export/export.md
+      - BackendExportConfig: api/export/config.md
+      - Registry: api/export/registry.md
+      - Common (shared machinery): api/export/common.md
+      - XNNPACK: api/export/xnnpack.md
+      - QNN: api/export/qnn.md
+      - TensorRT: api/export/tensorrt.md
 
 markdown_extensions:
   - admonition
