@@ -5,9 +5,13 @@
 ## Docs
 
 - [README](README.md): Installation, quick-start examples, manager API overview, VCON workflow, soft vs hard apply
-- [Core Concepts](docs/concepts.md): Three-layer architecture (Compressor / CompressionScheme / Manager), LinearCompressed internals, calibration pipeline (standard and cascade), VCON design, extension guide
-- [Agent Guide](AGENTS.md): File map, test commands, coding invariants, anti-patterns, compression parameter reference, extension recipes — read this before making code changes
+- [Core Concepts](docs/concepts.md): Three-layer architecture (Compressor / CompressionScheme / Manager), LinearCompressed internals, calibration pipeline (standard and cascade), VCON design, export backends, extension guide
+- [Agent Guide](AGENTS.md): File map, test commands, coding invariants, anti-patterns, compression parameter reference, export backends, extension recipes — read this before making code changes
 - [Framework Structure](FRAMEWORK_STRUCTURE.md): Package layout and internal wiring for contributors
+
+## Export
+
+- `transformersurgeon.export.export_to_backend(model, config)`: backend-agnostic export to `xnnpack`/`qnn` (ExecuTorch, `.pte`) or `tensorrt` (TensorRT engine/exported program, needs the `tensorrt` extra + CUDA). Mixed-precision export is driven entirely by per-layer compression metadata already on the model — see `export/common.py` and the Export Backends section of [AGENTS.md](AGENTS.md).
 
 ## Examples
 

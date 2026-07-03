@@ -53,6 +53,10 @@ class TensorRTExportConfig(ExporterConfig):
     optimization_level - TensorRT builder optimization level (None = default).
     output_format     - torch-tensorrt save format: "exported_program" | "torchscript".
     device            - target device string for compilation ("cuda:0" by default).
+    use_explicit_typing - torch-tensorrt "strong typing" mode. Must stay False for mixed
+                          fp16/int8 graphs: newer torch-tensorrt versions require
+                          enabled_precisions == {float32} when this is True, which is
+                          incompatible with the fp16/int8 mix this exporter builds.
     """
 
     use_fp16: bool = True
@@ -62,6 +66,7 @@ class TensorRTExportConfig(ExporterConfig):
     optimization_level: int | None = None
     output_format: str = "exported_program"
     device: str = "cuda:0"
+    use_explicit_typing: bool = False
 
 
 def _detect_float_dtype(wrapper: nn.Module) -> torch.dtype:
@@ -81,6 +86,7 @@ def _compile_tensorrt(exported_program: Any, example_inputs: tuple[Any, ...], *,
         "min_block_size": config.min_block_size,
         "truncate_double": config.truncate_double,
         "device": config.device,
+        "use_explicit_typing": config.use_explicit_typing,
     }
     if config.workspace_size:
         compile_kwargs["workspace_size"] = config.workspace_size
@@ -208,8 +214,13 @@ def export_with_tensorrt(
         program_for_trt = quantized_exported
         exported_for_mismatch = quantized_exported
 
-        # QDQ ops let TensorRT build INT8/INT4 layers for the quantized linears.
-        enabled_precisions.add(torch.int8)
+        # The quantized linears already carry explicit Q/DQ ops (from convert_pt2e),
+        # which is what lets TensorRT build INT8/INT4 layers for them. Do NOT also
+        # add torch.int8 to enabled_precisions: that flag asks the builder for
+        # *implicit*, network-wide INT8 quantization, which requires a calibrator
+        # (or explicit dynamic range) on every tensor in the graph, not just the
+        # already-quantized ones — and fails with "Calibration failure occurred
+        # with no scaling factors detected" for the untouched float layers.
 
     trt_module = _compile_tensorrt(
         program_for_trt,
