@@ -1,4 +1,5 @@
 from .linear_compressed import *
+from .pruning_dims import *
 from .vcon_block import *
 from .decoder import *
 from .encoder import *
