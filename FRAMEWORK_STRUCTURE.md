@@ -9,6 +9,7 @@ transformersurgeon/
 ├── __init__.py
 ├── blocks/
 │   ├── linear_compressed.py
+│   ├── pruning_dims.py          # effective_out_features: single source for ratio->kept dim
 │   ├── vcon_block.py
 │   ├── decoder.py
 │   ├── encoder.py
@@ -23,6 +24,7 @@ transformersurgeon/
 │   ├── registry.py
 │   ├── lrd.py
 │   ├── structured_pruning.py
+│   ├── coupled_pruning.py       # prunes next-layer inputs (cascaded by structured_pruning)
 │   ├── unstructured_pruning.py
 │   ├── quantization.py
 │   ├── lrd_methods/
@@ -35,6 +37,7 @@ transformersurgeon/
 │   └── summaries/
 ├── utils/
 │   ├── scheme.py
+│   ├── grouping.py              # SchemeGroup: shared-mask groups for pruning
 │   ├── manager.py
 │   ├── configuration.py
 │   ├── modeling.py

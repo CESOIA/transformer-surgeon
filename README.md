@@ -16,7 +16,7 @@ pip install -e .
 
 **Compression methods**
 - `lrd` — low-rank decomposition (SVD, calibration-aware SVD-LLM-v2, AA-SVD)
-- `structured_pruning` — output neuron removal by magnitude, gradient, or random
+- `structured_pruning` — output neuron removal (magnitude/gradient/random), with per-head `granularity`, shared masks across coupled layers (`auto_groups`), and hard removal that cascades into the next layer's inputs
 - `unstructured_pruning` — weight-level sparsity masks
 - `quantization` — fixed-point and binary weights
 
@@ -101,6 +101,44 @@ With `verbose=True`, cascade calibration prints shifted-activation sanity diagno
 - `mean_rel_l2_diff`: mean relative $\ell_2$ difference between base and shifted activations
 - `max_rel_l2_diff`: maximum relative $\ell_2$ difference observed in the stage
 
+### Structured pruning with grouping (`auto_groups`)
+
+Remove output neurons from layers, keeping coupled layers consistent. `auto_groups()`
+reads the model's indexing (`pruning.coupled_masks` / `coupled_masks_all`) and builds
+the groups of layers that must share a pruning mask (e.g. each block's `gate_proj`/`up_proj`,
+`q_proj`/`k_proj`). `share_mask` makes a group prune the *same* neurons; hard pruning then
+removes them and cascades the input pruning into the next layer (`down_proj`).
+
+```python
+manager = Qwen2CompressionSchemesManager(model)
+
+# 1. Build coupled-mask groups from indexing, and share one mask per MLP group.
+groups = manager.auto_groups()                       # {"group1": [...gate_proj, up_proj], ...}
+mlp_groups = {g: p for g, p in groups.items() if any("gate_proj" in x for x in p)}
+for g in mlp_groups:
+    manager.set("structured_pruning", "share_mask", True, group=g)   # group-only option
+    manager.set("structured_pruning", "reduce_op", "add",  group=g)  # how to reduce scores
+
+# 2. Configure pruning (random needs no calibration; "gradient" needs a loss callback).
+manager.set("structured_pruning", "method", "random", criteria=None)
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp.gate_proj")
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp.up_proj")
+
+# 3. Hard apply: removes neurons, resizes matrices, cascades down_proj's input.
+manager.apply(hard=True)
+print(model.model.layers[0].mlp.gate_proj.out_features)  # shrunk by ~10%
+```
+
+Notes:
+- **Group-only options** (`share_mask`) must be set through `group=`, never `criteria`;
+  enabling one resets that scheme's non-group config. `reduce_op` is a regular option
+  (also used per-layer by `repeated_pattern`), settable via `criteria` or `group=`.
+- `granularity=<int>` prunes uniformly within each chunk (e.g. per attention head);
+  `repeated_pattern=True` lets layers with different chunk counts (GQA `q_proj`/`k_proj`) share one mask.
+- Only MLP pruning is wired through convert/export today; attention pruning (GQA `head_dim`) is deferred.
+- See `scripts/compression/prune_qwen.py` (gradient pruning) and
+  `scripts/compression/prune_quant_export_tensorrt.py` (prune + quant → TensorRT).
+
 ### Convert to export-friendly graph, then compress
 
 ```python
@@ -168,9 +206,11 @@ manager.cancel_vcon(keep_block_b=True)      # collapse to compressed module
 
 | Method | Description |
 |---|---|
-| `set(compression, prop, value, criteria)` | Configure compression on filtered layers |
+| `set(compression, prop, value, criteria, group)` | Configure compression on filtered layers (or a whole `group`) |
 | `apply(hard, criteria, ...)` | Apply all configured schemes |
 | `restore(topology, criteria)` | Undo compression |
+| `auto_groups()` | Build coupled-mask pruning groups from indexing; returns `{name: [paths]}` |
+| `create_group(schemes, name)` / `delete_group(name)` | Manage shared-mask groups manually |
 | `init_vcon(criteria)` | Wrap target layers with `VCONBlock` |
 | `set_vcon_beta(beta, criteria)` | Set blending weight |
 | `cancel_vcon(keep_block_b, criteria)` | Collapse `VCONBlock` to one branch |

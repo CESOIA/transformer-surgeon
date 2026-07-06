@@ -106,6 +106,46 @@ Calls `compressor.restore(module)` for each scheme:
 
 ---
 
+## Structured Pruning — Coupling and Grouping
+
+Structured pruning removes whole output neurons (rows) of a layer. Two mechanisms
+keep a pruned model consistent, both driven by generic annotations under the
+`pruning` key of each model's `indexing_*.py` (so `compression/` and `utils/`
+stay model-agnostic):
+
+- **Coupling (`output_dependence`).** When a layer's output rows are removed,
+  the input columns of the layers it feeds must shrink to match. Hard
+  `StructuredPruner.apply` builds the keep-mask, removes the rows (resizing
+  `weight`/`bias`/`out_features`), then cascades into each coupled next layer via
+  `CoupledPruner` (input-column removal, hard-only). Soft apply just zeroes rows,
+  so no cascade is needed. The kept-dimension formula lives once in
+  `blocks/pruning_dims.py` (`effective_out_features`) and is reused by the pruner,
+  the coupled pruner, and the converted MLP blocks — so a hard-pruned model
+  converts and exports with matching shapes.
+
+- **Grouping (shared masks).** Some layers must be pruned *identically* — e.g.
+  `gate_proj`/`up_proj` (multiplied together) or `q_proj`/`k_proj` (matched
+  head dim). `manager.auto_groups()` reads `coupled_masks` (within a block) and
+  `coupled_masks_all` (across all blocks, for the residual/hidden writers) and
+  builds `SchemeGroup`s holding **pointers** to the schemes plus a shared
+  `properties` dict. With `share_mask` enabled, the first compressor in a group
+  computes one reduced mask (`reduce_op` over the members' scores) and stores it
+  in the group; the others reuse it. All of this lives in
+  `compression/structured_pruning.py` — the manager only builds groups and
+  iterates `scheme.apply`.
+
+`granularity=<int>` prunes uniformly within each chunk (e.g. per attention head);
+`repeated_pattern=True` reduces scores across chunks into one length-`granularity`
+mask that is tiled back, letting layers with different chunk counts (GQA
+`q_proj`/`k_proj`) share a single mask. Group-only options (`share_mask`, listed in
+`GROUP_OPTIONS`) can only be set through `manager.set(..., group=...)`.
+
+Scope: only MLP structured pruning is wired end-to-end through convert/export.
+Attention (q/k/v) hard pruning changes `head_dim` (and the GQA `v→o` coupling is
+not 1:1), which needs attention-forward/config changes — deferred.
+
+---
+
 ## Calibration Pipeline — Raw Data and Summaries
 
 The calibration system has two levels:

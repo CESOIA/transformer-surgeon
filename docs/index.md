@@ -23,7 +23,7 @@ pip install -e .
 **Compression methods**
 
 - `lrd` — low-rank decomposition (SVD, calibration-aware SVD-LLM-v2, AA-SVD)
-- `structured_pruning` — output neuron removal by magnitude, gradient, or random
+- `structured_pruning` — output neuron removal (magnitude/gradient/random) with per-head `granularity`, shared masks across coupled layers (`auto_groups`), and hard removal that cascades into the next layer's inputs
 - `unstructured_pruning` — weight-level sparsity masks
 - `quantization` — fixed-point and binary weights
 

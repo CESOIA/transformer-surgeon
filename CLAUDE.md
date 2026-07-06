@@ -15,6 +15,20 @@ manager.restore()                                   # undo
 
 `hard=True` is irreversible — only for final export.
 
+## Structured pruning & grouping
+
+```python
+manager.auto_groups()                                    # build coupled-mask groups from indexing
+manager.set("structured_pruning", "share_mask", True, group="group1")  # group-only option
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp")
+manager.apply(hard=True)                                 # removes neurons, resizes + cascades to next layer
+```
+
+- Hard pruning removes output rows and cascades the input pruning to coupled next
+  layers (`compression/coupled_pruning.py`), driven by `pruning.output_dependence` in `indexing_*.py`.
+- `share_mask`/`reduce_op`/`granularity`/`repeated_pattern` support grouped and per-head pruning; grouping + coupling logic lives in `compression/structured_pruning.py`, not the manager.
+- Only MLP pruning is wired end-to-end (prune → convert → export); attention (GQA head_dim) is deferred.
+
 ## Critical invariants
 
 - `Compressor.apply()` always receives a `LinearCompressed`, never a plain `nn.Linear`

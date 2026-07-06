@@ -83,8 +83,11 @@ Where to look when you need to change something:
 | Add a new compression method | Subclass `compression/abstract.py` → new file in `compression/` → register in `compression/registry.py` |
 | Add an LRD variant (e.g. new SVD method) | New file in `compression/lrd_methods/`, import in `compression/lrd.py` |
 | Add a pruning variant | New file in `compression/structured_pruning_methods/` or `unstructured_pruning_methods/` |
+| Change structured-pruning masks / scoring / effective dims | `compression/structured_pruning.py`, `compression/structured_pruning_methods/`, `blocks/pruning_dims.py` |
+| Change cross-layer input pruning (coupling) | `compression/coupled_pruning.py` (invoked in cascade by the structured pruner) |
+| Change scheme grouping (shared masks) | `utils/grouping.py` (`SchemeGroup`) + `utils/manager.py` (`create_group`/`delete_group`/`auto_groups`) |
 | Add a new model family | `models/newmodel_c/indexing_newmodel_c.py` + `models/newmodel_c/define_newmodel_c.py` |
-| Change what layers get compressed in a model | `models/qwen2_c/indexing_qwen2_c.py` (or the relevant model's `indexing_*.py`) |
+| Change what layers get compressed / pruning coupling in a model | `models/qwen2_c/indexing_qwen2_c.py` (or the relevant model's `indexing_*.py`) — `path_list` and the `pruning` block |
 | Change layer filtering / criteria logic | `utils/manager.py` → `iter_filtered()` |
 | Change calibration data collection hooks | `calibration/raw_data/activation.py` or `weight_grad.py` |
 | Add a new calibration summary (statistic) | Subclass `calibration/summaries/base.py` → new file → register in `calibration/summaries/registry.py` |
@@ -152,8 +155,57 @@ Calibration requirements by method:
 |---|---|---|
 | `ratio` | `0.0` | `float` in `[0, 1)` |
 | `method` | `"magnitude"` | `"magnitude"`, `"gradient"`, `"random"` |
+| `granularity` | `"layer"` | `"layer"`, or a positive `int` (chunk/head size) |
+| `repeated_pattern` | `False` | `bool` — one mask per chunk, tiled across chunks |
+| `reduce_op` | `None` | `None`, `"add"`, `"multiply"` |
+| `share_mask` | `False` | `bool` — **group-only** (set via `group=`) |
 
-`"gradient"` requires `"weight_grad"` calibration summary.
+`"gradient"` requires the `"weight_grad"` calibration summary (needs a loss
+callback: `manager.set_calibration_loss(...)`).
+
+- **Soft** (`hard=False`) zeroes pruned output rows in place (reversible). **Hard**
+  (`hard=True`) actually removes the rows, resizes `weight`/`bias`/`out_features`,
+  and **cascades** the removal into the input columns of the coupled next layers
+  (from the model's `pruning.output_dependence` indexing) via `CoupledPruner`.
+- `granularity=g` prunes the same count within each consecutive chunk of `g`
+  neurons (e.g. per attention head). `repeated_pattern=True` reduces scores across
+  those chunks (`reduce_op`) into one length-`g` mask that is tiled back — this is
+  what lets GQA `q_proj`/`k_proj` (different head counts) share one mask.
+- Effective kept dim is single-sourced in `blocks/pruning_dims.py`
+  (`effective_out_features`), reused by the pruner, coupled pruning, and the
+  converted MLP blocks so a hard-pruned model converts/exports with matching shapes.
+
+#### Grouped structured pruning (shared masks)
+
+Layers that must be pruned identically (same output mask) are expressed in model
+indexing and turned into groups by the manager:
+
+```python
+manager = Qwen2CompressionSchemesManager(model)
+groups = manager.auto_groups()                 # reads pruning.coupled_masks[_all]
+for g in groups:                               # e.g. per-block gate/up, q/k
+    manager.set("structured_pruning", "share_mask", True, group=g)   # group-only
+    manager.set("structured_pruning", "reduce_op", "add",  group=g)
+manager.set("structured_pruning", "method", "random", criteria=None)
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp.gate_proj")
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp.up_proj")
+manager.apply(hard=True)
+```
+
+Rules: `share_mask` (and any `GROUP_OPTIONS`) can only be set through `group=`
+(not `criteria`), and enabling one resets that scheme's non-group config. Grouping
+and the coupled cascade live entirely in `compression/structured_pruning.py` (the
+first compressor in a group computes the shared mask; siblings reuse it) — the
+manager only builds groups and iterates `scheme.apply`.
+
+Indexing annotations (`models/*/indexing_*.py`, under a `pruning` key):
+`output_dependence` (coupling targets), `coupled_masks` (share a mask within a
+block), `coupled_masks_all` (share a mask across all blocks — the residual/hidden
+writers), `per_head_uniform` (recorded only).
+
+Scope: only MLP structured pruning is wired end-to-end (prune → cascade → convert
+→ export). Attention (q/k/v) hard pruning changes `head_dim` (GQA), which needs
+attention-forward/config surgery — deferred; see the TODO in `structured_pruning.py`.
 
 ### `"unstructured_pruning"` — Weight-Level Sparsity
 
