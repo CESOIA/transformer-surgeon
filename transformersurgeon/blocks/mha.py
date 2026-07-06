@@ -148,7 +148,11 @@ class MHABase(torch.nn.Module):
         k_lrd_rank = compression_config["k_proj"]["lrd"]["rank"]
         v_lrd_rank = compression_config["v_proj"]["lrd"]["rank"]
         out_lrd_rank = compression_config["out_proj"]["lrd"]["rank"]
-        
+        # TODO: structured-pruning-aware sizing for attention. Unlike MLP, pruning
+        # q/k/v changes head_dim (and under GQA the v->o coupling is not 1:1), so the
+        # converted attention block would also need head_dim/num_heads updates.
+        # Deferred: only MLP structured pruning is honored in the converted graph.
+
         self.q_proj = LinearCompressed(
             embed_dim,
             embed_dim,
