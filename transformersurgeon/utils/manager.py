@@ -14,7 +14,9 @@ from copy import deepcopy
 
 logger = logging.getLogger(__name__)
 from ..calibration import run_compression_calibration
+from ..compression import GROUP_OPTIONS, COMPRESSION_REGISTRY
 from .scheme import CompressionScheme
+from .grouping import SchemeGroup
 from .utils import flatten_index_paths
 from .cascade import apply_cascade
 
@@ -60,6 +62,9 @@ class CompressionSchemesManager:
         self.indexing = indexing
         self.calibration_groups = self._get_calibration_groups_from_indexing()
         self.schemes = self._generate_schemes()
+        # Named scheme groups (name -> SchemeGroup) for grouped compression
+        # (e.g. shared pruning masks). Populated by create_group / auto_groups.
+        self.groups = {}
 
     def _get_calibration_groups_from_indexing(self):
         groups = []
@@ -103,19 +108,197 @@ class CompressionSchemesManager:
             )
         return groups
 
-    def set(self, compression, property, value, criteria=None, verbose=False):
+    def set(self, compression, property, value, criteria=None, group=None, verbose=False):
         """
-        Generic setter for compression properties based on criteria.
+        Generic setter for compression properties based on criteria or a group.
 
         Args:
             compression: The type of compression to set (e.g., 'pruning', 'lrd', 'quantization')
             property: The name of the property to set (e.g., 'ratio', 'rank')
             value: The value to set for the specified property
             criteria: List of criteria to filter modules (by name or block_id). No criteria = all
+            group: Optional group name. When given, the property is applied to every
+                scheme in that group and ``criteria`` must be None.
             verbose: If True, prints information about the setting process
+
+        Group-only options (``GROUP_OPTIONS``, e.g. ``share_mask``, ``reduce_op``)
+        can only be set through ``group=``; setting one without a group raises.
+        Enabling a group option first resets the affected scheme's compression
+        config for that compression type to registry defaults.
         """
-        for scheme in self.iter_filtered(criteria=criteria):
+        is_group_option = property in GROUP_OPTIONS.get(compression, [])
+
+        if group is not None:
+            if criteria is not None:
+                raise ValueError(
+                    "Provide either 'group' or 'criteria', not both. When setting via a "
+                    "group the group defines the target schemes."
+                )
+            if group not in self.groups:
+                raise ValueError(f"Unknown group '{group}'. Create it with create_group()/auto_groups() first.")
+            target_schemes = list(self.groups[group].schemes)
+        else:
+            if is_group_option:
+                raise ValueError(
+                    f"'{property}' is a group-only option for '{compression}' and can only be set "
+                    f"via a group name (manager.set(..., group=...))."
+                )
+            target_schemes = list(self.iter_filtered(criteria=criteria))
+
+        for scheme in target_schemes:
+            if is_group_option:
+                # Enabling a group option resets this scheme's compression config
+                # for the affected type before applying the group option.
+                self._reset_compression_config(scheme, compression)
             scheme.set(compression, property, value, verbose=verbose)
+
+    def _reset_compression_config(self, scheme, compression):
+        """Reset a scheme's regular (non-group) config for one compression type.
+
+        Group options themselves are preserved so several of them can be enabled
+        in sequence (e.g. ``share_mask`` then ``reduce_op``) without one wiping the
+        other; only the ordinary settings (ratio, method, granularity, ...) revert
+        to their registry defaults.
+        """
+        if compression not in COMPRESSION_REGISTRY:
+            raise ValueError(f"Unsupported compression type '{compression}'.")
+        group_props = GROUP_OPTIONS.get(compression, [])
+        for pname, meta in COMPRESSION_REGISTRY[compression].items():
+            if pname in group_props:
+                continue
+            scheme.set(compression, pname, meta["default"])
+
+    # --------------------------------------------------------------- grouping
+
+    def _find_scheme(self, path):
+        """Return the scheme at ``path`` (full module path), or None."""
+        for block_dicts in self.schemes.values():
+            if path in block_dicts:
+                return block_dicts[path]
+        return None
+
+    def _resolve_scheme(self, member):
+        """Resolve a group member given as a CompressionScheme or a full-path str."""
+        if isinstance(member, CompressionScheme):
+            return member
+        if isinstance(member, str):
+            scheme = self._find_scheme(member)
+            if scheme is None:
+                raise ValueError(f"No scheme found for path '{member}'.")
+            return scheme
+        raise TypeError(
+            f"Group members must be CompressionScheme or full-path str, got {type(member)}."
+        )
+
+    def _next_group_name(self):
+        """Return 'group{n}' using the lowest free index."""
+        i = 1
+        while f"group{i}" in self.groups:
+            i += 1
+        return f"group{i}"
+
+    def create_group(self, schemes, name=None):
+        """Create a named group from a list of schemes (or full-path strings).
+
+        Stores pointers to the existing schemes (never clones). ``name`` defaults
+        to ``"group{n}"`` with the lowest free index.
+
+        Args:
+            schemes: List of CompressionScheme objects or full module paths.
+            name: Optional group name.
+
+        Returns:
+            The created SchemeGroup.
+        """
+        if name is None:
+            name = self._next_group_name()
+        if name in self.groups:
+            raise ValueError(f"Group '{name}' already exists.")
+
+        resolved = [self._resolve_scheme(s) for s in schemes]
+        group = SchemeGroup(name=name)
+        for scheme in resolved:
+            scheme.add_to_group(group)   # enforces <=1 group per scheme
+            group.add(scheme)
+        self.groups[name] = group
+        return group
+
+    def delete_group(self, name):
+        """Delete a group and unlink it from its member schemes."""
+        group = self.groups.pop(name, None)
+        if group is None:
+            raise ValueError(f"Unknown group '{name}'.")
+        for scheme in list(group.schemes):
+            scheme.remove_from_group(name)
+
+    def auto_groups(self):
+        """Auto-create groups for structured pruning from indexing annotations.
+
+        Two annotation kinds, both consumed generically (no model-specific logic):
+
+        * ``pruning.coupled_masks`` — layers that share one output mask *within a
+          block*. One group is created per block per co-mask set (e.g. q/k,
+          gate/up for every block).
+        * ``pruning.coupled_masks_all`` — layers that share one output mask
+          *across every block* of the family. One group is created per set,
+          containing that set's layers from all block indices (e.g. every block's
+          o_proj and down_proj together, so the residual/hidden dim is pruned
+          identically everywhere).
+
+        Returns:
+            dict: ``{group_name: [layer full-paths]}`` for every group created.
+        """
+        created = {}
+        for block_name, block_indexing in self.indexing.items():
+            pruning = block_indexing.get("pruning", {})
+            coupled_masks = pruning.get("coupled_masks", [])
+            coupled_masks_all = pruning.get("coupled_masks_all", [])
+            if not coupled_masks and not coupled_masks_all:
+                continue
+
+            path_template = block_indexing["path_template"]
+            config_attr = block_indexing.get("config_attr", "")
+            block_config = self.config if config_attr == "" else getattr(self.config, config_attr)
+            num_blocks = getattr(block_config, block_indexing["num_blocks_attr"])
+
+            # Per-block coupling: one group per block per set.
+            for block_id in range(num_blocks):
+                for layer_group in coupled_masks:
+                    full_paths = [
+                        path_template.format(block_index=block_id, path=layer)
+                        for layer in layer_group
+                    ]
+                    existing = [p for p in full_paths if self._find_scheme(p) is not None]
+                    if len(existing) < 2:
+                        continue
+                    group = self.create_group(existing)
+                    created[group.name] = existing
+
+            # Cross-block coupling: one group per set, spanning all blocks.
+            for layer_group in coupled_masks_all:
+                full_paths = [
+                    path_template.format(block_index=block_id, path=layer)
+                    for block_id in range(num_blocks)
+                    for layer in layer_group
+                ]
+                existing = [p for p in full_paths if self._find_scheme(p) is not None]
+                if len(existing) < 2:
+                    continue
+                group = self.create_group(existing)
+                created[group.name] = existing
+        return created
+
+    def _validate_grouping(self, criteria=None):
+        """Ensure every compressor requiring grouping has a group (pre-apply)."""
+        for scheme in self.iter_filtered(criteria=criteria):
+            for cname, compressor in scheme.compressors.items():
+                needs = getattr(compressor, "needs_grouping", None)
+                if callable(needs) and needs() and not scheme.groups:
+                    raise ValueError(
+                        f"Compressor '{cname}' on scheme '{scheme.path}' requires a group "
+                        "(e.g. share_mask is enabled) but the scheme is not part of any group. "
+                        "Call manager.auto_groups() or manager.create_group(...) first."
+                    )
 
     def init_vcon(self, criteria=None, verbose=False):
         """
@@ -302,6 +485,8 @@ class CompressionSchemesManager:
             Note: If selected compressors require backward-based calibration,
                   set both calibration data and calibration loss first.
         """
+        self._validate_grouping(criteria=criteria)
+
         if self.calibration_mode == "cascade":
             apply_cascade(
                 manager=self,
@@ -637,6 +822,8 @@ class CompressionSchemesManager:
                         path=full_path,
                         compression_config=compression_config,
                         model=self.model,
+                        pruning_indexing=block_indexing.get('pruning', {}),
+                        path_template=path_template,
                     )
             
             all_schemes[block_name] = tmp_dict

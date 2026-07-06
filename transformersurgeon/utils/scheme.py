@@ -62,6 +62,8 @@ class CompressionScheme:
             # output_paths,
             compression_config=None,
             model=None,
+            pruning_indexing=None,
+            path_template=None,
             ):
         self.name = name
         self.block_id = block_id
@@ -70,6 +72,14 @@ class CompressionScheme:
         self.hard_applied = False # this flags the compression as non-reversible when True
         self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize with hard application
         self.vcon_initialized = False # this flags if the VCONBlock has been initialized
+
+        # Groups this scheme belongs to (name -> SchemeGroup). At most one for now.
+        self.groups = {}
+        # Generic (model-agnostic) pruning indexing metadata + path template,
+        # plumbed in by the manager so compressors can resolve coupled targets
+        # without the manager itself orchestrating them.
+        self.pruning_indexing = pruning_indexing or {}
+        self.path_template = path_template
 
         # Generate compressor list based on the provided configuration
         self.compressors = {}
@@ -84,6 +94,7 @@ class CompressionScheme:
                 self.compressors[comp_name] = compressor_class(comp_config)
 
         self._sort_compressors()
+        self._link_compressors()
 
         # Check if the module exists in the model
         if self.model is not None:
@@ -138,6 +149,7 @@ class CompressionScheme:
             # Build default dict
             self.config[compression_name] = {key: value["default"] for key, value in COMPRESSION_REGISTRY[compression_name].items()}
             self.compressors[compression_name] = compressor_class(self.config[compression_name])
+            self.compressors[compression_name].scheme = self
 
         # Set the specified (temp) property of the compressor
         compressor = self.compressors[compression_name]
@@ -148,6 +160,30 @@ class CompressionScheme:
 
         self._sort_compressors()
     
+    def _link_compressors(self):
+        """Plant a back-reference to this scheme on every compressor.
+
+        Compressors (e.g. the structured pruner) use it to reach group siblings
+        and the generic pruning indexing for coupled cascades. Set at construction
+        time only — never during apply.
+        """
+        for compressor in self.compressors.values():
+            compressor.scheme = self
+
+    def add_to_group(self, group):
+        """Register membership in ``group`` (enforces at most one group for now)."""
+        if self.groups and group.name not in self.groups:
+            existing = next(iter(self.groups))
+            raise ValueError(
+                f"Scheme '{self.path}' is already in group '{existing}'. "
+                "A scheme may belong to at most one group."
+            )
+        self.groups[group.name] = group
+
+    def remove_from_group(self, name):
+        """Drop membership in the named group if present."""
+        self.groups.pop(name, None)
+
     def _sort_compressors(self):
         """Re-order self.compressors to match APPLICATION_ORDER.
 
