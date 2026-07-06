@@ -2,6 +2,10 @@ from .structured_pruning import (
     StructuredPruner,
     validate_structured_pruning_ratio,
     validate_structured_pruning_method,
+    validate_structured_pruning_granularity,
+    validate_structured_pruning_share_mask,
+    validate_structured_pruning_reduce_op,
+    validate_structured_pruning_repeated_pattern,
 )
 from .unstructured_pruning import (
     UnstructuredPruner,
@@ -38,10 +42,30 @@ COMPRESSOR_DICT = {
 # then quantization (must see the final float weights).
 APPLICATION_ORDER = ["lrd", "structured_pruning", "unstructured_pruning", "quantization"]
 
+# Compression properties that are group-scoped: they may be set ONLY through a
+# group name (manager.set(..., group=...)), never via plain criteria. Enabling
+# any of them resets the affected scheme's (non-group) compression config to
+# defaults first. The list is keyed by compression type. reduce_op is NOT here:
+# it is also used per-layer by repeated_pattern, so it must be settable via
+# criteria too.
+GROUP_OPTIONS = {
+    "structured_pruning": ["share_mask"],
+}
+
 COMPRESSION_REGISTRY = {
     "structured_pruning": {
         "ratio": dict(default=0.0, validator=validate_structured_pruning_ratio),
         "method": dict(default="magnitude", validator=validate_structured_pruning_method),
+        "granularity": dict(default="layer", validator=validate_structured_pruning_granularity),
+        # repeated_pattern: prune the same position within every granularity group
+        # (e.g. every attention head) using a single length-granularity mask; lets
+        # layers with different group counts share one mask (GQA q/k).
+        "repeated_pattern": dict(default=False, validator=validate_structured_pruning_repeated_pattern),
+        # reduce_op: how scores are combined — across granularity groups for
+        # repeated_pattern, and/or across layers for a shared-mask group.
+        "reduce_op": dict(default=None, validator=validate_structured_pruning_reduce_op),
+        # Group-only option (see GROUP_OPTIONS): settable only via a group name.
+        "share_mask": dict(default=False, validator=validate_structured_pruning_share_mask),
     },
     "unstructured_pruning": {
         "ratio": dict(default=0.0, validator=validate_unstructured_pruning_ratio),
@@ -70,4 +94,5 @@ __all__ = [
     "COMPRESSION_REGISTRY",
     "COMPRESSOR_DICT",
     "APPLICATION_ORDER",
+    "GROUP_OPTIONS",
 ]

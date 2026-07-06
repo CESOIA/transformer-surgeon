@@ -110,6 +110,22 @@ class Compressor(ABC):
         """
         pass
 
+    def needs_grouping(self):
+        """Return whether this compressor requires the scheme to belong to a group.
+
+        The manager inspects the return value before ``apply`` (mirroring
+        ``needs_calibration``): if a compressor needs grouping but its scheme is
+        not part of any group, the manager raises rather than applying. Group-only
+        behaviour (e.g. ``share_mask``) reaches its sibling layers through the
+        scheme's group membership, so a group is mandatory.
+
+        Default: ``False``. Override in compressors that support group options.
+
+        Returns:
+            bool: ``True`` if the scheme must be grouped; ``False`` otherwise.
+        """
+        return False
+
     def reapply_mask(self, module):
         """Re-apply the stored pruning mask to the module weights.
 
