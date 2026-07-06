@@ -29,6 +29,22 @@ DISTILBERT_C_INDEXING = {
             "attention": [["q_lin", "k_lin", "v_lin"], ["out_lin"]],
             "ffn": [["lin1"], ["lin2"]],
         },
+        # Structured-pruning annotations (see llama_c for field semantics).
+        "pruning": {
+            "output_dependence": {
+                "ffn.lin1": ["ffn.lin2"],
+                "attention.v_lin": ["attention.out_lin"],
+            },
+            "coupled_masks": [
+                ["attention.q_lin", "attention.k_lin"],
+            ],
+            # coupled_masks_all: share ONE output mask across ALL blocks (the
+            # residual/hidden-dim writers).
+            "coupled_masks_all": [
+                ["attention.out_lin", "ffn.lin2"],
+            ],
+            "per_head_uniform": ["attention.q_lin", "attention.k_lin", "attention.v_lin"],
+        },
         "path_template": "distilbert.transformer.layer.{block_index}.{path}",
         "qkv_paths": [
             "attention.q_lin",

@@ -24,6 +24,21 @@ QWEN2_5_VL_C_INDEXING = {
             'attn': [['qkv'], ['proj']],
             'mlp': [['gate_proj', 'up_proj'], ['down_proj']],
         },
+        # Structured-pruning annotations (see llama_c). Vision attention uses a
+        # fused qkv projection, so only the gated MLP intermediate is cleanly prunable.
+        'pruning': {
+            'output_dependence': {
+                'mlp.gate_proj': ['mlp.down_proj'],
+                'mlp.up_proj': ['mlp.down_proj'],
+            },
+            'coupled_masks': [
+                ['mlp.gate_proj', 'mlp.up_proj'],
+            ],
+            'coupled_masks_all': [
+                ['attn.proj', 'mlp.down_proj'],
+            ],
+            'per_head_uniform': [],
+        },
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'preprocessing': "model.visual.patch_embed",
         'final_layer': "model.visual.merger",
@@ -54,6 +69,24 @@ QWEN2_5_VL_C_INDEXING = {
         'calibration_groups': {
             'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
             'mlp': [['gate_proj', 'up_proj'], ['down_proj']],
+        },
+        # Structured-pruning annotations (see llama_c for field semantics).
+        'pruning': {
+            'output_dependence': {
+                'mlp.gate_proj': ['mlp.down_proj'],
+                'mlp.up_proj': ['mlp.down_proj'],
+                'self_attn.v_proj': ['self_attn.o_proj'],
+            },
+            'coupled_masks': [
+                ['self_attn.q_proj', 'self_attn.k_proj'],
+                ['mlp.gate_proj', 'mlp.up_proj'],
+            ],
+            # coupled_masks_all: share ONE output mask across ALL blocks (the
+            # residual/hidden-dim writers).
+            'coupled_masks_all': [
+                ['self_attn.o_proj', 'mlp.down_proj'],
+            ],
+            'per_head_uniform': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
         },
         'path_template': "model.language_model.layers.{block_index}.{path}",
         'extra_layers': ["model.language_model.norm"],

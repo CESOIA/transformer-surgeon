@@ -29,6 +29,30 @@ LLAMA_C_INDEXING = {
             'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
             'mlp': [['gate_proj', 'up_proj'], ['down_proj']],
         },
+        # Structured-pruning annotations (model truth; consumed generically):
+        # - output_dependence: layer whose OUTPUT rows are pruned -> layers whose
+        #   INPUT columns must shrink to match (drives coupled_pruning).
+        # - coupled_masks: layers that must share ONE output pruning mask.
+        # - per_head_uniform: layers needing uniform ratio per head (recorded only,
+        #   not yet consumed).
+        'pruning': {
+            'output_dependence': {
+                'mlp.gate_proj': ['mlp.down_proj'],
+                'mlp.up_proj': ['mlp.down_proj'],
+                'self_attn.v_proj': ['self_attn.o_proj'],
+            },
+            'coupled_masks': [
+                ['self_attn.q_proj', 'self_attn.k_proj'],
+                ['mlp.gate_proj', 'mlp.up_proj'],
+            ],
+            # coupled_masks_all: share ONE output mask across ALL blocks (the
+            # residual/hidden-dim writers), so the hidden dim is pruned identically
+            # everywhere.
+            'coupled_masks_all': [
+                ['self_attn.o_proj', 'mlp.down_proj'],
+            ],
+            'per_head_uniform': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
+        },
         'path_template': "model.layers.{block_index}.{path}",
         'extra_layers': ["model.norm"],
         'preprocessing': "model.embed_tokens",

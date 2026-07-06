@@ -27,6 +27,22 @@ BERT_C_INDEXING = {
         'calibration_groups': [
             ['attention.self.query', 'attention.self.key', 'attention.self.value'],
         ],
+        # Structured-pruning annotations (see llama_c for field semantics).
+        'pruning': {
+            'output_dependence': {
+                'attention.self.value': ['attention.output.dense'],
+                'intermediate.dense': ['output.dense'],
+            },
+            'coupled_masks': [
+                ['attention.self.query', 'attention.self.key'],
+            ],
+            # coupled_masks_all: share ONE output mask across ALL blocks (the
+            # residual/hidden-dim writers).
+            'coupled_masks_all': [
+                ['attention.output.dense', 'output.dense'],
+            ],
+            'per_head_uniform': ['attention.self.query', 'attention.self.key', 'attention.self.value'],
+        },
         'no_cascade_calibration': True,
         'path_template': "bert.encoder.layer.{block_index}.{path}",
         'qkv_paths': [],

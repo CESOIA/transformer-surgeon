@@ -30,6 +30,22 @@ VIT_C_INDEXING = {
             'attention': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
             'mlp': [['fc1'], ['fc2']],
         },
+        # Structured-pruning annotations (see llama_c for field semantics).
+        'pruning': {
+            'output_dependence': {
+                'mlp.fc1': ['mlp.fc2'],
+                'attention.v_proj': ['attention.o_proj'],
+            },
+            'coupled_masks': [
+                ['attention.q_proj', 'attention.k_proj'],
+            ],
+            # coupled_masks_all: share ONE output mask across ALL blocks (the
+            # residual/hidden-dim writers).
+            'coupled_masks_all': [
+                ['attention.o_proj', 'mlp.fc2'],
+            ],
+            'per_head_uniform': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
+        },
         'path_template': "vit.layers.{block_index}.{path}",
         'qkv_paths': [],
         'preprocessing': "vit.embeddings",
