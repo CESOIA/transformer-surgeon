@@ -222,7 +222,7 @@ Pruning masks survive `restore()` for STE fine-tuning. Call `manager.remove_mask
 | param | default | valid values |
 |---|---|---|
 | `method` | `"vanilla"` | `"vanilla"`, `"gptq"` |
-| `precision` | `"full"` | `"full"`, `"int8"`, `"int4"`, `"int2"`, `"binary"` |
+| `precision` | `"full"` | `"full"`, `"binary"`, or `int` in `[2, 16]` (e.g. `8`, `4`, `2` — NOT the strings `"int8"`/`"int4"`/`"int2"`) |
 | `granularity` | `"per_tensor"` | `"per_tensor"`, `"per_channel"` |
 | `sparsity` | `0.0` | `float` in `[0, 1)` |
 | `sparse_method` | `"magnitude"` | `"magnitude"`, `"random"` |
