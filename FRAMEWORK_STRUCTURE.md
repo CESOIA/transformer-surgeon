@@ -50,6 +50,7 @@ transformersurgeon/
 │   ├── qwen2_vl_c/
 │   ├── qwen2_5_vl_c/
 │   ├── bert_c/
+│   ├── modernbert_c/
 │   ├── distilbert_c/
 │   └── vit_c/
 ├── hf/
@@ -137,6 +138,10 @@ Each indexing block can define explicit parallel calibration groups:
 ```
 
 Groups are interpreted with the same matching semantics used by manager filtering (substring criteria over layer paths). Ungrouped layers are calibrated as singleton stages.
+
+`calibration_groups` may also be given as a dict keyed by subblock name (each value a list of layer groups, with subblock-relative names auto-qualified) — see `models/qwen2_c/indexing_qwen2_c.py`. Both forms are parsed by `CompressionSchemesManager._get_calibration_groups_from_indexing`.
+
+An indexing block can opt entirely out of cascade calibration with `'no_cascade_calibration': True` — `apply_cascade` (`utils/cascade.py`) raises a `ValueError` up front if cascade mode is requested with any scheme selected from that block. `bert_c` and `modernbert_c` set this: BERT's grouped/bidirectional QKV layout and ModernBERT's per-layer-type rotary embeddings (alternating local/global attention) aren't modeled by the single-flow block-wise cascade algorithm. Use `"standard"` calibration mode for those families.
 
 ### 6) Export pipeline
 

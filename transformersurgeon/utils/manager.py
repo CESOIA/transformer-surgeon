@@ -102,6 +102,24 @@ class CompressionSchemesManager:
                         groups.append(normalized_group)
                 continue
 
+            # Flat format: a list of parallel layer groups, each already a list
+            # of fully-qualified (dot-containing) layer names, e.g.:
+            #   [
+            #     ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
+            #     ['mlp.gate_proj', 'mlp.up_proj'],
+            #   ]
+            if isinstance(block_groups, list):
+                for group_idx, group_layers in enumerate(block_groups):
+                    if not isinstance(group_layers, list):
+                        raise TypeError(
+                            "Each layer group in 'calibration_groups' list must be a list of layer names. "
+                            f"Invalid group at index {group_idx}: {type(group_layers)}."
+                        )
+
+                    normalized_group = [str(layer_name) for layer_name in group_layers]
+                    groups.append(normalized_group)
+                continue
+
             raise TypeError(
                 "Indexing field 'calibration_groups' must be a list or a dict. "
                 f"Got {type(block_groups)}."

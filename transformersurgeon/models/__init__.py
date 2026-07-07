@@ -31,6 +31,7 @@ for _module in [
 	"qwen2_5_vl_c",
 	"vit_c",
 	"bert_c",
+	"modernbert_c",
 	"distilbert_c",
 	"llama_c",
 ]:

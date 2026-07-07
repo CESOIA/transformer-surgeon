@@ -232,6 +232,29 @@ manager.apply(device=device, verbose=True)
 With `verbose=True`, cascade calibration prints per-stage diagnostics:
 `pairs`, `mean_rel_l2_diff`, and `max_rel_l2_diff` for shifted-summary stages.
 
+### Opting a family out of cascade calibration
+
+An indexing block can set `'no_cascade_calibration': True` when its layer layout
+isn't compatible with the block-wise cascade algorithm above. `manager.apply()`
+then raises a `ValueError` immediately if cascade mode is requested with any
+scheme from that block selected, instead of silently running an unsupported flow.
+`bert_c` and `modernbert_c` set this flag today:
+
+- **BERT** — cascade's `_collect_preprocessing_outputs`/`_collect_loader_inputs`
+  discard `attention_mask` once the embeddings step runs, threading only the raw
+  hidden-state tensor between blocks. Bidirectional encoders lean on
+  `attention_mask` much more than causal decoders (padded batches, no causal mask
+  to fall back on), so block-wise calibration without it isn't a safe stand-in for
+  real inference.
+- **ModernBERT** — alternating global/local attention layers each need their own
+  rotary embedding call keyed by layer type
+  (`rotary_emb(hidden_states, position_ids, layer_type)`), but cascade's
+  position-embedding injection calls the configured rotary module the same way
+  for every block.
+
+Use `"standard"` calibration mode for these families (`"svd"` or `"svd-llm-v2"`
+LRD instead of `"aa-svd"`).
+
 ---
 
 ## VCON — Smooth Compression for Fine-Tuning

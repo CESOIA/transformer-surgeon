@@ -279,6 +279,8 @@ Things the codebase silently relies on. Breaking these causes silent wrong behav
 
 - **Don't use `"standard"` calibration mode with `"aa-svd"`.** AA-SVD requires cross-layer shifted activations, which need staged (cascade) passes. Set `manager.set_calibration_mode("cascade")` before calling `apply()`.
 
+- **Don't use `"cascade"` calibration mode with a family indexed `'no_cascade_calibration': True`** (currently `bert_c`, `modernbert_c`). `apply()` raises `ValueError` immediately — these families' layer layout (grouped/bidirectional QKV, or ModernBERT's per-layer-type rotary embeddings) isn't modeled by the single-flow block-wise cascade in `utils/cascade.py`. Use `"standard"` mode (`"svd"`/`"svd-llm-v2"` LRD, or non-AA-SVD compressors) instead.
+
 - **Don't call `reapply_masks()` before `manager.apply()`.** Masks are created during `apply()`. `reapply_masks()` is for re-applying existing masks after an optimizer step during STE fine-tuning.
 
 ---

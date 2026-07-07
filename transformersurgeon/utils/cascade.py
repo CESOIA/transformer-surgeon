@@ -48,6 +48,11 @@ def apply_cascade(
         return
 
     selected_by_block = {}
+    for block_name in manager.indexing.keys():
+        block_scheme_set = set(manager.schemes.get(block_name, {}).values())
+        matched = [s for s in selected_schemes if s in block_scheme_set]
+        if len(matched) > 0:
+            selected_by_block[block_name] = matched
 
     for block_name, block_indexing in manager.indexing.items():
         if not block_indexing.get("no_cascade_calibration", False):

@@ -42,6 +42,7 @@ pip install -e .
 | Qwen2-VL | Vision-language | `Qwen2VLForConditionalGenerationCompress` |
 | Qwen2.5-VL | Vision-language | `Qwen2_5_VLForConditionalGenerationCompress` |
 | BERT | Encoder | `BertForSequenceClassificationCompress` |
+| ModernBERT | Encoder | `ModernBertForSequenceClassificationCompress` |
 | DistilBERT | Encoder | `DistilBertForSequenceClassificationCompress` |
 | ViT | Vision encoder | `ViTForImageClassificationCompress` |
 
@@ -100,6 +101,13 @@ With `verbose=True`, cascade calibration prints shifted-activation sanity diagno
 - `pairs`: number of paired `activation` / `activation_shifted` samples
 - `mean_rel_l2_diff`: mean relative $\ell_2$ difference between base and shifted activations
 - `max_rel_l2_diff`: maximum relative $\ell_2$ difference observed in the stage
+
+**Not every family supports cascade mode.** An indexing block can set
+`'no_cascade_calibration': True` to make `apply(..., mode="cascade")` raise
+immediately instead of running. BERT and ModernBERT are marked this way today
+(bidirectional/grouped-QKV layouts and, for ModernBERT, per-layer-type rotary
+embeddings that the single-flow cascade position-embedding injection doesn't
+model) — use `set_calibration_mode(mode="standard")` for those families.
 
 ### Structured pruning with grouping (`auto_groups`)
 
