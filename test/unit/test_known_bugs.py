@@ -30,16 +30,19 @@ def test_bert_manager_builds():
 
 # --------------------------------------------------------------------------- #
 # #2  Quantization precision string ("int8"/"int4"/"int2") — docs vs validator
+#     Resolved by fixing AGENTS.md (not the validator): the string form was never
+#     going to be silently accepted, so the contract is now "int form is the API,
+#     the string form raises a clear error" — both are pinned as plain assertions.
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(reason="FRAMEWORK_PROBLEMS.md #2: docs list precision='int8' but "
-                          "validate_precision only accepts int / 'full' / 'binary'",
-                   strict=False)
-def test_quantization_accepts_documented_int8_string():
+def test_quantization_rejects_int8_string_with_clear_error():
+    """precision="int8" is NOT valid (AGENTS.md was wrong and has been corrected);
+    the validator must keep rejecting it loudly rather than silently accepting or
+    misinterpreting it."""
     spec = FAMILIES["qwen2"]
     model = spec.build().eval()
     mgr = spec.manager(model)
-    mgr.set("quantization", "precision", "int8", criteria=spec.lrd_criteria)
-    mgr.apply(hard=False)  # raises ValueError today
+    with pytest.raises(ValueError, match="Precision must be"):
+        mgr.set("quantization", "precision", "int8", criteria=spec.lrd_criteria)
 
 
 def test_quantization_precision_int_is_the_real_api():

@@ -30,12 +30,12 @@ if forced — see P5).
 | # | Severity | Area | One-liner |
 |---|---|---|---|
 | P1 | **High** | BERT / manager | **Fixed.** `BertCompressionSchemesManager` could not be constructed at all — list-form `calibration_groups` was rejected by a parser that only understood the dict form. Also fixed in the same pass: the `no_cascade_calibration` enforcement in `apply_cascade` was dead code (an unpopulated `selected_by_block` dict), so BERT's cascade-calibration exclusion was never actually enforced. |
-| P2 | Medium | quantization / docs | Documented `precision="int8"/"int4"/"int2"` is rejected by the validator; the real API is the integer `8/4/2`. Every quant example in `AGENTS.md` fails as written. |
+| P2 | Medium | quantization / docs | **Fixed (docs).** `AGENTS.md` wrongly documented `precision="int8"/"int4"/"int2"`; the validator was already correct (only `"full"`/`"binary"`/integer `8/4/2` are valid) — the doc table has been corrected, no code change needed. |
 | P3 | Medium | structured pruning | Hard-pruning one half of a coupled gate/up pair silently produces a model that crashes on the next forward, with no validation error at `apply()`. |
 | P4 | Medium | TensorRT export / docs | The documented one-liner `export_to_backend(model, config)` fails with a cryptic FakeTensor device error when the model is on CUDA; export only works with CPU-resident components. |
 | P5 | Low–Med | QNN export | **Fixed.** `export_with_qnn` had no capability guard, so calling it on a machine without the full Qualcomm toolchain surfaced a bare `ImportError: install py-cpuinfo` deep inside the export pipeline. |
-| P6 | Low | VL structured pruning | `auto_groups()` builds shared-mask groups that span both the vision and text towers, so coupled MLP pruning on a VL model dies with a mask-length mismatch. |
-| T* | — | test suite | `pytest` is not a default dependency, and the existing suite does not collect: 15–16 collection errors from non-pytest CLI scripts, duplicate module names, stale APIs, and a `sys.modules` poisoning bug. |
+| P6 | Low | VL structured pruning | **Fixed.** `create_group()` had no guard against a shared-mask group spanning both the vision and text towers; it now rejects cross-tower groups immediately with a clear error. Structured MLP pruning on the text tower is verified working end-to-end (128→96 shrink, correct cascade, valid forward) — the earlier "still unsupported" conclusion was a bug in the test fixture's criteria, not the framework. |
+| T* | — | test suite | ~~`pytest` is not a default dependency~~ **fixed** (`test`/`dev` extras + docs). Remaining: the existing suite did not collect (15–16 collection errors from non-pytest CLI scripts, duplicate module names, stale APIs, a `sys.modules` poisoning bug) — now isolated under `test/test_deprecated/` and excluded from default collection. |
 | N1 | — | new model family | Added `models/modernbert_c/` (`ModernBertForSequenceClassificationCompress`) as a more reliable encoder family than BERT: no calibration-groups parser edge case, and its fused `Wqkv`/`Wi` projections sidestep the coupled-pruning pitfalls in P3/P6 by declaring structured pruning unsupported up front instead of silently breaking. Also marked `no_cascade_calibration: True` (see P1) — its per-layer-type rotary embeddings for alternating local/global attention aren't modeled by the single-flow cascade algorithm either. |
 
 ---
@@ -123,32 +123,27 @@ plain, non-xfail assertion), `test/e2e/test_model_families.py::test_build_manage
 
 ---
 
-## P2 — Quantization `precision` string values in the docs are rejected
+## P2 — Quantization `precision` string values in the docs were rejected — FIXED (docs)
 
-**Impact:** Following `AGENTS.md` (“`precision` … valid values `"full"`, `"int8"`,
-`"int4"`, `"int2"`, `"binary"`”, and `precision_activation` “same as precision”)
-raises `ValueError`. The working value is the bare integer.
+**Status:** Fixed by correcting `AGENTS.md`, not the validator. `validate_precision`
+(`transformersurgeon/compression/quantization.py:386-400`) accepts only `"full"`,
+`"binary"`, or an `int` in `[2,16]` — it never accepted `"int8"`/`"int4"`/`"int2"`
+strings. The table in `AGENTS.md` (“`"quantization"`” section) was wrong and has
+been corrected to `"full"`, `"binary"`, or `int` in `[2, 16]` (e.g. `8`, `4`, `2` —
+explicitly **not** the strings `"int8"`/`"int4"`/`"int2"`). No code changed; the
+validator's behavior was already correct, only the doc was misleading.
 
-**Reproduce:**
+**Reproduce (still the real, intended behavior):**
 ```python
 mgr.set("quantization", "precision", "int8", criteria="mlp.gate_proj")
 mgr.apply(hard=False)
-# ValueError: Precision must be an integer, 'full' or 'binary', but got 'int8'.
-mgr.set("quantization", "precision", 8, ...)   # <- this is what actually works
+# ValueError: Precision must be an integer, 'full' or 'binary', but got 'int8'.  <- correct, by design
+mgr.set("quantization", "precision", 8, ...)   # <- this is the real API
 ```
 
-**Root cause:** `transformersurgeon/compression/quantization.py:386-400`
-(`validate_precision`) accepts only `"full"`, `"binary"`, or an `int` in `[2,16]`.
-The parameter reference table in `AGENTS.md` (“`"quantization"`” section) is
-out of sync.
-
-**Fix direction:** either accept the `"int8"` spellings in `validate_precision`
-(map `"int8"→8`) or correct the `AGENTS.md` table and every `INT8/INT4` mention to
-the integer form. Recommend accepting the strings *and* fixing docs, since the
-export code already speaks in `"int8"` labels.
-
-**Regression tests:** `test/unit/test_known_bugs.py::test_quantization_accepts_documented_int8_string`
-(xfail) and `::test_quantization_precision_int_is_the_real_api` (pins the working form).
+**Regression tests:** `test/unit/test_known_bugs.py::test_quantization_rejects_int8_string_with_clear_error`
+(pins that the string form keeps raising a clear error) and
+`::test_quantization_precision_int_is_the_real_api` (pins the working integer form).
 
 ---
 
@@ -253,32 +248,66 @@ paying the crash.
 
 ---
 
-## P6 — VL structured pruning mixes vision and text towers
+## P6 — VL structured pruning mixes vision and text towers [FIXED]
 
-**Impact:** On Qwen2-VL / Qwen2.5-VL, `auto_groups()` returns shared-mask groups that
-include *both* the vision-tower and text-tower MLP projections. Applying coupled MLP
-pruning then fails:
-`ValueError: Coupled pruning mask length 32 does not match the input features 64 of
-LinearCompressed(...)` (`transformersurgeon/compression/coupled_pruning.py:70`) —
-the vision `down_proj` (hidden 32) and text `down_proj` (hidden 64) can’t share a mask.
+**Fix applied:** `create_group()` (`transformersurgeon/utils/manager.py`) now resolves
+which indexing block/tower (e.g. `"vision"` vs `"text"`) each member scheme belongs to
+(via a new `_scheme_block_name()` helper) and raises a clear `ValueError` up front if a
+group would span more than one tower, instead of allowing the group to be built and
+only failing later — deep inside `compression/coupled_pruning.py:70` with a confusing
+`ValueError: Coupled pruning mask length ... does not match the input features ... of
+LinearCompressed(...)` — once `apply()` tries to share one mask across towers with
+different hidden sizes.
 
-This is consistent with the documented scope (“Only MLP pruning is wired end-to-end …
-attention is deferred”), but `auto_groups()` should not silently produce
-cross-tower groups. Low severity because a caller can hand-build groups per tower.
+`auto_groups()` itself already only ever calls `create_group()` with members from a
+single tower's `pruning.coupled_masks`/`coupled_masks_all` (it iterates
+`self.indexing.items()` one tower at a time), so the new guard is a no-op on the
+existing automatic path — it protects the actually-risky path: manually-assembled
+groups (`mgr.create_group([...])`) or any future indexing that isn't perfectly
+tower-partitioned, both of which previously had no structural safeguard since
+`_find_scheme()` searches every tower's scheme dict by full path with no scoping check.
 
-**Fix direction:** make `auto_groups()` tower/sub-config aware, or let group members
-be filtered by an indexing scope before the shared mask is computed.
+Structured MLP pruning on the **text tower** of VL families (Qwen2-VL / Qwen2.5-VL)
+now works end-to-end, verified empirically (tiny model, `ratio=0.25` on
+`mlp.gate_proj`/`mlp.up_proj` with a shared mask via `auto_groups()`): both
+projections shrink `128 -> 96`, the coupled cascade correctly resizes
+`mlp.down_proj`'s input to `96`, and the forward pass produces a valid,
+correctly-shaped output. The earlier "unsupported" conclusion in this report was
+itself wrong — it was caused by a bug in the *test fixture*
+(`test/_helpers/model_factory.py`), not the framework: the criteria
+`["language_model", "mlp.gate_proj"]` looks like an AND (block/tower name plus
+layer name) but the criteria grammar treats a bare multi-item list as **OR across
+items**, not AND (AND requires the extra nesting `[["language_model",
+"mlp.gate_proj"]]`) — so the fixture was accidentally setting `ratio=0.25` on
+*every* language-model layer (attention projections, layernorms, ...), which is
+what actually produced the original mask-length mismatch. Fixed by using plain
+substrings (`"mlp.gate_proj"`/`"mlp.up_proj"`, unambiguous since the vision tower
+uses `fc1`/`fc2` naming, not `gate_proj`/`up_proj`).
 
-**Test:** skipped with a reason in
-`test/e2e/test_model_families.py::test_structured_prune_hard_mlp` (VL families).
+Note in passing: `pruning_supported: []`, declared in both `vision`/`text`
+sub-dicts of `models/qwen2_vl_c/indexing_qwen2_vl_c.py` (and the 2.5 variant) and
+in `models/modernbert_c/indexing_modernbert_c.py`, is dead metadata — grepping the
+package shows nothing ever reads it. It doesn't gate or block anything today; if
+it was meant to, that wiring is missing.
+
+**Regression test:** `test/unit/test_known_bugs.py::test_cross_tower_group_is_rejected`
+(cross-tower `create_group()` call now raises `ValueError` mentioning both towers) and
+`::test_auto_groups_still_works_per_tower` (confirms `auto_groups()` still produces only
+single-tower groups post-fix). `test/e2e/test_model_families.py::test_structured_prune_hard_mlp`
+now runs for real (no longer skipped) for both `qwen2_vl` and `qwen2_5_vl`.
 
 ---
 
 ## T* — Test-suite structural problems (motivating the refactor)
 
-- **`pytest` is not installed by default.** It lives only in the `dev` extra
+- **`pytest` is not installed by default.** ~~It lives only in the `dev` extra
   (`setup.py`), so `pytest ...` — the command every doc tells you to run — fails with
-  `No module named pytest` on a plain `pip install -e .`.
+  `No module named pytest` on a plain `pip install -e .`.~~ **Fixed:** `setup.py`
+  now also exposes a `test` extra (`pytest`, identical to `dev`), and every Quick
+  Install block (`README.md`, `docs/index.md`) installs `.[test]` so following the
+  docs verbatim leaves you with a working `pytest`. `pytest` is deliberately kept
+  out of `install_requires` — it's a test tool, not something downstream consumers
+  of this package as a library should be forced to install.
 - **The existing suite does not collect.** `python -m pytest` at the repo root
   produces **15 collection errors** (16 under `--import-mode=importlib`) and cannot
   run as a suite. Causes:

@@ -30,9 +30,11 @@ class FamilySpec:
     # Families that cannot yet build a manager / fully run are marked here so the
     # e2e suite can xfail them with a pointer to FRAMEWORK_PROBLEMS.md.
     known_broken: str = ""
-    # Structured MLP pruning is only cleanly wired for single-tower text decoders.
-    # On dual-tower VL models auto_groups() mixes vision+text coupled groups and the
-    # shared mask length no longer matches the text down_proj (FRAMEWORK_PROBLEMS.md #6).
+    # Some families have a structural reason coupled/hard structured MLP pruning
+    # can't apply cleanly (e.g. ModernBERT's fused Wqkv/Wi projections have no
+    # separate gate/up pair to couple — FRAMEWORK_PROBLEMS.md N1). Dual-tower VL
+    # models used to hit this too (auto_groups() mixing vision+text groups,
+    # FRAMEWORK_PROBLEMS.md #6) but that's now guarded/scoped per tower and works.
     struct_prune_supported: bool = True
 
 
@@ -176,9 +178,13 @@ FAMILIES: Dict[str, FamilySpec] = {
                  "Qwen2VLTextConfigCompress", "Qwen2VLConfigCompress"),
         _mgr("Qwen2VLCompressionSchemesManager"), _ids(),
         lrd_criteria=[["language_model", "self_attn.q_proj", 0]],
-        mlp_prune_criteria=[["language_model", "mlp.gate_proj"],
-                            ["language_model", "mlp.up_proj"]],
-        struct_prune_supported=False,
+        # Plain substrings, not ["language_model", "mlp.gate_proj"] pairs: a bare
+        # multi-item list is OR-across-items (not AND) in the criteria grammar, so
+        # that form would also match every other "language_model" layer (q_proj,
+        # k_proj, layernorms, ...). "gate_proj"/"up_proj"/"q_proj" only exist in
+        # the text tower here anyway (vision uses fc1/fc2), so plain substrings
+        # are unambiguous.
+        mlp_prune_criteria=["mlp.gate_proj", "mlp.up_proj"],
     ),
     "qwen2_5_vl": FamilySpec(
         "qwen2_5_vl",
@@ -186,9 +192,7 @@ FAMILIES: Dict[str, FamilySpec] = {
                  "Qwen2_5_VLTextConfigCompress", "Qwen2_5_VLConfigCompress"),
         _mgr("Qwen2_5_VLCompressionSchemesManager"), _ids(),
         lrd_criteria=[["language_model", "self_attn.q_proj", 0]],
-        mlp_prune_criteria=[["language_model", "mlp.gate_proj"],
-                            ["language_model", "mlp.up_proj"]],
-        struct_prune_supported=False,
+        mlp_prune_criteria=["mlp.gate_proj", "mlp.up_proj"],
     ),
 }
 
