@@ -174,6 +174,8 @@ result = export_to_backend(model, config=config)
 print(result.engine_path)
 ```
 
+Device placement is handled internally — `model` can live on CPU or CUDA; components are traced on CPU and the compiled engine is placed on `config.device` automatically.
+
 > TensorRT requires `pip install -e ".[tensorrt]"` and a CUDA device. See `scripts/tensorrt/run_export.sh` for a CLI runner and `test/tensorrt_tests/` for end-to-end examples (same pattern as `scripts/executorch/` / `test/executorch_tests/` for `xnnpack`/`qnn`).
 
 ## 🎯 Filtering Layers with `criteria`

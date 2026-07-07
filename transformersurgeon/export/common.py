@@ -174,6 +174,20 @@ class LLMWrapper(nn.Module):
         return logits, new_key_caches, new_value_caches
 
 
+def _normalize_component_devices(
+    embedding: nn.Module, decoder: nn.Module, final_layer: nn.Module, *, device: str = "cpu",
+) -> tuple[nn.Module, nn.Module, nn.Module]:
+    """Move export components onto a common device before tracing.
+
+    torch.export requires every tensor a traced module touches to share one
+    device, and build_example_inputs() always builds CPU tensors, so CPU is
+    the correct common device for every backend. Backends that need the
+    final artifact elsewhere (currently only TensorRT, via config.device)
+    re-place it themselves after tracing/compiling.
+    """
+    return embedding.to(device), decoder.to(device), final_layer.to(device)
+
+
 def build_wrapper(components: Any, *, model_config: Any | None) -> nn.Module:
     if isinstance(components, dict):
         embedding   = components["embedding"]
@@ -216,10 +230,12 @@ def resolve_components_and_wrapper(
     or a plain 3-tuple (embedding, decoder, final_layer).
     """
     if isinstance(model_or_graph, dict):
-        components   = {k: model_or_graph[k] for k in ("embedding", "decoder", "final_layer")}
+        embedding, decoder, final_layer = (
+            model_or_graph["embedding"], model_or_graph["decoder"], model_or_graph["final_layer"]
+        )
         model_config = model_or_graph.get("config")
     elif isinstance(model_or_graph, (tuple, list)) and len(model_or_graph) == 3:
-        components   = model_or_graph
+        embedding, decoder, final_layer = model_or_graph
         model_config = None
     else:
         raise TypeError(
@@ -227,6 +243,9 @@ def resolve_components_and_wrapper(
             "Pass export-ready components {embedding, decoder, final_layer} "
             "or call export_to_backend for full-model conversion."
         )
+
+    embedding, decoder, final_layer = _normalize_component_devices(embedding, decoder, final_layer)
+    components = {"embedding": embedding, "decoder": decoder, "final_layer": final_layer}
 
     wrapper = build_wrapper(components, model_config=model_config)
     wrapper.eval()

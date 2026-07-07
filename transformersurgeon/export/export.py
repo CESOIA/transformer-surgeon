@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from .registry import EXPORT_ROUTINES
 from .config import BackendExportConfig
+from .common import _normalize_component_devices
 from ..blocks import TransformerDecoder
 from ..utils import convert_for_export
 
@@ -73,6 +74,10 @@ def export_to_backend(
         convert_options=config.convert_options,
         verbose=config.verbose,
     )
+
+    # torch.export traces against CPU example inputs, so every component must
+    # share that device regardless of where the source model/caller left it.
+    embedding, decoder, final_layer = _normalize_component_devices(embedding, decoder, final_layer)
 
     if getattr(config, "float_type", None) is not None:
         embedding = embedding.to(config.float_type)

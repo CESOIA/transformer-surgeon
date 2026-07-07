@@ -123,6 +123,8 @@ result = export_to_backend(model, config=config)   # model can be a full HF mode
 print(result.engine_path)
 ```
 
+Device placement is normalized internally (`resolve_components_and_wrapper` traces on CPU regardless of the input model's device; TensorRT then compiles the traced graph onto `config.device`), so callers don't need to manage component devices themselves.
+
 `export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)` — use `export_to_backend`.
 
 TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live under `test/tensorrt_tests/` (mirroring `test/executorch_tests/`); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
