@@ -24,38 +24,32 @@ manager.restore()                                   # undo
 ```bash
 git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 Run tests:
 
 ```bash
-# Core logic — no large models required
-pytest test/compression_tests/ -v
+# Default: test/unit + test/e2e/test_model_families.py — no downloads, no GPU.
+# All 7 families (qwen2, llama, bert, modernbert, distilbert, vit, qwen2_vl,
+# qwen2_5_vl) via tiny random-weight models from test/_helpers/model_factory.py.
+pytest
 
-# Encoder model tests (BERT, DistilBERT) — small models, fast
-pytest test/bert_tests/ -v
-pytest test/distilbert_tests/ -v
+# Bug regressions (pinned xfail until fixed; XPASS = fixed, see FRAMEWORK_PROBLEMS.md)
+pytest test/unit/test_known_bugs.py -v
 
-# Causal LM tests — require model downloads
-pytest test/qwen_tests/inference_test.py -v
-pytest test/qwen_tests/test_calibration_compression.py -v
+# Real-checkpoint export pipelines — HF roundtrip, convert, XNNPACK, TensorRT, QNN.
+# Each backend is gated by test/_helpers/capabilities.py (skips if unavailable).
+pytest test/e2e/test_export_pipelines.py -v
 
-# Vision-language
-pytest test/qwen_vl_tests/ -v
-
-# HuggingFace export roundtrip
-pytest test/hf_export_tests/ -v
-
-# Backend export (ExecuTorch XNNPACK/QNN) — requires executorch extra
-pytest test/executorch_tests/ -v
-
-# Backend export (TensorRT) — requires tensorrt extra + CUDA; skips otherwise
-pytest test/tensorrt_tests/ -v
-
-# Single file
-pytest test/compression_tests/compression_test.py::test_name -v
+# Single file / test
+pytest test/e2e/test_model_families.py::test_lrd_soft_apply_and_restore -v
 ```
+
+Legacy per-model CLI scripts (pre-dating this hardened suite) live under
+`test/test_deprecated/` — kept for reference only, not collected by default
+(`pytest.ini` sets `testpaths = test/unit test/e2e`). See its README and
+`FRAMEWORK_PROBLEMS.md` (section T*) for why they were retired.
 
 ---
 
@@ -127,7 +121,7 @@ Device placement is normalized internally (`resolve_components_and_wrapper` trac
 
 `export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)` — use `export_to_backend`.
 
-TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live under `test/tensorrt_tests/` (mirroring `test/executorch_tests/`); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
+TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live in `test/e2e/test_export_pipelines.py` (capability-gated, skips without torch-tensorrt/CUDA); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
 
 ---
 

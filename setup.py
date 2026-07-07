@@ -14,6 +14,10 @@ setup(
     extras_require={
         "executorch": ["executorch>=1.0.0"],
         "tensorrt": ["torch-tensorrt"],
+        # "test" and "dev" are intentionally identical — "test" is the minimal
+        # extra needed to run the pytest suite; "dev" is the name contributors
+        # expect. Keep both so `pip install -e ".[test]"` and `-e ".[dev]"` work.
+        "test": ["pytest"],
         "dev": ["pytest"],
     },
 )

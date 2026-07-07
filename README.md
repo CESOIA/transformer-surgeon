@@ -9,7 +9,7 @@ Apply low-rank decomposition, pruning, or quantization to any supported model in
 ```bash
 git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
-pip install -e .
+pip install -e ".[test]"   # add [test] to also get pytest for running the test suite
 ```
 
 ## 🗂️ What's Included
@@ -176,7 +176,7 @@ print(result.engine_path)
 
 Device placement is handled internally — `model` can live on CPU or CUDA; components are traced on CPU and the compiled engine is placed on `config.device` automatically.
 
-> TensorRT requires `pip install -e ".[tensorrt]"` and a CUDA device. See `scripts/tensorrt/run_export.sh` for a CLI runner and `test/tensorrt_tests/` for end-to-end examples (same pattern as `scripts/executorch/` / `test/executorch_tests/` for `xnnpack`/`qnn`).
+> TensorRT requires `pip install -e ".[tensorrt]"` and a CUDA device. See `scripts/tensorrt/run_export.sh` for a CLI runner and `test/e2e/test_export_pipelines.py` for end-to-end examples covering `xnnpack`/`tensorrt`/`qnn`.
 
 ## 🎯 Filtering Layers with `criteria`
 
@@ -244,13 +244,11 @@ These groups are consumed by `CompressionSchemesManager` exactly like previous u
 
 ## 📂 References
 
-- [test/compression_tests/compression_test.py](test/compression_tests/compression_test.py) — manager basics and convert-then-compress flow
-- [test/qwen_tests/inference_test.py](test/qwen_tests/inference_test.py) — Qwen2 end-to-end
-- [test/qwen_tests/test_calibration_compression.py](test/qwen_tests/test_calibration_compression.py) — calibrated LRD
-- [test/qwen_vl_tests/inference_test.py](test/qwen_vl_tests/inference_test.py) — vision-language
-- [test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py](test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py) — mixed-precision backend export (XNNPACK)
-- [test/tensorrt_tests/exporter_function/tensorrt/test_pretrained_quant_export.py](test/tensorrt_tests/exporter_function/tensorrt/test_pretrained_quant_export.py) — mixed-precision backend export (TensorRT)
+- [test/e2e/test_model_families.py](test/e2e/test_model_families.py) — manager basics, LRD/quant/pruning, convert-then-compress, all 7 families
+- [test/e2e/test_export_pipelines.py](test/e2e/test_export_pipelines.py) — HF roundtrip, XNNPACK, TensorRT, QNN export (capability-gated)
+- [test/unit/test_known_bugs.py](test/unit/test_known_bugs.py) — pinned regressions for open framework bugs
 - [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package internals and extension guide
+- [FRAMEWORK_PROBLEMS.md](FRAMEWORK_PROBLEMS.md) — known issues and test-suite hardening notes
 
 ## License
 

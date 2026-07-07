@@ -13,7 +13,7 @@ reversible by default.
 ```bash
 git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
-pip install -e .
+pip install -e ".[test]"   # add [test] to also get pytest for running the test suite
 ```
 
 ---
