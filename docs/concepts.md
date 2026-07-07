@@ -320,7 +320,7 @@ print(result.engine_path)
 
 `export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)`.
 
-TensorRT is the newest backend. It needs the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests live under `test/tensorrt_tests/` and the CLI runner is `scripts/tensorrt/run_export.sh`, mirroring the ExecuTorch backends' `test/executorch_tests/` / `scripts/executorch/`.
+TensorRT is the newest backend. It needs the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests live in `test/e2e/test_export_pipelines.py` (capability-gated) and the CLI runner is `scripts/tensorrt/run_export.sh`, mirroring the ExecuTorch backends there.
 
 ---
 
@@ -396,4 +396,4 @@ Export the three classes from `models/newmodel_c/__init__.py` and add them to
        "config_class": <Backend>ExportConfig,
    }
    ```
-4. Add tests under `test/<backend>_tests/` (or `test/executorch_tests/` if it's an ExecuTorch backend) mirroring `test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py`.
+4. Add a capability-gated test case in `test/e2e/test_export_pipelines.py` mirroring the existing `test_export_xnnpack`/`test_export_tensorrt` pattern.

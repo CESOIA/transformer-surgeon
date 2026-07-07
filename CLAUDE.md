@@ -41,14 +41,14 @@ manager.apply(hard=True)                                 # removes neurons, resi
 ## Tests
 
 ```bash
-pytest test/compression_tests/ -v          # core logic, no large models
-pytest test/bert_tests/ -v                 # small encoder models
-pytest test/distilbert_tests/ -v
-pytest test/qwen_tests/inference_test.py -v   # requires model download
-pytest test/hf_export_tests/ -v
-pytest test/executorch_tests/ -v           # ExecuTorch backend export (xnnpack/qnn)
-pytest test/tensorrt_tests/ -v             # TensorRT backend export (requires CUDA)
+pytest                                    # default: test/unit + test/e2e, no downloads
+pytest test/unit                          # fast pure-logic + bug regressions
+pytest test/e2e/test_model_families.py    # all 7 families, tiny models, no downloads
+pytest test/e2e/test_export_pipelines.py  # HF/convert/XNNPACK/TensorRT/QNN, capability-gated
 ```
+
+Legacy per-model scripts live under `test/test_deprecated/` (see its README) — kept
+for reference only, not collected by default. See `FRAMEWORK_PROBLEMS.md` for why.
 
 ## Backend export
 

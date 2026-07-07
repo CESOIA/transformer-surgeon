@@ -157,7 +157,7 @@ An indexing block can opt entirely out of cascade calibration with `'no_cascade_
 - `export/executorch_exporters/{xnnpack,qnn}/`
 	- ExecuTorch backend exporters (`XNNPACKExportConfig`/`export_with_xnnpack`, `QNNExportConfig`/`export_with_qnn`), each producing a `.pte` file. Mixed INT8/INT4 + float export is driven entirely by per-layer compression metadata already on the model.
 - `export/tensorrt/`
-	- TensorRT backend exporter (`TensorRTExportConfig`/`export_with_tensorrt`), lowering via `torch-tensorrt`'s Dynamo path to a TensorRT engine/exported program. Reuses `export/common.py` for everything except the quantizer and compile/save step. Requires the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests under `test/tensorrt_tests/`, CLI runner at `scripts/tensorrt/run_export.sh`.
+	- TensorRT backend exporter (`TensorRTExportConfig`/`export_with_tensorrt`), lowering via `torch-tensorrt`'s Dynamo path to a TensorRT engine/exported program. Reuses `export/common.py` for everything except the quantizer and compile/save step. Requires the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests under `test/e2e/test_export_pipelines.py`, CLI runner at `scripts/tensorrt/run_export.sh`.
 
 ## End-to-End Data Flow
 
