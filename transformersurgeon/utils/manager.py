@@ -195,6 +195,13 @@ class CompressionSchemesManager:
                 return block_dicts[path]
         return None
 
+    def _scheme_block_name(self, scheme):
+        """Return the indexing block/tower name (e.g. 'vision', 'text') that owns ``scheme``."""
+        for block_name, block_dicts in self.schemes.items():
+            if scheme.path in block_dicts:
+                return block_name
+        return None
+
     def _resolve_scheme(self, member):
         """Resolve a group member given as a CompressionScheme or a full-path str."""
         if isinstance(member, CompressionScheme):
@@ -234,6 +241,24 @@ class CompressionSchemesManager:
             raise ValueError(f"Group '{name}' already exists.")
 
         resolved = [self._resolve_scheme(s) for s in schemes]
+
+        block_names = {self._scheme_block_name(s) for s in resolved}
+        if len(block_names) > 1:
+            raise ValueError(
+                f"Cannot create a shared-mask group spanning multiple indexing blocks "
+                f"{tuple(sorted(block_names))}: {[s.path for s in resolved]}. "
+                "Coupled/shared-mask pruning groups must stay within a single tower/block "
+                "-- different towers have independently-sized hidden dimensions and cannot "
+                "share one pruning mask."
+            )
+
+        conflicts = {s.path: next(iter(s.groups)) for s in resolved if s.groups}
+        if conflicts:
+            raise ValueError(
+                f"Cannot create group '{name}': the following schemes already belong to "
+                f"another group: {conflicts}. A scheme may belong to at most one group."
+            )
+
         group = SchemeGroup(name=name)
         for scheme in resolved:
             scheme.add_to_group(group)   # enforces <=1 group per scheme

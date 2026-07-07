@@ -101,3 +101,53 @@ def test_qnn_unavailable_raises_clear_error_instead_of_cpuinfo_importerror():
     config = QNNExportConfig(output_path="/tmp/unused.pte", backend="qnn")
     with pytest.raises(RuntimeError, match="QNN backend unavailable"):
         export_with_qnn(None, config=config)
+
+
+# --------------------------------------------------------------------------- #
+# #6  VL structured pruning: auto_groups()/create_group() could build a
+#     shared-mask group spanning both the vision and text towers, which only
+#     surfaced later as a confusing mask-length mismatch inside
+#     compression/coupled_pruning.py at apply() time.
+#     Fixed: create_group() now rejects members drawn from more than one
+#     indexing block/tower up front with a clear ValueError.
+# --------------------------------------------------------------------------- #
+def test_cross_tower_group_is_rejected():
+    spec = FAMILIES["qwen2_vl"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    vision_path = "model.visual.blocks.0.mlp.fc2"
+    text_path = "model.language_model.layers.0.mlp.down_proj"
+    with pytest.raises(ValueError, match="multiple indexing blocks"):
+        mgr.create_group([vision_path, text_path])
+
+
+def test_auto_groups_still_works_per_tower():
+    """auto_groups() already only ever groups within one tower at a time; the new
+    cross-tower guard in create_group() must not regress that working path."""
+    spec = FAMILIES["qwen2_vl"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    groups = mgr.auto_groups()
+    assert groups
+    for name, paths in groups.items():
+        towers = {"vision" if "visual" in p else "text" for p in paths}
+        assert len(towers) == 1, f"group '{name}' spans towers {towers}: {paths}"
+
+
+def test_create_group_rejects_scheme_already_in_another_group():
+    """A scheme can belong to at most one group. Without an upfront check,
+    create_group() could partially mutate a scheme's group membership before
+    hitting the per-scheme conflict inside the loop; the check now runs before
+    any mutation and reports every conflicting scheme at once."""
+    spec = FAMILIES["qwen2"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    mgr.create_group(["model.layers.0.mlp.gate_proj"], name="g1")
+    with pytest.raises(ValueError, match="already belong to another group"):
+        mgr.create_group(
+            ["model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj"], name="g2"
+        )
+    # The rejected call must not have registered the new group or reassigned
+    # gate_proj's membership away from g1.
+    assert "g2" not in mgr.groups
+    assert "g1" in mgr.schemes["text"]["model.layers.0.mlp.gate_proj"].groups
