@@ -78,3 +78,26 @@ def test_both_coupled_gate_up_pruned_independently_is_guarded():
     mgr.set("structured_pruning", "ratio", 0.25, criteria="mlp.up_proj")
     with pytest.raises(ValueError, match="Coupled pruning"):
         mgr.apply(hard=True)
+
+
+# --------------------------------------------------------------------------- #
+# #5  QNN export: no capability guard, undeclared py-cpuinfo dep crashes on import
+#     Fixed: is_qnn_available() probes cheap preconditions without importing the
+#     Qualcomm backend package, and export_with_qnn() checks it up front (with a
+#     try/except fallback around the real Qualcomm import) instead of letting a
+#     bare "install py-cpuinfo" ImportError surface mid-export.
+# --------------------------------------------------------------------------- #
+def test_qnn_unavailable_raises_clear_error_instead_of_cpuinfo_importerror():
+    from transformersurgeon.export.executorch_exporters.qnn import (
+        QNNExportConfig,
+        export_with_qnn,
+        is_qnn_available,
+    )
+
+    # This box has no Qualcomm QNN SDK — is_qnn_available() must say so without
+    # raising (it must not import executorch.backends.qualcomm to find out).
+    assert is_qnn_available() is False
+
+    config = QNNExportConfig(output_path="/tmp/unused.pte", backend="qnn")
+    with pytest.raises(RuntimeError, match="QNN backend unavailable"):
+        export_with_qnn(None, config=config)

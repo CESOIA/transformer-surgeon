@@ -33,7 +33,7 @@ if forced — see P5).
 | P2 | Medium | quantization / docs | Documented `precision="int8"/"int4"/"int2"` is rejected by the validator; the real API is the integer `8/4/2`. Every quant example in `AGENTS.md` fails as written. |
 | P3 | Medium | structured pruning | Hard-pruning one half of a coupled gate/up pair silently produces a model that crashes on the next forward, with no validation error at `apply()`. |
 | P4 | Medium | TensorRT export / docs | The documented one-liner `export_to_backend(model, config)` fails with a cryptic FakeTensor device error when the model is on CUDA; export only works with CPU-resident components. |
-| P5 | Low–Med | QNN export | `import QNNExportConfig` crashes with `ImportError: install py-cpuinfo` on machines without the full Qualcomm toolchain — no capability guard, and the dependency is undeclared. |
+| P5 | Low–Med | QNN export | **Fixed.** `export_with_qnn` had no capability guard, so calling it on a machine without the full Qualcomm toolchain surfaced a bare `ImportError: install py-cpuinfo` deep inside the export pipeline. |
 | P6 | Low | VL structured pruning | `auto_groups()` builds shared-mask groups that span both the vision and text towers, so coupled MLP pruning on a VL model dies with a mask-length mismatch. |
 | T* | — | test suite | `pytest` is not a default dependency, and the existing suite does not collect: 15–16 collection errors from non-pytest CLI scripts, duplicate module names, stale APIs, and a `sys.modules` poisoning bug. |
 | N1 | — | new model family | Added `models/modernbert_c/` (`ModernBertForSequenceClassificationCompress`) as a more reliable encoder family than BERT: no calibration-groups parser edge case, and its fused `Wqkv`/`Wi` projections sidestep the coupled-pruning pitfalls in P3/P6 by declaring structured pruning unsupported up front instead of silently breaking. Also marked `no_cascade_calibration: True` (see P1) — its per-layer-type rotary embeddings for alternating local/global attention aren't modeled by the single-flow cascade algorithm either. |
@@ -220,24 +220,36 @@ CPU-components pattern; gated by `requires_tensorrt`).
 
 ---
 
-## P5 — QNN export import crashes instead of degrading gracefully
+## P5 — QNN export import crashes instead of degrading gracefully [FIXED]
 
-**Impact:** On any machine without the full Qualcomm ExecuTorch toolchain, merely
-importing the QNN config explodes:
+**Fix applied:** `transformersurgeon/export/executorch_exporters/qnn/qnn_export.py`
+now exposes `is_qnn_available()`, a capability probe that checks the cheap
+preconditions (`executorch` and `cpuinfo` resolvable via `importlib.util.find_spec`,
+plus `QNN_SDK_ROOT`/`QUALCOMM_SDK_ROOT` set) **without importing**
+`executorch.backends.qualcomm` — `find_spec` locates a module without executing its
+`__init__.py`, which is exactly what was triggering the undeclared `py-cpuinfo`
+import. `export_with_qnn()` checks `is_qnn_available()` up front and raises a clear
+`RuntimeError` ("QNN backend unavailable: install the Qualcomm ExecuTorch
+toolchain...") instead of proceeding; the real Qualcomm import later in the function
+is also wrapped in a `try/except ImportError` that re-raises the same clear message,
+as a fallback in case the cheap probe passes but the toolchain still isn't fully
+usable. `is_qnn_available` is re-exported from
+`transformersurgeon.export.executorch_exporters.qnn` so callers can check
+availability ahead of time, mirroring the test suite's `_helpers/capabilities.HAS_QNN`.
+Regression test:
+`test/unit/test_known_bugs.py::test_qnn_unavailable_raises_clear_error_instead_of_cpuinfo_importerror`.
+
+**Impact (historical):** On any machine without the full Qualcomm ExecuTorch
+toolchain, calling `export_with_qnn` (e.g. via `export_to_backend(model, config)`
+with `backend="qnn"`) surfaced:
 ```python
-from transformersurgeon.export.executorch_exporters.qnn import QNNExportConfig
+from executorch.backends.qualcomm.utils.utils import generate_htp_compiler_spec
 # ImportError: Please install the cpuinfo with pip install py-cpuinfo.
 ```
-The failure is a missing transitive dependency (`py-cpuinfo`, pulled in by
-`executorch.backends.qualcomm` at
-`transformersurgeon/export/executorch_exporters/qnn/qnn_export.py:32`), surfaced
-long before any “QNN SDK not found” check.
-
-**Fix direction:** (a) declare/soft-import the Qualcomm deps and raise a clear
-“QNN backend unavailable: install the Qualcomm ExecuTorch toolchain” message; (b)
-add a capability probe so callers can detect QNN availability without a hard import.
-The new suite already models the capability gate (`_helpers/capabilities.HAS_QNN`,
-`requires_qnn`) — the framework should expose an equivalent.
+The failure was a missing transitive dependency (`py-cpuinfo`, pulled in by
+`executorch.backends.qualcomm/__init__.py`), surfaced long before any “QNN SDK not
+found” check, with no capability guard and no way to probe availability without
+paying the crash.
 
 ---
 
