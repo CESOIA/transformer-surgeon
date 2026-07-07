@@ -126,6 +126,25 @@ class Compressor(ABC):
         """
         return False
 
+    def check_coupling(self, hard, siblings):
+        """Validate consistency with sibling compressors in the same coupled-mask set.
+
+        The manager resolves ``pruning.coupled_masks`` groups purely from
+        indexing metadata (model-agnostic) and calls this once per compressor
+        before ``apply`` runs, passing the sibling compressors of the same
+        registry name resolved for the other paths in its group. Raise
+        ``ValueError`` to abort ``apply()`` with an actionable message.
+
+        Default: no-op. Only compressors that care about coupling (e.g.
+        structured pruning, where coupled layers must be pruned together with
+        one shared mask) need to override this.
+
+        Args:
+            hard (bool): the ``hard`` flag passed to the in-flight ``apply()`` call.
+            siblings (list[Compressor]): sibling compressors sharing this group.
+        """
+        pass
+
     def reapply_mask(self, module):
         """Re-apply the stored pruning mask to the module weights.
 

@@ -55,20 +55,26 @@ def test_quantization_precision_int_is_the_real_api():
 
 # --------------------------------------------------------------------------- #
 # #3  Partial coupled MLP prune silently yields a broken model
+#     Fixed: Compressor.check_coupling() (called from manager._validate_coupling())
+#     now rejects inconsistent coupled-mask groups before apply() touches any weights.
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(reason="FRAMEWORK_PROBLEMS.md #3: hard-pruning one of a coupled "
-                          "gate/up pair should error or stay valid, not silently "
-                          "break the forward pass",
-                   strict=False)
 def test_partial_coupled_gate_prune_is_guarded():
     spec = FAMILIES["qwen2"]
     model = spec.build().eval()
     mgr = spec.manager(model)
     # Prune ONLY gate_proj (its coupled partner up_proj is left full).
     mgr.set("structured_pruning", "ratio", 0.25, criteria="mlp.gate_proj")
-    mgr.apply(hard=True)  # succeeds today with no warning
-    model.eval()
-    with torch.no_grad():
-        # ... but the forward then blows up on a shape mismatch. Either the apply
-        # should have raised, or the model should still run.
-        model(**spec.sample_inputs(model))
+    with pytest.raises(ValueError, match="Coupled pruning"):
+        mgr.apply(hard=True)
+
+
+def test_both_coupled_gate_up_pruned_independently_is_guarded():
+    """Pruning both members without a shared mask is equally unsafe: independent
+    masks over the same ratio can select different neurons."""
+    spec = FAMILIES["qwen2"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    mgr.set("structured_pruning", "ratio", 0.25, criteria="mlp.gate_proj")
+    mgr.set("structured_pruning", "ratio", 0.25, criteria="mlp.up_proj")
+    with pytest.raises(ValueError, match="Coupled pruning"):
+        mgr.apply(hard=True)

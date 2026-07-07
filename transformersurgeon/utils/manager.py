@@ -282,11 +282,9 @@ class CompressionSchemesManager:
             # Per-block coupling: one group per block per set.
             for block_id in range(num_blocks):
                 for layer_group in coupled_masks:
-                    full_paths = [
-                        path_template.format(block_index=block_id, path=layer)
-                        for layer in layer_group
-                    ]
-                    existing = [p for p in full_paths if self._find_scheme(p) is not None]
+                    existing = self._resolve_coupled_group_paths(
+                        path_template, layer_group, block_id
+                    )
                     if len(existing) < 2:
                         continue
                     group = self.create_group(existing)
@@ -305,6 +303,81 @@ class CompressionSchemesManager:
                 group = self.create_group(existing)
                 created[group.name] = existing
         return created
+
+    def _resolve_coupled_group_paths(self, path_template, layer_group, block_id):
+        """Resolve one ``pruning.coupled_masks`` layer set to concrete scheme paths.
+
+        Pure indexing-metadata resolution (model-agnostic): expands the
+        ``path_template`` for ``block_id`` over each layer name in
+        ``layer_group`` and keeps only the paths that actually have a scheme
+        built. Shared by ``auto_groups()`` and ``_validate_coupling()``.
+        """
+        full_paths = [
+            path_template.format(block_index=block_id, path=layer)
+            for layer in layer_group
+        ]
+        return [p for p in full_paths if self._find_scheme(p) is not None]
+
+    def _iter_coupled_groups(self):
+        """Yield lists of scheme paths for every resolved coupled-mask group.
+
+        Covers both per-block (``pruning.coupled_masks``) and cross-block
+        (``pruning.coupled_masks_all``) sets, purely from indexing metadata.
+        """
+        for block_indexing in self.indexing.values():
+            pruning = block_indexing.get("pruning", {})
+            coupled_masks = pruning.get("coupled_masks", [])
+            coupled_masks_all = pruning.get("coupled_masks_all", [])
+            if not coupled_masks and not coupled_masks_all:
+                continue
+
+            path_template = block_indexing["path_template"]
+            config_attr = block_indexing.get("config_attr", "")
+            block_config = self.config if config_attr == "" else getattr(self.config, config_attr)
+            num_blocks = getattr(block_config, block_indexing["num_blocks_attr"])
+
+            for block_id in range(num_blocks):
+                for layer_group in coupled_masks:
+                    paths = self._resolve_coupled_group_paths(path_template, layer_group, block_id)
+                    if len(paths) >= 2:
+                        yield paths
+
+            for layer_group in coupled_masks_all:
+                full_paths = [
+                    path_template.format(block_index=block_id, path=layer)
+                    for block_id in range(num_blocks)
+                    for layer in layer_group
+                ]
+                existing = [p for p in full_paths if self._find_scheme(p) is not None]
+                if len(existing) >= 2:
+                    yield existing
+
+    def _validate_coupling(self, hard, criteria=None):
+        """Ask each compressor to validate consistency with its coupled siblings.
+
+        Resolves coupled-mask groups purely from indexing metadata, then
+        delegates the actual consistency check to each compressor via the
+        generic ``Compressor.check_coupling()`` hook -- the manager never
+        interprets compression-method-specific state (e.g. pruning ratios or
+        ``share_mask``) itself.
+        """
+        filtered = set(scheme.path for scheme in self.iter_filtered(criteria=criteria))
+        for paths in self._iter_coupled_groups():
+            if not any(p in filtered for p in paths):
+                continue
+            schemes = [self._find_scheme(p) for p in paths]
+            compressor_names = set()
+            for scheme in schemes:
+                compressor_names.update(scheme.compressors.keys())
+
+            for cname in compressor_names:
+                members = [(s, s.compressors.get(cname)) for s in schemes]
+                members = [(s, c) for s, c in members if c is not None]
+                if len(members) < 2:
+                    continue
+                for scheme, compressor in members:
+                    siblings = [c for s, c in members if s is not scheme]
+                    compressor.check_coupling(hard, siblings)
 
     def _validate_grouping(self, criteria=None):
         """Ensure every compressor requiring grouping has a group (pre-apply)."""
@@ -504,6 +577,7 @@ class CompressionSchemesManager:
                   set both calibration data and calibration loss first.
         """
         self._validate_grouping(criteria=criteria)
+        self._validate_coupling(hard=hard, criteria=criteria)
 
         if self.calibration_mode == "cascade":
             apply_cascade(

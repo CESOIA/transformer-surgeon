@@ -61,6 +61,38 @@ class StructuredPruner(Compressor):
         # reachable through group membership.
         return bool(self.share_mask) and self._to_compress()
 
+    def check_coupling(self, hard, siblings):
+        # Only hard removal actually resizes tensors; soft pruning just zeroes
+        # rows in place, so a mismatch between coupled layers can't manifest.
+        if not hard or not siblings:
+            return
+
+        path = self.scheme.path if self.scheme is not None else "<unknown>"
+        states = [(path, self._to_compress(), self.share_mask)]
+        states += [
+            (s.scheme.path if s.scheme is not None else "<unknown>", s._to_compress(), s.share_mask)
+            for s in siblings
+        ]
+
+        active = [p for p, is_active, _ in states if is_active]
+        inactive = [p for p, is_active, _ in states if not is_active]
+        if active and inactive:
+            raise ValueError(
+                f"Coupled pruning: {active} are being hard-pruned but {inactive} "
+                "(coupled via pruning.coupled_masks) are not. Prune all members of a "
+                "coupled_masks group together -- call manager.auto_groups() and set "
+                "share_mask=True on the resulting group -- or leave every member of "
+                "the group unpruned."
+            )
+
+        if active and not all(shares_mask for _, _, shares_mask in states):
+            raise ValueError(
+                f"Coupled pruning: {active} are all being hard-pruned but do not share "
+                "one mask (share_mask is not enabled on all of them), so their masks "
+                "may select different neurons. Call manager.auto_groups() and set "
+                "share_mask=True on the resulting group before apply(hard=True)."
+            )
+
     # ------------------------------------------------------------------ scoring
 
     def get_scores(self, module):
