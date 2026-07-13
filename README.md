@@ -248,7 +248,6 @@ These groups are consumed by `CompressionSchemesManager` exactly like previous u
 - [test/e2e/test_export_pipelines.py](test/e2e/test_export_pipelines.py) — HF roundtrip, XNNPACK, TensorRT, QNN export (capability-gated)
 - [test/unit/test_known_bugs.py](test/unit/test_known_bugs.py) — pinned regressions for open framework bugs
 - [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package internals and extension guide
-- [FRAMEWORK_PROBLEMS.md](FRAMEWORK_PROBLEMS.md) — known issues and test-suite hardening notes
 
 ## License
 

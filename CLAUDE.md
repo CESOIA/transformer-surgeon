@@ -48,7 +48,7 @@ pytest test/e2e/test_export_pipelines.py  # HF/convert/XNNPACK/TensorRT/QNN, cap
 ```
 
 Legacy per-model scripts live under `test/test_deprecated/` (see its README) — kept
-for reference only, not collected by default. See `FRAMEWORK_PROBLEMS.md` for why.
+for reference only, not collected by default.
 
 ## Backend export
 

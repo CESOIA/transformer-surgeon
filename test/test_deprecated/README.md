@@ -1,9 +1,8 @@
 # Deprecated tests
 
 Everything under this directory predates the `test/unit` / `test/e2e` hardening
-pass (see `FRAMEWORK_PROBLEMS.md`, section T*) and is kept for reference only —
-it is **not** part of the default `pytest` run (`pytest.ini` sets
-`testpaths = test/unit test/e2e`).
+pass and is kept for reference only — it is **not** part of the default `pytest`
+run (`pytest.ini` sets `testpaths = test/unit test/e2e`).
 
 Most files here are not actually pytest tests: they are `argparse` + `main()` CLI
 scripts (`test_*` functions that take a positional `args`), several share a

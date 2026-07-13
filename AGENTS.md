@@ -35,7 +35,7 @@ Run tests:
 # qwen2_5_vl) via tiny random-weight models from test/_helpers/model_factory.py.
 pytest
 
-# Bug regressions (pinned xfail until fixed; XPASS = fixed, see FRAMEWORK_PROBLEMS.md)
+# Bug regressions (pinned assertions for previously-broken framework behavior)
 pytest test/unit/test_known_bugs.py -v
 
 # Real-checkpoint export pipelines — HF roundtrip, convert, XNNPACK, TensorRT, QNN.
@@ -48,8 +48,8 @@ pytest test/e2e/test_model_families.py::test_lrd_soft_apply_and_restore -v
 
 Legacy per-model CLI scripts (pre-dating this hardened suite) live under
 `test/test_deprecated/` — kept for reference only, not collected by default
-(`pytest.ini` sets `testpaths = test/unit test/e2e`). See its README and
-`FRAMEWORK_PROBLEMS.md` (section T*) for why they were retired.
+(`pytest.ini` sets `testpaths = test/unit test/e2e`). See its README for why
+they were retired.
 
 ---
 
