@@ -84,7 +84,14 @@ def apply_cascade(
         for block_name, block_indexing in manager.indexing.items():
             block_scheme_dict = manager.schemes.get(block_name, {})
             block_scheme_set = set(block_scheme_dict.values())
-            block_selected = [s for s in selected_schemes if s in block_scheme_set]
+            # 'preprocessing'/'final_layer' singleton schemes (block_id=None)
+            # don't fit the per-block staged cascade below -- they aren't
+            # repeated per block_index, so they're excluded here. Any
+            # calibration they need is handled by the "standard" (non-cascade)
+            # calibration path instead.
+            block_selected = [
+                s for s in selected_schemes if s in block_scheme_set and s.block_id is not None
+            ]
             if len(block_selected) == 0:
                 continue
 

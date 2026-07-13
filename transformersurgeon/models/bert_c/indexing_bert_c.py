@@ -30,10 +30,24 @@ BERT_C_INDEXING = {
         # Structured-pruning annotations (see llama_c for field semantics).
         'pruning': {
             'output_dependence': {
+                # 'bert.embeddings' is a composite module (word + position +
+                # token_type embeddings + LayerNorm), not a plain nn.Embedding,
+                # so it isn't given a CompressionScheme -- no 'preprocessing'
+                # sentinel here.
+                #
+                # BERT is post-norm: attention.output.LayerNorm sits between
+                # attention.output.dense's (residual-summed) output and
+                # intermediate.dense's input; output.LayerNorm sits between
+                # output.dense's output and the *next* block's q/k/v (or, on
+                # the last block, 'final_layer' -- there's no separate final
+                # norm in a post-norm architecture, the last block's own
+                # output.LayerNorm already plays that role).
                 'attention.self.value': ['attention.output.dense'],
-                'attention.output.dense': ['intermediate.dense'],
+                'attention.output.dense': ['attention.output.LayerNorm'],
+                'attention.output.LayerNorm': ['intermediate.dense'],
                 'intermediate.dense': ['output.dense'],
-                'output.dense': ['attention.self.query', 'attention.self.key', 'attention.self.value'],
+                'output.dense': ['output.LayerNorm'],
+                'output.LayerNorm': ['attention.self.query', 'attention.self.key', 'attention.self.value', 'final_layer'],
             },
             'coupled_masks': [
                 ['attention.self.query', 'attention.self.key'],
@@ -44,6 +58,10 @@ BERT_C_INDEXING = {
                 ['attention.output.dense', 'output.dense'],
             ],
             'per_head_uniform': ['attention.self.query', 'attention.self.key', 'attention.self.value'],
+            # Normalization layers: transparent to the embedding/hidden size,
+            # never user-compressible, and only ever pruned by forwarding a
+            # mask through them (see CoupledPruner.apply_chain).
+            'norm_layers': ['attention.output.LayerNorm', 'output.LayerNorm'],
         },
         'no_cascade_calibration': True,
         'path_template': "bert.encoder.layer.{block_index}.{path}",

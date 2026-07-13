@@ -1,7 +1,8 @@
 # Copyright 2025 The CESOIA project team, Politecnico di Torino and King Abdullah University of Science and Technology. All rights reserved.
+import warnings
 import torch
 from transformers import PretrainedConfig
-from ..blocks import LinearCompressed
+from ..blocks import LinearCompressed, EmbeddingCompressed
 from typing import Dict, Any
 import math
 from .utils import flatten_index_paths
@@ -76,5 +77,78 @@ def replace_layers_upon_init(
                     )
 
                 setattr(parent_module, module_name, new_module)
-                
+
+    # Substitute the singleton preprocessing/final_layer modules (not part of
+    # path_list's per-block loop -- each is a single, already-resolved path).
+    for full_path, compressed_cls, get_config in (
+        (indexing.get("preprocessing"), EmbeddingCompressed, _embedding_new_module_kwargs),
+        (indexing.get("final_layer"), LinearCompressed, _linear_new_module_kwargs),
+    ):
+        if not full_path:
+            continue
+        _replace_singleton_layer(model, full_path, compressed_cls, get_config, config_dict)
+
+
+def _linear_new_module_kwargs(old_module, compression_config):
+    lrd_config = compression_config.get("lrd", {})
+    return dict(
+        in_features=old_module.in_features,
+        out_features=old_module.out_features,
+        bias=old_module.bias is not None,
+        device=old_module.weight.device,
+        dtype=old_module.weight.dtype,
+        rank=lrd_config.get("rank", None),
+    )
+
+
+def _embedding_new_module_kwargs(old_module, compression_config):
+    lrd_config = compression_config.get("lrd", {})
+    return dict(
+        num_embeddings=old_module.num_embeddings,
+        embedding_dim=old_module.embedding_dim,
+        device=old_module.weight.device,
+        dtype=old_module.weight.dtype,
+        rank=lrd_config.get("rank", None),
+    )
+
+
+def _replace_singleton_layer(model, full_path, compressed_cls, get_config, config_dict):
+    """Substitute the module at ``full_path`` with its compressed counterpart.
+
+    Handles ``preprocessing``/``final_layer`` indexing entries: a single
+    concrete module path (no ``path_template``/block loop). Silently skips
+    (with a warning) modules whose type doesn't match what ``compressed_cls``
+    expects (e.g. Conv2d patch-embed preprocessing), since those aren't
+    supported yet.
+    """
+    expected_type = torch.nn.Linear if compressed_cls is LinearCompressed else torch.nn.Embedding
+
+    split_path = full_path.split('.')
+    parent_module = model
+    for path_piece in split_path[:-1]:
+        parent_module = getattr(parent_module, path_piece, None)
+        if parent_module is None:
+            raise AttributeError(f"Module '{path_piece}' not found in the model while accessing '{full_path}'")
+
+    module_name = split_path[-1]
+    old_module = getattr(parent_module, module_name, None)
+
+    if type(old_module) is not expected_type:
+        if old_module is not None:
+            warnings.warn(
+                f"Skipping compression substitution at '{full_path}': expected "
+                f"{expected_type.__name__}, got {type(old_module).__name__}."
+            )
+        return
+
+    compression_config = config_dict.get('compression_config', {})
+    compression_config = compression_config.get(full_path, {})
+
+    # No weight copy here: replacement happens inside __init__, before
+    # from_pretrained's state-dict loading runs -- it only needs to match the
+    # target class/shape so the subsequent load (by parameter name) succeeds,
+    # mirroring the path_list Linear substitution above.
+    new_module = compressed_cls(**get_config(old_module, compression_config))
+    setattr(parent_module, module_name, new_module)
+
 __all__ = ["replace_layers_upon_init"]

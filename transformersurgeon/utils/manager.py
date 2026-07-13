@@ -17,8 +17,18 @@ from ..calibration import run_compression_calibration
 from ..compression import GROUP_OPTIONS, COMPRESSION_REGISTRY
 from .scheme import CompressionScheme
 from .grouping import SchemeGroup
-from .utils import flatten_index_paths
+from .utils import flatten_index_paths, get_submodule
 from .cascade import apply_cascade
+from ..blocks import LinearCompressed, EmbeddingCompressed
+
+# Sentinel layer names used by 'preprocessing'/'final_layer' entries in
+# pruning.output_dependence / pruning.coupled_masks[_all] -- resolved directly
+# from indexing['preprocessing']/['final_layer'] rather than via
+# path_template.format(block_index=..., path=...).
+_SENTINEL_COMPRESSED_TYPE = {
+    "preprocessing": EmbeddingCompressed,
+    "final_layer": LinearCompressed,
+}
 
 class CompressionSchemesManager:
     """
@@ -317,17 +327,37 @@ class CompressionSchemesManager:
 
             # Cross-block coupling: one group per set, spanning all blocks.
             for layer_group in coupled_masks_all:
-                full_paths = [
-                    path_template.format(block_index=block_id, path=layer)
-                    for block_id in range(num_blocks)
-                    for layer in layer_group
-                ]
+                full_paths = self._resolve_coupled_masks_all_paths(
+                    block_indexing, path_template, layer_group, num_blocks
+                )
                 existing = [p for p in full_paths if self._find_scheme(p) is not None]
                 if len(existing) < 2:
                     continue
                 group = self.create_group(existing)
                 created[group.name] = existing
         return created
+
+    @staticmethod
+    def _resolve_coupled_masks_all_paths(block_indexing, path_template, layer_group, num_blocks):
+        """Expand a ``coupled_masks_all`` layer set to concrete full paths.
+
+        Most entries are per-block leaf names (e.g. ``'self_attn.o_proj'``),
+        repeated over every block index. The ``'preprocessing'``/``'final_layer'``
+        sentinels are singleton paths instead -- resolved once (not per block)
+        directly from ``block_indexing['preprocessing']``/``['final_layer']``.
+        """
+        full_paths = []
+        for layer in layer_group:
+            if layer in _SENTINEL_COMPRESSED_TYPE:
+                sentinel_path = block_indexing.get(layer)
+                if sentinel_path:
+                    full_paths.append(sentinel_path)
+                continue
+            full_paths.extend(
+                path_template.format(block_index=block_id, path=layer)
+                for block_id in range(num_blocks)
+            )
+        return full_paths
 
     def _resolve_coupled_group_paths(self, path_template, layer_group, block_id):
         """Resolve one ``pruning.coupled_masks`` layer set to concrete scheme paths.
@@ -368,11 +398,9 @@ class CompressionSchemesManager:
                         yield paths
 
             for layer_group in coupled_masks_all:
-                full_paths = [
-                    path_template.format(block_index=block_id, path=layer)
-                    for block_id in range(num_blocks)
-                    for layer in layer_group
-                ]
+                full_paths = self._resolve_coupled_masks_all_paths(
+                    block_indexing, path_template, layer_group, num_blocks
+                )
                 existing = [p for p in full_paths if self._find_scheme(p) is not None]
                 if len(existing) >= 2:
                     yield existing
@@ -924,6 +952,18 @@ class CompressionSchemesManager:
             num_blocks = getattr(block_specific_config, num_blocks_attr, None)
             assert num_blocks is not None, f"Number of blocks attribute '{num_blocks_attr}' not found in the model configuration for block '{block_name}'. Please check the indexing configuration."
 
+            # Resolve the 'preprocessing'/'final_layer' singleton paths (if
+            # annotated and actually substituted with a compressed module by
+            # replace_layers_upon_init -- e.g. Conv2d patch-embed or composite
+            # BERT-style embeddings are not, and get no scheme).
+            preprocessing_path = self._resolve_sentinel_path(block_indexing, 'preprocessing')
+            final_layer_path = self._resolve_sentinel_path(block_indexing, 'final_layer')
+            # 'final_norm' (e.g. the post-block norm some families keep in
+            # extra_layers) is never substituted with a different class -- no
+            # type-check gate needed, just confirm the path resolves.
+            final_norm_path = self._resolve_final_norm_path(block_indexing)
+            norm_layers = set(block_indexing.get('pruning', {}).get('norm_layers', ()))
+
             tmp_dict = {}
             for i in range(num_blocks):
                 for path in path_list:
@@ -943,12 +983,71 @@ class CompressionSchemesManager:
                         path_template=path_template,
                         path_list=path_list,
                         num_blocks=num_blocks,
+                        preprocessing_path=preprocessing_path,
+                        final_layer_path=final_layer_path,
+                        final_norm_path=final_norm_path,
+                        is_norm=path in norm_layers,
                     )
-            
+
+            for sentinel_name, full_path, sentinel_is_norm in (
+                ('preprocessing', preprocessing_path, False),
+                ('final_layer', final_layer_path, False),
+                ('final_norm', final_norm_path, True),
+            ):
+                if full_path is None:
+                    continue
+                compression_config = getattr(block_specific_config, 'compression_config', {})
+                compression_config = compression_config.setdefault(full_path, {})
+                tmp_dict[full_path] = CompressionScheme(
+                    name=sentinel_name,
+                    block_id=None,
+                    path=full_path,
+                    compression_config=compression_config,
+                    model=self.model,
+                    pruning_indexing=block_indexing.get('pruning', {}),
+                    path_template=path_template,
+                    path_list=path_list,
+                    num_blocks=num_blocks,
+                    preprocessing_path=preprocessing_path,
+                    final_layer_path=final_layer_path,
+                    final_norm_path=final_norm_path,
+                    is_norm=sentinel_is_norm,
+                )
+
             all_schemes[block_name] = tmp_dict
-        
+
         return all_schemes
-    
+
+    def _resolve_sentinel_path(self, block_indexing, sentinel_name):
+        """Return the full path of a 'preprocessing'/'final_layer' indexing
+        entry if it's annotated *and* was actually substituted with its
+        compressed counterpart (EmbeddingCompressed/LinearCompressed) by
+        replace_layers_upon_init. Returns None otherwise (e.g. Conv2d
+        patch-embed, composite BERT-style embeddings, or unannotated).
+        """
+        full_path = block_indexing.get(sentinel_name)
+        if not full_path:
+            return None
+        module = get_submodule(self.model, full_path)
+        expected_type = _SENTINEL_COMPRESSED_TYPE[sentinel_name]
+        if type(module) is not expected_type:
+            return None
+        return full_path
+
+    def _resolve_final_norm_path(self, block_indexing):
+        """Return the full path of a 'final_norm' indexing entry, if any.
+
+        Unlike 'preprocessing'/'final_layer', a normalization layer is never
+        substituted with a different class -- it stays whatever it already
+        was (RMSNorm/LayerNorm) -- so there's no type-check gate, only
+        confirmation that the annotated path actually resolves.
+        """
+        full_path = block_indexing.get('final_norm')
+        if not full_path:
+            return None
+        get_submodule(self.model, full_path)  # raises if the annotation is wrong
+        return full_path
+
     def print_filtered(self, criteria:list=None):
         """
         Prints CompressionScheme objects filtered by name and/or block_id.

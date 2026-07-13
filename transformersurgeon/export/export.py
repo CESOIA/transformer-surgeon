@@ -8,6 +8,7 @@ from .config import BackendExportConfig
 from .common import _normalize_component_devices
 from ..blocks import TransformerDecoder
 from ..utils import convert_for_export
+from ..utils.utils import get_submodule
 
 def _resolve_model_components_for_export(
     model_or_graph: Any,
@@ -30,8 +31,24 @@ def _resolve_model_components_for_export(
         return embedding, decoder, final_layer, None
 
     if hasattr(model_or_graph, "get_input_embeddings") and hasattr(model_or_graph, "lm_head"):
-        embedding = model_or_graph.get_input_embeddings()
-        final_layer = model_or_graph.lm_head
+        # Resolve via indexing (preprocessing/final_layer) when available, so
+        # any EmbeddingCompressed/LinearCompressed compression applied by the
+        # manager (pruning/LRD/quantization) survives into export, rather than
+        # falling back to the raw, uncompressed HF modules.
+        text_indexing = getattr(model_or_graph, "indexing", {}).get("text")
+        embedding = None
+        final_layer = None
+        if text_indexing is not None:
+            preprocessing_path = text_indexing.get("preprocessing")
+            final_layer_path = text_indexing.get("final_layer")
+            if preprocessing_path:
+                embedding = get_submodule(model_or_graph, preprocessing_path)
+            if final_layer_path:
+                final_layer = get_submodule(model_or_graph, final_layer_path)
+        if embedding is None:
+            embedding = model_or_graph.get_input_embeddings()
+        if final_layer is None:
+            final_layer = model_or_graph.lm_head
 
         # Check if the model is already converted to tsurgeon's graph
         if isinstance(model_or_graph, TransformerDecoder):

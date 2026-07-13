@@ -11,17 +11,26 @@ from .structured_pruning_methods import (
     reduce_pattern_scores,
     tile_pattern_mask,
 )
+from ..blocks import EmbeddingCompressed
 
 logger = logging.getLogger(__name__)
 
-# TODO: Add compression for the model's INPUT layer (e.g. ViT patch-embed conv,
-# LLM token embedding) and FINAL layer (lm_head / classifier). These are not in
-# `path_list`, so no scheme is built for them today. They are also consumers of
-# the residual/hidden dim, so wiring them up is a prerequisite for full hidden-dim
-# structured pruning (see coupled_masks_all / the residual-wide coupling next step):
-# an embedding output-pruned by the hidden-dim mask, and lm_head/classifier
-# input-pruned by the same mask, must be coupled alongside every block's
-# q/k/v/gate/up inputs and the norms.
+# The model's preprocessing/embedding layer (nn.Embedding -> EmbeddingCompressed)
+# and final layer (lm_head/classifier, nn.Linear -> LinearCompressed) are wired
+# into hidden-dim structured pruning via the 'preprocessing'/'final_layer'
+# sentinels in indexing's pruning.output_dependence / coupled_masks_all (see
+# _coupled_target_chains below and manager._resolve_sentinel_path). Not every
+# family supports this: models whose preprocessing module isn't a plain
+# nn.Embedding (e.g. ViT/Qwen-VL patch-embed Conv2d, BERT-style composite
+# embeddings) don't get a 'preprocessing' scheme, so only their 'final_layer'
+# cascade applies.
+#
+# Normalization layers (input_layernorm, the final post-block norm, ...) sit
+# between a residual writer and its consumer and are transparent to the
+# hidden dim, so output_dependence routes through them ('final_norm' is the
+# singleton sentinel for the post-block norm some families keep in
+# extra_layers) and CoupledPruner.apply_chain forwards the mask through each
+# normalization hop until it reaches a real matmul target.
 
 VALID_METHODS = ["magnitude", "gradient", "random"]
 VALID_REDUCE_OPS = ["add", "multiply"]
@@ -31,6 +40,19 @@ CALIBRATED_METHOD_DICT = {
 
 # Keys used in the owning SchemeGroup's properties dict for shared-mask coordination.
 _SHARED_MASK_KEY = "structured_pruning.shared_mask"
+
+
+def _is_embedding(module) -> bool:
+    """Whether the prunable (residual/embedding_dim) axis is weight's dim 1.
+
+    Every other compressible module (LinearCompressed) keeps the prunable
+    axis at weight's dim 0 ("out_features" rows). EmbeddingCompressed's
+    ``weight`` is stored in nn.Embedding's native ``[num_embeddings,
+    embedding_dim]`` layout (checkpoint-compatible), so its prunable axis
+    (``embedding_dim``) is dim 1 instead -- everywhere below that reads/
+    writes/removes rows branches on this.
+    """
+    return isinstance(module, EmbeddingCompressed)
 
 
 class StructuredPruner(Compressor):
@@ -105,10 +127,12 @@ class StructuredPruner(Compressor):
         score_fn = SCORE_FUNCTIONS.get(method)
         if score_fn is None:
             raise ValueError(f"Unsupported structured pruning method '{method}'.")
+        weight = module.weight.t() if _is_embedding(module) else module.weight
         if method == "gradient":
             weight_grad = self.calibration_store["weight_grad"]
-            return score_fn(module.weight, weight_grad)
-        return score_fn(module.weight)
+            weight_grad = weight_grad.t() if _is_embedding(module) else weight_grad
+            return score_fn(weight, weight_grad)
+        return score_fn(weight)
 
     # ------------------------------------------------------------------- masks
 
@@ -120,7 +144,7 @@ class StructuredPruner(Compressor):
         return build_structured_mask(pattern_scores, self.ratio, "layer")
 
     def _own_mask(self, module):
-        out_dim = module.weight.shape[0]
+        out_dim = module.weight.shape[1] if _is_embedding(module) else module.weight.shape[0]
         if self.repeated_pattern:
             pattern_mask = self._pattern_keep_mask(module)
             return tile_pattern_mask(pattern_mask, out_dim)
@@ -243,9 +267,12 @@ class StructuredPruner(Compressor):
             module.register_buffer("weight_mask", mask)
             with torch.no_grad():
                 dtype = module.weight.dtype
-                module.weight.mul_(mask.unsqueeze(1).to(dtype))
-                if module.bias is not None:
-                    module.bias.mul_(mask.to(dtype))
+                if _is_embedding(module):
+                    module.weight.mul_(mask.unsqueeze(0).to(dtype))
+                else:
+                    module.weight.mul_(mask.unsqueeze(1).to(dtype))
+                    if module.bias is not None:
+                        module.bias.mul_(mask.to(dtype))
 
         if hard:
             # Actual neuron removal + matrix resizing, then cascade the input
@@ -256,28 +283,39 @@ class StructuredPruner(Compressor):
     def _hard_remove(self, module, mask):
         """Remove pruned output rows and resize weight/bias/out_features in place."""
         keep = mask.to(torch.bool)
-        with torch.no_grad():
-            new_weight = module.weight.detach()[keep, :].clone()
-        module.weight = nn.Parameter(new_weight, requires_grad=module.weight.requires_grad)
 
-        if module.bias is not None:
+        if _is_embedding(module):
+            # Prunable axis is dim 1 (embedding_dim); vocab (dim 0) is untouched.
             with torch.no_grad():
-                new_bias = module.bias.detach()[keep].clone()
-            module.bias = nn.Parameter(new_bias, requires_grad=module.bias.requires_grad)
+                new_weight = module.weight.detach()[:, keep].clone()
+            module.weight = nn.Parameter(new_weight, requires_grad=module.weight.requires_grad)
+            module.embedding_dim = int(keep.sum().item())
+            module.out_features = module.embedding_dim
+        else:
+            with torch.no_grad():
+                new_weight = module.weight.detach()[keep, :].clone()
+            module.weight = nn.Parameter(new_weight, requires_grad=module.weight.requires_grad)
 
-        module.out_features = int(keep.sum().item())
+            if module.bias is not None:
+                with torch.no_grad():
+                    new_bias = module.bias.detach()[keep].clone()
+                module.bias = nn.Parameter(new_bias, requires_grad=module.bias.requires_grad)
+
+            module.out_features = int(keep.sum().item())
+
         # The 1-D mask no longer matches the resized weight; drop it.
         module._buffers.pop("weight_mask", None)
 
-    def _target_block_id(self, scheme, next_layer):
-        """Resolve which block a coupled target lives in.
+    @staticmethod
+    def _hop_block_id(path_list, source_name, source_block_id, target_name):
+        """Resolve which block a coupled hop lives in, given its source hop.
 
         ``output_dependence`` entries are declared per-block, at the granularity
         of a single block's layer list (``path_list``). A dependency stays within
         the same block if the target comes *later* in that per-block execution
-        order (e.g. self_attn.o_proj -> mlp.gate_proj/up_proj, both consumed
+        order (e.g. self_attn.o_proj -> post_attention_layernorm, both consumed
         within this block via the residual stream). If the target comes at the
-        same position or *earlier* (e.g. mlp.down_proj -> self_attn.q/k/v), the
+        same position or *earlier* (e.g. mlp.down_proj -> input_layernorm), the
         dependency wraps around: this block's output feeds the *next* block's
         input via the residual stream, so the coupled cascade must target
         ``block_id + 1``.
@@ -286,23 +324,101 @@ class StructuredPruner(Compressor):
         skip connections), but ``coupled_masks_all`` already forces one shared
         mask across all blocks' residual writers, so cascading strictly one
         block ahead is sufficient -- that next block's own cascade continues
-        the chain from there.
+        the chain from there. Generalized from a single scheme's own
+        name/block_id so it can also resolve hops *within* a chain (e.g. a
+        norm forwarding to its own output_dependence targets), not just the
+        scheme's immediate targets.
         """
-        path_list = getattr(scheme, "path_list", None)
-        if not path_list:
-            return scheme.block_id
+        if not path_list or source_block_id is None:
+            return source_block_id
         try:
-            source_pos = path_list.index(scheme.name)
-            target_pos = path_list.index(next_layer)
+            source_pos = path_list.index(source_name)
+            target_pos = path_list.index(target_name)
         except ValueError:
-            return scheme.block_id
-        return scheme.block_id + 1 if target_pos <= source_pos else scheme.block_id
+            return source_block_id
+        return source_block_id + 1 if target_pos <= source_pos else source_block_id
 
-    def _coupled_targets(self):
-        """Resolve dependent (next) layer modules from generic pruning indexing.
+    @staticmethod
+    def _resolve_named_module(scheme, name, block_id, num_blocks):
+        """Resolve a single ``output_dependence`` entry name to a module.
+
+        Handles the ``'final_layer'``/``'final_norm'`` singleton sentinels
+        (resolved off the scheme's pre-threaded paths, not block-indexed) and
+        ordinary ``path_list`` leaf names (block-indexed via
+        ``path_template``, dropped if out of range). Returns ``None`` if the
+        entry can't be resolved (missing sentinel path, block out of range,
+        or -- for the sentinels -- ``block_id`` isn't the last block).
+
+        The last-block gating for the sentinels applies regardless of how
+        deep in a chain they're reached: a source's own ``output_dependence``
+        entry may name ``'final_layer'``/``'final_norm'`` directly (e.g.
+        llama_c's ``mlp.down_proj``), or a normalization hop's *own*
+        ``output_dependence`` entry may (e.g. bert_c's post-norm
+        ``output.LayerNorm``, resolved through the recursion in
+        ``_resolve_target_chains``) -- both must only fire once the walk has
+        reached the last block, tracked via the ``block_id`` threaded through
+        every hop by ``_hop_block_id``.
+        """
+        from ..utils.utils import get_submodule  # lazy: avoid import cycle
+
+        if name in ("final_layer", "final_norm"):
+            is_last_block = (
+                num_blocks is not None and block_id is not None and block_id == num_blocks - 1
+            )
+            if not is_last_block:
+                return None
+            sentinel_path = scheme.final_layer_path if name == "final_layer" else scheme.final_norm_path
+            if not sentinel_path:
+                return None
+            return get_submodule(scheme.model, sentinel_path)
+
+        if num_blocks is not None and (block_id is None or block_id >= num_blocks):
+            return None
+        full_path = scheme.path_template.format(block_index=block_id, path=name)
+        return get_submodule(scheme.model, full_path)
+
+    def _resolve_target_chains(self, scheme, name, block_id):
+        """Resolve one ``output_dependence`` entry to a list of hop chains.
+
+        A chain is ``[hop_1, ..., terminal]``: normalization-layer hops
+        (per indexing's ``pruning.norm_layers``, or the ``'final_norm'``
+        sentinel) are transparent, so resolution walks through them via
+        their *own* ``output_dependence`` entry -- which may fan out to
+        several onward targets, producing multiple chains rooted at the same
+        top-level name (e.g. ``input_layernorm`` -> q/k/v).
+        """
+        num_blocks = getattr(scheme, "num_blocks", None)
+        module = self._resolve_named_module(scheme, name, block_id, num_blocks)
+        if module is None:
+            return []
+
+        pruning_indexing = getattr(scheme, "pruning_indexing", None) or {}
+        norm_layers = pruning_indexing.get("norm_layers", ())
+        if name not in norm_layers and name != "final_norm":
+            return [[module]]
+
+        onward_names = pruning_indexing.get("output_dependence", {}).get(name, [])
+        path_list = getattr(scheme, "path_list", None)
+        chains = []
+        for onward_name in onward_names:
+            onward_block_id = self._hop_block_id(path_list, name, block_id, onward_name)
+            for sub_chain in self._resolve_target_chains(scheme, onward_name, onward_block_id):
+                chains.append([module] + sub_chain)
+        return chains
+
+    def _coupled_target_chains(self):
+        """Resolve dependent (next) layer chains from generic pruning indexing.
 
         Model specifics come only from the scheme's ``pruning_indexing``
         (``output_dependence``); resolution/invocation stay in this compressor.
+
+        One sentinel source gets special resolution: ``'preprocessing'`` --
+        the singleton embedding scheme itself (``scheme.block_id is None``)
+        always cascades into block 0. Every other name (including the
+        ``'final_layer'``/``'final_norm'`` sentinels, wherever they appear)
+        resolves generically through ``_resolve_target_chains``, which
+        applies the last-block gating itself (see
+        ``_resolve_named_module``).
         """
         scheme = self.scheme
         if scheme is None:
@@ -313,26 +429,21 @@ class StructuredPruner(Compressor):
         if not next_layers:
             return []
 
-        from ..utils.utils import get_submodule  # lazy: avoid import cycle
-
         num_blocks = getattr(scheme, "num_blocks", None)
-        targets = []
+        chains = []
         for next_layer in next_layers:
-            target_block_id = self._target_block_id(scheme, next_layer)
-            if num_blocks is not None and target_block_id >= num_blocks:
-                # No next block to cascade into (e.g. the last block's mlp
-                # output feeds the final norm / lm_head, not a self_attn --
-                # those consumers aren't wired into path_list/pruning yet).
-                continue
-            full_path = scheme.path_template.format(
-                block_index=target_block_id, path=next_layer
+            target_block_id = 0 if scheme.block_id is None else self._hop_block_id(
+                scheme.path_list, scheme.name, scheme.block_id, next_layer
             )
-            targets.append(get_submodule(scheme.model, full_path))
-        return targets
+            if num_blocks is not None and target_block_id is not None and target_block_id >= num_blocks:
+                # No next block to cascade into (ordinary path_list target).
+                continue
+            chains.extend(self._resolve_target_chains(scheme, next_layer, target_block_id))
+        return chains
 
     def _cascade_coupled(self, mask, hard):
-        for target_module in self._coupled_targets():
-            CoupledPruner().apply(target_module, mask, hard=hard)
+        for chain in self._coupled_target_chains():
+            CoupledPruner().apply_chain(chain, mask, hard=hard)
 
     # ----------------------------------------------------------------- restore
 
@@ -343,8 +454,8 @@ class StructuredPruner(Compressor):
         self.config["method"] = "magnitude"
 
         # Undo coupled input pruning on dependent layers.
-        for target_module in self._coupled_targets():
-            CoupledPruner().revert(target_module)
+        for chain in self._coupled_target_chains():
+            CoupledPruner().revert_chain(chain)
 
         # Clear any shared mask left on the owning group so a later apply recomputes.
         if self.scheme is not None:
@@ -358,9 +469,12 @@ class StructuredPruner(Compressor):
             return
         with torch.no_grad():
             dtype = module.weight.dtype
-            module.weight.mul_(mask.unsqueeze(1).to(dtype))
-            if module.bias is not None:
-                module.bias.mul_(mask.to(dtype))
+            if _is_embedding(module):
+                module.weight.mul_(mask.unsqueeze(0).to(dtype))
+            else:
+                module.weight.mul_(mask.unsqueeze(1).to(dtype))
+                if module.bias is not None:
+                    module.bias.mul_(mask.to(dtype))
 
     def remove_mask(self, module):
         """Drop the weight_mask buffer from the module."""

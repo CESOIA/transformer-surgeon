@@ -33,10 +33,26 @@ VIT_C_INDEXING = {
         # Structured-pruning annotations (see llama_c for field semantics).
         'pruning': {
             'output_dependence': {
+                # 'vit.embeddings' is a composite module (patch-embed conv +
+                # cls token + position embeddings), not a plain nn.Embedding,
+                # so it isn't given a CompressionScheme -- no 'preprocessing'
+                # sentinel here.
+                #
+                # ViT is pre-norm: layernorm_after sits between
+                # attention.o_proj's (residual-summed) output and mlp.fc1's
+                # input; mlp.fc2's (residual-summed) output feeds the *next*
+                # block's layernorm_before, or, on the last block,
+                # 'final_norm' (vit.layernorm, the pre-classifier norm kept
+                # in extra_layers) -> 'final_layer' (classifier).
                 'mlp.fc1': ['mlp.fc2'],
-                'mlp.fc2': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
+                'mlp.fc2': ['layernorm_before', 'final_norm'],
+                'layernorm_before': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
                 'attention.v_proj': ['attention.o_proj'],
-                'attention.o_proj': ['mlp.fc1'],
+                'attention.o_proj': ['layernorm_after'],
+                'layernorm_after': ['mlp.fc1'],
+                # 'final_norm' (vit.layernorm) is transparent to the hidden
+                # dim and forwards straight to 'final_layer' (classifier).
+                'final_norm': ['final_layer'],
             },
             'coupled_masks': [
                 ['attention.q_proj', 'attention.k_proj'],
@@ -47,11 +63,16 @@ VIT_C_INDEXING = {
                 ['attention.o_proj', 'mlp.fc2'],
             ],
             'per_head_uniform': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
+            # Normalization layers: transparent to the embedding/hidden size,
+            # never user-compressible, and only ever pruned by forwarding a
+            # mask through them (see CoupledPruner.apply_chain).
+            'norm_layers': ['layernorm_before', 'layernorm_after'],
         },
         'path_template': "vit.layers.{block_index}.{path}",
         'qkv_paths': [],
         'preprocessing': "vit.embeddings",
         'final_layer': "classifier",
+        'final_norm': "vit.layernorm",
 
         # Transformersurgeon export topology specifics
         'structure': 'transformer_encoder',

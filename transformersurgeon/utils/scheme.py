@@ -8,6 +8,7 @@ import inspect
 import torch
 from typing import Union
 from ..blocks import LinearCompressed
+from ..blocks import EmbeddingCompressed
 from ..blocks import VCONBlock
 from ..compression import (
     COMPRESSOR_DICT,
@@ -66,6 +67,10 @@ class CompressionScheme:
             path_template=None,
             path_list=None,
             num_blocks=None,
+            preprocessing_path=None,
+            final_layer_path=None,
+            final_norm_path=None,
+            is_norm=False,
             ):
         self.name = name
         self.block_id = block_id
@@ -87,6 +92,18 @@ class CompressionScheme:
         # the same block or wraps into the next one (see StructuredPruner).
         self.path_list = path_list or []
         self.num_blocks = num_blocks
+        # Resolved full paths of the 'preprocessing'/'final_layer' sentinel
+        # layers (if a scheme was built for them), so coupled-cascade code can
+        # resolve those output_dependence targets without re-deriving them
+        # from path_template (they aren't block-indexed).
+        self.preprocessing_path = preprocessing_path
+        self.final_layer_path = final_layer_path
+        self.final_norm_path = final_norm_path
+        # Normalization layers (e.g. RMSNorm/LayerNorm) get a scheme so the
+        # manager/coupled-pruning cascade can route through them, but they are
+        # never user-compressible (see set() below) -- pruning only ever
+        # forwards a mask through them via CoupledPruner.apply_chain.
+        self.is_norm = is_norm
 
         # Generate compressor list based on the provided configuration
         self.compressors = {}
@@ -130,6 +147,16 @@ class CompressionScheme:
             compression_property (str): The name of the property to set (e.g., 'ratio' for pruning).
             value: The new value to set for the specified property.
         """
+        if self.is_norm:
+            # Normalization layers are never user-compressible: they only
+            # ever get pruned indirectly, by CoupledPruner forwarding a mask
+            # through them. A no-op (not an error) keeps broadcast calls like
+            # manager.set(..., criteria=None) safe even when they happen to
+            # match a norm scheme.
+            if verbose:
+                print(f"Skipping {compression_property} of {compression_name} for normalization layer {self.path}: not user-compressible.")
+            return
+
         if verbose:
             print(f"Setting {compression_property} of {compression_name} to {value} for module {self.path}.")
 
@@ -261,14 +288,17 @@ class CompressionScheme:
         Checks if the module is compatible with compression.
         Compatible modules:
             - LinearCompressed
+            - EmbeddingCompressed
 
         Returns:
             bool: True if the module is compatible, False otherwise.
         """
         compatible = False
         compatible = compatible or self.vcon_initialized # if VCON is initialized, compatible by definition
-        compatible = compatible or (type(self.get_module()) is LinearCompressed)
-        
+        module_type = type(self.get_module())
+        compatible = compatible or module_type is LinearCompressed
+        compatible = compatible or module_type is EmbeddingCompressed
+
         return compatible
     
     def _module_copy(self, module):

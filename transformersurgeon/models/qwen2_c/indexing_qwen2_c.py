@@ -45,11 +45,24 @@ QWEN2_C_INDEXING = {
         #   not yet consumed).
         'pruning': {
             'output_dependence': {
+                # 'preprocessing' is a sentinel: the embedding's output feeds
+                # block 0's residual stream via input_layernorm. Resolved
+                # directly (no block_index) by the manager/structured pruner,
+                # not via path_template.
+                'preprocessing': ['input_layernorm'],
+                'input_layernorm': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
                 'mlp.gate_proj': ['mlp.down_proj'],
                 'mlp.up_proj': ['mlp.down_proj'],
-                'mlp.down_proj': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
+                # Wraps to the next block's input_layernorm (or, on the last
+                # block, to 'final_norm' -- see the 'final_norm'/'final_layer'
+                # gating in structured_pruning.py).
+                'mlp.down_proj': ['input_layernorm', 'final_norm'],
                 'self_attn.v_proj': ['self_attn.o_proj'],
-                'self_attn.o_proj': ['mlp.up_proj', 'mlp.gate_proj'],
+                'self_attn.o_proj': ['post_attention_layernorm', 'final_norm'],
+                'post_attention_layernorm': ['mlp.up_proj', 'mlp.gate_proj'],
+                # 'final_norm' (model.norm) is transparent to the hidden dim
+                # and forwards straight to 'final_layer' (lm_head).
+                'final_norm': ['final_layer'],
             },
             'coupled_masks': [
                 ['self_attn.q_proj', 'self_attn.k_proj'],
@@ -57,14 +70,20 @@ QWEN2_C_INDEXING = {
             ],
             # coupled_masks_all: share ONE output mask across ALL blocks (the
             # residual/hidden-dim writers), so the hidden dim is pruned identically
-            # everywhere.
+            # everywhere. 'preprocessing' joins this set as the residual stream's
+            # initial writer.
             'coupled_masks_all': [
-                ['self_attn.o_proj', 'mlp.down_proj'],
+                ['self_attn.o_proj', 'mlp.down_proj', 'preprocessing'],
             ],
             'per_head_uniform': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
+            # Normalization layers: transparent to the embedding/hidden size,
+            # never user-compressible, and only ever pruned by forwarding a
+            # mask through them (see CoupledPruner.apply_chain).
+            'norm_layers': ['input_layernorm', 'post_attention_layernorm'],
         },
         'path_template': "model.layers.{block_index}.{path}",
         'extra_layers': ["model.norm"],
+        'final_norm': "model.norm",
         'preprocessing': "model.embed_tokens",
         'position_embeddings_source': "model.rotary_emb",
         'position_embeddings_targets': ["self_attn"],
