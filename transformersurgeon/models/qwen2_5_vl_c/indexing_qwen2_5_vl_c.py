@@ -30,6 +30,8 @@ QWEN2_5_VL_C_INDEXING = {
             'output_dependence': {
                 'mlp.gate_proj': ['mlp.down_proj'],
                 'mlp.up_proj': ['mlp.down_proj'],
+                'mlp.down_proj': ['attn.qkv'],
+                'attn.proj': ['mlp.up_proj', 'mlp.gate_proj'],
             },
             'coupled_masks': [
                 ['mlp.gate_proj', 'mlp.up_proj'],
@@ -75,7 +77,9 @@ QWEN2_5_VL_C_INDEXING = {
             'output_dependence': {
                 'mlp.gate_proj': ['mlp.down_proj'],
                 'mlp.up_proj': ['mlp.down_proj'],
+                'mlp.down_proj': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
                 'self_attn.v_proj': ['self_attn.o_proj'],
+                'self_attn.o_proj': ['mlp.up_proj', 'mlp.gate_proj'],
             },
             'coupled_masks': [
                 ['self_attn.q_proj', 'self_attn.k_proj'],

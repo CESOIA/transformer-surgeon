@@ -64,6 +64,8 @@ class CompressionScheme:
             model=None,
             pruning_indexing=None,
             path_template=None,
+            path_list=None,
+            num_blocks=None,
             ):
         self.name = name
         self.block_id = block_id
@@ -80,6 +82,11 @@ class CompressionScheme:
         # without the manager itself orchestrating them.
         self.pruning_indexing = pruning_indexing or {}
         self.path_template = path_template
+        # Flattened per-block layer order and total block count, so coupled
+        # pruning can tell whether an output_dependence target sits later in
+        # the same block or wraps into the next one (see StructuredPruner).
+        self.path_list = path_list or []
+        self.num_blocks = num_blocks
 
         # Generate compressor list based on the provided configuration
         self.compressors = {}

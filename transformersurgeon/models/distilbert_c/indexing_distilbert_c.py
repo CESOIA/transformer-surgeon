@@ -33,7 +33,9 @@ DISTILBERT_C_INDEXING = {
         "pruning": {
             "output_dependence": {
                 "ffn.lin1": ["ffn.lin2"],
+                "ffn.lin2": ["attention.q_lin", "attention.k_lin", "attention.v_lin"],
                 "attention.v_lin": ["attention.out_lin"],
+                "attention.out_lin": ["ffn.lin1"],
             },
             "coupled_masks": [
                 ["attention.q_lin", "attention.k_lin"],

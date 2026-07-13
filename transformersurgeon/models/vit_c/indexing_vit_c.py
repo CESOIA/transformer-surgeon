@@ -34,7 +34,9 @@ VIT_C_INDEXING = {
         'pruning': {
             'output_dependence': {
                 'mlp.fc1': ['mlp.fc2'],
+                'mlp.fc2': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
                 'attention.v_proj': ['attention.o_proj'],
+                'attention.o_proj': ['mlp.fc1'],
             },
             'coupled_masks': [
                 ['attention.q_proj', 'attention.k_proj'],

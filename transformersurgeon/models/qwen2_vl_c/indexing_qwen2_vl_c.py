@@ -27,6 +27,8 @@ QWEN2_VL_C_INDEXING = {
         'pruning': {
             'output_dependence': {
                 'mlp.fc1': ['mlp.fc2'],
+                'mlp.fc2': ['attn.qkv'],
+                'attn.proj': ['mlp.fc1'],
             },
             'coupled_masks': [],
             'coupled_masks_all': [
@@ -61,7 +63,9 @@ QWEN2_VL_C_INDEXING = {
             'output_dependence': {
                 'mlp.gate_proj': ['mlp.down_proj'],
                 'mlp.up_proj': ['mlp.down_proj'],
+                'mlp.down_proj': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
                 'self_attn.v_proj': ['self_attn.o_proj'],
+                'self_attn.o_proj': ['mlp.up_proj', 'mlp.gate_proj'],
             },
             'coupled_masks': [
                 ['self_attn.q_proj', 'self_attn.k_proj'],

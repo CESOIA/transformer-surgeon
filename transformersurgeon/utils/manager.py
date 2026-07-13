@@ -941,6 +941,8 @@ class CompressionSchemesManager:
                         model=self.model,
                         pruning_indexing=block_indexing.get('pruning', {}),
                         path_template=path_template,
+                        path_list=path_list,
+                        num_blocks=num_blocks,
                     )
             
             all_schemes[block_name] = tmp_dict

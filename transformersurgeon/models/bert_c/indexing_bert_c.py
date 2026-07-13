@@ -31,7 +31,9 @@ BERT_C_INDEXING = {
         'pruning': {
             'output_dependence': {
                 'attention.self.value': ['attention.output.dense'],
+                'attention.output.dense': ['intermediate.dense'],
                 'intermediate.dense': ['output.dense'],
+                'output.dense': ['attention.self.query', 'attention.self.key', 'attention.self.value'],
             },
             'coupled_masks': [
                 ['attention.self.query', 'attention.self.key'],

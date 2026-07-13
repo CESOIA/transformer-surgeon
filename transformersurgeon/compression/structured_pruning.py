@@ -269,6 +269,35 @@ class StructuredPruner(Compressor):
         # The 1-D mask no longer matches the resized weight; drop it.
         module._buffers.pop("weight_mask", None)
 
+    def _target_block_id(self, scheme, next_layer):
+        """Resolve which block a coupled target lives in.
+
+        ``output_dependence`` entries are declared per-block, at the granularity
+        of a single block's layer list (``path_list``). A dependency stays within
+        the same block if the target comes *later* in that per-block execution
+        order (e.g. self_attn.o_proj -> mlp.gate_proj/up_proj, both consumed
+        within this block via the residual stream). If the target comes at the
+        same position or *earlier* (e.g. mlp.down_proj -> self_attn.q/k/v), the
+        dependency wraps around: this block's output feeds the *next* block's
+        input via the residual stream, so the coupled cascade must target
+        ``block_id + 1``.
+
+        Every output-writing layer touches every later block too (residual
+        skip connections), but ``coupled_masks_all`` already forces one shared
+        mask across all blocks' residual writers, so cascading strictly one
+        block ahead is sufficient -- that next block's own cascade continues
+        the chain from there.
+        """
+        path_list = getattr(scheme, "path_list", None)
+        if not path_list:
+            return scheme.block_id
+        try:
+            source_pos = path_list.index(scheme.name)
+            target_pos = path_list.index(next_layer)
+        except ValueError:
+            return scheme.block_id
+        return scheme.block_id + 1 if target_pos <= source_pos else scheme.block_id
+
     def _coupled_targets(self):
         """Resolve dependent (next) layer modules from generic pruning indexing.
 
@@ -286,10 +315,17 @@ class StructuredPruner(Compressor):
 
         from ..utils.utils import get_submodule  # lazy: avoid import cycle
 
+        num_blocks = getattr(scheme, "num_blocks", None)
         targets = []
         for next_layer in next_layers:
+            target_block_id = self._target_block_id(scheme, next_layer)
+            if num_blocks is not None and target_block_id >= num_blocks:
+                # No next block to cascade into (e.g. the last block's mlp
+                # output feeds the final norm / lm_head, not a self_attn --
+                # those consumers aren't wired into path_list/pruning yet).
+                continue
             full_path = scheme.path_template.format(
-                block_index=scheme.block_id, path=next_layer
+                block_index=target_block_id, path=next_layer
             )
             targets.append(get_submodule(scheme.model, full_path))
         return targets
