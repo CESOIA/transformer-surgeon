@@ -172,10 +172,102 @@ def apply_rope_multihead(
     
     return out
 
+def _derive_rope_prune_pattern(
+        keep_mask: torch.Tensor,
+        head_dim: int,
+        num_heads: int,
+        source: str = "",
+        ):
+    """Extract the length-``head_dim//2`` rotary keep-pattern from a
+    structured-pruning keep mask over a q/k projection's full output rows.
+
+    Prunable RoPE requires:
+      * the same keep pattern in every head (so one projection works for all
+        heads at once);
+      * each rotary frequency's "real" and "imaginary" channels (indices ``i``
+        and ``i + head_dim//2`` within a head, see ``apply_rope_multihead``)
+        kept or pruned together, since they share one ``cos``/``sin`` value.
+
+    Both are satisfied for free by ``structured_pruning`` with
+    ``granularity=head_dim // 2`` and ``repeated_pattern=True``: scores are
+    reduced in contiguous chunks of size ``head_dim // 2`` (real chunk, then
+    imaginary chunk, per head -- see ``reduce_pattern_scores``), and the
+    resulting length-``head_dim // 2`` pattern is tiled back over *every*
+    chunk, so frequency ``i`` gets one keep/prune decision shared by the real
+    channel, the imaginary channel, and every head at once. (A coarser
+    ``granularity=head_dim`` only enforces the first bullet, not the second.)
+
+    Returns the length-``head_dim//2`` boolean pattern (True = keep that
+    rotary frequency). Raises ``ValueError`` if either requirement is broken.
+    """
+    if keep_mask.numel() != num_heads * head_dim:
+        raise ValueError(
+            f"{source}: rope_prune_mask has {keep_mask.numel()} entries, expected "
+            f"num_heads * head_dim = {num_heads} * {head_dim} = {num_heads * head_dim}."
+        )
+
+    pattern = keep_mask.view(num_heads, head_dim)
+    if not torch.all(pattern == pattern[0:1]):
+        raise ValueError(
+            f"{source}: prunable RoPE requires the same keep pattern in every head "
+            "(structured_pruning with granularity=head_dim // 2 and repeated_pattern=True); "
+            "got a mask that differs across heads."
+        )
+    pattern = pattern[0]
+
+    half = head_dim // 2
+    real, imag = pattern[:half], pattern[half:]
+    if not torch.equal(real, imag):
+        raise ValueError(
+            f"{source}: prunable RoPE requires each rotary frequency's real/imaginary "
+            "channel pair (indices i and i + head_dim//2) to be kept or pruned together "
+            "(structured_pruning with granularity=head_dim // 2 and repeated_pattern=True); "
+            "got a mask that splits a pair."
+        )
+    return real
+
+
+def build_rope_prune_projection(
+        q_keep_mask: torch.Tensor,
+        k_keep_mask: torch.Tensor,
+        head_dim: int,
+        q_num_heads: int,
+        k_num_heads: int,
+        ):
+    """Build the static 0/1 selection matrix that projects full-size RoPE
+    ``cos``/``sin`` (``head_dim//2`` entries) down to the rotary frequencies
+    surviving structured pruning of q_proj/k_proj.
+
+    q_proj and k_proj are coupled (``pruning.position_linked``) and must have
+    been pruned with a shared mask, so both reduce to the identical
+    length-``head_dim//2`` pattern; this is checked explicitly here.
+
+    Returns a ``(kept_freqs, head_dim//2)`` float tensor with exactly one 1
+    per row (selecting the corresponding kept frequency); ``cos_pruned = cos
+    @ proj.t()`` (and likewise for ``sin``).
+    """
+    q_pattern = _derive_rope_prune_pattern(q_keep_mask, head_dim, q_num_heads, source="q_proj")
+    k_pattern = _derive_rope_prune_pattern(k_keep_mask, head_dim, k_num_heads, source="k_proj")
+    if not torch.equal(q_pattern, k_pattern):
+        raise ValueError(
+            "Prunable RoPE requires q_proj and k_proj to be pruned with the same "
+            "shared mask (they are coupled via pruning.position_linked / "
+            "pruning.coupled_masks -- use manager.auto_groups() + share_mask=True), "
+            "so a single cos/sin projection is valid for both. Got two different "
+            "rotary keep patterns."
+        )
+
+    kept_idx = torch.nonzero(q_pattern, as_tuple=True)[0]
+    proj = torch.zeros(kept_idx.numel(), q_pattern.numel(), dtype=torch.float32)
+    proj[torch.arange(kept_idx.numel()), kept_idx] = 1.0
+    return proj
+
+
 __all__ = [
     "precompute_mrope_inv_freqs",
     "precompute_mrope_cos_sin_half",
     "precompute_rope_inv_freqs",
     "precompute_rope_cos_sin_half",
     "apply_rope_multihead",
+    "build_rope_prune_projection",
 ]

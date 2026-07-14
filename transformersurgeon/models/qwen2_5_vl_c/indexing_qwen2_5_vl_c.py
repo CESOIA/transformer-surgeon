@@ -133,6 +133,13 @@ QWEN2_5_VL_C_INDEXING = {
                 ['self_attn.o_proj', 'mlp.down_proj', 'preprocessing'],
             ],
             'per_head_uniform': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
+            # position_linked: layers whose output rows are indexed by RoPE
+            # position (q/k head slices are paired 1:1 with rotary sin/cos
+            # bands). Hard structured pruning removes rows by importance score,
+            # not by contiguous rotary band, which desyncs the surviving rows
+            # from the positional embedding they were paired with -- see the
+            # warning raised in StructuredPruner.apply (structured_pruning.py).
+            'position_linked': ['self_attn.q_proj', 'self_attn.k_proj'],
             # Normalization layers: transparent to the embedding/hidden size,
             # never user-compressible, and only ever pruned by forwarding a
             # mask through them (see CoupledPruner.apply_chain).

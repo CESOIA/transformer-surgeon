@@ -88,6 +88,10 @@ class CompressionScheme:
         # plumbed in by the manager so compressors can resolve coupled targets
         # without the manager itself orchestrating them.
         self.pruning_indexing = pruning_indexing or {}
+        # Whether this layer's output rows are indexed by positional embedding
+        # (RoPE q/k projections; see e.g. llama_c's pruning.position_linked).
+        # Consumed by StructuredPruner.apply to warn before hard-pruning it.
+        self.position_linked = name in self.pruning_indexing.get('position_linked', ())
         self.path_template = path_template
         # Flattened per-block layer order and total block count, so coupled
         # pruning can tell whether an output_dependence target sits later in

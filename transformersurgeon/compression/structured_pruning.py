@@ -281,6 +281,15 @@ class StructuredPruner(Compressor):
             # Soft effect (STE): register the mask buffer and zero pruned rows.
             # Runs for both a soft apply and the first hard apply.
             module.register_buffer("weight_mask", mask)
+            if getattr(self.scheme, "position_linked", False):
+                # RoPE-dependent layer (q_proj/k_proj): keep a copy of the
+                # full-length keep mask around under its own name, in both
+                # soft and hard mode. Unlike weight_mask -- which _hard_remove
+                # drops once it no longer matches the resized weight -- this
+                # buffer is never removed, so blocks/mha.py can look it up
+                # after hard pruning to build the RoPE cos/sin projection
+                # (see build_rope_prune_projection in blocks/rope.py).
+                module.register_buffer("rope_prune_mask", mask.clone())
             with torch.no_grad():
                 dtype = module.weight.dtype
                 if _is_embedding(module):
@@ -295,6 +304,19 @@ class StructuredPruner(Compressor):
                         module.bias.mul_(mask.to(dtype))
 
         if hard:
+            if getattr(self.scheme, "position_linked", False):
+                path = self.scheme.path if self.scheme is not None else "<unknown>"
+                logger.warning(
+                    "Hard structured pruning of '%s' removes rows out of positional order, "
+                    "desyncing the surviving q/k rows from the rotary (RoPE) positions they "
+                    "were paired with. The result is numerically broken in torch/HF "
+                    "(model.generate/forward will produce garbage) -- hard pruning of "
+                    "position-linked projections is only safe as a final step right before "
+                    "export to a backend that re-derives/bakes rotary indices for the pruned "
+                    "layout. For training/testing/evaluation in torch or HF, use soft pruning "
+                    "(apply(hard=False)) instead.",
+                    path,
+                )
             # Actual neuron removal + matrix resizing, then cascade the input
             # pruning to any dependent (next) layers.
             self._hard_remove(module, mask)

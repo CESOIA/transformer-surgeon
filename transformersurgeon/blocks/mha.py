@@ -3,7 +3,7 @@
 import math
 import torch
 import torch.nn.functional as F
-from .rope import apply_rope_multihead
+from .rope import apply_rope_multihead, build_rope_prune_projection
 from . import LinearCompressed  
 
 def attention(query, key, value, attn_mask=None):
@@ -148,10 +148,16 @@ class MHABase(torch.nn.Module):
         k_lrd_rank = compression_config["k_proj"]["lrd"]["rank"]
         v_lrd_rank = compression_config["v_proj"]["lrd"]["rank"]
         out_lrd_rank = compression_config["out_proj"]["lrd"]["rank"]
-        # TODO: structured-pruning-aware sizing for attention. Unlike MLP, pruning
-        # q/k/v changes head_dim (and under GQA the v->o coupling is not 1:1), so the
-        # converted attention block would also need head_dim/num_heads updates.
-        # Deferred: only MLP structured pruning is honored in the converted graph.
+        # Structured-pruning-aware sizing for attention, partially resolved:
+        # q_proj/k_proj may now be hard-pruned (their head_dim shrinks) -- forward()
+        # below reads their *current* out_features rather than a fixed head_dim, and
+        # _project_rope projects RoPE's cos/sin to match when they're position_linked.
+        # Still TODO: v_proj. Pruning it shrinks attn_output's last dim, and under GQA
+        # the v->o coupling is not 1:1 (repeat_interleave duplicates each kv head's
+        # slice group_size times before o_proj, so CoupledPruner's plain index-select
+        # on o_proj's input columns -- sized off v_proj's un-expanded mask -- doesn't
+        # line up); out_proj's in_features and the reshape after attention are not
+        # adjusted for a pruned v_proj.
 
         self.q_proj = LinearCompressed(
             embed_dim,
@@ -178,6 +184,72 @@ class MHABase(torch.nn.Module):
             rank=out_lrd_rank,
             dtype=dtype)
 
+        # Cached RoPE-frequency selection matrix for pruned q/k (see
+        # _project_rope below). None until (and unless) q_proj/k_proj are
+        # hard-pruned; rebuilt lazily the first time it's needed.
+        self.register_buffer("rope_freq_proj", None, persistent=False)
+
+    def _project_rope(self, cos, sin):
+        """Project precomputed RoPE ``cos``/``sin`` down to the pruned rotary
+        dimension, when structured pruning has hard-pruned q_proj/k_proj.
+
+        Structured pruning of a position-linked q_proj/k_proj (see
+        ``pruning.position_linked`` in the model's indexing) only removes
+        output rows -- it does not know which rotary frequency each surviving
+        row corresponds to. ``cos``/``sin`` are still precomputed at the
+        original (unpruned) head_dim, so they must be re-indexed with the
+        exact same keep pattern before being applied to the now-narrower
+        q/k, via a small static 0/1 projection matrix built from the
+        pruning mask (``build_rope_prune_projection`` in ``blocks/rope.py``).
+
+        No-op (returns cos/sin unchanged) if q_proj/k_proj are not pruned.
+        Raises ``ValueError`` if only one of q_proj/k_proj was pruned, since
+        the pair must always be pruned together for RoPE to remain valid.
+        """
+        q_head_dim = self.q_proj.out_features // self.num_heads
+        k_head_dim = self.k_proj.out_features // self.kv_num_heads
+        q_pruned = q_head_dim < self.head_dim
+        k_pruned = k_head_dim < self.head_dim
+
+        if not q_pruned and not k_pruned:
+            return cos, sin
+
+        if q_pruned != k_pruned:
+            raise ValueError(
+                "Structured pruning was applied to only one of q_proj/k_proj "
+                f"(head_dim: q_proj={q_head_dim}, k_proj={k_head_dim}, original="
+                f"{self.head_dim}). RoPE requires q_proj and k_proj to be pruned "
+                "together (they are coupled via pruning.position_linked / "
+                "pruning.coupled_masks) -- prune both with a shared mask, or "
+                "neither."
+            )
+
+        if q_head_dim != k_head_dim:
+            raise ValueError(
+                f"q_proj and k_proj were pruned to different head dims "
+                f"({q_head_dim} vs {k_head_dim}); RoPE requires them to match."
+            )
+
+        proj = self.rope_freq_proj
+        if proj is None or proj.shape[0] != q_head_dim // 2:
+            q_mask = getattr(self.q_proj, "rope_prune_mask", None)
+            k_mask = getattr(self.k_proj, "rope_prune_mask", None)
+            if q_mask is None or k_mask is None:
+                raise ValueError(
+                    "q_proj/k_proj head_dim has shrunk but no rope_prune_mask was "
+                    "recorded by structured pruning; cannot determine which rotary "
+                    "frequencies survived. This should not happen if pruning went "
+                    "through StructuredPruner on a position_linked scheme."
+                )
+            proj = build_rope_prune_projection(
+                q_mask, k_mask, self.head_dim, self.num_heads, self.kv_num_heads,
+            )
+            self.rope_freq_proj = proj.to(device=cos.device, dtype=cos.dtype)
+            proj = self.rope_freq_proj
+
+        proj = proj.to(device=cos.device, dtype=cos.dtype)
+        return cos @ proj.t(), sin @ proj.t()
+
 class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -185,17 +257,21 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
     def forward(self, x, rope=None):
         seq_length, embed_dim = x.size()
         
-        # Project inputs to Q, K, V
-        q = self.q_proj(x).view(seq_length, self.num_heads, self.head_dim).transpose(0, 1) # (num_heads, seq_length, head_dim)
-        k = self.k_proj(x).view(seq_length, self.kv_num_heads, self.head_dim).transpose(0, 1) # (kv_num_heads, seq_length, head_dim)
+        # Project inputs to Q, K, V. q_proj/k_proj's per-head dim may be smaller
+        # than self.head_dim if position-linked structured pruning hard-pruned
+        # them (see _project_rope) -- v_proj is uncoupled from that pruning and
+        # always keeps self.head_dim.
+        q = self.q_proj(x).view(seq_length, self.num_heads, self.q_proj.out_features // self.num_heads).transpose(0, 1) # (num_heads, seq_length, q_head_dim)
+        k = self.k_proj(x).view(seq_length, self.kv_num_heads, self.k_proj.out_features // self.kv_num_heads).transpose(0, 1) # (kv_num_heads, seq_length, k_head_dim)
         v = self.v_proj(x).view(seq_length, self.kv_num_heads, self.head_dim).transpose(0, 1) # (kv_num_heads, seq_length, head_dim)
 
         # Apply RoPE
         if rope is not None:
             cos, sin = rope
+            cos, sin = self._project_rope(cos, sin)
             q = apply_rope_multihead(q, cos, sin)
             k = apply_rope_multihead(k, cos, sin)
-        
+
         # Scaled dot-product attention
         if self.use_sdpa:
             attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
@@ -386,15 +462,23 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         if value_cache is None:
             value_cache = self.value_cache
 
-        # Project inputs to Q, K, V
-        q = self.q_proj(x).view(in_seq_len, self.num_heads, self.head_dim) # (in_seq_len, num_heads, head_dim)
-        k = self.k_proj(x).view(in_seq_len, self.kv_num_heads, self.head_dim) # (in_seq_len, kv_num_heads, head_dim)
+        # Project inputs to Q, K, V. q_proj/k_proj's per-head dim may be smaller
+        # than self.head_dim if position-linked structured pruning hard-pruned
+        # them (see _project_rope) -- v_proj is uncoupled from that pruning and
+        # always keeps self.head_dim. NOTE: key_cache/value_cache below are
+        # still allocated at self.head_dim (attention resizing for the causal
+        # KV-cache is a separate, not-yet-supported piece of work -- see the
+        # TODO in MHABase.__init__), so a hard-pruned k_proj will fail at the
+        # cache write below, not silently produce wrong results.
+        q = self.q_proj(x).view(in_seq_len, self.num_heads, self.q_proj.out_features // self.num_heads) # (in_seq_len, num_heads, q_head_dim)
+        k = self.k_proj(x).view(in_seq_len, self.kv_num_heads, self.k_proj.out_features // self.kv_num_heads) # (in_seq_len, kv_num_heads, k_head_dim)
         v = self.v_proj(x).view(in_seq_len, self.kv_num_heads, self.head_dim) # (in_seq_len, kv_num_heads, head_dim)
 
         # Apply RoPE
         if rope is not None:
             cos = rope[0][pos_id]
             sin = rope[1][pos_id]
+            cos, sin = self._project_rope(cos, sin)
             q = apply_rope_multihead(q, cos, sin)
             k = apply_rope_multihead(k, cos, sin)
 
