@@ -354,6 +354,7 @@ def _apply_torchao_hard_quantization(module, precision, granularity: str) -> Non
 
     quantize_(module, config)
 
+    quantized_any = False
     for m in module.modules():
         if not isinstance(m, nn.Linear):
             continue
@@ -364,11 +365,23 @@ def _apply_torchao_hard_quantization(module, precision, granularity: str) -> Non
             continue
         if not isinstance(w, torch.Tensor):
             continue
+        quantized_any = True
         m._torchao_precision = precision
         scale = _extract_aqt_scale(w)
         if scale is not None:
             m.register_buffer("_torchao_scale", scale)
             m._torchao_per_channel = scale.numel() > 1
+
+    if not quantized_any and not isinstance(module, nn.Linear):
+        # torchao's quantize_() only dispatches to nn.Linear submodules in this
+        # version -- on anything else (Conv2dCompressed/Conv3dCompressed,
+        # EmbeddingCompressed, ...) it silently leaves the weight untouched.
+        # Fail loudly instead of returning a model that looks quantized but isn't.
+        raise NotImplementedError(
+            f"Hard (torchao) quantization is not supported for {type(module).__name__} "
+            "in this torchao version (quantize_() only targets nn.Linear and made no "
+            "change here). Use soft quantization (hard=False) instead."
+        )
 
 
 ### CONFIGURATION VALIDATORS ###

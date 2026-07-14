@@ -33,10 +33,12 @@ VIT_C_INDEXING = {
         # Structured-pruning annotations (see llama_c for field semantics).
         'pruning': {
             'output_dependence': {
-                # 'vit.embeddings' is a composite module (patch-embed conv +
-                # cls token + position embeddings), not a plain nn.Embedding,
-                # so it isn't given a CompressionScheme -- no 'preprocessing'
-                # sentinel here.
+                # 'vit.embeddings' as a whole is a composite module
+                # (patch-embed conv + cls token + position embeddings), not a
+                # plain nn.Embedding, so it isn't given a CompressionScheme --
+                # no 'preprocessing' sentinel here. Its patch-embed *conv*
+                # leaf (vit.embeddings.patch_embeddings.projection) is
+                # separately compressible though -- see 'preprocessing_conv'.
                 #
                 # ViT is pre-norm: layernorm_after sits between
                 # attention.o_proj's (residual-summed) output and mlp.fc1's
@@ -44,6 +46,11 @@ VIT_C_INDEXING = {
                 # block's layernorm_before, or, on the last block,
                 # 'final_norm' (vit.layernorm, the pre-classifier norm kept
                 # in extra_layers) -> 'final_layer' (classifier).
+                # 'preprocessing_conv' is a sentinel: the conv's output feeds
+                # block 0's residual stream via layernorm_before. Resolved
+                # directly (no block_index) by the manager/structured pruner,
+                # not via path_template.
+                'preprocessing_conv': ['layernorm_before'],
                 'mlp.fc1': ['mlp.fc2'],
                 'mlp.fc2': ['layernorm_before', 'final_norm'],
                 'layernorm_before': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
@@ -58,9 +65,10 @@ VIT_C_INDEXING = {
                 ['attention.q_proj', 'attention.k_proj'],
             ],
             # coupled_masks_all: share ONE output mask across ALL blocks (the
-            # residual/hidden-dim writers).
+            # residual/hidden-dim writers). 'preprocessing_conv' joins this
+            # set as the residual stream's initial writer.
             'coupled_masks_all': [
-                ['attention.o_proj', 'mlp.fc2'],
+                ['attention.o_proj', 'mlp.fc2', 'preprocessing_conv'],
             ],
             'per_head_uniform': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
             # Normalization layers: transparent to the embedding/hidden size,
@@ -71,6 +79,16 @@ VIT_C_INDEXING = {
         'path_template': "vit.layers.{block_index}.{path}",
         'qkv_paths': [],
         'preprocessing': "vit.embeddings",
+        'preprocessing_conv': "vit.embeddings.patch_embeddings.projection",
+        # cls_token/position_embeddings are concatenated/added directly to
+        # the conv's output along the hidden dim inside ViTEmbeddings (a
+        # composite module, hence no 'preprocessing' scheme) -- hard-pruning
+        # 'preprocessing_conv' also index-selects these along their last dim
+        # with the same mask, see StructuredPruner._prune_extra_params.
+        'preprocessing_conv_extra_params': [
+            "vit.embeddings.cls_token",
+            "vit.embeddings.position_embeddings",
+        ],
         'final_layer': "classifier",
         'final_norm': "vit.layernorm",
 

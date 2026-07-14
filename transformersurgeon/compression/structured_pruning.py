@@ -55,6 +55,20 @@ def _is_embedding(module) -> bool:
     return isinstance(module, EmbeddingCompressed)
 
 
+def _score_view(weight):
+    """Flatten a >2-D weight (e.g. a Conv2d/Conv3d kernel, ``[out, in, *k]``)
+    to ``[out, -1]`` before scoring.
+
+    ``score_magnitude``/``score_gradient`` reduce over exactly dim 1, so a
+    4-D/5-D conv weight would otherwise leave the kernel dims un-reduced
+    (wrong-shaped score tensor). A pure dimensionality check, not a
+    conv-specific one -- ``out_channels`` is already dim 0 for a conv, same
+    convention as ``LinearCompressed``'s ``out_features``, so no axis flip is
+    needed, just flattening the trailing dims into one.
+    """
+    return weight.reshape(weight.shape[0], -1) if weight.dim() > 2 else weight
+
+
 class StructuredPruner(Compressor):
     def __init__(self, config):
         self.config = config
@@ -128,9 +142,11 @@ class StructuredPruner(Compressor):
         if score_fn is None:
             raise ValueError(f"Unsupported structured pruning method '{method}'.")
         weight = module.weight.t() if _is_embedding(module) else module.weight
+        weight = _score_view(weight)
         if method == "gradient":
             weight_grad = self.calibration_store["weight_grad"]
             weight_grad = weight_grad.t() if _is_embedding(module) else weight_grad
+            weight_grad = _score_view(weight_grad)
             return score_fn(weight, weight_grad)
         return score_fn(weight)
 
@@ -270,7 +286,11 @@ class StructuredPruner(Compressor):
                 if _is_embedding(module):
                     module.weight.mul_(mask.unsqueeze(0).to(dtype))
                 else:
-                    module.weight.mul_(mask.unsqueeze(1).to(dtype))
+                    # view(-1, 1, ..., 1) broadcasts over dim 0 regardless of
+                    # weight's rank -- identical to unsqueeze(1) for a 2-D
+                    # Linear weight, and also correct for a >2-D conv kernel.
+                    broadcast_mask = mask.view(-1, *([1] * (module.weight.dim() - 1)))
+                    module.weight.mul_(broadcast_mask.to(dtype))
                     if module.bias is not None:
                         module.bias.mul_(mask.to(dtype))
 
@@ -279,6 +299,7 @@ class StructuredPruner(Compressor):
             # pruning to any dependent (next) layers.
             self._hard_remove(module, mask)
             self._cascade_coupled(mask, hard=True)
+            self._prune_extra_params(mask)
 
     def _hard_remove(self, module, mask):
         """Remove pruned output rows and resize weight/bias/out_features in place."""
@@ -301,7 +322,11 @@ class StructuredPruner(Compressor):
                     new_bias = module.bias.detach()[keep].clone()
                 module.bias = nn.Parameter(new_bias, requires_grad=module.bias.requires_grad)
 
-            module.out_features = int(keep.sum().item())
+            new_out = int(keep.sum().item())
+            if hasattr(module, "out_channels"):
+                module.out_channels = new_out
+            else:
+                module.out_features = new_out
 
         # The 1-D mask no longer matches the resized weight; drop it.
         module._buffers.pop("weight_mask", None)
@@ -445,6 +470,38 @@ class StructuredPruner(Compressor):
         for chain in self._coupled_target_chains():
             CoupledPruner().apply_chain(chain, mask, hard=hard)
 
+    def _prune_extra_params(self, mask):
+        """Index-select the last dim of any raw nn.Parameters co-located with
+        'preprocessing_conv' (e.g. ViT's cls_token/position_embeddings) by
+        the same keep-mask used to hard-prune the conv's out_channels.
+
+        These aren't CompressionScheme members -- they're plain Parameters
+        directly concatenated/added to the conv's output along the hidden
+        dim inside the same composite preprocessing wrapper (ViTEmbeddings),
+        so ordinary coupled-cascade (which only walks output_dependence
+        module targets) can't reach them. Only fires for the
+        'preprocessing_conv' scheme itself (the sole writer of these params);
+        every other member of its coupled_masks_all group shares this exact
+        mask but has no extra_params_paths of its own (see manager.py).
+        """
+        scheme = self.scheme
+        if scheme is None or scheme.name != "preprocessing_conv":
+            return
+        extra_paths = getattr(scheme, "preprocessing_conv_extra_params_paths", None) or ()
+        if not extra_paths:
+            return
+
+        from ..utils.utils import get_submodule  # lazy: avoid import cycle
+
+        keep = mask.to(torch.bool)
+        for path in extra_paths:
+            parent_path, _, attr = path.rpartition(".")
+            parent = get_submodule(scheme.model, parent_path) if parent_path else scheme.model
+            param = getattr(parent, attr)
+            with torch.no_grad():
+                new_param = param.detach()[..., keep].clone()
+            setattr(parent, attr, nn.Parameter(new_param, requires_grad=param.requires_grad))
+
     # ----------------------------------------------------------------- restore
 
     def restore(self, module):
@@ -472,7 +529,8 @@ class StructuredPruner(Compressor):
             if _is_embedding(module):
                 module.weight.mul_(mask.unsqueeze(0).to(dtype))
             else:
-                module.weight.mul_(mask.unsqueeze(1).to(dtype))
+                broadcast_mask = mask.view(-1, *([1] * (module.weight.dim() - 1)))
+                module.weight.mul_(broadcast_mask.to(dtype))
                 if module.bias is not None:
                     module.bias.mul_(mask.to(dtype))
 

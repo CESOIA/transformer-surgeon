@@ -26,23 +26,51 @@ QWEN2_5_VL_C_INDEXING = {
         },
         # Structured-pruning annotations (see llama_c). Vision attention uses a
         # fused qkv projection, so only the gated MLP intermediate is cleanly prunable.
+        #
+        # 'model.visual.patch_embed' as a whole is a thin reshape+conv3d+reshape
+        # wrapper, not a bare Conv3d, so it isn't given a CompressionScheme --
+        # no 'preprocessing' sentinel here. Its conv leaf
+        # (model.visual.patch_embed.proj) is separately compressible though --
+        # see 'preprocessing_conv'.
+        #
+        # Pre-norm: norm1 sits between the previous block's (residual-summed)
+        # output and attn.qkv's input; norm2 sits between attn.proj's output
+        # and mlp.gate_proj/up_proj's input. 'model.visual.merger'
+        # ('final_layer') is a composite module (LayerNorm + MLP), not a
+        # plain nn.Linear, so it isn't given a scheme either -- the last
+        # block's cascade has nothing further to reach, same as before.
         'pruning': {
             'output_dependence': {
+                # 'preprocessing_conv' is a sentinel: the conv's output feeds
+                # block 0's residual stream via norm1. Resolved directly (no
+                # block_index) by the manager/structured pruner, not via
+                # path_template.
+                'preprocessing_conv': ['norm1'],
+                'norm1': ['attn.qkv'],
                 'mlp.gate_proj': ['mlp.down_proj'],
                 'mlp.up_proj': ['mlp.down_proj'],
-                'mlp.down_proj': ['attn.qkv'],
-                'attn.proj': ['mlp.up_proj', 'mlp.gate_proj'],
+                'mlp.down_proj': ['norm1'],
+                'attn.proj': ['norm2'],
+                'norm2': ['mlp.up_proj', 'mlp.gate_proj'],
             },
             'coupled_masks': [
                 ['mlp.gate_proj', 'mlp.up_proj'],
             ],
+            # coupled_masks_all: share ONE output mask across ALL blocks (the
+            # residual/hidden-dim writers). 'preprocessing_conv' joins this
+            # set as the residual stream's initial writer.
             'coupled_masks_all': [
-                ['attn.proj', 'mlp.down_proj'],
+                ['attn.proj', 'mlp.down_proj', 'preprocessing_conv'],
             ],
             'per_head_uniform': [],
+            # Normalization layers: transparent to the embedding/hidden size,
+            # never user-compressible, and only ever pruned by forwarding a
+            # mask through them (see CoupledPruner.apply_chain).
+            'norm_layers': ['norm1', 'norm2'],
         },
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'preprocessing': "model.visual.patch_embed",
+        'preprocessing_conv': "model.visual.patch_embed.proj",
         'final_layer': "model.visual.merger",
         'pruning_supported': [],
     },

@@ -45,6 +45,13 @@ class LRDer(Compressor):
         self.config["eps"] = eps
 
         if rank and not soft_applied:
+            if module.weight.dim() > 2:
+                raise ValueError(
+                    f"LRD is not supported for a {module.weight.dim()}-D weight "
+                    f"({type(module).__name__}, e.g. a Conv2d/Conv3d patch-embed "
+                    "kernel) -- low-rank factorization only applies to a 2-D matmul "
+                    "weight. Use structured pruning or quantization instead."
+                )
             with torch.no_grad():
 
                 # To maintain flexibility for future methods, we handle methods with different input requirements separately.

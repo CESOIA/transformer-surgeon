@@ -9,6 +9,7 @@ import torch
 from typing import Union
 from ..blocks import LinearCompressed
 from ..blocks import EmbeddingCompressed
+from ..blocks import Conv2dCompressed, Conv3dCompressed
 from ..blocks import VCONBlock
 from ..compression import (
     COMPRESSOR_DICT,
@@ -70,6 +71,7 @@ class CompressionScheme:
             preprocessing_path=None,
             final_layer_path=None,
             final_norm_path=None,
+            preprocessing_conv_extra_params_paths=None,
             is_norm=False,
             ):
         self.name = name
@@ -99,6 +101,16 @@ class CompressionScheme:
         self.preprocessing_path = preprocessing_path
         self.final_layer_path = final_layer_path
         self.final_norm_path = final_norm_path
+        # Dotted paths (relative to the model root) of raw nn.Parameters that
+        # live alongside 'preprocessing_conv' in the same composite
+        # preprocessing wrapper (e.g. ViT's cls_token/position_embeddings,
+        # concatenated/added directly to the conv's output along the hidden
+        # dim) and therefore must be index-selected on their last dim in sync
+        # with the conv's hard-pruning mask -- see
+        # StructuredPruner._prune_extra_params. Only meaningful on the
+        # 'preprocessing_conv' scheme itself; empty for models without such
+        # extra params (e.g. Qwen-VL's patch_embed, a bare reshape+conv).
+        self.preprocessing_conv_extra_params_paths = preprocessing_conv_extra_params_paths or []
         # Normalization layers (e.g. RMSNorm/LayerNorm) get a scheme so the
         # manager/coupled-pruning cascade can route through them, but they are
         # never user-compressible (see set() below) -- pruning only ever
@@ -289,6 +301,8 @@ class CompressionScheme:
         Compatible modules:
             - LinearCompressed
             - EmbeddingCompressed
+            - Conv2dCompressed
+            - Conv3dCompressed
 
         Returns:
             bool: True if the module is compatible, False otherwise.
@@ -298,6 +312,8 @@ class CompressionScheme:
         module_type = type(self.get_module())
         compatible = compatible or module_type is LinearCompressed
         compatible = compatible or module_type is EmbeddingCompressed
+        compatible = compatible or module_type is Conv2dCompressed
+        compatible = compatible or module_type is Conv3dCompressed
 
         return compatible
     

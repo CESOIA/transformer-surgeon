@@ -19,15 +19,19 @@ from .scheme import CompressionScheme
 from .grouping import SchemeGroup
 from .utils import flatten_index_paths, get_submodule
 from .cascade import apply_cascade
-from ..blocks import LinearCompressed, EmbeddingCompressed
+from ..blocks import LinearCompressed, EmbeddingCompressed, Conv2dCompressed, Conv3dCompressed
 
-# Sentinel layer names used by 'preprocessing'/'final_layer' entries in
-# pruning.output_dependence / pruning.coupled_masks[_all] -- resolved directly
-# from indexing['preprocessing']/['final_layer'] rather than via
-# path_template.format(block_index=..., path=...).
+# Sentinel layer names used by 'preprocessing'/'final_layer'/'preprocessing_conv'
+# entries in pruning.output_dependence / pruning.coupled_masks[_all] -- resolved
+# directly from indexing['preprocessing']/['final_layer']/['preprocessing_conv']
+# rather than via path_template.format(block_index=..., path=...). Values are
+# the compressed type(s) replace_layers_upon_init must have actually
+# substituted for a scheme to be built (a tuple when more than one type is
+# acceptable, e.g. Conv2d vs Conv3d patch-embed).
 _SENTINEL_COMPRESSED_TYPE = {
-    "preprocessing": EmbeddingCompressed,
-    "final_layer": LinearCompressed,
+    "preprocessing": (EmbeddingCompressed,),
+    "final_layer": (LinearCompressed,),
+    "preprocessing_conv": (Conv2dCompressed, Conv3dCompressed),
 }
 
 class CompressionSchemesManager:
@@ -952,17 +956,30 @@ class CompressionSchemesManager:
             num_blocks = getattr(block_specific_config, num_blocks_attr, None)
             assert num_blocks is not None, f"Number of blocks attribute '{num_blocks_attr}' not found in the model configuration for block '{block_name}'. Please check the indexing configuration."
 
-            # Resolve the 'preprocessing'/'final_layer' singleton paths (if
-            # annotated and actually substituted with a compressed module by
-            # replace_layers_upon_init -- e.g. Conv2d patch-embed or composite
-            # BERT-style embeddings are not, and get no scheme).
+            # Resolve the 'preprocessing'/'final_layer'/'preprocessing_conv'
+            # singleton paths (if annotated and actually substituted with a
+            # compressed module by replace_layers_upon_init -- e.g. composite
+            # BERT-style embeddings are not, and get no scheme). 'preprocessing'
+            # is the nn.Embedding case; 'preprocessing_conv' is a separate,
+            # independently-annotated key for Conv2d/Conv3d patch-embed leaves
+            # (the whole preprocessing wrapper generally isn't itself a bare
+            # conv -- see e.g. vit_c/qwen2_5_vl_c indexing).
             preprocessing_path = self._resolve_sentinel_path(block_indexing, 'preprocessing')
+            preprocessing_conv_path = self._resolve_sentinel_path(block_indexing, 'preprocessing_conv')
             final_layer_path = self._resolve_sentinel_path(block_indexing, 'final_layer')
             # 'final_norm' (e.g. the post-block norm some families keep in
             # extra_layers) is never substituted with a different class -- no
             # type-check gate needed, just confirm the path resolves.
             final_norm_path = self._resolve_final_norm_path(block_indexing)
             norm_layers = set(block_indexing.get('pruning', {}).get('norm_layers', ()))
+            # Raw nn.Parameters (e.g. ViT's cls_token/position_embeddings)
+            # co-located with 'preprocessing_conv' in the same composite
+            # preprocessing wrapper, only meaningful if that sentinel actually
+            # resolved to a scheme (see CompressionScheme.preprocessing_conv_extra_params_paths).
+            preprocessing_conv_extra_params_paths = (
+                list(block_indexing.get('preprocessing_conv_extra_params', ()))
+                if preprocessing_conv_path is not None else []
+            )
 
             tmp_dict = {}
             for i in range(num_blocks):
@@ -986,11 +1003,13 @@ class CompressionSchemesManager:
                         preprocessing_path=preprocessing_path,
                         final_layer_path=final_layer_path,
                         final_norm_path=final_norm_path,
+                        preprocessing_conv_extra_params_paths=preprocessing_conv_extra_params_paths,
                         is_norm=path in norm_layers,
                     )
 
             for sentinel_name, full_path, sentinel_is_norm in (
                 ('preprocessing', preprocessing_path, False),
+                ('preprocessing_conv', preprocessing_conv_path, False),
                 ('final_layer', final_layer_path, False),
                 ('final_norm', final_norm_path, True),
             ):
@@ -1011,6 +1030,7 @@ class CompressionSchemesManager:
                     preprocessing_path=preprocessing_path,
                     final_layer_path=final_layer_path,
                     final_norm_path=final_norm_path,
+                    preprocessing_conv_extra_params_paths=preprocessing_conv_extra_params_paths,
                     is_norm=sentinel_is_norm,
                 )
 
@@ -1019,18 +1039,19 @@ class CompressionSchemesManager:
         return all_schemes
 
     def _resolve_sentinel_path(self, block_indexing, sentinel_name):
-        """Return the full path of a 'preprocessing'/'final_layer' indexing
-        entry if it's annotated *and* was actually substituted with its
-        compressed counterpart (EmbeddingCompressed/LinearCompressed) by
-        replace_layers_upon_init. Returns None otherwise (e.g. Conv2d
-        patch-embed, composite BERT-style embeddings, or unannotated).
+        """Return the full path of a 'preprocessing'/'final_layer'/
+        'preprocessing_conv' indexing entry if it's annotated *and* was
+        actually substituted with its compressed counterpart
+        (EmbeddingCompressed/LinearCompressed/Conv2dCompressed/
+        Conv3dCompressed) by replace_layers_upon_init. Returns None otherwise
+        (e.g. composite BERT-style embeddings, or unannotated).
         """
         full_path = block_indexing.get(sentinel_name)
         if not full_path:
             return None
         module = get_submodule(self.model, full_path)
-        expected_type = _SENTINEL_COMPRESSED_TYPE[sentinel_name]
-        if type(module) is not expected_type:
+        expected_types = _SENTINEL_COMPRESSED_TYPE[sentinel_name]
+        if type(module) not in expected_types:
             return None
         return full_path
 

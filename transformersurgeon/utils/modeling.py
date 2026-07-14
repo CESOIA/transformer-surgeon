@@ -2,7 +2,7 @@
 import warnings
 import torch
 from transformers import PretrainedConfig
-from ..blocks import LinearCompressed, EmbeddingCompressed
+from ..blocks import LinearCompressed, EmbeddingCompressed, Conv2dCompressed, Conv3dCompressed
 from typing import Dict, Any
 import math
 from .utils import flatten_index_paths
@@ -78,15 +78,41 @@ def replace_layers_upon_init(
 
                 setattr(parent_module, module_name, new_module)
 
-    # Substitute the singleton preprocessing/final_layer modules (not part of
-    # path_list's per-block loop -- each is a single, already-resolved path).
-    for full_path, compressed_cls, get_config in (
-        (indexing.get("preprocessing"), EmbeddingCompressed, _embedding_new_module_kwargs),
-        (indexing.get("final_layer"), LinearCompressed, _linear_new_module_kwargs),
+    # Substitute the singleton preprocessing/final_layer/preprocessing_conv
+    # modules (not part of path_list's per-block loop -- each is a single,
+    # already-resolved path).
+    for full_path, type_map, get_config in (
+        (indexing.get("preprocessing"), {torch.nn.Embedding: EmbeddingCompressed}, _embedding_new_module_kwargs),
+        (indexing.get("final_layer"), {torch.nn.Linear: LinearCompressed}, _linear_new_module_kwargs),
+        (indexing.get("preprocessing_conv"), _CONV_TYPE_MAP, _conv_new_module_kwargs),
     ):
         if not full_path:
             continue
-        _replace_singleton_layer(model, full_path, compressed_cls, get_config, config_dict)
+        _replace_singleton_layer(model, full_path, type_map, get_config, config_dict)
+
+
+# Conv patch-embed preprocessing: either Conv2d (e.g. ViT) or Conv3d (e.g.
+# Qwen-VL's temporal patches) -- the substituted class depends on which the
+# original module actually is.
+_CONV_TYPE_MAP = {
+    torch.nn.Conv2d: Conv2dCompressed,
+    torch.nn.Conv3d: Conv3dCompressed,
+}
+
+
+def _conv_new_module_kwargs(old_module, compression_config):
+    return dict(
+        in_channels=old_module.in_channels,
+        out_channels=old_module.out_channels,
+        kernel_size=old_module.kernel_size,
+        stride=old_module.stride,
+        padding=old_module.padding,
+        dilation=old_module.dilation,
+        groups=old_module.groups,
+        bias=old_module.bias is not None,
+        device=old_module.weight.device,
+        dtype=old_module.weight.dtype,
+    )
 
 
 def _linear_new_module_kwargs(old_module, compression_config):
@@ -112,17 +138,17 @@ def _embedding_new_module_kwargs(old_module, compression_config):
     )
 
 
-def _replace_singleton_layer(model, full_path, compressed_cls, get_config, config_dict):
+def _replace_singleton_layer(model, full_path, type_map, get_config, config_dict):
     """Substitute the module at ``full_path`` with its compressed counterpart.
 
-    Handles ``preprocessing``/``final_layer`` indexing entries: a single
-    concrete module path (no ``path_template``/block loop). Silently skips
-    (with a warning) modules whose type doesn't match what ``compressed_cls``
-    expects (e.g. Conv2d patch-embed preprocessing), since those aren't
-    supported yet.
+    Handles ``preprocessing``/``final_layer``/``preprocessing_conv`` indexing
+    entries: a single concrete module path (no ``path_template``/block loop).
+    ``type_map`` maps the original module's exact type to the compressed
+    class to substitute (more than one entry when several original types are
+    acceptable, e.g. Conv2d vs Conv3d patch-embed). Silently skips (with a
+    warning) modules whose type isn't in ``type_map`` (e.g. a composite
+    BERT-style embeddings module), since those aren't supported.
     """
-    expected_type = torch.nn.Linear if compressed_cls is LinearCompressed else torch.nn.Embedding
-
     split_path = full_path.split('.')
     parent_module = model
     for path_piece in split_path[:-1]:
@@ -133,11 +159,13 @@ def _replace_singleton_layer(model, full_path, compressed_cls, get_config, confi
     module_name = split_path[-1]
     old_module = getattr(parent_module, module_name, None)
 
-    if type(old_module) is not expected_type:
+    compressed_cls = type_map.get(type(old_module))
+    if compressed_cls is None:
         if old_module is not None:
+            expected_names = ", ".join(t.__name__ for t in type_map)
             warnings.warn(
                 f"Skipping compression substitution at '{full_path}': expected "
-                f"{expected_type.__name__}, got {type(old_module).__name__}."
+                f"one of ({expected_names}), got {type(old_module).__name__}."
             )
         return
 
