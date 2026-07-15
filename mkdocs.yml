@@ -30,6 +30,7 @@ plugins:
 nav:
   - Home: index.md
   - Concepts: concepts.md
+  - Compression Methods: compression_methods.md
   - Examples:
     - Basic LRD: examples/01_basic_lrd.md
     - Calibrated LRD (SVD-LLM-v2): examples/02_calibrated_lrd_svd_llm_v2.md
@@ -38,6 +39,9 @@ nav:
     - Compression:
       - Compressor (ABC): api/compression/abstract.md
       - LRDer: api/compression/lrd.md
+      - StructuredPruner: api/compression/structured_pruning.md
+      - UnstructuredPruner: api/compression/unstructured_pruning.md
+      - Quantizer: api/compression/quantization.md
       - Registry: api/compression/registry.md
     - Calibration:
       - RawDataCollector (ABC): api/calibration/raw_data_base.md

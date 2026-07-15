@@ -87,5 +87,6 @@ manager.restore()  # undo all compression, back to original weights
 ## Where to Go Next
 
 - [**Concepts**](concepts.md) — understand the mental model before diving into the API
+- [**Compression Methods**](compression_methods.md) — every compression type, method, and parameter, explained
 - [**Examples**](examples/01_basic_lrd.md) — runnable scripts for common workflows
 - [**API Reference**](api/utils/manager.md) — full method-level documentation

@@ -128,6 +128,8 @@ TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a C
 ## Compression Parameter Reference
 
 All parameters are set via `manager.set(compression_type, param, value, criteria=...)`.
+This is the terse lookup table; for a plain-language explanation of what each
+method/parameter actually does, see [docs/compression_methods.md](docs/compression_methods.md).
 
 ### `"lrd"` — Low-Rank Decomposition
 
