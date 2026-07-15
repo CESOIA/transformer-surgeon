@@ -149,26 +149,37 @@ class CompressionSchemesManager:
             property: The name of the property to set (e.g., 'ratio', 'rank')
             value: The value to set for the specified property
             criteria: List of criteria to filter modules (by name or block_id). No criteria = all
-            group: Optional group name. When given, the property is applied to every
-                scheme in that group and ``criteria`` must be None.
+            group: Optional group name. When given together with ``criteria``, the two
+                filters combine: ``criteria`` selects schemes as usual and the result is
+                then restricted to members of ``group``. When given alone, the property
+                is applied to every scheme in that group.
             verbose: If True, prints information about the setting process
 
         Group-only options (``GROUP_OPTIONS``, e.g. ``share_mask``, ``reduce_op``)
-        can only be set through ``group=``; setting one without a group raises.
-        Enabling a group option first resets the affected scheme's compression
-        config for that compression type to registry defaults.
+        can only be set through ``group=`` and apply to the whole group, so combining
+        them with ``criteria`` raises. Enabling a group option first resets the
+        affected scheme's compression config for that compression type to registry
+        defaults.
         """
         is_group_option = property in GROUP_OPTIONS.get(compression, [])
 
         if group is not None:
-            if criteria is not None:
-                raise ValueError(
-                    "Provide either 'group' or 'criteria', not both. When setting via a "
-                    "group the group defines the target schemes."
-                )
             if group not in self.groups:
                 raise ValueError(f"Unknown group '{group}'. Create it with create_group()/auto_groups() first.")
-            target_schemes = list(self.groups[group].schemes)
+            group_schemes = list(self.groups[group].schemes)
+            if criteria is not None:
+                if is_group_option:
+                    raise ValueError(
+                        f"'{property}' is a group-only option for '{compression}' and applies to the "
+                        "whole group -- it cannot be combined with 'criteria'."
+                    )
+                group_paths = {scheme.path for scheme in group_schemes}
+                target_schemes = [
+                    scheme for scheme in self.iter_filtered(criteria=criteria)
+                    if scheme.path in group_paths
+                ]
+            else:
+                target_schemes = group_schemes
         else:
             if is_group_option:
                 raise ValueError(
