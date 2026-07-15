@@ -76,6 +76,7 @@ class StructuredPruner(Compressor):
         self.method = self.config.get("method", self.config.get("criterion", "magnitude"))
         self.granularity = self.config.get("granularity", "layer")
         self.repeated_pattern = self.config.get("repeated_pattern", False)
+        self.coupled_repeated_pattern = self.config.get("coupled_repeated_pattern", False)
         self.share_mask = self.config.get("share_mask", False)
         self.reduce_op = self.config.get("reduce_op", None)
         self.calibration_store = None
@@ -152,18 +153,35 @@ class StructuredPruner(Compressor):
 
     # ------------------------------------------------------------------- masks
 
+    def _repeat_n(self):
+        """``None`` for "reduce/tile across every group" (``True``/``"max"``),
+        else the positive int N: reduce/tile in chunks of N consecutive groups.
+        """
+        rp = self.repeated_pattern
+        if rp is True or rp == "max":
+            return None
+        return int(rp)
+
     def _pattern_keep_mask(self, module):
-        """Length-``granularity`` keep-mask reduced across this layer's own groups."""
+        """Keep-mask pattern(s) reduced across this layer's own groups.
+
+        A single length-``granularity`` pattern when repeated_pattern is
+        ``True``/``"max"``; ``num_groups // N`` concatenated length-``granularity``
+        patterns (one per chunk of N consecutive groups) when repeated_pattern
+        is an int N.
+        """
         scores = self.get_scores(module)
-        pattern_scores = reduce_pattern_scores(scores, self.granularity, self.reduce_op)
-        # Prune int(ratio * granularity) positions within the single pattern.
-        return build_structured_mask(pattern_scores, self.ratio, "layer")
+        repeat = self._repeat_n()
+        pattern_scores = reduce_pattern_scores(scores, self.granularity, self.reduce_op, repeat=repeat)
+        # Prune int(ratio * granularity) positions within each pattern.
+        granularity = "layer" if repeat is None else self.granularity
+        return build_structured_mask(pattern_scores, self.ratio, granularity)
 
     def _own_mask(self, module):
         out_dim = module.weight.shape[1] if _is_embedding(module) else module.weight.shape[0]
         if self.repeated_pattern:
             pattern_mask = self._pattern_keep_mask(module)
-            return tile_pattern_mask(pattern_mask, out_dim)
+            return tile_pattern_mask(pattern_mask, out_dim, granularity=self.granularity, repeat=self._repeat_n())
         scores = self.get_scores(module)
         return build_structured_mask(scores, self.ratio, self.granularity)
 
@@ -198,14 +216,17 @@ class StructuredPruner(Compressor):
 
         kind, mask = cached["kind"], cached["mask"]
         if kind == "pattern":
-            return tile_pattern_mask(mask, module.weight.shape[0])
+            return tile_pattern_mask(
+                mask, module.weight.shape[0], granularity=self.granularity, repeat=cached.get("repeat")
+            )
         return mask
 
     def _compute_group_shared(self, group):
         """Reduce every member's scores into the group's shared mask/pattern."""
         if self.repeated_pattern:
-            # Each member contributes a length-granularity pattern; reduce across
-            # members, then build one pattern mask that all members tile.
+            # Each member contributes length-granularity pattern(s); reduce across
+            # members, then build the pattern mask(s) that all members tile.
+            repeat = self._repeat_n()
             pattern_list = []
             for sibling in group.schemes:
                 compressor = sibling.compressors.get("structured_pruning", None)
@@ -214,11 +235,14 @@ class StructuredPruner(Compressor):
                 sibling_module = sibling.get_compression_module()
                 sibling_scores = compressor.get_scores(sibling_module)
                 pattern_list.append(
-                    reduce_pattern_scores(sibling_scores, compressor.granularity, compressor.reduce_op)
+                    reduce_pattern_scores(
+                        sibling_scores, compressor.granularity, compressor.reduce_op, repeat=repeat
+                    )
                 )
             reduced = reduce_scores(pattern_list, self.reduce_op)
-            pattern_mask = build_structured_mask(reduced, self.ratio, "layer")
-            return {"kind": "pattern", "mask": pattern_mask}
+            granularity = "layer" if repeat is None else self.granularity
+            pattern_mask = build_structured_mask(reduced, self.ratio, granularity)
+            return {"kind": "pattern", "mask": pattern_mask, "repeat": repeat}
 
         # Full shared mask: members must share the same output dimension.
         score_list = []
@@ -251,6 +275,7 @@ class StructuredPruner(Compressor):
         validate_structured_pruning_method(method)
         validate_structured_pruning_granularity(granularity)
         validate_structured_pruning_repeated_pattern(self.repeated_pattern)
+        validate_structured_pruning_coupled_repeated_pattern(self.coupled_repeated_pattern)
         validate_structured_pruning_share_mask(self.share_mask)
         validate_structured_pruning_reduce_op(self.reduce_op)
 
@@ -258,6 +283,11 @@ class StructuredPruner(Compressor):
             raise ValueError(
                 "repeated_pattern requires an integer 'granularity' (the pattern size, "
                 f"e.g. head_dim); got granularity={granularity!r}."
+            )
+        if self.coupled_repeated_pattern and not isinstance(granularity, int):
+            raise ValueError(
+                "coupled_repeated_pattern requires an integer 'granularity' (the chunk "
+                f"size repeated onto coupled next layers); got granularity={granularity!r}."
             )
 
         self.config["ratio"] = ratio
@@ -488,9 +518,28 @@ class StructuredPruner(Compressor):
             chains.extend(self._resolve_target_chains(scheme, next_layer, target_block_id))
         return chains
 
+    def _coupled_cascade_mask(self, mask):
+        """Expand ``mask`` for cascading onto coupled next layers.
+
+        A no-op unless ``coupled_repeated_pattern`` (int N) is set. When set,
+        ``mask`` is split into consecutive length-``granularity`` chunks and
+        each chunk is repeated N times in place -- ``[chunk_1][chunk_1]...
+        [chunk_2][chunk_2]...`` -- producing a mask N times longer than
+        ``mask``. This is for a coupled next layer whose input dimension is a
+        repeated expansion of this layer's own (pruned) output dimension
+        (e.g. each pruned group's channels consumed N times over by the
+        downstream layer), as opposed to matching it 1:1.
+        """
+        if not self.coupled_repeated_pattern:
+            return mask
+        n = int(self.coupled_repeated_pattern)
+        out_dim = mask.numel() * n
+        return tile_pattern_mask(mask, out_dim, granularity=self.granularity, repeat=n)
+
     def _cascade_coupled(self, mask, hard):
+        cascade_mask = self._coupled_cascade_mask(mask)
         for chain in self._coupled_target_chains():
-            CoupledPruner().apply_chain(chain, mask, hard=hard)
+            CoupledPruner().apply_chain(chain, cascade_mask, hard=hard)
 
     def _prune_extra_params(self, mask):
         """Index-select the last dim of any raw nn.Parameters co-located with
@@ -567,6 +616,7 @@ class StructuredPruner(Compressor):
         return (
             f"StructuredPruner(ratio={self.ratio}, method='{self.method}', "
             f"granularity={self.granularity!r}, repeated_pattern={self.repeated_pattern}, "
+            f"coupled_repeated_pattern={self.coupled_repeated_pattern}, "
             f"share_mask={self.share_mask}, reduce_op={self.reduce_op!r})"
         )
 
@@ -592,8 +642,32 @@ def validate_structured_pruning_granularity(granularity) -> None:
         raise ValueError(f"Pruning granularity must be a positive integer, but got {granularity}.")
 
 def validate_structured_pruning_repeated_pattern(repeated_pattern) -> None:
-    if not isinstance(repeated_pattern, bool):
-        raise ValueError(f"repeated_pattern must be a boolean, but got {type(repeated_pattern)}.")
+    if isinstance(repeated_pattern, bool):
+        return
+    if repeated_pattern == "max":
+        return
+    if isinstance(repeated_pattern, int) and repeated_pattern > 0:
+        return
+    raise ValueError(
+        "repeated_pattern must be False (disabled), True/'max' (repeat one pattern "
+        "across every group), or a positive integer N (re-derive and repeat the "
+        f"pattern every N consecutive groups); got {repeated_pattern!r}."
+    )
+
+def validate_structured_pruning_coupled_repeated_pattern(coupled_repeated_pattern) -> None:
+    if coupled_repeated_pattern is False:
+        return
+    if isinstance(coupled_repeated_pattern, bool) or not isinstance(coupled_repeated_pattern, int):
+        raise ValueError(
+            "coupled_repeated_pattern must be False (disabled) or a positive integer N "
+            "-- when cascading this layer's keep-mask onto coupled next layers, each "
+            "length-'granularity' chunk of the mask is repeated N times in place "
+            f"(chunk chunk ... | next_chunk next_chunk ...); got {coupled_repeated_pattern!r}."
+        )
+    if coupled_repeated_pattern <= 0:
+        raise ValueError(
+            f"coupled_repeated_pattern must be a positive integer, got {coupled_repeated_pattern}."
+        )
 
 def validate_structured_pruning_share_mask(share_mask) -> None:
     if not isinstance(share_mask, bool):
@@ -613,6 +687,7 @@ __all__ = [
     "validate_structured_pruning_method",
     "validate_structured_pruning_granularity",
     "validate_structured_pruning_repeated_pattern",
+    "validate_structured_pruning_coupled_repeated_pattern",
     "validate_structured_pruning_share_mask",
     "validate_structured_pruning_reduce_op",
 ]

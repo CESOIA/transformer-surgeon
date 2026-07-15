@@ -41,7 +41,7 @@ def attention(query, key, value, attn_mask=None):
     key   = key.transpose(0, 1)                          # (q_head_num, kv_len, head_dim)
     value = value.transpose(0, 1)                        # (q_head_num, kv_len, head_dim)
 
-    scores = torch.matmul(query, key.transpose(-2, -1)) * scale  # (q_head_num, seq_len, kv_len)
+    scores = torch.matmul(query * scale, key.transpose(-2, -1)) # (q_head_num, seq_len, kv_len)
 
     if attn_mask is not None:
         scores = scores + attn_mask
@@ -261,23 +261,28 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
         # than self.head_dim if position-linked structured pruning hard-pruned
         # them (see _project_rope) -- v_proj is uncoupled from that pruning and
         # always keeps self.head_dim.
-        q = self.q_proj(x).view(seq_length, self.num_heads, self.q_proj.out_features // self.num_heads).transpose(0, 1) # (num_heads, seq_length, q_head_dim)
-        k = self.k_proj(x).view(seq_length, self.kv_num_heads, self.k_proj.out_features // self.kv_num_heads).transpose(0, 1) # (kv_num_heads, seq_length, k_head_dim)
-        v = self.v_proj(x).view(seq_length, self.kv_num_heads, self.head_dim).transpose(0, 1) # (kv_num_heads, seq_length, head_dim)
+        q = self.q_proj(x).view(seq_length, self.num_heads, self.q_proj.out_features // self.num_heads) # (seq_length, num_heads, q_head_dim)
+        k = self.k_proj(x).view(seq_length, self.kv_num_heads, self.k_proj.out_features // self.kv_num_heads) # (seq_length, kv_num_heads, k_head_dim)
+        v = self.v_proj(x).view(seq_length, self.kv_num_heads, self.head_dim) # (seq_length, kv_num_heads, head_dim)
 
-        # Apply RoPE
+        # Apply RoPE (expects (seq_length, num_heads, head_dim), not transposed)
         if rope is not None:
             cos, sin = rope
             cos, sin = self._project_rope(cos, sin)
             q = apply_rope_multihead(q, cos, sin)
             k = apply_rope_multihead(k, cos, sin)
 
-        # Scaled dot-product attention
+        # Scaled dot-product attention. `attention()` takes (seq, heads, dim) and
+        # transposes internally, same as `q`/`k`/`v` above -- only the SDPA path
+        # needs the (heads, seq, dim) layout, so transpose just for that call.
         if self.use_sdpa:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
+                is_causal=False, enable_gqa=True,
+            )
         else:
             attn_output = attention(q, k, v)
-        
+
         # Concatenate heads and project output
         attn_output = attn_output.transpose(0, 1).reshape(seq_length, embed_dim)
         output = self.out_proj(attn_output)

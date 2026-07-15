@@ -153,6 +153,7 @@ Calibration requirements by method:
 | `method` | `"magnitude"` | `"magnitude"`, `"gradient"`, `"random"` |
 | `granularity` | `"layer"` | `"layer"`, or a positive `int` (chunk/head size) |
 | `repeated_pattern` | `False` | `bool` — one mask per chunk, tiled across chunks |
+| `coupled_repeated_pattern` | `False` | `False`, or a positive `int` N — repeat each length-`granularity` chunk of the mask N times when cascading onto coupled next layers |
 | `reduce_op` | `None` | `None`, `"add"`, `"multiply"` |
 | `share_mask` | `False` | `bool` — **group-only** (set via `group=`) |
 
@@ -167,6 +168,14 @@ callback: `manager.set_calibration_loss(...)`).
   neurons (e.g. per attention head). `repeated_pattern=True` reduces scores across
   those chunks (`reduce_op`) into one length-`g` mask that is tiled back — this is
   what lets GQA `q_proj`/`k_proj` (different head counts) share one mask.
+- `coupled_repeated_pattern=N` changes only the mask *cascaded onto coupled next
+  layers* (hard apply): each length-`g` chunk of this layer's own keep-mask is
+  repeated `N` times in place (`chunk chunk ... | next_chunk next_chunk ...`)
+  before being used to prune the coupled layer's input columns, for a coupled
+  layer whose input is `N`x this layer's own (pruned) output width. E.g. mask
+  `[0,1,1,0,0,1,0,1]` with `granularity=4`, `coupled_repeated_pattern=2` cascades
+  as `[0,1,1,0, 0,1,1,0, 0,1,0,1, 0,1,0,1]`. This layer's own output rows are
+  still pruned by the unexpanded mask; only the downstream cascade changes.
 - Effective kept dim is single-sourced in `blocks/pruning_dims.py`
   (`effective_out_features`), reused by the pruner, coupled pruning, and the
   converted MLP blocks so a hard-pruned model converts/exports with matching shapes.

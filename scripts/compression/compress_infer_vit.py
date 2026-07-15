@@ -28,6 +28,10 @@ Usage:
     python scripts/compression/compress_infer_vit.py
     python scripts/compression/compress_infer_vit.py --hard
     python scripts/compression/compress_infer_vit.py --skip-compress   # float baseline
+
+    # Convert the compressed model's encoder to a transformer-surgeon block
+    # model and evaluate on that instead of the HF model.
+    python scripts/compression/compress_infer_vit.py --convert
 """
 
 import argparse
@@ -40,6 +44,7 @@ from transformers import ViTImageProcessor
 
 from transformersurgeon import ViTForImageClassificationCompress
 from transformersurgeon.models.vit_c import ViTCompressionSchemesManager
+from transformersurgeon.utils import convert_for_export
 
 
 MODEL_NAME = "Ahmed9275/Vit-Cifar100"
@@ -73,6 +78,13 @@ def parse_args():
     parser.add_argument(
         "--skip-compress", action="store_true",
         help="Run the unmodified float baseline for comparison",
+    )
+    parser.add_argument(
+        "--convert", action="store_true",
+        help="Convert the (compressed) model's encoder to a transformer-surgeon "
+             "block model (transformersurgeon.utils.convert_for_export) and run "
+             "evaluation on that instead of the HF model. The block model has "
+             "no batch dimension, so images are processed one at a time.",
     )
     return parser.parse_args()
 
@@ -228,6 +240,36 @@ def evaluate(model, loader):
     return correct, total
 
 
+# --------------------------------------------------------------------------
+# Inference on the converted block model (no batch dimension, so images go
+# through the encoder one at a time).
+# --------------------------------------------------------------------------
+
+def build_converted_encoder(model):
+    """Convert the (compressed) HF model's encoder stack to a transformer-surgeon
+    TransformerEncoder block model."""
+    converted = convert_for_export(model, options={"use_sdpa": False})
+    encoder = converted["vit"]
+    encoder.eval()
+    return encoder
+
+
+def evaluate_converted(model, encoder, loader):
+    correct, total = 0, 0
+    with torch.no_grad():
+        for batch in loader:
+            embeddings = model.vit.embeddings(batch["pixel_values"])
+            preds = []
+            for image_embeddings in embeddings:  # (batch, seq, hidden) -> (seq, hidden)
+                hidden = encoder(image_embeddings)
+                logits = model.classifier(hidden[0:1, :])
+                preds.append(logits.argmax(dim=-1))
+            preds = torch.cat(preds)
+            correct += (preds == batch["labels"]).sum().item()
+            total += batch["labels"].numel()
+    return correct, total
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -260,7 +302,12 @@ def main():
         print("\nSkipping compression — running float baseline.")
 
     print(f"\nEvaluating on {args.num_test_samples} held-out CIFAR-100 test images ...")
-    correct, total = evaluate(model, test_loader)
+    if args.convert:
+        print("\nConverting to transformer-surgeon block model ...")
+        encoder = build_converted_encoder(model)
+        correct, total = evaluate_converted(model, encoder, test_loader)
+    else:
+        correct, total = evaluate(model, test_loader)
     print(f"\nTop-1 accuracy: {correct}/{total} = {100.0 * correct / total:.2f}%")
 
 

@@ -6,6 +6,7 @@ from .structured_pruning import (
     validate_structured_pruning_share_mask,
     validate_structured_pruning_reduce_op,
     validate_structured_pruning_repeated_pattern,
+    validate_structured_pruning_coupled_repeated_pattern,
 )
 from .unstructured_pruning import (
     UnstructuredPruner,
@@ -57,10 +58,22 @@ COMPRESSION_REGISTRY = {
         "ratio": dict(default=0.0, validator=validate_structured_pruning_ratio),
         "method": dict(default="magnitude", validator=validate_structured_pruning_method),
         "granularity": dict(default="layer", validator=validate_structured_pruning_granularity),
-        # repeated_pattern: prune the same position within every granularity group
-        # (e.g. every attention head) using a single length-granularity mask; lets
-        # layers with different group counts share one mask (GQA q/k).
+        # repeated_pattern: prune the same position(s) within groups of size
+        # granularity (e.g. attention heads). True/"max" reduces all groups into
+        # one shared length-granularity mask (lets layers with different group
+        # counts share one mask, e.g. GQA q/k); a positive int N instead
+        # re-derives an independent length-granularity mask every N consecutive
+        # groups and repeats it only across that run.
         "repeated_pattern": dict(default=False, validator=validate_structured_pruning_repeated_pattern),
+        # coupled_repeated_pattern: when cascading this layer's keep-mask onto
+        # coupled next layers (hard apply), repeat each length-granularity
+        # chunk of the mask N times in place (chunk chunk ... | next_chunk
+        # next_chunk ...) instead of forwarding it 1:1. For a coupled next
+        # layer whose input dimension is a repeated expansion of this layer's
+        # own pruned output dimension.
+        "coupled_repeated_pattern": dict(
+            default=False, validator=validate_structured_pruning_coupled_repeated_pattern
+        ),
         # reduce_op: how scores are combined — across granularity groups for
         # repeated_pattern, and/or across layers for a shared-mask group.
         "reduce_op": dict(default=None, validator=validate_structured_pruning_reduce_op),

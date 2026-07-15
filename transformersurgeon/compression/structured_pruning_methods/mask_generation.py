@@ -62,16 +62,24 @@ def reduce_pattern_scores(
     scores: torch.Tensor,
     granularity: int,
     op: Optional[str],
+    repeat: Optional[int] = None,
 ) -> torch.Tensor:
-    """Collapse a per-neuron score vector into a single repeated-pattern vector.
+    """Collapse a per-neuron score vector into one or more repeated-pattern vectors.
 
     The output dimension is treated as ``num_groups`` repetitions of a pattern of
-    size ``granularity`` (e.g. attention heads, each of size ``head_dim``). The
-    scores of the corresponding position across every group are reduced with
-    ``op`` into one length-``granularity`` vector. Building a mask from this and
-    tiling it back (see :func:`tile_pattern_mask`) prunes the *same* position in
-    every group — which is what lets layers with a *different* number of groups
-    (e.g. GQA q_proj with 14 heads and k_proj with 2 heads) share one mask.
+    size ``granularity`` (e.g. attention heads, each of size ``head_dim``).
+
+    * ``repeat=None`` (default): the scores of the corresponding position across
+      *every* group are reduced with ``op`` into one length-``granularity``
+      vector. Building a mask from this and tiling it back (see
+      :func:`tile_pattern_mask`) prunes the *same* position in every group —
+      which is what lets layers with a *different* number of groups (e.g. GQA
+      q_proj with 14 heads and k_proj with 2 heads) share one mask.
+    * ``repeat=N``: groups are chunked into consecutive runs of ``N``; each
+      chunk is reduced independently, producing ``num_groups // N``
+      length-``granularity`` patterns concatenated into one flat vector of
+      length ``(num_groups // N) * granularity``. ``num_groups`` must be an
+      exact multiple of ``N``.
 
     Model-agnostic: ``granularity`` is just an integer pattern size.
     """
@@ -86,23 +94,67 @@ def reduce_pattern_scores(
         raise ValueError(
             "reduce_op is required for repeated_pattern scoring. Set 'add' or 'multiply'."
         )
-    grouped = scores.view(dim // g, g)
+    num_groups = dim // g
+    grouped = scores.view(num_groups, g)
+    if repeat is not None:
+        n = int(repeat)
+        if n <= 0 or num_groups % n != 0:
+            raise ValueError(
+                f"repeated_pattern={n} must evenly divide the number of groups "
+                f"({num_groups}=dim/granularity)."
+            )
+        grouped = grouped.view(num_groups // n, n, g)
+        reduce_dim = 1
+    else:
+        reduce_dim = 0
     if op == "add":
-        return grouped.sum(dim=0)
-    if op == "multiply":
-        return grouped.prod(dim=0)
-    raise ValueError(f"Unsupported reduce_op '{op}'. Supported: 'add', 'multiply'.")
+        reduced = grouped.sum(dim=reduce_dim)
+    elif op == "multiply":
+        reduced = grouped.prod(dim=reduce_dim)
+    else:
+        raise ValueError(f"Unsupported reduce_op '{op}'. Supported: 'add', 'multiply'.")
+    return reduced.reshape(-1)
 
 
-def tile_pattern_mask(pattern_mask: torch.Tensor, out_dim: int) -> torch.Tensor:
-    """Tile a length-``granularity`` pattern keep-mask up to ``out_dim`` rows.
+def tile_pattern_mask(
+    pattern_mask: torch.Tensor,
+    out_dim: int,
+    granularity: Optional[int] = None,
+    repeat: Optional[int] = None,
+) -> torch.Tensor:
+    """Tile pattern keep-mask(s) up to ``out_dim`` rows.
 
-    ``out_dim`` must be a whole number of pattern repetitions (``num_groups * g``).
+    * ``repeat=None`` (default): ``pattern_mask`` is a single length-``granularity``
+      pattern; it's repeated ``out_dim // g`` times (``out_dim`` must be a whole
+      number of pattern repetitions).
+    * ``repeat=N``: ``pattern_mask`` holds ``num_chunks`` concatenated
+      length-``granularity`` patterns (as produced by
+      ``reduce_pattern_scores(..., repeat=N)``); each chunk is repeated ``N``
+      times consecutively (``chunk chunk ... | next_chunk next_chunk ...``),
+      producing ``num_chunks * N * granularity`` rows, which must equal
+      ``out_dim``.
     """
-    g = pattern_mask.numel()
-    if g == 0 or out_dim % g != 0:
-        raise ValueError(f"pattern mask length {g} must divide out_dim {out_dim}.")
-    return pattern_mask.repeat(out_dim // g)
+    if repeat is None:
+        g = pattern_mask.numel()
+        if g == 0 or out_dim % g != 0:
+            raise ValueError(f"pattern mask length {g} must divide out_dim {out_dim}.")
+        return pattern_mask.repeat(out_dim // g)
+
+    g = int(granularity)
+    n = int(repeat)
+    if g <= 0 or pattern_mask.numel() % g != 0:
+        raise ValueError(
+            f"pattern mask length {pattern_mask.numel()} must be a multiple of "
+            f"granularity {g}."
+        )
+    num_chunks = pattern_mask.numel() // g
+    tiled = pattern_mask.view(num_chunks, 1, g).expand(num_chunks, n, g).reshape(-1)
+    if tiled.numel() != out_dim:
+        raise ValueError(
+            f"repeated_pattern={n} tiling produced {tiled.numel()} rows, expected "
+            f"out_dim {out_dim}."
+        )
+    return tiled
 
 
 def reduce_scores(score_list: List[torch.Tensor], op: Optional[str]) -> torch.Tensor:
