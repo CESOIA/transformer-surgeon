@@ -37,6 +37,19 @@ def _extract_aqt_scale(w: torch.Tensor) -> torch.Tensor | None:
     return None
 
 
+def _replace_param(root: nn.Module, dotted_key: str, ref: torch.Tensor) -> None:
+    """Replace the parameter at ``dotted_key`` with an empty one shaped like ``ref``.
+
+    Used to let a freshly-built block layer adopt the source layer's hard-pruned
+    weight/bias shape before a strict ``load_state_dict`` copies the values in.
+    """
+    parent_path, _, attr = dotted_key.rpartition(".")
+    parent = get_submodule(root, parent_path) if parent_path else root
+    old = getattr(parent, attr)
+    setattr(parent, attr, nn.Parameter(
+        torch.empty_like(ref), requires_grad=getattr(old, "requires_grad", True)))
+
+
 def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> None:
     """Copy old_layer's state dict into new_layer, dequantizing quantized tensors first.
 
@@ -70,6 +83,26 @@ def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> 
             if parent_mod is not None and buf_name not in parent_mod._buffers:
                 parent_mod.register_buffer(buf_name, torch.empty_like(tensor))
 
+    # Adopt the source's (possibly hard-pruned) parameter shapes, and register any
+    # non-quant buffers that exist only on the source. Hard structured pruning of a
+    # position-linked q_proj/k_proj shrinks its out_features and records a
+    # ``rope_prune_mask`` buffer; the freshly-built block layer is still full-size
+    # and lacks that buffer, so without this the strict load below fails on a
+    # size mismatch / unexpected key. (Coupled dims that other layers depend on --
+    # e.g. the MLP intermediate -- are pre-sized from the compression config at
+    # block construction; this just reconciles the leaf tensors.)
+    new_params = dict(new_layer.named_parameters())
+    new_buffers = dict(new_layer.named_buffers())
+    for key, tensor in plain_state.items():
+        if key in new_params:
+            if new_params[key].shape != tensor.shape:
+                _replace_param(new_layer, key, tensor)
+        elif key not in new_buffers:
+            parent_path, buf_name = key.rsplit(".", 1) if "." in key else ("", key)
+            parent_mod = new_modules.get(parent_path)
+            if parent_mod is not None and buf_name not in parent_mod._buffers:
+                parent_mod.register_buffer(buf_name, torch.empty_like(tensor))
+
     new_layer.load_state_dict(plain_state)
 
     # Propagate non-tensor compression metadata (plain attributes not in state_dict).
@@ -79,6 +112,16 @@ def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> 
         new_submod = new_modules.get(name)
         if new_submod is None:
             continue
+
+        # in_features/out_features are plain attributes (not in the state dict), so
+        # a layer that adopted hard-pruned weights above still advertises its old
+        # size. Copy the source's -- the pruned ground truth (correct for LRD, where
+        # in_features tracks linear_V, not weight.shape[1]) -- so downstream geometry
+        # (per-head dim, RoPE projection, KV-cache sizing, out_proj input width) is
+        # right.
+        for dim_attr in ("in_features", "out_features"):
+            if hasattr(old_submod, dim_attr):
+                setattr(new_submod, dim_attr, getattr(old_submod, dim_attr))
 
         for attr in _QUANT_PLAIN_ATTRS:
             if hasattr(old_submod, attr):

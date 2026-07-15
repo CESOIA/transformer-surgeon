@@ -19,27 +19,32 @@ def attention(query, key, value, attn_mask=None):
         value: Tensor of shape (seq_length, kv_head_num, kv_head_dim)
         attn_mask: Optional boolean tensor of shape (1, 1, q_seq_length, kv_seq_length) where True indicates positions to mask (set to -inf in scores)        
     """
-    _, q_head_num, head_dim = query.size()
-    _, kv_head_num,       _ = key.size()
+    _, q_head_num, q_head_dim = query.size()
+    _, kv_head_num, k_head_dim = key.size()
+    _, _, v_head_dim = value.size()
     group_size = q_head_num // kv_head_num
 
     dtype = query.dtype
-    scale = 1.0 / math.sqrt(head_dim)
+    # Score scale uses the query/key head dim. Under position-linked structured
+    # pruning q/k shrink together (k_head_dim == q_head_dim) while value stays at
+    # its own (possibly larger) v_head_dim, so key and value are expanded/handled
+    # with their own last dims rather than one shared head_dim.
+    scale = 1.0 / math.sqrt(q_head_dim)
 
     # -------------------------------------------------------------------------
     # CURRENT PATH: materialize GQA expansion before matmul.
     # Avoids this block if switching to einsum or broadcasting alternatives below.
     # -------------------------------------------------------------------------
     # expand key, value for possible GQA
-    # key   = key.repeat_interleave(group_size, dim=1)    # (seq_length, q_head_num, head_dim)
-    # value = value.repeat_interleave(group_size, dim=1)  # (seq_length, q_head_num, head_dim)
-    key   = key.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
-    value = value.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, head_dim)
+    # key   = key.repeat_interleave(group_size, dim=1)    # (seq_length, q_head_num, k_head_dim)
+    # value = value.repeat_interleave(group_size, dim=1)  # (seq_length, q_head_num, v_head_dim)
+    key   = key.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, k_head_dim)
+    value = value.unsqueeze(2).expand(-1, -1, group_size, -1).reshape(-1, q_head_num, v_head_dim)
 
     # Swap head and sequence dimensions for attention computation
-    query = query.transpose(0, 1)                        # (q_head_num, seq_len, head_dim)
-    key   = key.transpose(0, 1)                          # (q_head_num, kv_len, head_dim)
-    value = value.transpose(0, 1)                        # (q_head_num, kv_len, head_dim)
+    query = query.transpose(0, 1)                        # (q_head_num, seq_len, q_head_dim)
+    key   = key.transpose(0, 1)                          # (q_head_num, kv_len, k_head_dim)
+    value = value.transpose(0, 1)                        # (q_head_num, kv_len, v_head_dim)
 
     scores = torch.matmul(query * scale, key.transpose(-2, -1)) # (q_head_num, seq_len, kv_len)
 
@@ -48,7 +53,7 @@ def attention(query, key, value, attn_mask=None):
 
     scores = torch.nn.functional.softmax(scores, dim=-1)
 
-    attn_output = torch.matmul(scores.to(dtype), value)  # (q_head_num, seq_len, head_dim)
+    attn_output = torch.matmul(scores.to(dtype), value)  # (q_head_num, seq_len, v_head_dim)
     # -------------------------------------------------------------------------
     # END CURRENT PATH
     # -------------------------------------------------------------------------
@@ -148,16 +153,18 @@ class MHABase(torch.nn.Module):
         k_lrd_rank = compression_config["k_proj"]["lrd"]["rank"]
         v_lrd_rank = compression_config["v_proj"]["lrd"]["rank"]
         out_lrd_rank = compression_config["out_proj"]["lrd"]["rank"]
-        # Structured-pruning-aware sizing for attention, partially resolved:
-        # q_proj/k_proj may now be hard-pruned (their head_dim shrinks) -- forward()
-        # below reads their *current* out_features rather than a fixed head_dim, and
-        # _project_rope projects RoPE's cos/sin to match when they're position_linked.
-        # Still TODO: v_proj. Pruning it shrinks attn_output's last dim, and under GQA
-        # the v->o coupling is not 1:1 (repeat_interleave duplicates each kv head's
-        # slice group_size times before o_proj, so CoupledPruner's plain index-select
-        # on o_proj's input columns -- sized off v_proj's un-expanded mask -- doesn't
-        # line up); out_proj's in_features and the reshape after attention are not
-        # adjusted for a pruned v_proj.
+        # Structured-pruning-aware sizing for attention:
+        # - q_proj/k_proj may be hard-pruned (their rotary head_dim shrinks) --
+        #   forward() reads their *current* out_features rather than a fixed
+        #   head_dim, and _project_rope projects RoPE's cos/sin to match (per
+        #   kv-group) for position_linked q/k.
+        # - v_proj may be hard-pruned too: its v->o coupling is not 1:1 under GQA
+        #   (attention repeat_interleaves each kv head's value slice group_size
+        #   times before o_proj), so the cascade onto o_proj's input uses
+        #   coupled_repeated_pattern=group_size to repeat each kv head's kept-mask
+        #   chunk accordingly. forward() reads value_head_dim and reshapes attn
+        #   output to num_heads * value_head_dim (== o_proj's cascade-pruned
+        #   in_features). value cache follows value_head_dim.
 
         self.q_proj = LinearCompressed(
             embed_dim,
@@ -189,6 +196,20 @@ class MHABase(torch.nn.Module):
         # hard-pruned; rebuilt lazily the first time it's needed.
         self.register_buffer("rope_freq_proj", None, persistent=False)
 
+    @property
+    def key_head_dim(self):
+        """Per-head key dim from k_proj's *current* out_features (pruned-aware)."""
+        return self.k_proj.out_features // self.kv_num_heads
+
+    @property
+    def value_head_dim(self):
+        """Per-head value dim from v_proj's *current* out_features (pruned-aware).
+
+        v_proj is uncoupled from q/k rotary pruning, so this stays at head_dim
+        until (unsupported) value pruning lands.
+        """
+        return self.v_proj.out_features // self.kv_num_heads
+
     def _project_rope(self, cos, sin):
         """Project precomputed RoPE ``cos``/``sin`` down to the pruned rotary
         dimension, when structured pruning has hard-pruned q_proj/k_proj.
@@ -199,12 +220,17 @@ class MHABase(torch.nn.Module):
         row corresponds to. ``cos``/``sin`` are still precomputed at the
         original (unpruned) head_dim, so they must be re-indexed with the
         exact same keep pattern before being applied to the now-narrower
-        q/k, via a small static 0/1 projection matrix built from the
-        pruning mask (``build_rope_prune_projection`` in ``blocks/rope.py``).
+        q/k, via static 0/1 projection matrices built from the pruning mask
+        (``build_rope_prune_projection`` in ``blocks/rope.py``).
 
-        No-op (returns cos/sin unchanged) if q_proj/k_proj are not pruned.
-        Raises ``ValueError`` if only one of q_proj/k_proj was pruned, since
-        the pair must always be pruned together for RoPE to remain valid.
+        Under GQA the mask may keep different rotary frequencies per kv-group,
+        so the projection is **per kv-group**: it yields a group-wise
+        ``cos``/``sin`` that is broadcast to that group's query heads for ``q``
+        and used one-per-head for ``k``. Returns ``(cos_q, sin_q, cos_k, sin_k)``.
+
+        No-op (returns the inputs, shared for q and k) if q_proj/k_proj are not
+        pruned. Raises ``ValueError`` if only one of q_proj/k_proj was pruned,
+        since the pair must always be pruned together for RoPE to remain valid.
         """
         q_head_dim = self.q_proj.out_features // self.num_heads
         k_head_dim = self.k_proj.out_features // self.kv_num_heads
@@ -212,7 +238,7 @@ class MHABase(torch.nn.Module):
         k_pruned = k_head_dim < self.head_dim
 
         if not q_pruned and not k_pruned:
-            return cos, sin
+            return cos, sin, cos, sin
 
         if q_pruned != k_pruned:
             raise ValueError(
@@ -231,7 +257,8 @@ class MHABase(torch.nn.Module):
             )
 
         proj = self.rope_freq_proj
-        if proj is None or proj.shape[0] != q_head_dim // 2:
+        # proj is (num_kv_groups, kept_freqs, head_dim//2); kept_freqs == q_head_dim//2.
+        if proj is None or proj.shape[1] != q_head_dim // 2:
             q_mask = getattr(self.q_proj, "rope_prune_mask", None)
             k_mask = getattr(self.k_proj, "rope_prune_mask", None)
             if q_mask is None or k_mask is None:
@@ -248,7 +275,19 @@ class MHABase(torch.nn.Module):
             proj = self.rope_freq_proj
 
         proj = proj.to(device=cos.device, dtype=cos.dtype)
-        return cos @ proj.t(), sin @ proj.t()
+        num_groups, kept, half = proj.shape
+        group_size = self.num_heads // num_groups
+
+        # Project cos/sin (..., 1, half) per kv-group -> (..., num_groups, kept).
+        lead = cos.shape[:-2]
+        proj_flat = proj.reshape(num_groups * kept, half)
+        cos_g = (cos.reshape(-1, half) @ proj_flat.t()).reshape(*lead, num_groups, kept)
+        sin_g = (sin.reshape(-1, half) @ proj_flat.t()).reshape(*lead, num_groups, kept)
+
+        # q broadcasts each group to its query heads; k uses one per kv head.
+        cos_q = cos_g.repeat_interleave(group_size, dim=-2)
+        sin_q = sin_g.repeat_interleave(group_size, dim=-2)
+        return cos_q, sin_q, cos_g, sin_g
 
 class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
     def __init__(self, *args, **kwargs):
@@ -263,14 +302,14 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
         # always keeps self.head_dim.
         q = self.q_proj(x).view(seq_length, self.num_heads, self.q_proj.out_features // self.num_heads) # (seq_length, num_heads, q_head_dim)
         k = self.k_proj(x).view(seq_length, self.kv_num_heads, self.k_proj.out_features // self.kv_num_heads) # (seq_length, kv_num_heads, k_head_dim)
-        v = self.v_proj(x).view(seq_length, self.kv_num_heads, self.head_dim) # (seq_length, kv_num_heads, head_dim)
+        v = self.v_proj(x).view(seq_length, self.kv_num_heads, self.value_head_dim) # (seq_length, kv_num_heads, v_head_dim)
 
         # Apply RoPE (expects (seq_length, num_heads, head_dim), not transposed)
         if rope is not None:
             cos, sin = rope
-            cos, sin = self._project_rope(cos, sin)
-            q = apply_rope_multihead(q, cos, sin)
-            k = apply_rope_multihead(k, cos, sin)
+            cos_q, sin_q, cos_k, sin_k = self._project_rope(cos, sin)
+            q = apply_rope_multihead(q, cos_q, sin_q)
+            k = apply_rope_multihead(k, cos_k, sin_k)
 
         # Scaled dot-product attention. `attention()` takes (seq, heads, dim) and
         # transposes internally, same as `q`/`k`/`v` above -- only the SDPA path
@@ -283,10 +322,12 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
         else:
             attn_output = attention(q, k, v)
 
-        # Concatenate heads and project output
-        attn_output = attn_output.transpose(0, 1).reshape(seq_length, embed_dim)
+        # Concatenate heads and project output. The concatenated width is
+        # num_heads * value_head_dim (== embed_dim unless v_proj was hard-pruned,
+        # in which case out_proj's in_features was cascade-pruned to match).
+        attn_output = attn_output.transpose(0, 1).reshape(seq_length, self.num_heads * self.value_head_dim)
         output = self.out_proj(attn_output)
-        
+
         return output
 
 class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (No GQA)
@@ -401,12 +442,17 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         # Buffers back the "mutable" path; harmless (and cheap) for io_* modes,
         # where they also serve as the initial cache when none is passed in.
+        # Sized from key_head_dim/value_head_dim so a hard-pruned k_proj (shrunk
+        # rotary head_dim) gets a matching key cache; v is uncoupled and keeps
+        # value_head_dim. At construction these equal head_dim (weights are loaded
+        # -- and possibly resized -- afterwards), so the mutable path re-checks
+        # geometry lazily in forward via _ensure_cache_geometry.
         self.register_buffer(
             "key_cache",
             torch.zeros(
                 self.max_cache_length,
                 self.kv_num_heads,
-                self.head_dim,
+                self.key_head_dim,
                 dtype=self.dtype),
             persistent=False
         )
@@ -415,10 +461,24 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             torch.zeros(
                 self.max_cache_length,
                 self.kv_num_heads,
-                self.head_dim,
+                self.value_head_dim,
                 dtype=self.dtype),
             persistent=False
         )
+
+    def _ensure_cache_geometry(self):
+        """Reallocate the internal (mutable-path) KV buffers if q/k pruning has
+        changed the key head_dim since construction. No-op once sized correctly."""
+        if self.key_cache.shape[-1] != self.key_head_dim:
+            self.key_cache = torch.zeros(
+                self.max_cache_length, self.kv_num_heads, self.key_head_dim,
+                dtype=self.key_cache.dtype, device=self.key_cache.device,
+            )
+        if self.value_cache.shape[-1] != self.value_head_dim:
+            self.value_cache = torch.zeros(
+                self.max_cache_length, self.kv_num_heads, self.value_head_dim,
+                dtype=self.value_cache.dtype, device=self.value_cache.device,
+            )
 
     def _write_mutable(self, k, v, write_index, key_cache, value_cache):
         """In-place write on the internal buffers (QNN peak path)."""
@@ -437,8 +497,8 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         """Scatter-free write: positional one-hot mask + where (in_seq_len==1)."""
         idx = torch.arange(self.max_cache_length, device=k.device)
         sel = (idx == write_index).view(self.max_cache_length, 1, 1)  # (L,1,1)
-        k_row = k.reshape(1, self.kv_num_heads, self.head_dim)
-        v_row = v.reshape(1, self.kv_num_heads, self.head_dim)
+        k_row = k.reshape(1, self.kv_num_heads, self.key_head_dim)
+        v_row = v.reshape(1, self.kv_num_heads, self.value_head_dim)
         key_cache = torch.where(sel, k_row, key_cache)
         value_cache = torch.where(sel, v_row, value_cache)
         return key_cache, value_cache
@@ -461,6 +521,9 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         """
         in_seq_len, embed_dim = x.size()
 
+        # Match the internal buffers to the current (possibly pruned) key head_dim.
+        self._ensure_cache_geometry()
+
         # Fall back to internal buffers when caches are not threaded in.
         if key_cache is None:
             key_cache = self.key_cache
@@ -470,22 +533,20 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # Project inputs to Q, K, V. q_proj/k_proj's per-head dim may be smaller
         # than self.head_dim if position-linked structured pruning hard-pruned
         # them (see _project_rope) -- v_proj is uncoupled from that pruning and
-        # always keeps self.head_dim. NOTE: key_cache/value_cache below are
-        # still allocated at self.head_dim (attention resizing for the causal
-        # KV-cache is a separate, not-yet-supported piece of work -- see the
-        # TODO in MHABase.__init__), so a hard-pruned k_proj will fail at the
-        # cache write below, not silently produce wrong results.
+        # keeps value_head_dim. The key cache follows the pruned key_head_dim (set
+        # by _ensure_cache_geometry / build_zero_caches), so a hard-pruned k_proj
+        # writes into a matching cache.
         q = self.q_proj(x).view(in_seq_len, self.num_heads, self.q_proj.out_features // self.num_heads) # (in_seq_len, num_heads, q_head_dim)
-        k = self.k_proj(x).view(in_seq_len, self.kv_num_heads, self.k_proj.out_features // self.kv_num_heads) # (in_seq_len, kv_num_heads, k_head_dim)
-        v = self.v_proj(x).view(in_seq_len, self.kv_num_heads, self.head_dim) # (in_seq_len, kv_num_heads, head_dim)
+        k = self.k_proj(x).view(in_seq_len, self.kv_num_heads, self.key_head_dim) # (in_seq_len, kv_num_heads, k_head_dim)
+        v = self.v_proj(x).view(in_seq_len, self.kv_num_heads, self.value_head_dim) # (in_seq_len, kv_num_heads, v_head_dim)
 
         # Apply RoPE
         if rope is not None:
             cos = rope[0][pos_id]
             sin = rope[1][pos_id]
-            cos, sin = self._project_rope(cos, sin)
-            q = apply_rope_multihead(q, cos, sin)
-            k = apply_rope_multihead(k, cos, sin)
+            cos_q, sin_q, cos_k, sin_k = self._project_rope(cos, sin)
+            q = apply_rope_multihead(q, cos_q, sin_q)
+            k = apply_rope_multihead(k, cos_k, sin_k)
 
         # Write new K/V into the fixed-size cache (mechanism per cache_impl).
         write_index = torch.clamp(pos_id, 0, self.max_cache_length-1).long()
@@ -509,8 +570,10 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         else:
             attn_output = attention(q, key_cache, value_cache, attn_mask)
 
-        # Concatenate heads and project output
-        attn_output = attn_output.transpose(0, 1).reshape(in_seq_len, embed_dim)
+        # Concatenate heads and project output. Width is num_heads * value_head_dim
+        # (== embed_dim unless v_proj was hard-pruned, in which case out_proj's
+        # in_features was cascade-pruned to match).
+        attn_output = attn_output.transpose(0, 1).reshape(in_seq_len, self.num_heads * self.value_head_dim)
         output = self.out_proj(attn_output)
 
         if self.cache_impl == "mutable":

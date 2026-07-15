@@ -9,6 +9,7 @@ from .structured_pruning_methods import (
     build_structured_mask,
     reduce_scores,
     reduce_pattern_scores,
+    reduce_member_to_patterns,
     tile_pattern_mask,
 )
 from ..blocks import EmbeddingCompressed
@@ -156,10 +157,19 @@ class StructuredPruner(Compressor):
     def _repeat_n(self):
         """``None`` for "reduce/tile across every group" (``True``/``"max"``),
         else the positive int N: reduce/tile in chunks of N consecutive groups.
+
+        ``"auto"`` has no single per-layer repeat (it is derived per member from
+        the group's shapes), so it is only valid on the shared-mask path and
+        raises here.
         """
         rp = self.repeated_pattern
         if rp is True or rp == "max":
             return None
+        if rp == "auto":
+            raise RuntimeError(
+                "repeated_pattern='auto' is only valid with share_mask=True "
+                "(GQA-style shared q/k groups); it has no standalone per-layer repeat."
+            )
         return int(rp)
 
     def _pattern_keep_mask(self, module):
@@ -199,13 +209,18 @@ class StructuredPruner(Compressor):
         """First-in-group computes the reduced shared mask; others reuse it.
 
         The reduced result is stored in the group's properties dict so every
-        member reuses it. Two kinds:
+        member reuses it. Three kinds:
 
         * ``"full"`` — a full-length keep-mask shared verbatim; requires all
           members to have the same output dimension (e.g. gate/up).
-        * ``"pattern"`` — a length-``granularity`` pattern (repeated_pattern),
-          which each member tiles up to its own output dimension. This lets
-          members with a *different* number of groups share a mask (GQA q/k).
+        * ``"pattern"`` — length-``granularity`` pattern(s) (``repeated_pattern``
+          ``True``/``"max"`` or int N), which each member tiles up to its own
+          output dimension using *its own* repeat factor. This lets members with
+          a *different* number of groups share a mask (GQA q/k).
+        * ``"pattern_auto"`` — ``P`` distinct length-``granularity`` patterns whose
+          count is auto-derived from the group's shapes (``P`` = the smallest
+          member's group count = num_kv_heads for GQA); each member tiles by its
+          own ``num_groups // P`` (q x group_size, k x1).
         """
         group = self._group()
 
@@ -217,44 +232,127 @@ class StructuredPruner(Compressor):
         kind, mask = cached["kind"], cached["mask"]
         if kind == "pattern":
             return tile_pattern_mask(
-                mask, module.weight.shape[0], granularity=self.granularity, repeat=cached.get("repeat")
+                mask, module.weight.shape[0], granularity=self.granularity, repeat=self._repeat_n()
             )
+        if kind == "pattern_auto":
+            g, P = cached["granularity"], cached["P"]
+            out_dim = module.weight.shape[0]
+            num_groups = out_dim // g
+            if num_groups % P != 0:
+                raise ValueError(
+                    f"repeated_pattern='auto': pattern count {P} must divide this member's "
+                    f"group count {num_groups} (out_dim={out_dim}, granularity={g})."
+                )
+            return tile_pattern_mask(mask, out_dim, granularity=g, repeat=num_groups // P)
         return mask
 
-    def _compute_group_shared(self, group):
-        """Reduce every member's scores into the group's shared mask/pattern."""
-        if self.repeated_pattern:
-            # Each member contributes length-granularity pattern(s); reduce across
-            # members, then build the pattern mask(s) that all members tile.
-            repeat = self._repeat_n()
-            pattern_list = []
-            for sibling in group.schemes:
-                compressor = sibling.compressors.get("structured_pruning", None)
-                if compressor is None:
-                    continue
-                sibling_module = sibling.get_compression_module()
-                sibling_scores = compressor.get_scores(sibling_module)
-                pattern_list.append(
-                    reduce_pattern_scores(
-                        sibling_scores, compressor.granularity, compressor.reduce_op, repeat=repeat
-                    )
-                )
-            reduced = reduce_scores(pattern_list, self.reduce_op)
-            granularity = "layer" if repeat is None else self.granularity
-            pattern_mask = build_structured_mask(reduced, self.ratio, granularity)
-            return {"kind": "pattern", "mask": pattern_mask, "repeat": repeat}
-
-        # Full shared mask: members must share the same output dimension.
-        score_list = []
+    def _group_members(self, group):
+        """(compressor, scores) for every member of ``group`` that prunes."""
+        members = []
         for sibling in group.schemes:
             compressor = sibling.compressors.get("structured_pruning", None)
             if compressor is None:
                 continue
             sibling_module = sibling.get_compression_module()
-            score_list.append(compressor.get_scores(sibling_module))
-        reduced = reduce_scores(score_list, self.reduce_op)
+            members.append((compressor, compressor.get_scores(sibling_module)))
+        return members
+
+    def _compute_group_shared(self, group):
+        """Reduce every member's scores into the group's shared mask/pattern."""
+        members = self._group_members(group)
+
+        if self.repeated_pattern == "auto":
+            return self._compute_auto_shared(members)
+
+        if self.repeated_pattern:
+            # Each member contributes length-granularity pattern(s) reduced with
+            # *its own* repeat factor, so members with different group counts (but
+            # matching pattern counts) still align; reduce across members, then
+            # build the pattern mask(s) that each member tiles back.
+            pattern_list = [
+                reduce_pattern_scores(
+                    scores, comp.granularity, comp.reduce_op, repeat=comp._repeat_n()
+                )
+                for comp, scores in members
+            ]
+            reduced = reduce_scores(pattern_list, self.reduce_op)
+            repeat = self._repeat_n()
+            granularity = "layer" if repeat is None else self.granularity
+            pattern_mask = build_structured_mask(reduced, self.ratio, granularity)
+            return {"kind": "pattern", "mask": pattern_mask, "repeat": repeat}
+
+        # Full shared mask: members must share the same output dimension.
+        reduced = reduce_scores([scores for _, scores in members], self.reduce_op)
         mask = build_structured_mask(reduced, self.ratio, self.granularity)
         return {"kind": "full", "mask": mask}
+
+    def _compute_auto_shared(self, members):
+        """GQA-style shared mask with an auto-derived per-kv-group pattern count.
+
+        ``P`` (number of distinct patterns) = the smallest member's group count
+        (``= num_kv_heads`` for a q/k group). Every member is reduced into ``P``
+        length-``granularity`` patterns, duplicating smaller members up to the
+        largest groups-per-pattern so all members weigh equally (the user's
+        "duplicate scoring matrix" step). Members then tile the shared ``[P*g]``
+        mask by their own ``num_groups // P``.
+        """
+        g = self.granularity
+        if not isinstance(g, int) or isinstance(g, bool):
+            raise ValueError(
+                "repeated_pattern='auto' requires an integer 'granularity' (e.g. head_dim); "
+                f"got granularity={g!r}."
+            )
+        group_counts = []
+        for _, scores in members:
+            dim = scores.size(0)
+            if dim % g != 0:
+                raise ValueError(
+                    f"repeated_pattern='auto': granularity {g} must divide every member's "
+                    f"output dim; got {dim}."
+                )
+            group_counts.append(dim // g)
+        P = min(group_counts)
+        for c in group_counts:
+            if c % P != 0:
+                raise ValueError(
+                    f"repeated_pattern='auto': the auto pattern count P={P} (smallest member) "
+                    f"must divide every member's group count; got {group_counts}."
+                )
+        max_gpp = max(c // P for c in group_counts)
+        pattern_list = [
+            reduce_member_to_patterns(scores, g, P, comp.reduce_op, target_gpp=max_gpp)
+            for comp, scores in members
+        ]
+        reduced = reduce_scores(pattern_list, self.reduce_op)  # [P*g]
+        position_linked = bool(getattr(self.scheme, "position_linked", False))
+        mask = self._build_auto_mask(reduced, P, g, position_linked)
+        return {"kind": "pattern_auto", "mask": mask, "P": P, "granularity": g}
+
+    def _build_auto_mask(self, reduced, P, g, position_linked):
+        """Build the ``[P*g]`` keep-mask from the ``P`` reduced patterns.
+
+        For non-rotary groups this is a plain per-pattern topk. For
+        ``position_linked`` (q/k) groups the two ``g//2`` halves of each pattern
+        are the RoPE real/imaginary channels of one frequency and must be kept or
+        pruned together, so they are folded with ``reduce_op`` before the mask
+        build and the resulting ``[P*(g//2)]`` mask is expanded back to ``[P*g]``
+        with ``real == imag`` -- yielding a rotary-valid mask.
+        """
+        if not position_linked:
+            return build_structured_mask(reduced, self.ratio, g)
+
+        if g % 2 != 0:
+            raise ValueError(
+                "position_linked repeated_pattern='auto' requires an even granularity "
+                f"(head_dim, so real/imag pair evenly); got granularity={g}."
+            )
+        half = g // 2
+        # reduced is P patterns of width g = [real(half), imag(half)] each; fold the
+        # two halves per pattern together, then build a [P*half] mask.
+        folded = reduce_pattern_scores(reduced, half, self.reduce_op, repeat=2)
+        half_mask = build_structured_mask(folded, self.ratio, half)
+        # Expand each half-pattern back to g (real == imag).
+        return half_mask.view(P, half).repeat(1, 2).reshape(-1)
 
     def _resolve_mask(self, module):
         if self.share_mask:
@@ -283,6 +381,12 @@ class StructuredPruner(Compressor):
             raise ValueError(
                 "repeated_pattern requires an integer 'granularity' (the pattern size, "
                 f"e.g. head_dim); got granularity={granularity!r}."
+            )
+        if self.repeated_pattern == "auto" and not self.share_mask:
+            raise ValueError(
+                "repeated_pattern='auto' derives its per-kv-group pattern count from the "
+                "shared group's shapes, so it requires share_mask=True. Enable it via "
+                "manager.auto_groups() + share_mask=True on the q/k group."
             )
         if self.coupled_repeated_pattern and not isinstance(granularity, int):
             raise ValueError(
@@ -644,14 +748,15 @@ def validate_structured_pruning_granularity(granularity) -> None:
 def validate_structured_pruning_repeated_pattern(repeated_pattern) -> None:
     if isinstance(repeated_pattern, bool):
         return
-    if repeated_pattern == "max":
+    if repeated_pattern in ("max", "auto"):
         return
     if isinstance(repeated_pattern, int) and repeated_pattern > 0:
         return
     raise ValueError(
         "repeated_pattern must be False (disabled), True/'max' (repeat one pattern "
-        "across every group), or a positive integer N (re-derive and repeat the "
-        f"pattern every N consecutive groups); got {repeated_pattern!r}."
+        "across every group), a positive integer N (re-derive and repeat the pattern "
+        "every N consecutive groups), or 'auto' (shared q/k groups: derive one pattern "
+        f"per kv-group from the group's shapes); got {repeated_pattern!r}."
     )
 
 def validate_structured_pruning_coupled_repeated_pattern(coupled_repeated_pattern) -> None:

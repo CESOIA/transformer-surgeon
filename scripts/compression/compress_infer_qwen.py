@@ -203,13 +203,17 @@ def configure_compression(manager: Qwen2CompressionSchemesManager) -> None:
         manager.set("structured_pruning", "share_mask", True, group=g)
         manager.set("structured_pruning", "reduce_op", "add", group=g)
 
-    # Only MLP pruning is wired end-to-end for hard=True (attention GQA
-    # head_dim resizing is not implemented). "magnitude"/"gradient" need
-    # calibration; "random" doesn't.
-    manager.set("structured_pruning", "method", "magnitude", group="group49")
-    # manager.set("structured_pruning", "granularity", 128, group="group49")
-    # manager.set("structured_pruning", "repeated_pattern", True, group="group49")
-    manager.set("structured_pruning", "ratio", 0.1, group="group49")
+    # GQA-coupled per-kv-group pruning of the q/k group (group1). granularity=64
+    # is Qwen2-0.5B's head_dim; repeated_pattern="auto" derives one distinct
+    # pattern per kv-head from the group's shapes (q_proj 14 heads, k_proj 2 ->
+    # 2 patterns) and tiles it group_size=7x over q, 1x over k. Because q/k are
+    # position_linked, the mask ties each rotary frequency's real/imag channels,
+    # so hard pruning stays RoPE-valid. "magnitude"/"gradient" need calibration;
+    # "random" doesn't.
+    manager.set("structured_pruning", "method", "magnitude", group="group1")
+    manager.set("structured_pruning", "granularity", 64, group="group1")
+    manager.set("structured_pruning", "repeated_pattern", "auto", group="group1")
+    manager.set("structured_pruning", "ratio", 0.1, group="group1")
     # Example: prune 12.5% of MLP intermediate neurons in every block.
     # manager.set("structured_pruning", "ratio", 0.125, criteria="mlp")
     # Example: prune only block 0's MLP harder.

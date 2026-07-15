@@ -63,7 +63,10 @@ COMPRESSION_REGISTRY = {
         # one shared length-granularity mask (lets layers with different group
         # counts share one mask, e.g. GQA q/k); a positive int N instead
         # re-derives an independent length-granularity mask every N consecutive
-        # groups and repeats it only across that run.
+        # groups and repeats it only across that run. "auto" (shared-mask groups
+        # only) derives one pattern per kv-group from the group's shapes -- the
+        # pattern count = the smallest member's group count (= num_kv_heads) --
+        # and each member tiles it by its own num_groups // pattern_count.
         "repeated_pattern": dict(default=False, validator=validate_structured_pruning_repeated_pattern),
         # coupled_repeated_pattern: when cascading this layer's keep-mask onto
         # coupled next layers (hard apply), repeat each length-granularity

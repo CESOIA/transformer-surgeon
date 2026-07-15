@@ -4,7 +4,9 @@ import torch
 
 from transformersurgeon.compression.structured_pruning_methods import (
     build_structured_mask,
+    reduce_member_to_patterns,
     reduce_pattern_scores,
+    reduce_scores,
     tile_pattern_mask,
 )
 
@@ -66,3 +68,59 @@ def test_repeated_pattern_max_behaviour_unchanged():
     pattern = torch.tensor([True, False])
     tiled = tile_pattern_mask(pattern, out_dim=6)
     assert tiled.tolist() == [True, False, True, False, True, False]
+
+
+# --- GQA auto-derived per-kv-group patterns -------------------------------
+
+
+def test_reduce_member_to_patterns_duplicates_smaller_member():
+    # k head (1 group per pattern) is duplicated up to target_gpp=3 before summing,
+    # so it contributes 3x -- equal weight to a member with 3 groups per pattern.
+    k = torch.tensor([1.0, 2.0, 3.0, 4.0])  # P=2 patterns of granularity 2, gpp=1
+    reduced = reduce_member_to_patterns(k, granularity=2, num_patterns=2, op="add", target_gpp=3)
+    assert reduced.tolist() == [3.0, 6.0, 9.0, 12.0]  # each pattern position x3
+
+
+def test_auto_gqa_shared_mask_layout():
+    # q_proj: 14 heads x head_dim 64; k_proj: 2 heads x 64. granularity=head_dim.
+    g, num_q, num_k = 64, 14, 2
+    torch.manual_seed(0)
+    q, k = torch.rand(num_q * g), torch.rand(num_k * g)
+
+    counts = [num_q, num_k]           # group counts at granularity g
+    P = min(counts)                   # 2 == num_kv_heads
+    max_gpp = max(c // P for c in counts)  # 7
+
+    qp = reduce_member_to_patterns(q, g, P, "add", max_gpp)
+    kp = reduce_member_to_patterns(k, g, P, "add", max_gpp)
+    assert qp.shape == kp.shape == (P * g,)  # no shape mismatch
+
+    reduced = reduce_scores([qp, kp], "add")
+    mask = build_structured_mask(reduced, ratio=0.25, granularity=g)  # 2 patterns of 64
+    patterns = mask.view(P, g)
+    assert not torch.equal(patterns[0], patterns[1])  # two DISTINCT masks
+    assert patterns.sum(1).tolist() == [g - g // 4, g - g // 4]  # same count each
+
+    q_mask = tile_pattern_mask(mask, num_q * g, granularity=g, repeat=num_q // P).view(num_q, g)
+    k_mask = tile_pattern_mask(mask, num_k * g, granularity=g, repeat=num_k // P).view(num_k, g)
+    # q heads 0..6 -> mask0, 7..13 -> mask1; k head 0 -> mask0, head 1 -> mask1.
+    for i in range(7):
+        assert torch.equal(q_mask[i], patterns[0])
+        assert torch.equal(q_mask[i + 7], patterns[1])
+    assert torch.equal(k_mask[0], patterns[0])
+    assert torch.equal(k_mask[1], patterns[1])
+
+
+def test_auto_gqa_rope_ties_real_imag():
+    # position_linked (q/k): each per-kv-group 64-pattern must keep freq i and
+    # i+32 together -- fold halves, build [P*32] mask, expand back to [P*64].
+    g, P = 64, 2
+    torch.manual_seed(1)
+    reduced = torch.rand(P * g)
+    half = g // 2
+    folded = reduce_pattern_scores(reduced, half, "add", repeat=2)
+    assert folded.shape == (P * half,)
+    half_mask = build_structured_mask(folded, ratio=0.25, granularity=half)
+    full = half_mask.view(P, half).repeat(1, 2).reshape(-1).view(P, g)
+    for p in range(P):
+        assert torch.equal(full[p][:half], full[p][half:])  # real == imag

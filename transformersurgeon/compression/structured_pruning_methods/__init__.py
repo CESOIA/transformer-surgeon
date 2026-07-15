@@ -6,7 +6,10 @@ from .mask_generation import (
     effective_num_pruned,
     effective_out_features,
     reduce_scores,
+)
+from .pattern_ops import (
     reduce_pattern_scores,
+    reduce_member_to_patterns,
     tile_pattern_mask,
 )
 
@@ -33,5 +36,6 @@ __all__ = [
     "effective_out_features",
     "reduce_scores",
     "reduce_pattern_scores",
+    "reduce_member_to_patterns",
     "tile_pattern_mask",
 ]

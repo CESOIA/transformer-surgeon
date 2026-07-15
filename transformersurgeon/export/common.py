@@ -129,9 +129,11 @@ def build_zero_caches(decoder: nn.Module) -> tuple[list[torch.Tensor], list[torc
     key_caches, value_caches = [], []
     for block in decoder.blocks:
         attn = block.attn
-        shape = (attn.max_cache_length, attn.kv_num_heads, attn.head_dim)
-        key_caches.append(torch.zeros(shape, dtype=attn.dtype))
-        value_caches.append(torch.zeros(shape, dtype=attn.dtype))
+        # Key cache follows the (possibly pruned) key head_dim; value keeps its own.
+        key_shape = (attn.max_cache_length, attn.kv_num_heads, attn.key_head_dim)
+        value_shape = (attn.max_cache_length, attn.kv_num_heads, attn.value_head_dim)
+        key_caches.append(torch.zeros(key_shape, dtype=attn.dtype))
+        value_caches.append(torch.zeros(value_shape, dtype=attn.dtype))
     return key_caches, value_caches
 
 
