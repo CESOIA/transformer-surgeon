@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import _operator
 from dataclasses import dataclass
@@ -16,6 +17,35 @@ from ..common import (
     extract_layer_quant_info,
     inject_scales_into_pt2e_observers,
     calibrate_pt2e_observers,
+)
+
+
+def is_qnn_available() -> bool:
+    """Whether the QNN ExecuTorch backend can actually be used on this machine.
+
+    ``executorch.backends.qualcomm`` unconditionally imports ``cpuinfo`` at
+    package-init time and raises a bare ``ImportError`` if it's missing — an
+    undeclared transitive dependency, not a real "toolchain not installed"
+    signal. There's no side-effect-free way to probe deeper than that (the
+    Qualcomm partitioner itself only fails at lowering time), so this checks
+    the two cheap preconditions without importing either package: `executorch`
+    and `cpuinfo` must both be resolvable, and one of the QNN SDK env vars the
+    backend documents must be set. ``importlib.util.find_spec`` only locates a
+    module, it does not execute its ``__init__.py``, so this is safe to call
+    even when the Qualcomm toolchain isn't installed.
+    """
+    if importlib.util.find_spec("executorch") is None:
+        return False
+    if importlib.util.find_spec("cpuinfo") is None:
+        return False
+    return bool(os.environ.get("QNN_SDK_ROOT") or os.environ.get("QUALCOMM_SDK_ROOT"))
+
+
+_QNN_UNAVAILABLE_MSG = (
+    "QNN backend unavailable: install the Qualcomm ExecuTorch toolchain "
+    "(`pip install py-cpuinfo` plus the Qualcomm QNN SDK) and set "
+    "QNN_SDK_ROOT (or QUALCOMM_SDK_ROOT) before calling export_with_qnn(). "
+    "Use `is_qnn_available()` to check this ahead of time."
 )
 
 
@@ -246,6 +276,9 @@ def export_with_qnn(
     *,
     config: QNNExportConfig,
 ) -> ExecuTorchExportResult:
+    if not is_qnn_available():
+        raise RuntimeError(_QNN_UNAVAILABLE_MSG)
+
     os.makedirs(os.path.dirname(config.output_path) or ".", exist_ok=True)
 
     wrapper, model_config, example_inputs = resolve_components_and_wrapper(
@@ -343,11 +376,17 @@ def export_with_qnn(
         model_for_edge = converted
         exported_for_mismatch = quantized_exported
 
-    from executorch.backends.qualcomm.utils.utils import (
-        generate_htp_compiler_spec,
-        generate_qnn_executorch_compiler_spec,
-        to_edge_transform_and_lower_to_qnn,
-    )
+    try:
+        from executorch.backends.qualcomm.utils.utils import (
+            generate_htp_compiler_spec,
+            generate_qnn_executorch_compiler_spec,
+            to_edge_transform_and_lower_to_qnn,
+        )
+    except ImportError as e:
+        # is_qnn_available() only checks the cheap preconditions (executorch,
+        # cpuinfo, an SDK env var) — this is the actual Qualcomm backend import,
+        # so surface a clear error if the toolchain still isn't fully usable.
+        raise RuntimeError(_QNN_UNAVAILABLE_MSG) from e
     from executorch.exir.capture._config import ExecutorchBackendConfig
     from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 

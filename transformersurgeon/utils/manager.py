@@ -14,9 +14,25 @@ from copy import deepcopy
 
 logger = logging.getLogger(__name__)
 from ..calibration import run_compression_calibration
+from ..compression import GROUP_OPTIONS, COMPRESSION_REGISTRY
 from .scheme import CompressionScheme
-from .utils import flatten_index_paths
+from .grouping import SchemeGroup
+from .utils import flatten_index_paths, get_submodule
 from .cascade import apply_cascade
+from ..blocks import LinearCompressed, EmbeddingCompressed, Conv2dCompressed, Conv3dCompressed
+
+# Sentinel layer names used by 'preprocessing'/'final_layer'/'preprocessing_conv'
+# entries in pruning.output_dependence / pruning.coupled_masks[_all] -- resolved
+# directly from indexing['preprocessing']/['final_layer']/['preprocessing_conv']
+# rather than via path_template.format(block_index=..., path=...). Values are
+# the compressed type(s) replace_layers_upon_init must have actually
+# substituted for a scheme to be built (a tuple when more than one type is
+# acceptable, e.g. Conv2d vs Conv3d patch-embed).
+_SENTINEL_COMPRESSED_TYPE = {
+    "preprocessing": (EmbeddingCompressed,),
+    "final_layer": (LinearCompressed,),
+    "preprocessing_conv": (Conv2dCompressed, Conv3dCompressed),
+}
 
 class CompressionSchemesManager:
     """
@@ -60,6 +76,9 @@ class CompressionSchemesManager:
         self.indexing = indexing
         self.calibration_groups = self._get_calibration_groups_from_indexing()
         self.schemes = self._generate_schemes()
+        # Named scheme groups (name -> SchemeGroup) for grouped compression
+        # (e.g. shared pruning masks). Populated by create_group / auto_groups.
+        self.groups = {}
 
     def _get_calibration_groups_from_indexing(self):
         groups = []
@@ -97,25 +116,348 @@ class CompressionSchemesManager:
                         groups.append(normalized_group)
                 continue
 
+            # Flat format: a list of parallel layer groups, each already a list
+            # of fully-qualified (dot-containing) layer names, e.g.:
+            #   [
+            #     ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
+            #     ['mlp.gate_proj', 'mlp.up_proj'],
+            #   ]
+            if isinstance(block_groups, list):
+                for group_idx, group_layers in enumerate(block_groups):
+                    if not isinstance(group_layers, list):
+                        raise TypeError(
+                            "Each layer group in 'calibration_groups' list must be a list of layer names. "
+                            f"Invalid group at index {group_idx}: {type(group_layers)}."
+                        )
+
+                    normalized_group = [str(layer_name) for layer_name in group_layers]
+                    groups.append(normalized_group)
+                continue
+
             raise TypeError(
                 "Indexing field 'calibration_groups' must be a list or a dict. "
                 f"Got {type(block_groups)}."
             )
         return groups
 
-    def set(self, compression, property, value, criteria=None, verbose=False):
+    def set(self, compression, property, value, criteria=None, group=None, verbose=False):
         """
-        Generic setter for compression properties based on criteria.
+        Generic setter for compression properties based on criteria or a group.
 
         Args:
             compression: The type of compression to set (e.g., 'pruning', 'lrd', 'quantization')
             property: The name of the property to set (e.g., 'ratio', 'rank')
             value: The value to set for the specified property
             criteria: List of criteria to filter modules (by name or block_id). No criteria = all
+            group: Optional group name. When given together with ``criteria``, the two
+                filters combine: ``criteria`` selects schemes as usual and the result is
+                then restricted to members of ``group``. When given alone, the property
+                is applied to every scheme in that group.
             verbose: If True, prints information about the setting process
+
+        Group-only options (``GROUP_OPTIONS``, e.g. ``share_mask``, ``reduce_op``)
+        can only be set through ``group=`` and apply to the whole group, so combining
+        them with ``criteria`` raises. Enabling a group option first resets the
+        affected scheme's compression config for that compression type to registry
+        defaults.
         """
-        for scheme in self.iter_filtered(criteria=criteria):
+        is_group_option = property in GROUP_OPTIONS.get(compression, [])
+
+        if group is not None:
+            if group not in self.groups:
+                raise ValueError(f"Unknown group '{group}'. Create it with create_group()/auto_groups() first.")
+            group_schemes = list(self.groups[group].schemes)
+            if criteria is not None:
+                if is_group_option:
+                    raise ValueError(
+                        f"'{property}' is a group-only option for '{compression}' and applies to the "
+                        "whole group -- it cannot be combined with 'criteria'."
+                    )
+                group_paths = {scheme.path for scheme in group_schemes}
+                target_schemes = [
+                    scheme for scheme in self.iter_filtered(criteria=criteria)
+                    if scheme.path in group_paths
+                ]
+            else:
+                target_schemes = group_schemes
+        else:
+            if is_group_option:
+                raise ValueError(
+                    f"'{property}' is a group-only option for '{compression}' and can only be set "
+                    f"via a group name (manager.set(..., group=...))."
+                )
+            target_schemes = list(self.iter_filtered(criteria=criteria))
+
+        for scheme in target_schemes:
+            if is_group_option:
+                # Enabling a group option resets this scheme's compression config
+                # for the affected type before applying the group option.
+                self._reset_compression_config(scheme, compression)
             scheme.set(compression, property, value, verbose=verbose)
+
+    def _reset_compression_config(self, scheme, compression):
+        """Reset a scheme's regular (non-group) config for one compression type.
+
+        Group options themselves are preserved so several of them can be enabled
+        in sequence (e.g. ``share_mask`` then ``reduce_op``) without one wiping the
+        other; only the ordinary settings (ratio, method, granularity, ...) revert
+        to their registry defaults.
+        """
+        if compression not in COMPRESSION_REGISTRY:
+            raise ValueError(f"Unsupported compression type '{compression}'.")
+        group_props = GROUP_OPTIONS.get(compression, [])
+        for pname, meta in COMPRESSION_REGISTRY[compression].items():
+            if pname in group_props:
+                continue
+            scheme.set(compression, pname, meta["default"])
+
+    # --------------------------------------------------------------- grouping
+
+    def _find_scheme(self, path):
+        """Return the scheme at ``path`` (full module path), or None."""
+        for block_dicts in self.schemes.values():
+            if path in block_dicts:
+                return block_dicts[path]
+        return None
+
+    def _scheme_block_name(self, scheme):
+        """Return the indexing block/tower name (e.g. 'vision', 'text') that owns ``scheme``."""
+        for block_name, block_dicts in self.schemes.items():
+            if scheme.path in block_dicts:
+                return block_name
+        return None
+
+    def _resolve_scheme(self, member):
+        """Resolve a group member given as a CompressionScheme or a full-path str."""
+        if isinstance(member, CompressionScheme):
+            return member
+        if isinstance(member, str):
+            scheme = self._find_scheme(member)
+            if scheme is None:
+                raise ValueError(f"No scheme found for path '{member}'.")
+            return scheme
+        raise TypeError(
+            f"Group members must be CompressionScheme or full-path str, got {type(member)}."
+        )
+
+    def _next_group_name(self):
+        """Return 'group{n}' using the lowest free index."""
+        i = 1
+        while f"group{i}" in self.groups:
+            i += 1
+        return f"group{i}"
+
+    def create_group(self, schemes, name=None):
+        """Create a named group from a list of schemes (or full-path strings).
+
+        Stores pointers to the existing schemes (never clones). ``name`` defaults
+        to ``"group{n}"`` with the lowest free index.
+
+        Args:
+            schemes: List of CompressionScheme objects or full module paths.
+            name: Optional group name.
+
+        Returns:
+            The created SchemeGroup.
+        """
+        if name is None:
+            name = self._next_group_name()
+        if name in self.groups:
+            raise ValueError(f"Group '{name}' already exists.")
+
+        resolved = [self._resolve_scheme(s) for s in schemes]
+
+        block_names = {self._scheme_block_name(s) for s in resolved}
+        if len(block_names) > 1:
+            raise ValueError(
+                f"Cannot create a shared-mask group spanning multiple indexing blocks "
+                f"{tuple(sorted(block_names))}: {[s.path for s in resolved]}. "
+                "Coupled/shared-mask pruning groups must stay within a single tower/block "
+                "-- different towers have independently-sized hidden dimensions and cannot "
+                "share one pruning mask."
+            )
+
+        conflicts = {s.path: next(iter(s.groups)) for s in resolved if s.groups}
+        if conflicts:
+            raise ValueError(
+                f"Cannot create group '{name}': the following schemes already belong to "
+                f"another group: {conflicts}. A scheme may belong to at most one group."
+            )
+
+        group = SchemeGroup(name=name)
+        for scheme in resolved:
+            scheme.add_to_group(group)   # enforces <=1 group per scheme
+            group.add(scheme)
+        self.groups[name] = group
+        return group
+
+    def delete_group(self, name):
+        """Delete a group and unlink it from its member schemes."""
+        group = self.groups.pop(name, None)
+        if group is None:
+            raise ValueError(f"Unknown group '{name}'.")
+        for scheme in list(group.schemes):
+            scheme.remove_from_group(name)
+
+    def auto_groups(self):
+        """Auto-create groups for structured pruning from indexing annotations.
+
+        Two annotation kinds, both consumed generically (no model-specific logic):
+
+        * ``pruning.coupled_masks`` — layers that share one output mask *within a
+          block*. One group is created per block per co-mask set (e.g. q/k,
+          gate/up for every block).
+        * ``pruning.coupled_masks_all`` — layers that share one output mask
+          *across every block* of the family. One group is created per set,
+          containing that set's layers from all block indices (e.g. every block's
+          o_proj and down_proj together, so the residual/hidden dim is pruned
+          identically everywhere).
+
+        Returns:
+            dict: ``{group_name: [layer full-paths]}`` for every group created.
+        """
+        created = {}
+        for block_name, block_indexing in self.indexing.items():
+            pruning = block_indexing.get("pruning", {})
+            coupled_masks = pruning.get("coupled_masks", [])
+            coupled_masks_all = pruning.get("coupled_masks_all", [])
+            if not coupled_masks and not coupled_masks_all:
+                continue
+
+            path_template = block_indexing["path_template"]
+            config_attr = block_indexing.get("config_attr", "")
+            block_config = self.config if config_attr == "" else getattr(self.config, config_attr)
+            num_blocks = getattr(block_config, block_indexing["num_blocks_attr"])
+
+            # Per-block coupling: one group per block per set.
+            for block_id in range(num_blocks):
+                for layer_group in coupled_masks:
+                    existing = self._resolve_coupled_group_paths(
+                        path_template, layer_group, block_id
+                    )
+                    if len(existing) < 2:
+                        continue
+                    group = self.create_group(existing)
+                    created[group.name] = existing
+
+            # Cross-block coupling: one group per set, spanning all blocks.
+            for layer_group in coupled_masks_all:
+                full_paths = self._resolve_coupled_masks_all_paths(
+                    block_indexing, path_template, layer_group, num_blocks
+                )
+                existing = [p for p in full_paths if self._find_scheme(p) is not None]
+                if len(existing) < 2:
+                    continue
+                group = self.create_group(existing)
+                created[group.name] = existing
+        return created
+
+    @staticmethod
+    def _resolve_coupled_masks_all_paths(block_indexing, path_template, layer_group, num_blocks):
+        """Expand a ``coupled_masks_all`` layer set to concrete full paths.
+
+        Most entries are per-block leaf names (e.g. ``'self_attn.o_proj'``),
+        repeated over every block index. The ``'preprocessing'``/``'final_layer'``
+        sentinels are singleton paths instead -- resolved once (not per block)
+        directly from ``block_indexing['preprocessing']``/``['final_layer']``.
+        """
+        full_paths = []
+        for layer in layer_group:
+            if layer in _SENTINEL_COMPRESSED_TYPE:
+                sentinel_path = block_indexing.get(layer)
+                if sentinel_path:
+                    full_paths.append(sentinel_path)
+                continue
+            full_paths.extend(
+                path_template.format(block_index=block_id, path=layer)
+                for block_id in range(num_blocks)
+            )
+        return full_paths
+
+    def _resolve_coupled_group_paths(self, path_template, layer_group, block_id):
+        """Resolve one ``pruning.coupled_masks`` layer set to concrete scheme paths.
+
+        Pure indexing-metadata resolution (model-agnostic): expands the
+        ``path_template`` for ``block_id`` over each layer name in
+        ``layer_group`` and keeps only the paths that actually have a scheme
+        built. Shared by ``auto_groups()`` and ``_validate_coupling()``.
+        """
+        full_paths = [
+            path_template.format(block_index=block_id, path=layer)
+            for layer in layer_group
+        ]
+        return [p for p in full_paths if self._find_scheme(p) is not None]
+
+    def _iter_coupled_groups(self):
+        """Yield lists of scheme paths for every resolved coupled-mask group.
+
+        Covers both per-block (``pruning.coupled_masks``) and cross-block
+        (``pruning.coupled_masks_all``) sets, purely from indexing metadata.
+        """
+        for block_indexing in self.indexing.values():
+            pruning = block_indexing.get("pruning", {})
+            coupled_masks = pruning.get("coupled_masks", [])
+            coupled_masks_all = pruning.get("coupled_masks_all", [])
+            if not coupled_masks and not coupled_masks_all:
+                continue
+
+            path_template = block_indexing["path_template"]
+            config_attr = block_indexing.get("config_attr", "")
+            block_config = self.config if config_attr == "" else getattr(self.config, config_attr)
+            num_blocks = getattr(block_config, block_indexing["num_blocks_attr"])
+
+            for block_id in range(num_blocks):
+                for layer_group in coupled_masks:
+                    paths = self._resolve_coupled_group_paths(path_template, layer_group, block_id)
+                    if len(paths) >= 2:
+                        yield paths
+
+            for layer_group in coupled_masks_all:
+                full_paths = self._resolve_coupled_masks_all_paths(
+                    block_indexing, path_template, layer_group, num_blocks
+                )
+                existing = [p for p in full_paths if self._find_scheme(p) is not None]
+                if len(existing) >= 2:
+                    yield existing
+
+    def _validate_coupling(self, hard, criteria=None):
+        """Ask each compressor to validate consistency with its coupled siblings.
+
+        Resolves coupled-mask groups purely from indexing metadata, then
+        delegates the actual consistency check to each compressor via the
+        generic ``Compressor.check_coupling()`` hook -- the manager never
+        interprets compression-method-specific state (e.g. pruning ratios or
+        ``share_mask``) itself.
+        """
+        filtered = set(scheme.path for scheme in self.iter_filtered(criteria=criteria))
+        for paths in self._iter_coupled_groups():
+            if not any(p in filtered for p in paths):
+                continue
+            schemes = [self._find_scheme(p) for p in paths]
+            compressor_names = set()
+            for scheme in schemes:
+                compressor_names.update(scheme.compressors.keys())
+
+            for cname in compressor_names:
+                members = [(s, s.compressors.get(cname)) for s in schemes]
+                members = [(s, c) for s, c in members if c is not None]
+                if len(members) < 2:
+                    continue
+                for scheme, compressor in members:
+                    siblings = [c for s, c in members if s is not scheme]
+                    compressor.check_coupling(hard, siblings)
+
+    def _validate_grouping(self, criteria=None):
+        """Ensure every compressor requiring grouping has a group (pre-apply)."""
+        for scheme in self.iter_filtered(criteria=criteria):
+            for cname, compressor in scheme.compressors.items():
+                needs = getattr(compressor, "needs_grouping", None)
+                if callable(needs) and needs() and not scheme.groups:
+                    raise ValueError(
+                        f"Compressor '{cname}' on scheme '{scheme.path}' requires a group "
+                        "(e.g. share_mask is enabled) but the scheme is not part of any group. "
+                        "Call manager.auto_groups() or manager.create_group(...) first."
+                    )
 
     def init_vcon(self, criteria=None, verbose=False):
         """
@@ -302,6 +644,9 @@ class CompressionSchemesManager:
             Note: If selected compressors require backward-based calibration,
                   set both calibration data and calibration loss first.
         """
+        self._validate_grouping(criteria=criteria)
+        self._validate_coupling(hard=hard, criteria=criteria)
+
         if self.calibration_mode == "cascade":
             apply_cascade(
                 manager=self,
@@ -622,6 +967,31 @@ class CompressionSchemesManager:
             num_blocks = getattr(block_specific_config, num_blocks_attr, None)
             assert num_blocks is not None, f"Number of blocks attribute '{num_blocks_attr}' not found in the model configuration for block '{block_name}'. Please check the indexing configuration."
 
+            # Resolve the 'preprocessing'/'final_layer'/'preprocessing_conv'
+            # singleton paths (if annotated and actually substituted with a
+            # compressed module by replace_layers_upon_init -- e.g. composite
+            # BERT-style embeddings are not, and get no scheme). 'preprocessing'
+            # is the nn.Embedding case; 'preprocessing_conv' is a separate,
+            # independently-annotated key for Conv2d/Conv3d patch-embed leaves
+            # (the whole preprocessing wrapper generally isn't itself a bare
+            # conv -- see e.g. vit_c/qwen2_5_vl_c indexing).
+            preprocessing_path = self._resolve_sentinel_path(block_indexing, 'preprocessing')
+            preprocessing_conv_path = self._resolve_sentinel_path(block_indexing, 'preprocessing_conv')
+            final_layer_path = self._resolve_sentinel_path(block_indexing, 'final_layer')
+            # 'final_norm' (e.g. the post-block norm some families keep in
+            # extra_layers) is never substituted with a different class -- no
+            # type-check gate needed, just confirm the path resolves.
+            final_norm_path = self._resolve_final_norm_path(block_indexing)
+            norm_layers = set(block_indexing.get('pruning', {}).get('norm_layers', ()))
+            # Raw nn.Parameters (e.g. ViT's cls_token/position_embeddings)
+            # co-located with 'preprocessing_conv' in the same composite
+            # preprocessing wrapper, only meaningful if that sentinel actually
+            # resolved to a scheme (see CompressionScheme.preprocessing_conv_extra_params_paths).
+            preprocessing_conv_extra_params_paths = (
+                list(block_indexing.get('preprocessing_conv_extra_params', ()))
+                if preprocessing_conv_path is not None else []
+            )
+
             tmp_dict = {}
             for i in range(num_blocks):
                 for path in path_list:
@@ -637,12 +1007,79 @@ class CompressionSchemesManager:
                         path=full_path,
                         compression_config=compression_config,
                         model=self.model,
+                        pruning_indexing=block_indexing.get('pruning', {}),
+                        path_template=path_template,
+                        path_list=path_list,
+                        num_blocks=num_blocks,
+                        preprocessing_path=preprocessing_path,
+                        final_layer_path=final_layer_path,
+                        final_norm_path=final_norm_path,
+                        preprocessing_conv_extra_params_paths=preprocessing_conv_extra_params_paths,
+                        is_norm=path in norm_layers,
                     )
-            
+
+            for sentinel_name, full_path, sentinel_is_norm in (
+                ('preprocessing', preprocessing_path, False),
+                ('preprocessing_conv', preprocessing_conv_path, False),
+                ('final_layer', final_layer_path, False),
+                ('final_norm', final_norm_path, True),
+            ):
+                if full_path is None:
+                    continue
+                compression_config = getattr(block_specific_config, 'compression_config', {})
+                compression_config = compression_config.setdefault(full_path, {})
+                tmp_dict[full_path] = CompressionScheme(
+                    name=sentinel_name,
+                    block_id=None,
+                    path=full_path,
+                    compression_config=compression_config,
+                    model=self.model,
+                    pruning_indexing=block_indexing.get('pruning', {}),
+                    path_template=path_template,
+                    path_list=path_list,
+                    num_blocks=num_blocks,
+                    preprocessing_path=preprocessing_path,
+                    final_layer_path=final_layer_path,
+                    final_norm_path=final_norm_path,
+                    preprocessing_conv_extra_params_paths=preprocessing_conv_extra_params_paths,
+                    is_norm=sentinel_is_norm,
+                )
+
             all_schemes[block_name] = tmp_dict
-        
+
         return all_schemes
-    
+
+    def _resolve_sentinel_path(self, block_indexing, sentinel_name):
+        """Return the full path of a 'preprocessing'/'final_layer'/
+        'preprocessing_conv' indexing entry if it's annotated *and* was
+        actually substituted with its compressed counterpart
+        (EmbeddingCompressed/LinearCompressed/Conv2dCompressed/
+        Conv3dCompressed) by replace_layers_upon_init. Returns None otherwise
+        (e.g. composite BERT-style embeddings, or unannotated).
+        """
+        full_path = block_indexing.get(sentinel_name)
+        if not full_path:
+            return None
+        module = get_submodule(self.model, full_path)
+        expected_types = _SENTINEL_COMPRESSED_TYPE[sentinel_name]
+        if type(module) not in expected_types:
+            return None
+        return full_path
+
+    def _resolve_final_norm_path(self, block_indexing):
+        """Return the full path of a 'final_norm' indexing entry, if any.
+
+        Unlike 'preprocessing'/'final_layer', a normalization layer is never
+        substituted with a different class -- it stays whatever it already
+        was (RMSNorm/LayerNorm) -- so there's no type-check gate, only
+        confirmation that the annotated path actually resolves.
+        """
+        full_path = block_indexing.get('final_norm')
+        if not full_path:
+            return None
+        get_submodule(self.model, full_path)  # raises if the annotation is wrong
+        return full_path
+
     def print_filtered(self, criteria:list=None):
         """
         Prints CompressionScheme objects filtered by name and/or block_id.

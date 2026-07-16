@@ -106,6 +106,48 @@ Calls `compressor.restore(module)` for each scheme:
 
 ---
 
+## Structured Pruning — Coupling and Grouping
+
+Structured pruning removes whole output neurons (rows) of a layer. Two mechanisms
+keep a pruned model consistent, both driven by generic annotations under the
+`pruning` key of each model's `indexing_*.py` (so `compression/` and `utils/`
+stay model-agnostic):
+
+- **Coupling (`output_dependence`).** When a layer's output rows are removed,
+  the input columns of the layers it feeds must shrink to match. Hard
+  `StructuredPruner.apply` builds the keep-mask, removes the rows (resizing
+  `weight`/`bias`/`out_features`), then cascades into each coupled next layer via
+  `CoupledPruner` (input-column removal, hard-only). Soft apply just zeroes rows,
+  so no cascade is needed. The kept-dimension formula lives once in
+  `blocks/pruning_dims.py` (`effective_out_features`) and is reused by the pruner,
+  the coupled pruner, and the converted MLP blocks — so a hard-pruned model
+  converts and exports with matching shapes.
+
+- **Grouping (shared masks).** Some layers must be pruned *identically* — e.g.
+  `gate_proj`/`up_proj` (multiplied together) or `q_proj`/`k_proj` (matched
+  head dim). `manager.auto_groups()` reads `coupled_masks` (within a block) and
+  `coupled_masks_all` (across all blocks, for the residual/hidden writers) and
+  builds `SchemeGroup`s holding **pointers** to the schemes plus a shared
+  `properties` dict. With `share_mask` enabled, the first compressor in a group
+  computes one reduced mask (`reduce_op` over the members' scores) and stores it
+  in the group; the others reuse it. All of this lives in
+  `compression/structured_pruning.py` — the manager only builds groups and
+  iterates `scheme.apply`.
+
+`granularity=<int>` prunes uniformly within each chunk (e.g. per attention head);
+`repeated_pattern=True` reduces scores across chunks into one length-`granularity`
+mask that is tiled back, letting layers with different chunk counts (GQA
+`q_proj`/`k_proj`) share a single mask. Group-only options (`share_mask`, listed in
+`GROUP_OPTIONS`) can only be set through `manager.set(..., group=...)`.
+
+Scope: both MLP and attention (q/k/v) structured pruning are wired end-to-end
+through convert/export. Attention hard pruning changes `head_dim` (GQA); RoPE
+projection geometry and the pruned KV-cache are resolved per-kv-group at
+conversion time, and the GQA `v→o` coupling is handled via
+`coupled_repeated_pattern`.
+
+---
+
 ## Calibration Pipeline — Raw Data and Summaries
 
 The calibration system has two levels:
@@ -192,6 +234,29 @@ manager.apply(device=device, verbose=True)
 With `verbose=True`, cascade calibration prints per-stage diagnostics:
 `pairs`, `mean_rel_l2_diff`, and `max_rel_l2_diff` for shifted-summary stages.
 
+### Opting a family out of cascade calibration
+
+An indexing block can set `'no_cascade_calibration': True` when its layer layout
+isn't compatible with the block-wise cascade algorithm above. `manager.apply()`
+then raises a `ValueError` immediately if cascade mode is requested with any
+scheme from that block selected, instead of silently running an unsupported flow.
+`bert_c` and `modernbert_c` set this flag today:
+
+- **BERT** — cascade's `_collect_preprocessing_outputs`/`_collect_loader_inputs`
+  discard `attention_mask` once the embeddings step runs, threading only the raw
+  hidden-state tensor between blocks. Bidirectional encoders lean on
+  `attention_mask` much more than causal decoders (padded batches, no causal mask
+  to fall back on), so block-wise calibration without it isn't a safe stand-in for
+  real inference.
+- **ModernBERT** — alternating global/local attention layers each need their own
+  rotary embedding call keyed by layer type
+  (`rotary_emb(hidden_states, position_ids, layer_type)`), but cascade's
+  position-embedding injection calls the configured rotary module the same way
+  for every block.
+
+Use `"standard"` calibration mode for these families (`"svd"` or `"svd-llm-v2"`
+LRD instead of `"aa-svd"`).
+
 ---
 
 ## VCON — Smooth Compression for Fine-Tuning
@@ -257,7 +322,7 @@ print(result.engine_path)
 
 `export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)`.
 
-TensorRT is the newest backend. It needs the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests live under `test/tensorrt_tests/` and the CLI runner is `scripts/tensorrt/run_export.sh`, mirroring the ExecuTorch backends' `test/executorch_tests/` / `scripts/executorch/`.
+TensorRT is the newest backend. It needs the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests live in `test/e2e/test_export_pipelines.py` (capability-gated) and the CLI runner is `scripts/tensorrt/run_export.sh`, mirroring the ExecuTorch backends there.
 
 ---
 
@@ -333,4 +398,4 @@ Export the three classes from `models/newmodel_c/__init__.py` and add them to
        "config_class": <Backend>ExportConfig,
    }
    ```
-4. Add tests under `test/<backend>_tests/` (or `test/executorch_tests/` if it's an ExecuTorch backend) mirroring `test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py`.
+4. Add a capability-gated test case in `test/e2e/test_export_pipelines.py` mirroring the existing `test_export_xnnpack`/`test_export_tensorrt` pattern.

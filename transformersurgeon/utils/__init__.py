@@ -1,4 +1,5 @@
 # Common utilities for transformer surgeon
+from .grouping import *
 from .scheme import *
 from .configuration import *
 from .manager import *

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="transformer-surgeon",
-    version="0.7.3",
+    version="0.9.0",
     description="Transformer model compression and optimization tools",
     packages=find_packages(),
     python_requires=">=3.10",
@@ -14,6 +14,10 @@ setup(
     extras_require={
         "executorch": ["executorch>=1.0.0"],
         "tensorrt": ["torch-tensorrt"],
+        # "test" and "dev" are intentionally identical — "test" is the minimal
+        # extra needed to run the pytest suite; "dev" is the name contributors
+        # expect. Keep both so `pip install -e ".[test]"` and `-e ".[dev]"` work.
+        "test": ["pytest"],
         "dev": ["pytest"],
     },
 )

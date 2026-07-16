@@ -24,38 +24,32 @@ manager.restore()                                   # undo
 ```bash
 git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 Run tests:
 
 ```bash
-# Core logic — no large models required
-pytest test/compression_tests/ -v
+# Default: test/unit + test/e2e/test_model_families.py — no downloads, no GPU.
+# All 7 families (qwen2, llama, bert, modernbert, distilbert, vit, qwen2_vl,
+# qwen2_5_vl) via tiny random-weight models from test/_helpers/model_factory.py.
+pytest
 
-# Encoder model tests (BERT, DistilBERT) — small models, fast
-pytest test/bert_tests/ -v
-pytest test/distilbert_tests/ -v
+# Bug regressions (pinned assertions for previously-broken framework behavior)
+pytest test/unit/test_known_bugs.py -v
 
-# Causal LM tests — require model downloads
-pytest test/qwen_tests/inference_test.py -v
-pytest test/qwen_tests/test_calibration_compression.py -v
+# Real-checkpoint export pipelines — HF roundtrip, convert, XNNPACK, TensorRT, QNN.
+# Each backend is gated by test/_helpers/capabilities.py (skips if unavailable).
+pytest test/e2e/test_export_pipelines.py -v
 
-# Vision-language
-pytest test/qwen_vl_tests/ -v
-
-# HuggingFace export roundtrip
-pytest test/hf_export_tests/ -v
-
-# Backend export (ExecuTorch XNNPACK/QNN) — requires executorch extra
-pytest test/executorch_tests/ -v
-
-# Backend export (TensorRT) — requires tensorrt extra + CUDA; skips otherwise
-pytest test/tensorrt_tests/ -v
-
-# Single file
-pytest test/compression_tests/compression_test.py::test_name -v
+# Single file / test
+pytest test/e2e/test_model_families.py::test_lrd_soft_apply_and_restore -v
 ```
+
+Legacy per-model CLI scripts (pre-dating this hardened suite) live under
+`test/test_deprecated/` — kept for reference only, not collected by default
+(`pytest.ini` sets `testpaths = test/unit test/e2e`). See its README for why
+they were retired.
 
 ---
 
@@ -83,8 +77,11 @@ Where to look when you need to change something:
 | Add a new compression method | Subclass `compression/abstract.py` → new file in `compression/` → register in `compression/registry.py` |
 | Add an LRD variant (e.g. new SVD method) | New file in `compression/lrd_methods/`, import in `compression/lrd.py` |
 | Add a pruning variant | New file in `compression/structured_pruning_methods/` or `unstructured_pruning_methods/` |
+| Change structured-pruning masks / scoring / effective dims | `compression/structured_pruning.py`, `compression/structured_pruning_methods/`, `blocks/pruning_dims.py` |
+| Change cross-layer input pruning (coupling) | `compression/coupled_pruning.py` (invoked in cascade by the structured pruner) |
+| Change scheme grouping (shared masks) | `utils/grouping.py` (`SchemeGroup`) + `utils/manager.py` (`create_group`/`delete_group`/`auto_groups`) |
 | Add a new model family | `models/newmodel_c/indexing_newmodel_c.py` + `models/newmodel_c/define_newmodel_c.py` |
-| Change what layers get compressed in a model | `models/qwen2_c/indexing_qwen2_c.py` (or the relevant model's `indexing_*.py`) |
+| Change what layers get compressed / pruning coupling in a model | `models/qwen2_c/indexing_qwen2_c.py` (or the relevant model's `indexing_*.py`) — `path_list` and the `pruning` block |
 | Change layer filtering / criteria logic | `utils/manager.py` → `iter_filtered()` |
 | Change calibration data collection hooks | `calibration/raw_data/activation.py` or `weight_grad.py` |
 | Add a new calibration summary (statistic) | Subclass `calibration/summaries/base.py` → new file → register in `calibration/summaries/registry.py` |
@@ -120,15 +117,19 @@ result = export_to_backend(model, config=config)   # model can be a full HF mode
 print(result.engine_path)
 ```
 
+Device placement is normalized internally (`resolve_components_and_wrapper` traces on CPU regardless of the input model's device; TensorRT then compiles the traced graph onto `config.device`), so callers don't need to manage component devices themselves.
+
 `export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)` — use `export_to_backend`.
 
-TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live under `test/tensorrt_tests/` (mirroring `test/executorch_tests/`); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
+TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live in `test/e2e/test_export_pipelines.py` (capability-gated, skips without torch-tensorrt/CUDA); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
 
 ---
 
 ## Compression Parameter Reference
 
 All parameters are set via `manager.set(compression_type, param, value, criteria=...)`.
+This is the terse lookup table; for a plain-language explanation of what each
+method/parameter actually does, see [docs/compression_methods.md](docs/compression_methods.md).
 
 ### `"lrd"` — Low-Rank Decomposition
 
@@ -152,8 +153,69 @@ Calibration requirements by method:
 |---|---|---|
 | `ratio` | `0.0` | `float` in `[0, 1)` |
 | `method` | `"magnitude"` | `"magnitude"`, `"gradient"`, `"random"` |
+| `granularity` | `"layer"` | `"layer"`, or a positive `int` (chunk/head size) |
+| `repeated_pattern` | `False` | `bool` — one mask per chunk, tiled across chunks |
+| `coupled_repeated_pattern` | `False` | `False`, or a positive `int` N — repeat each length-`granularity` chunk of the mask N times when cascading onto coupled next layers |
+| `reduce_op` | `None` | `None`, `"add"`, `"multiply"` |
+| `share_mask` | `False` | `bool` — **group-only** (set via `group=`) |
 
-`"gradient"` requires `"weight_grad"` calibration summary.
+`"gradient"` requires the `"weight_grad"` calibration summary (needs a loss
+callback: `manager.set_calibration_loss(...)`).
+
+- **Soft** (`hard=False`) zeroes pruned output rows in place (reversible). **Hard**
+  (`hard=True`) actually removes the rows, resizes `weight`/`bias`/`out_features`,
+  and **cascades** the removal into the input columns of the coupled next layers
+  (from the model's `pruning.output_dependence` indexing) via `CoupledPruner`.
+- `granularity=g` prunes the same count within each consecutive chunk of `g`
+  neurons (e.g. per attention head). `repeated_pattern=True` reduces scores across
+  those chunks (`reduce_op`) into one length-`g` mask that is tiled back — this is
+  what lets GQA `q_proj`/`k_proj` (different head counts) share one mask.
+- `coupled_repeated_pattern=N` changes only the mask *cascaded onto coupled next
+  layers* (hard apply): each length-`g` chunk of this layer's own keep-mask is
+  repeated `N` times in place (`chunk chunk ... | next_chunk next_chunk ...`)
+  before being used to prune the coupled layer's input columns, for a coupled
+  layer whose input is `N`x this layer's own (pruned) output width. E.g. mask
+  `[0,1,1,0,0,1,0,1]` with `granularity=4`, `coupled_repeated_pattern=2` cascades
+  as `[0,1,1,0, 0,1,1,0, 0,1,0,1, 0,1,0,1]`. This layer's own output rows are
+  still pruned by the unexpanded mask; only the downstream cascade changes.
+- Effective kept dim is single-sourced in `blocks/pruning_dims.py`
+  (`effective_out_features`), reused by the pruner, coupled pruning, and the
+  converted MLP blocks so a hard-pruned model converts/exports with matching shapes.
+
+#### Grouped structured pruning (shared masks)
+
+Layers that must be pruned identically (same output mask) are expressed in model
+indexing and turned into groups by the manager:
+
+```python
+manager = Qwen2CompressionSchemesManager(model)
+groups = manager.auto_groups()                 # reads pruning.coupled_masks[_all]
+for g in groups:                               # e.g. per-block gate/up, q/k
+    manager.set("structured_pruning", "share_mask", True, group=g)   # group-only
+    manager.set("structured_pruning", "reduce_op", "add",  group=g)
+manager.set("structured_pruning", "method", "random", criteria=None)
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp.gate_proj")
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp.up_proj")
+manager.apply(hard=True)
+```
+
+Rules: `share_mask` (and any `GROUP_OPTIONS`) can only be set through `group=`
+(not `criteria`), and enabling one resets that scheme's non-group config. Grouping
+and the coupled cascade live entirely in `compression/structured_pruning.py` (the
+first compressor in a group computes the shared mask; siblings reuse it) — the
+manager only builds groups and iterates `scheme.apply`.
+
+Indexing annotations (`models/*/indexing_*.py`, under a `pruning` key):
+`output_dependence` (coupling targets), `coupled_masks` (share a mask within a
+block), `coupled_masks_all` (share a mask across all blocks — the residual/hidden
+writers), `per_head_uniform` (recorded only).
+
+Scope: both MLP and attention (q/k/v) structured pruning are wired end-to-end
+(prune → cascade → convert → export). Attention hard pruning changes `head_dim`
+(GQA); RoPE projection geometry and the pruned KV-cache are resolved per-kv-group
+at conversion time (`blocks/mha.py::MHABase.finalize_rope_pruning()`), and a
+hard-pruned `v_proj` cascades into `o_proj` via `coupled_repeated_pattern`. See
+`test/e2e/test_gqa_attention_pruning.py`.
 
 ### `"unstructured_pruning"` — Weight-Level Sparsity
 
@@ -170,7 +232,7 @@ Pruning masks survive `restore()` for STE fine-tuning. Call `manager.remove_mask
 | param | default | valid values |
 |---|---|---|
 | `method` | `"vanilla"` | `"vanilla"`, `"gptq"` |
-| `precision` | `"full"` | `"full"`, `"int8"`, `"int4"`, `"int2"`, `"binary"` |
+| `precision` | `"full"` | `"full"`, `"binary"`, or `int` in `[2, 16]` (e.g. `8`, `4`, `2` — NOT the strings `"int8"`/`"int4"`/`"int2"`) |
 | `granularity` | `"per_tensor"` | `"per_tensor"`, `"per_channel"` |
 | `sparsity` | `0.0` | `float` in `[0, 1)` |
 | `sparse_method` | `"magnitude"` | `"magnitude"`, `"random"` |
@@ -226,6 +288,8 @@ Things the codebase silently relies on. Breaking these causes silent wrong behav
 - **Don't put model-specific logic in `CompressionSchemesManager`.** The manager is generic. All model-specific information belongs in the model's `indexing_*.py` file.
 
 - **Don't use `"standard"` calibration mode with `"aa-svd"`.** AA-SVD requires cross-layer shifted activations, which need staged (cascade) passes. Set `manager.set_calibration_mode("cascade")` before calling `apply()`.
+
+- **Don't use `"cascade"` calibration mode with a family indexed `'no_cascade_calibration': True`** (currently `bert_c`, `modernbert_c`). `apply()` raises `ValueError` immediately — these families' layer layout (grouped/bidirectional QKV, or ModernBERT's per-layer-type rotary embeddings) isn't modeled by the single-flow block-wise cascade in `utils/cascade.py`. Use `"standard"` mode (`"svd"`/`"svd-llm-v2"` LRD, or non-AA-SVD compressors) instead.
 
 - **Don't call `reapply_masks()` before `manager.apply()`.** Masks are created during `apply()`. `reapply_masks()` is for re-applying existing masks after an optimizer step during STE fine-tuning.
 

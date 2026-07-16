@@ -9,6 +9,7 @@ transformersurgeon/
 ├── __init__.py
 ├── blocks/
 │   ├── linear_compressed.py
+│   ├── pruning_dims.py          # effective_out_features: single source for ratio->kept dim
 │   ├── vcon_block.py
 │   ├── decoder.py
 │   ├── encoder.py
@@ -16,13 +17,13 @@ transformersurgeon/
 │   ├── mlp.py
 │   ├── norm.py
 │   ├── rope.py
-│   ├── config.py
-│   └── indexing.py
+│   └── config.py
 ├── compression/
 │   ├── abstract.py
 │   ├── registry.py
 │   ├── lrd.py
 │   ├── structured_pruning.py
+│   ├── coupled_pruning.py       # prunes next-layer inputs (cascaded by structured_pruning)
 │   ├── unstructured_pruning.py
 │   ├── quantization.py
 │   ├── lrd_methods/
@@ -35,6 +36,7 @@ transformersurgeon/
 │   └── summaries/
 ├── utils/
 │   ├── scheme.py
+│   ├── grouping.py              # SchemeGroup: shared-mask groups for pruning
 │   ├── manager.py
 │   ├── configuration.py
 │   ├── modeling.py
@@ -47,6 +49,7 @@ transformersurgeon/
 │   ├── qwen2_vl_c/
 │   ├── qwen2_5_vl_c/
 │   ├── bert_c/
+│   ├── modernbert_c/
 │   ├── distilbert_c/
 │   └── vit_c/
 ├── hf/
@@ -135,6 +138,10 @@ Each indexing block can define explicit parallel calibration groups:
 
 Groups are interpreted with the same matching semantics used by manager filtering (substring criteria over layer paths). Ungrouped layers are calibrated as singleton stages.
 
+`calibration_groups` may also be given as a dict keyed by subblock name (each value a list of layer groups, with subblock-relative names auto-qualified) — see `models/qwen2_c/indexing_qwen2_c.py`. Both forms are parsed by `CompressionSchemesManager._get_calibration_groups_from_indexing`.
+
+An indexing block can opt entirely out of cascade calibration with `'no_cascade_calibration': True` — `apply_cascade` (`utils/cascade.py`) raises a `ValueError` up front if cascade mode is requested with any scheme selected from that block. `bert_c` and `modernbert_c` set this: BERT's grouped/bidirectional QKV layout and ModernBERT's per-layer-type rotary embeddings (alternating local/global attention) aren't modeled by the single-flow block-wise cascade algorithm. Use `"standard"` calibration mode for those families.
+
 ### 6) Export pipeline
 
 - `utils/convert.py`
@@ -149,7 +156,7 @@ Groups are interpreted with the same matching semantics used by manager filterin
 - `export/executorch_exporters/{xnnpack,qnn}/`
 	- ExecuTorch backend exporters (`XNNPACKExportConfig`/`export_with_xnnpack`, `QNNExportConfig`/`export_with_qnn`), each producing a `.pte` file. Mixed INT8/INT4 + float export is driven entirely by per-layer compression metadata already on the model.
 - `export/tensorrt/`
-	- TensorRT backend exporter (`TensorRTExportConfig`/`export_with_tensorrt`), lowering via `torch-tensorrt`'s Dynamo path to a TensorRT engine/exported program. Reuses `export/common.py` for everything except the quantizer and compile/save step. Requires the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests under `test/tensorrt_tests/`, CLI runner at `scripts/tensorrt/run_export.sh`.
+	- TensorRT backend exporter (`TensorRTExportConfig`/`export_with_tensorrt`), lowering via `torch-tensorrt`'s Dynamo path to a TensorRT engine/exported program. Reuses `export/common.py` for everything except the quantizer and compile/save step. Requires the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests under `test/e2e/test_export_pipelines.py`, CLI runner at `scripts/tensorrt/run_export.sh`.
 
 ## End-to-End Data Flow
 

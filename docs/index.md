@@ -13,7 +13,7 @@ reversible by default.
 ```bash
 git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
-pip install -e .
+pip install -e ".[test]"   # add [test] to also get pytest for running the test suite
 ```
 
 ---
@@ -23,7 +23,7 @@ pip install -e .
 **Compression methods**
 
 - `lrd` — low-rank decomposition (SVD, calibration-aware SVD-LLM-v2, AA-SVD)
-- `structured_pruning` — output neuron removal by magnitude, gradient, or random
+- `structured_pruning` — output neuron removal (magnitude/gradient/random) with per-head `granularity`, shared masks across coupled layers (`auto_groups`), and hard removal that cascades into the next layer's inputs
 - `unstructured_pruning` — weight-level sparsity masks
 - `quantization` — fixed-point and binary weights
 
@@ -54,6 +54,7 @@ pip install -e .
 | Qwen2-VL | Vision-language | `Qwen2VLForConditionalGenerationCompress` |
 | Qwen2.5-VL | Vision-language | `Qwen2_5_VLForConditionalGenerationCompress` |
 | BERT | Encoder | `BertForSequenceClassificationCompress` |
+| ModernBERT | Encoder | `ModernBertForSequenceClassificationCompress` |
 | DistilBERT | Encoder | `DistilBertForSequenceClassificationCompress` |
 | ViT | Vision encoder | `ViTForImageClassificationCompress` |
 
@@ -86,5 +87,6 @@ manager.restore()  # undo all compression, back to original weights
 ## Where to Go Next
 
 - [**Concepts**](concepts.md) — understand the mental model before diving into the API
+- [**Compression Methods**](compression_methods.md) — every compression type, method, and parameter, explained
 - [**Examples**](examples/01_basic_lrd.md) — runnable scripts for common workflows
 - [**API Reference**](api/utils/manager.md) — full method-level documentation

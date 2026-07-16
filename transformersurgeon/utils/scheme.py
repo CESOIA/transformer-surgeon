@@ -8,6 +8,8 @@ import inspect
 import torch
 from typing import Union
 from ..blocks import LinearCompressed
+from ..blocks import EmbeddingCompressed
+from ..blocks import Conv2dCompressed, Conv3dCompressed
 from ..blocks import VCONBlock
 from ..compression import (
     COMPRESSOR_DICT,
@@ -62,6 +64,15 @@ class CompressionScheme:
             # output_paths,
             compression_config=None,
             model=None,
+            pruning_indexing=None,
+            path_template=None,
+            path_list=None,
+            num_blocks=None,
+            preprocessing_path=None,
+            final_layer_path=None,
+            final_norm_path=None,
+            preprocessing_conv_extra_params_paths=None,
+            is_norm=False,
             ):
         self.name = name
         self.block_id = block_id
@@ -70,6 +81,45 @@ class CompressionScheme:
         self.hard_applied = False # this flags the compression as non-reversible when True
         self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize with hard application
         self.vcon_initialized = False # this flags if the VCONBlock has been initialized
+
+        # Groups this scheme belongs to (name -> SchemeGroup). At most one for now.
+        self.groups = {}
+        # Generic (model-agnostic) pruning indexing metadata + path template,
+        # plumbed in by the manager so compressors can resolve coupled targets
+        # without the manager itself orchestrating them.
+        self.pruning_indexing = pruning_indexing or {}
+        # Whether this layer's output rows are indexed by positional embedding
+        # (RoPE q/k projections; see e.g. llama_c's pruning.position_linked).
+        # Consumed by StructuredPruner.apply to warn before hard-pruning it.
+        self.position_linked = name in self.pruning_indexing.get('position_linked', ())
+        self.path_template = path_template
+        # Flattened per-block layer order and total block count, so coupled
+        # pruning can tell whether an output_dependence target sits later in
+        # the same block or wraps into the next one (see StructuredPruner).
+        self.path_list = path_list or []
+        self.num_blocks = num_blocks
+        # Resolved full paths of the 'preprocessing'/'final_layer' sentinel
+        # layers (if a scheme was built for them), so coupled-cascade code can
+        # resolve those output_dependence targets without re-deriving them
+        # from path_template (they aren't block-indexed).
+        self.preprocessing_path = preprocessing_path
+        self.final_layer_path = final_layer_path
+        self.final_norm_path = final_norm_path
+        # Dotted paths (relative to the model root) of raw nn.Parameters that
+        # live alongside 'preprocessing_conv' in the same composite
+        # preprocessing wrapper (e.g. ViT's cls_token/position_embeddings,
+        # concatenated/added directly to the conv's output along the hidden
+        # dim) and therefore must be index-selected on their last dim in sync
+        # with the conv's hard-pruning mask -- see
+        # StructuredPruner._prune_extra_params. Only meaningful on the
+        # 'preprocessing_conv' scheme itself; empty for models without such
+        # extra params (e.g. Qwen-VL's patch_embed, a bare reshape+conv).
+        self.preprocessing_conv_extra_params_paths = preprocessing_conv_extra_params_paths or []
+        # Normalization layers (e.g. RMSNorm/LayerNorm) get a scheme so the
+        # manager/coupled-pruning cascade can route through them, but they are
+        # never user-compressible (see set() below) -- pruning only ever
+        # forwards a mask through them via CoupledPruner.apply_chain.
+        self.is_norm = is_norm
 
         # Generate compressor list based on the provided configuration
         self.compressors = {}
@@ -84,6 +134,7 @@ class CompressionScheme:
                 self.compressors[comp_name] = compressor_class(comp_config)
 
         self._sort_compressors()
+        self._link_compressors()
 
         # Check if the module exists in the model
         if self.model is not None:
@@ -112,6 +163,16 @@ class CompressionScheme:
             compression_property (str): The name of the property to set (e.g., 'ratio' for pruning).
             value: The new value to set for the specified property.
         """
+        if self.is_norm:
+            # Normalization layers are never user-compressible: they only
+            # ever get pruned indirectly, by CoupledPruner forwarding a mask
+            # through them. A no-op (not an error) keeps broadcast calls like
+            # manager.set(..., criteria=None) safe even when they happen to
+            # match a norm scheme.
+            if verbose:
+                print(f"Skipping {compression_property} of {compression_name} for normalization layer {self.path}: not user-compressible.")
+            return
+
         if verbose:
             print(f"Setting {compression_property} of {compression_name} to {value} for module {self.path}.")
 
@@ -138,6 +199,7 @@ class CompressionScheme:
             # Build default dict
             self.config[compression_name] = {key: value["default"] for key, value in COMPRESSION_REGISTRY[compression_name].items()}
             self.compressors[compression_name] = compressor_class(self.config[compression_name])
+            self.compressors[compression_name].scheme = self
 
         # Set the specified (temp) property of the compressor
         compressor = self.compressors[compression_name]
@@ -148,6 +210,30 @@ class CompressionScheme:
 
         self._sort_compressors()
     
+    def _link_compressors(self):
+        """Plant a back-reference to this scheme on every compressor.
+
+        Compressors (e.g. the structured pruner) use it to reach group siblings
+        and the generic pruning indexing for coupled cascades. Set at construction
+        time only — never during apply.
+        """
+        for compressor in self.compressors.values():
+            compressor.scheme = self
+
+    def add_to_group(self, group):
+        """Register membership in ``group`` (enforces at most one group for now)."""
+        if self.groups and group.name not in self.groups:
+            existing = next(iter(self.groups))
+            raise ValueError(
+                f"Scheme '{self.path}' is already in group '{existing}'. "
+                "A scheme may belong to at most one group."
+            )
+        self.groups[group.name] = group
+
+    def remove_from_group(self, name):
+        """Drop membership in the named group if present."""
+        self.groups.pop(name, None)
+
     def _sort_compressors(self):
         """Re-order self.compressors to match APPLICATION_ORDER.
 
@@ -218,14 +304,21 @@ class CompressionScheme:
         Checks if the module is compatible with compression.
         Compatible modules:
             - LinearCompressed
+            - EmbeddingCompressed
+            - Conv2dCompressed
+            - Conv3dCompressed
 
         Returns:
             bool: True if the module is compatible, False otherwise.
         """
         compatible = False
         compatible = compatible or self.vcon_initialized # if VCON is initialized, compatible by definition
-        compatible = compatible or (type(self.get_module()) is LinearCompressed)
-        
+        module_type = type(self.get_module())
+        compatible = compatible or module_type is LinearCompressed
+        compatible = compatible or module_type is EmbeddingCompressed
+        compatible = compatible or module_type is Conv2dCompressed
+        compatible = compatible or module_type is Conv3dCompressed
+
         return compatible
     
     def _module_copy(self, module):

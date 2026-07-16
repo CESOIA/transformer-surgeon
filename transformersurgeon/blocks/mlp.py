@@ -2,6 +2,7 @@
 # Multi Layer Perceptron (MLP) blocks
 import torch
 from . import LinearCompressed
+from .pruning_dims import pruning_config_dims
 
 # Activation function mapping
 activation_map = {
@@ -43,6 +44,11 @@ class MLP(torch.nn.Module):
         up_proj_lrd_rank = compression_config["up_proj"]["lrd"]["rank"]
         down_proj_lrd_rank = compression_config["down_proj"]["lrd"]["rank"]
 
+        # Structured pruning: effective intermediate dim (up output rows removed,
+        # down input columns coupled to match) and effective output dim.
+        eff_hidden = pruning_config_dims(compression_config["up_proj"], hidden_dim)
+        eff_out = pruning_config_dims(compression_config["down_proj"], embed_dim)
+
         # Setup bias requirement
         if bias_required is None:
             bias_required = {
@@ -56,16 +62,16 @@ class MLP(torch.nn.Module):
 
         self.up_proj = LinearCompressed(
             embed_dim,
-            hidden_dim,
+            eff_hidden,
             bias=bias_required["up_proj"],
             rank=up_proj_lrd_rank,
             dtype=dtype)
-        
+
         self.activation = activation_map[activation]()
 
         self.down_proj = LinearCompressed(
-            hidden_dim,
-            embed_dim,
+            eff_hidden,
+            eff_out,
             bias=bias_required["down_proj"],
             rank=down_proj_lrd_rank,
             dtype=dtype)
@@ -120,6 +126,12 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
         gate_proj_lrd_rank = compression_config["gate_proj"]["lrd"]["rank"]
         down_proj_lrd_rank = compression_config["down_proj"]["lrd"]["rank"]
 
+        # Structured pruning: gate/up are pruned together (shared mask), so the
+        # effective intermediate dim comes from either — use up_proj. down_proj's
+        # input is coupled to that; its output dim follows its own ratio.
+        eff_hidden = pruning_config_dims(compression_config["up_proj"], hidden_dim)
+        eff_out = pruning_config_dims(compression_config["down_proj"], embed_dim)
+
         # Setup bias requirement
         if bias_required is None:
             bias_required = {
@@ -135,23 +147,23 @@ class MLPGated(torch.nn.Module): # Qwen-style gated MLP
 
         self.up_proj = LinearCompressed(
             embed_dim,
-            hidden_dim,
+            eff_hidden,
             bias=bias_required["up_proj"],
             rank=up_proj_lrd_rank,
             dtype=dtype)
-        
+
         self.gate_proj = LinearCompressed(
             embed_dim,
-            hidden_dim,
+            eff_hidden,
             bias=bias_required["gate_proj"],
             rank=gate_proj_lrd_rank,
             dtype=dtype)
-        
+
         self.activation = activation_map[activation]()
 
         self.down_proj = LinearCompressed(
-            hidden_dim,
-            embed_dim,
+            eff_hidden,
+            eff_out,
             bias=bias_required["down_proj"],
             rank=down_proj_lrd_rank,
             dtype=dtype)

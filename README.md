@@ -9,14 +9,14 @@ Apply low-rank decomposition, pruning, or quantization to any supported model in
 ```bash
 git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
-pip install -e .
+pip install -e ".[test]"   # add [test] to also get pytest for running the test suite
 ```
 
 ## 🗂️ What's Included
 
 **Compression methods**
 - `lrd` — low-rank decomposition (SVD, calibration-aware SVD-LLM-v2, AA-SVD)
-- `structured_pruning` — output neuron removal by magnitude, gradient, or random
+- `structured_pruning` — output neuron removal (magnitude/gradient/random), with per-head `granularity`, shared masks across coupled layers (`auto_groups`), and hard removal that cascades into the next layer's inputs
 - `unstructured_pruning` — weight-level sparsity masks
 - `quantization` — fixed-point and binary weights
 
@@ -42,6 +42,7 @@ pip install -e .
 | Qwen2-VL | Vision-language | `Qwen2VLForConditionalGenerationCompress` |
 | Qwen2.5-VL | Vision-language | `Qwen2_5_VLForConditionalGenerationCompress` |
 | BERT | Encoder | `BertForSequenceClassificationCompress` |
+| ModernBERT | Encoder | `ModernBertForSequenceClassificationCompress` |
 | DistilBERT | Encoder | `DistilBertForSequenceClassificationCompress` |
 | ViT | Vision encoder | `ViTForImageClassificationCompress` |
 
@@ -101,6 +102,51 @@ With `verbose=True`, cascade calibration prints shifted-activation sanity diagno
 - `mean_rel_l2_diff`: mean relative $\ell_2$ difference between base and shifted activations
 - `max_rel_l2_diff`: maximum relative $\ell_2$ difference observed in the stage
 
+**Not every family supports cascade mode.** An indexing block can set
+`'no_cascade_calibration': True` to make `apply(..., mode="cascade")` raise
+immediately instead of running. BERT and ModernBERT are marked this way today
+(bidirectional/grouped-QKV layouts and, for ModernBERT, per-layer-type rotary
+embeddings that the single-flow cascade position-embedding injection doesn't
+model) — use `set_calibration_mode(mode="standard")` for those families.
+
+### Structured pruning with grouping (`auto_groups`)
+
+Remove output neurons from layers, keeping coupled layers consistent. `auto_groups()`
+reads the model's indexing (`pruning.coupled_masks` / `coupled_masks_all`) and builds
+the groups of layers that must share a pruning mask (e.g. each block's `gate_proj`/`up_proj`,
+`q_proj`/`k_proj`). `share_mask` makes a group prune the *same* neurons; hard pruning then
+removes them and cascades the input pruning into the next layer (`down_proj`).
+
+```python
+manager = Qwen2CompressionSchemesManager(model)
+
+# 1. Build coupled-mask groups from indexing, and share one mask per MLP group.
+groups = manager.auto_groups()                       # {"group1": [...gate_proj, up_proj], ...}
+mlp_groups = {g: p for g, p in groups.items() if any("gate_proj" in x for x in p)}
+for g in mlp_groups:
+    manager.set("structured_pruning", "share_mask", True, group=g)   # group-only option
+    manager.set("structured_pruning", "reduce_op", "add",  group=g)  # how to reduce scores
+
+# 2. Configure pruning (random needs no calibration; "gradient" needs a loss callback).
+manager.set("structured_pruning", "method", "random", criteria=None)
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp.gate_proj")
+manager.set("structured_pruning", "ratio", 0.1, criteria="mlp.up_proj")
+
+# 3. Hard apply: removes neurons, resizes matrices, cascades down_proj's input.
+manager.apply(hard=True)
+print(model.model.layers[0].mlp.gate_proj.out_features)  # shrunk by ~10%
+```
+
+Notes:
+- **Group-only options** (`share_mask`) must be set through `group=`, never `criteria`;
+  enabling one resets that scheme's non-group config. `reduce_op` is a regular option
+  (also used per-layer by `repeated_pattern`), settable via `criteria` or `group=`.
+- `granularity=<int>` prunes uniformly within each chunk (e.g. per attention head);
+  `repeated_pattern=True` lets layers with different chunk counts (GQA `q_proj`/`k_proj`) share one mask.
+- MLP pruning and GQA-aware attention pruning (q/k head-dim via RoPE, v→o cascade) are both wired through convert/export; see `test/e2e/test_gqa_attention_pruning.py`.
+- See `scripts/compression/prune_qwen.py` (gradient pruning) and
+  `scripts/compression/prune_quant_export_tensorrt.py` (prune + quant → TensorRT).
+
 ### Convert to export-friendly graph, then compress
 
 ```python
@@ -128,7 +174,9 @@ result = export_to_backend(model, config=config)
 print(result.engine_path)
 ```
 
-> TensorRT requires `pip install -e ".[tensorrt]"` and a CUDA device. See `scripts/tensorrt/run_export.sh` for a CLI runner and `test/tensorrt_tests/` for end-to-end examples (same pattern as `scripts/executorch/` / `test/executorch_tests/` for `xnnpack`/`qnn`).
+Device placement is handled internally — `model` can live on CPU or CUDA; components are traced on CPU and the compiled engine is placed on `config.device` automatically.
+
+> TensorRT requires `pip install -e ".[tensorrt]"` and a CUDA device. See `scripts/tensorrt/run_export.sh` for a CLI runner and `test/e2e/test_export_pipelines.py` for end-to-end examples covering `xnnpack`/`tensorrt`/`qnn`.
 
 ## 🎯 Filtering Layers with `criteria`
 
@@ -168,9 +216,11 @@ manager.cancel_vcon(keep_block_b=True)      # collapse to compressed module
 
 | Method | Description |
 |---|---|
-| `set(compression, prop, value, criteria)` | Configure compression on filtered layers |
+| `set(compression, prop, value, criteria, group)` | Configure compression on filtered layers (or a whole `group`) |
 | `apply(hard, criteria, ...)` | Apply all configured schemes |
 | `restore(topology, criteria)` | Undo compression |
+| `auto_groups()` | Build coupled-mask pruning groups from indexing; returns `{name: [paths]}` |
+| `create_group(schemes, name)` / `delete_group(name)` | Manage shared-mask groups manually |
 | `init_vcon(criteria)` | Wrap target layers with `VCONBlock` |
 | `set_vcon_beta(beta, criteria)` | Set blending weight |
 | `cancel_vcon(keep_block_b, criteria)` | Collapse `VCONBlock` to one branch |
@@ -194,12 +244,9 @@ These groups are consumed by `CompressionSchemesManager` exactly like previous u
 
 ## 📂 References
 
-- [test/compression_tests/compression_test.py](test/compression_tests/compression_test.py) — manager basics and convert-then-compress flow
-- [test/qwen_tests/inference_test.py](test/qwen_tests/inference_test.py) — Qwen2 end-to-end
-- [test/qwen_tests/test_calibration_compression.py](test/qwen_tests/test_calibration_compression.py) — calibrated LRD
-- [test/qwen_vl_tests/inference_test.py](test/qwen_vl_tests/inference_test.py) — vision-language
-- [test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py](test/executorch_tests/exporter_function/xnnpack/test_pretrained_quant_export.py) — mixed-precision backend export (XNNPACK)
-- [test/tensorrt_tests/exporter_function/tensorrt/test_pretrained_quant_export.py](test/tensorrt_tests/exporter_function/tensorrt/test_pretrained_quant_export.py) — mixed-precision backend export (TensorRT)
+- [test/e2e/test_model_families.py](test/e2e/test_model_families.py) — manager basics, LRD/quant/pruning, convert-then-compress, all 7 families
+- [test/e2e/test_export_pipelines.py](test/e2e/test_export_pipelines.py) — HF roundtrip, XNNPACK, TensorRT, QNN export (capability-gated)
+- [test/unit/test_known_bugs.py](test/unit/test_known_bugs.py) — pinned regressions for open framework bugs
 - [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package internals and extension guide
 
 ## License

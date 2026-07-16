@@ -6,7 +6,7 @@ quantizer and the compile/save step are TensorRT-specific.
 
 !!! note "Requirements"
     Requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) and a CUDA
-    device. Tests live under `test/tensorrt_tests/`; CLI runner at
+    device. Tests live under `test/e2e/test_export_pipelines.py`; CLI runner at
     `scripts/tensorrt/run_export.sh`.
 
 ::: transformersurgeon.export.tensorrt.tensorrt_export

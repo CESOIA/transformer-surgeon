@@ -1,0 +1,156 @@
+"""Regression tests that pin currently-open framework bugs.
+
+Each test asserts the *correct* (documented / expected) behavior and is marked
+``xfail`` with a pointer to ``FRAMEWORK_PROBLEMS.md``. When the underlying bug is
+fixed the test XPASSes, which surfaces in the summary and is the signal to remove
+the ``xfail`` marker. Keep ``strict=False`` so a fix never turns the suite red.
+
+All tests use tiny random-weight models — no downloads, no GPU.
+"""
+from __future__ import annotations
+
+import pytest
+import torch
+
+from _helpers.model_factory import FAMILIES
+
+pytestmark = pytest.mark.unit
+
+
+# --------------------------------------------------------------------------- #
+# #1  BERT (list-form calibration_groups) — manager cannot be constructed
+#     Fixed: _get_calibration_groups_from_indexing now has a list branch.
+# --------------------------------------------------------------------------- #
+def test_bert_manager_builds():
+    spec = FAMILIES["bert"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    assert len(list(mgr)) > 0
+
+
+# --------------------------------------------------------------------------- #
+# #2  Quantization precision string ("int8"/"int4"/"int2") — docs vs validator
+#     Resolved by fixing AGENTS.md (not the validator): the string form was never
+#     going to be silently accepted, so the contract is now "int form is the API,
+#     the string form raises a clear error" — both are pinned as plain assertions.
+# --------------------------------------------------------------------------- #
+def test_quantization_rejects_int8_string_with_clear_error():
+    """precision="int8" is NOT valid (AGENTS.md was wrong and has been corrected);
+    the validator must keep rejecting it loudly rather than silently accepting or
+    misinterpreting it."""
+    spec = FAMILIES["qwen2"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    with pytest.raises(ValueError, match="Precision must be"):
+        mgr.set("quantization", "precision", "int8", criteria=spec.lrd_criteria)
+
+
+def test_quantization_precision_int_is_the_real_api():
+    """The integer form (precision=8) is what actually works — pin it so it stays."""
+    spec = FAMILIES["qwen2"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    mgr.set("quantization", "precision", 8, criteria=spec.lrd_criteria)
+    mgr.apply(hard=False)
+    with torch.no_grad():
+        model(**spec.sample_inputs(model))
+
+
+# --------------------------------------------------------------------------- #
+# #3  Partial coupled MLP prune silently yields a broken model
+#     Fixed: Compressor.check_coupling() (called from manager._validate_coupling())
+#     now rejects inconsistent coupled-mask groups before apply() touches any weights.
+# --------------------------------------------------------------------------- #
+def test_partial_coupled_gate_prune_is_guarded():
+    spec = FAMILIES["qwen2"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    # Prune ONLY gate_proj (its coupled partner up_proj is left full).
+    mgr.set("structured_pruning", "ratio", 0.25, criteria="mlp.gate_proj")
+    with pytest.raises(ValueError, match="Coupled pruning"):
+        mgr.apply(hard=True)
+
+
+def test_both_coupled_gate_up_pruned_independently_is_guarded():
+    """Pruning both members without a shared mask is equally unsafe: independent
+    masks over the same ratio can select different neurons."""
+    spec = FAMILIES["qwen2"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    mgr.set("structured_pruning", "ratio", 0.25, criteria="mlp.gate_proj")
+    mgr.set("structured_pruning", "ratio", 0.25, criteria="mlp.up_proj")
+    with pytest.raises(ValueError, match="Coupled pruning"):
+        mgr.apply(hard=True)
+
+
+# --------------------------------------------------------------------------- #
+# #5  QNN export: no capability guard, undeclared py-cpuinfo dep crashes on import
+#     Fixed: is_qnn_available() probes cheap preconditions without importing the
+#     Qualcomm backend package, and export_with_qnn() checks it up front (with a
+#     try/except fallback around the real Qualcomm import) instead of letting a
+#     bare "install py-cpuinfo" ImportError surface mid-export.
+# --------------------------------------------------------------------------- #
+def test_qnn_unavailable_raises_clear_error_instead_of_cpuinfo_importerror():
+    from transformersurgeon.export.executorch_exporters.qnn import (
+        QNNExportConfig,
+        export_with_qnn,
+        is_qnn_available,
+    )
+
+    # This box has no Qualcomm QNN SDK — is_qnn_available() must say so without
+    # raising (it must not import executorch.backends.qualcomm to find out).
+    assert is_qnn_available() is False
+
+    config = QNNExportConfig(output_path="/tmp/unused.pte", backend="qnn")
+    with pytest.raises(RuntimeError, match="QNN backend unavailable"):
+        export_with_qnn(None, config=config)
+
+
+# --------------------------------------------------------------------------- #
+# #6  VL structured pruning: auto_groups()/create_group() could build a
+#     shared-mask group spanning both the vision and text towers, which only
+#     surfaced later as a confusing mask-length mismatch inside
+#     compression/coupled_pruning.py at apply() time.
+#     Fixed: create_group() now rejects members drawn from more than one
+#     indexing block/tower up front with a clear ValueError.
+# --------------------------------------------------------------------------- #
+def test_cross_tower_group_is_rejected():
+    spec = FAMILIES["qwen2_vl"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    vision_path = "model.visual.blocks.0.mlp.fc2"
+    text_path = "model.language_model.layers.0.mlp.down_proj"
+    with pytest.raises(ValueError, match="multiple indexing blocks"):
+        mgr.create_group([vision_path, text_path])
+
+
+def test_auto_groups_still_works_per_tower():
+    """auto_groups() already only ever groups within one tower at a time; the new
+    cross-tower guard in create_group() must not regress that working path."""
+    spec = FAMILIES["qwen2_vl"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    groups = mgr.auto_groups()
+    assert groups
+    for name, paths in groups.items():
+        towers = {"vision" if "visual" in p else "text" for p in paths}
+        assert len(towers) == 1, f"group '{name}' spans towers {towers}: {paths}"
+
+
+def test_create_group_rejects_scheme_already_in_another_group():
+    """A scheme can belong to at most one group. Without an upfront check,
+    create_group() could partially mutate a scheme's group membership before
+    hitting the per-scheme conflict inside the loop; the check now runs before
+    any mutation and reports every conflicting scheme at once."""
+    spec = FAMILIES["qwen2"]
+    model = spec.build().eval()
+    mgr = spec.manager(model)
+    mgr.create_group(["model.layers.0.mlp.gate_proj"], name="g1")
+    with pytest.raises(ValueError, match="already belong to another group"):
+        mgr.create_group(
+            ["model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj"], name="g2"
+        )
+    # The rejected call must not have registered the new group or reassigned
+    # gate_proj's membership away from g1.
+    assert "g2" not in mgr.groups
+    assert "g1" in mgr.schemes["text"]["model.layers.0.mlp.gate_proj"].groups
