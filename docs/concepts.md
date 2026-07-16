@@ -140,9 +140,11 @@ mask that is tiled back, letting layers with different chunk counts (GQA
 `q_proj`/`k_proj`) share a single mask. Group-only options (`share_mask`, listed in
 `GROUP_OPTIONS`) can only be set through `manager.set(..., group=...)`.
 
-Scope: only MLP structured pruning is wired end-to-end through convert/export.
-Attention (q/k/v) hard pruning changes `head_dim` (and the GQA `v→o` coupling is
-not 1:1), which needs attention-forward/config changes — deferred.
+Scope: both MLP and attention (q/k/v) structured pruning are wired end-to-end
+through convert/export. Attention hard pruning changes `head_dim` (GQA); RoPE
+projection geometry and the pruned KV-cache are resolved per-kv-group at
+conversion time, and the GQA `v→o` coupling is handled via
+`coupled_repeated_pattern`.
 
 ---
 

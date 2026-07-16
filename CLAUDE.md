@@ -27,7 +27,7 @@ manager.apply(hard=True)                                 # removes neurons, resi
 - Hard pruning removes output rows and cascades the input pruning to coupled next
   layers (`compression/coupled_pruning.py`), driven by `pruning.output_dependence` in `indexing_*.py`.
 - `share_mask`/`reduce_op`/`granularity`/`repeated_pattern` support grouped and per-head pruning; grouping + coupling logic lives in `compression/structured_pruning.py`, not the manager.
-- Only MLP pruning is wired end-to-end (prune → convert → export); attention (GQA head_dim) is deferred.
+- MLP pruning and GQA-aware attention pruning (q/k head_dim via RoPE, v→o cascade) are both wired end-to-end (prune → convert → export).
 
 ## `blocks/` is a frozen model — never a compression target
 

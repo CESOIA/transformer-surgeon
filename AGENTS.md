@@ -210,9 +210,12 @@ Indexing annotations (`models/*/indexing_*.py`, under a `pruning` key):
 block), `coupled_masks_all` (share a mask across all blocks — the residual/hidden
 writers), `per_head_uniform` (recorded only).
 
-Scope: only MLP structured pruning is wired end-to-end (prune → cascade → convert
-→ export). Attention (q/k/v) hard pruning changes `head_dim` (GQA), which needs
-attention-forward/config surgery — deferred; see the TODO in `structured_pruning.py`.
+Scope: both MLP and attention (q/k/v) structured pruning are wired end-to-end
+(prune → cascade → convert → export). Attention hard pruning changes `head_dim`
+(GQA); RoPE projection geometry and the pruned KV-cache are resolved per-kv-group
+at conversion time (`blocks/mha.py::MHABase.finalize_rope_pruning()`), and a
+hard-pruned `v_proj` cascades into `o_proj` via `coupled_repeated_pattern`. See
+`test/e2e/test_gqa_attention_pruning.py`.
 
 ### `"unstructured_pruning"` — Weight-Level Sparsity
 

@@ -143,7 +143,7 @@ Notes:
   (also used per-layer by `repeated_pattern`), settable via `criteria` or `group=`.
 - `granularity=<int>` prunes uniformly within each chunk (e.g. per attention head);
   `repeated_pattern=True` lets layers with different chunk counts (GQA `q_proj`/`k_proj`) share one mask.
-- Only MLP pruning is wired through convert/export today; attention pruning (GQA `head_dim`) is deferred.
+- MLP pruning and GQA-aware attention pruning (q/k head-dim via RoPE, v→o cascade) are both wired through convert/export; see `test/e2e/test_gqa_attention_pruning.py`.
 - See `scripts/compression/prune_qwen.py` (gradient pruning) and
   `scripts/compression/prune_quant_export_tensorrt.py` (prune + quant → TensorRT).
 
