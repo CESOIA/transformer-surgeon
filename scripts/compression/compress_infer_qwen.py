@@ -188,8 +188,8 @@ def configure_compression(manager: Qwen2CompressionSchemesManager) -> None:
     # rank="full" disables LRD. "svd" needs no calibration; "svd-llm-v2" needs
     # the "covariance" calibration summary (handled automatically once you
     # call manager.set_calibration_data(...) below).
-    manager.set("lrd", "rank", "full", criteria=None)
-    manager.set("lrd", "method", "svd", criteria=None)
+    # manager.set("lrd", "rank", "full", criteria=None)
+    # manager.set("lrd", "method", "svd", criteria=None)
     # Example: low-rank the down_proj of every block.
     # manager.set("lrd", "rank", 128, criteria="mlp.down_proj")
 
@@ -213,7 +213,11 @@ def configure_compression(manager: Qwen2CompressionSchemesManager) -> None:
     manager.set("structured_pruning", "method", "magnitude", group="group1")
     manager.set("structured_pruning", "granularity", 64, group="group1")
     manager.set("structured_pruning", "repeated_pattern", "auto", group="group1")
-    manager.set("structured_pruning", "ratio", 0.1, group="group1")
+    manager.set("structured_pruning", "ratio", 0.2, group="group1")
+    # manager.set("structured_pruning", "method", "magnitude", criteria="0.self_attn.v_proj")
+    # manager.set("structured_pruning", "granularity", 64, criteria="0.self_attn.v_proj")
+    # manager.set("structured_pruning", "coupled_repeated_pattern", 7, criteria="0.self_attn.v_proj")
+    # manager.set("structured_pruning", "ratio", 0.05, criteria="0.self_attn.v_proj")
     # Example: prune 12.5% of MLP intermediate neurons in every block.
     # manager.set("structured_pruning", "ratio", 0.125, criteria="mlp")
     # Example: prune only block 0's MLP harder.
@@ -222,8 +226,8 @@ def configure_compression(manager: Qwen2CompressionSchemesManager) -> None:
     # --- 3) Quantization ------------------------------------------------------
     # precision="full" disables quantization. precision is an int bit-width
     # (8, 4, 2, ...), NOT a string like "int8".
-    manager.set("quantization", "precision", "full", criteria=None)
-    manager.set("quantization", "granularity", "per_channel", criteria=None)
+    # manager.set("quantization", "precision", "full", criteria=None)
+    # manager.set("quantization", "granularity", "per_channel", criteria=None)
     # Example: int8 weight-only quantization on attention projections.
     # manager.set("quantization", "precision", 8, criteria="self_attn")
     # Example: int8 weight + int8 activation (needs calibration) on MLP.

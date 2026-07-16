@@ -17,8 +17,7 @@ transformersurgeon/
 │   ├── mlp.py
 │   ├── norm.py
 │   ├── rope.py
-│   ├── config.py
-│   └── indexing.py
+│   └── config.py
 ├── compression/
 │   ├── abstract.py
 │   ├── registry.py
