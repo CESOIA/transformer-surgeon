@@ -6,7 +6,6 @@ import torch.nn as nn
 
 from ..blocks import TransformerDecoder
 from ..blocks.encoder import TransformerEncoder
-from ..blocks.indexing import CUSTOM_DECODER_INDEXING, CUSTOM_ENCODER_INDEXING
 from ..blocks.config import CustomDecoderConfigCompress, CustomEncoderConfigCompress
 from .utils import get_submodule, flatten_index_paths
 
@@ -225,30 +224,44 @@ def _build_converted_compression_config(indexing, source_config_obj, num_blocks)
     return converted_cfg
 
 
+# Static shape of the converted (blocks/) graph: every block lives at
+# "blocks.{block_index}.{path}" and blocks are counted the same way
+# regardless of model family. This is purely descriptive metadata consumed
+# by init_compressed_config() to default-fill each layer's compression_config
+# -- it is never attached to the converted model itself (blocks/ is a frozen,
+# already-compressed model; nothing may re-drive compression against it once
+# built, see CLAUDE.md).
+_CONVERTED_BLOCK_INDEXING_TEMPLATE = {
+    "config_attr": "",
+    "num_blocks_attr": "num_hidden_layers",
+    "path_template": "blocks.{block_index}.{path}",
+}
+
+
 def _build_converted_decoder_indexing(indexing):
     """Build converted indexing compatible with converted decoder config/model."""
-    converted_indexing = copy.deepcopy(CUSTOM_DECODER_INDEXING)
     source_paths = flatten_index_paths(indexing["path_list"])
     layer_matching = _flatten_layer_matching(indexing, source_paths)
-    converted_indexing["decoder"]["path_list"] = [
+    decoder_indexing = dict(_CONVERTED_BLOCK_INDEXING_TEMPLATE)
+    decoder_indexing["path_list"] = [
         path
         for path in layer_matching
         if path.startswith("attn.") or path.startswith("mlp.")
     ]
-    return converted_indexing
+    return {"decoder": decoder_indexing}
 
 
 def _build_converted_encoder_indexing(indexing):
     """Build converted indexing compatible with converted encoder config/model."""
-    converted_indexing = copy.deepcopy(CUSTOM_ENCODER_INDEXING)
     source_paths = flatten_index_paths(indexing["path_list"])
     layer_matching = _flatten_layer_matching(indexing, source_paths)
-    converted_indexing["encoder"]["path_list"] = [
+    encoder_indexing = dict(_CONVERTED_BLOCK_INDEXING_TEMPLATE)
+    encoder_indexing["path_list"] = [
         path
         for path in layer_matching
         if path.startswith("attn.") or path.startswith("mlp.")
     ]
-    return converted_indexing
+    return {"encoder": encoder_indexing}
 
 def convert_for_export(model, options=None, verbose=False):
     """
@@ -366,6 +379,16 @@ def convert_for_export(model, options=None, verbose=False):
                     for pname, param in new_layer.named_parameters():
                         print(f"  {pname}: {param.shape}, dtype={param.dtype}, device={param.device}")
 
+            # q_proj/k_proj (and their rope_prune_mask buffers, if hard-pruned)
+            # are now loaded -- freeze this block's RoPE-pruning geometry once,
+            # here at conversion time, so blocks/mha.py's forward() never has
+            # to re-derive it. attn's submodule name is a fixed convention of
+            # TransformerDecoderBlock/TransformerEncoderBlock, not driven by
+            # layer_matching.
+            attn_module = get_submodule(new_model, path_template.format(i=i, path="attn"))
+            if hasattr(attn_module, "finalize_rope_pruning"):
+                attn_module.finalize_rope_pruning()
+
         # Handle extra layers if any
         if 'extra_layers' in indexing:
             extra_layers_matching = indexing.get('extra_layers_matching', [])
@@ -377,9 +400,6 @@ def convert_for_export(model, options=None, verbose=False):
                 old_layer = get_submodule(model, old_path)
                 new_layer = get_submodule(new_model, new_path)
                 _load_state_dict_dequantized(old_layer, new_layer)
-
-        # Attach converted indexing so manager can be used directly on converted graph.
-        new_model.indexing = converted_indexing
 
         new_models[name] = new_model
 

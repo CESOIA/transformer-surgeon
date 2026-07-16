@@ -191,9 +191,15 @@ class MHABase(torch.nn.Module):
             rank=out_lrd_rank,
             dtype=dtype)
 
-        # Cached RoPE-frequency selection matrix for pruned q/k (see
-        # _project_rope below). None until (and unless) q_proj/k_proj are
-        # hard-pruned; rebuilt lazily the first time it's needed.
+        # RoPE-pruning geometry: decided once, at instantiation, via
+        # finalize_rope_pruning() -- never re-derived inside forward(). A
+        # freshly constructed module (this __init__) is always unpruned;
+        # utils.convert.convert_for_export calls finalize_rope_pruning()
+        # once, right after q_proj/k_proj's (possibly hard-pruned) weights
+        # and rope_prune_mask buffers are loaded during HF-model ->
+        # blocks/ conversion, and before any forward() call. See
+        # finalize_rope_pruning/_project_rope below.
+        self.rope_pruned = False
         self.register_buffer("rope_freq_proj", None, persistent=False)
 
     @property
@@ -210,27 +216,30 @@ class MHABase(torch.nn.Module):
         """
         return self.v_proj.out_features // self.kv_num_heads
 
-    def _project_rope(self, cos, sin):
-        """Project precomputed RoPE ``cos``/``sin`` down to the pruned rotary
-        dimension, when structured pruning has hard-pruned q_proj/k_proj.
+    def finalize_rope_pruning(self):
+        """Freeze this module's RoPE-pruning geometry from q_proj/k_proj's
+        *current* shapes and ``rope_prune_mask`` buffers. Instantiation-time
+        setup: call this once, after weights (and any ``rope_prune_mask``
+        buffers left by structured pruning) have been loaded and before the
+        first ``forward()`` call -- ``utils.convert.convert_for_export`` does
+        this right after copying q_proj/k_proj's state during HF-model ->
+        blocks/ conversion. blocks/ modules are a frozen, already-compressed
+        model (see CLAUDE.md); this is the only place pruning geometry is
+        decided, so ``_project_rope`` can stay a pure, static runtime
+        application with no shape checks or mask lookups of its own.
 
-        Structured pruning of a position-linked q_proj/k_proj (see
-        ``pruning.position_linked`` in the model's indexing) only removes
-        output rows -- it does not know which rotary frequency each surviving
-        row corresponds to. ``cos``/``sin`` are still precomputed at the
-        original (unpruned) head_dim, so they must be re-indexed with the
-        exact same keep pattern before being applied to the now-narrower
-        q/k, via static 0/1 projection matrices built from the pruning mask
-        (``build_rope_prune_projection`` in ``blocks/rope.py``).
+        Sets ``self.rope_pruned`` and, if pruned, ``self.rope_freq_proj`` --
+        the static per-kv-group 0/1 selection matrix (see
+        ``build_rope_prune_projection`` in ``blocks/rope.py``) used by
+        ``_project_rope`` to re-index precomputed ``cos``/``sin`` onto the
+        rotary frequencies that survived pruning.
 
-        Under GQA the mask may keep different rotary frequencies per kv-group,
-        so the projection is **per kv-group**: it yields a group-wise
-        ``cos``/``sin`` that is broadcast to that group's query heads for ``q``
-        and used one-per-head for ``k``. Returns ``(cos_q, sin_q, cos_k, sin_k)``.
-
-        No-op (returns the inputs, shared for q and k) if q_proj/k_proj are not
-        pruned. Raises ``ValueError`` if only one of q_proj/k_proj was pruned,
-        since the pair must always be pruned together for RoPE to remain valid.
+        A freshly constructed module is already unpruned (``__init__`` sets
+        ``rope_pruned = False``) and never needs this called. Raises
+        ``ValueError`` if only one of q_proj/k_proj was pruned, or to
+        different head dims -- the pair must always be pruned together
+        (coupled via ``pruning.position_linked`` / ``pruning.coupled_masks``)
+        for RoPE to remain valid.
         """
         q_head_dim = self.q_proj.out_features // self.num_heads
         k_head_dim = self.k_proj.out_features // self.kv_num_heads
@@ -238,7 +247,9 @@ class MHABase(torch.nn.Module):
         k_pruned = k_head_dim < self.head_dim
 
         if not q_pruned and not k_pruned:
-            return cos, sin, cos, sin
+            self.rope_pruned = False
+            self.rope_freq_proj = None
+            return
 
         if q_pruned != k_pruned:
             raise ValueError(
@@ -256,25 +267,45 @@ class MHABase(torch.nn.Module):
                 f"({q_head_dim} vs {k_head_dim}); RoPE requires them to match."
             )
 
-        proj = self.rope_freq_proj
-        # proj is (num_kv_groups, kept_freqs, head_dim//2); kept_freqs == q_head_dim//2.
-        if proj is None or proj.shape[1] != q_head_dim // 2:
-            q_mask = getattr(self.q_proj, "rope_prune_mask", None)
-            k_mask = getattr(self.k_proj, "rope_prune_mask", None)
-            if q_mask is None or k_mask is None:
-                raise ValueError(
-                    "q_proj/k_proj head_dim has shrunk but no rope_prune_mask was "
-                    "recorded by structured pruning; cannot determine which rotary "
-                    "frequencies survived. This should not happen if pruning went "
-                    "through StructuredPruner on a position_linked scheme."
-                )
-            proj = build_rope_prune_projection(
-                q_mask, k_mask, self.head_dim, self.num_heads, self.kv_num_heads,
+        q_mask = getattr(self.q_proj, "rope_prune_mask", None)
+        k_mask = getattr(self.k_proj, "rope_prune_mask", None)
+        if q_mask is None or k_mask is None:
+            raise ValueError(
+                "q_proj/k_proj head_dim has shrunk but no rope_prune_mask was "
+                "recorded by structured pruning; cannot determine which rotary "
+                "frequencies survived. This should not happen if pruning went "
+                "through StructuredPruner on a position_linked scheme."
             )
-            self.rope_freq_proj = proj.to(device=cos.device, dtype=cos.dtype)
-            proj = self.rope_freq_proj
 
-        proj = proj.to(device=cos.device, dtype=cos.dtype)
+        self.rope_freq_proj = build_rope_prune_projection(
+            q_mask, k_mask, self.head_dim, self.num_heads, self.kv_num_heads,
+        )
+        self.rope_pruned = True
+
+    def _project_rope(self, cos, sin):
+        """Apply this module's already-finalized RoPE-pruning geometry to
+        precomputed ``cos``/``sin``, splitting them per q/k. Pure runtime
+        application -- see ``finalize_rope_pruning`` for how
+        ``self.rope_pruned``/``self.rope_freq_proj`` are decided; this method
+        performs no shape checks or mask lookups, only the (data-independent)
+        projection/broadcast math, so it stays cheap and static under
+        ``torch.export``.
+
+        When this module was never pruned, ``cos``/``sin`` are returned
+        as-is (shared for q and k): they already carry a singleton head
+        dimension (``(seq_len, 1, head_dim//2)``) that broadcasts across all
+        heads in ``apply_rope_multihead`` -- standard RoPE, no repeat.
+
+        When pruned, the projection is **per kv-group** (different kv-groups
+        may keep different rotary frequencies): it yields a group-wise
+        ``cos``/``sin`` that ``repeat_interleave``s to each group's query
+        heads for ``q``, and is used one-per-head for ``k``. Returns
+        ``(cos_q, sin_q, cos_k, sin_k)``.
+        """
+        if not self.rope_pruned:
+            return cos, sin, cos, sin
+
+        proj = self.rope_freq_proj.to(device=cos.device, dtype=cos.dtype)
         num_groups, kept, half = proj.shape
         group_size = self.num_heads // num_groups
 

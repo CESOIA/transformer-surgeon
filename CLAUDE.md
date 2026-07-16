@@ -29,6 +29,16 @@ manager.apply(hard=True)                                 # removes neurons, resi
 - `share_mask`/`reduce_op`/`granularity`/`repeated_pattern` support grouped and per-head pruning; grouping + coupling logic lives in `compression/structured_pruning.py`, not the manager.
 - Only MLP pruning is wired end-to-end (prune → convert → export); attention (GQA head_dim) is deferred.
 
+## `blocks/` is a frozen model — never a compression target
+
+`blocks/` (`mha.py`, `mlp.py`, `decoder.py`, `encoder.py`, `linear_compressed.py`, `pruning_dims.py`, `config.py`, `rope.py`, ...) defines the **converted, already-compressed** graph — the step right before `torch.export`/ONNX/backend lowering. It must never itself decide *what* to prune or compress:
+
+- Compression/pruning is always decided beforehand, on the original HF `*_c` model, via `CompressionSchemesManager.apply()` (`utils/manager.py` + `compression/*`). `utils/convert.py::convert_for_export()` then builds the `blocks/` module tree and copies over the already-decided (possibly hard-pruned) weights/shapes/masks — it never re-derives a pruning decision.
+- `blocks/pruning_dims.py`, `blocks/linear_compressed.py`, `blocks/config.py` are passive: they turn an already-decided ratio/rank/mask into static geometry (kept-dim sizing, `LinearCompressed` shapes, HF-style config plumbing), never choosing ratios or building masks themselves.
+- Data-dependent pruning geometry that can only be known once weights are loaded (e.g. attention's RoPE frequency projection, `blocks/mha.py::MHABase.finalize_rope_pruning()`) is resolved **once, at conversion time** (`convert_for_export`, right after the relevant weights/buffers are copied) — never lazily inside `forward()`. `forward()`/`_project_rope` only ever do the static runtime application of an already-frozen decision.
+- There used to be a `blocks/indexing.py` (`CUSTOM_DECODER_INDEXING`/`CUSTOM_ENCODER_INDEXING`) whose sole purpose was letting a `CompressionSchemesManager` be pointed at an already-converted `blocks/` model (`new_model.indexing = ...`) to compress it a second time, post-conversion. That workflow was removed — it's exactly the "compress a frozen model" anti-pattern this section forbids. `convert_for_export` still builds an equivalent indexing dict internally (inlined in `utils/convert.py`), but only to default-fill each layer's `compression_config` (`utils/configuration.py::init_compressed_config`, itself passive); it is not attached to the converted model.
+- Do not add a path that lets a `blocks/` model be handed to `CompressionSchemesManager` or otherwise mutated after construction (besides the one-time `finalize_*` conversion-time hooks described above). If a new block type needs pruning-aware sizing, follow the `pruning_dims.py` pattern (or, for weight-dependent geometry, a `finalize_*` method called once from `convert_for_export`) — not a runtime check inside `forward()`.
+
 ## Critical invariants
 
 - `Compressor.apply()` always receives a `LinearCompressed`, never a plain `nn.Linear`
