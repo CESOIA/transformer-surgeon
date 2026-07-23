@@ -5,6 +5,8 @@ from __future__ import annotations
 from .activation_range import ActivationRangeSummary, OutputActivationRangeSummary
 from .covariance import CovarianceSummary, CrossCovarianceSummary, ShiftedCovarianceSummary
 from .weight_grad import WeightGradSummary
+from .params import WeightSummary, BiasSummary
+from .raw_activation import InputActivationSummary, OutputActivationSummary
 
 
 SUMMARY_REGISTRY = {
@@ -20,6 +22,14 @@ SUMMARY_REGISTRY = {
     "activation_range": ActivationRangeSummary(),
     # Running min/max of output activations, used by output-side static fake-quant.
     "output_activation_range": OutputActivationRangeSummary(),
+    # Raw module weight parameter, captured via the generic calibration forward-hook pipeline.
+    "weight": WeightSummary(),
+    # Raw module bias parameter, captured via the generic calibration forward-hook pipeline.
+    "bias": BiasSummary(),
+    # Concatenated raw input activations over the whole calibration pass.
+    "input_activation": InputActivationSummary(),
+    # Concatenated raw output activations over the whole calibration pass.
+    "output_activation": OutputActivationSummary(),
 }
 SUPPORTED_SUMMARIES = tuple(SUMMARY_REGISTRY.keys())
 

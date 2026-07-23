@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from copy import deepcopy
 
 logger = logging.getLogger(__name__)
-from ..calibration import run_compression_calibration
+from ..calibration import run_compression_calibration, SUPPORTED_SUMMARIES
 from ..compression import GROUP_OPTIONS, COMPRESSION_REGISTRY
 from .scheme import CompressionScheme
 from .grouping import SchemeGroup
@@ -605,6 +605,71 @@ class CompressionSchemesManager:
             summary_dump_dir=summary_dump_dir,
             summary_dump_names=summary_dump_names,
         )
+
+    def extract_summaries(
+        self,
+        criteria=None,
+        summaries: List[str] = (),
+        shifted_model: Optional[torch.nn.Module] = None,
+        max_batches: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        offload_to_cpu: bool = True,
+        verbose: bool = False,
+        show_progress: bool = True,
+    ):
+        """
+        Run calibration and collect the requested summaries for each filtered layer.
+
+        Routes through the same calibration forward-pass pipeline as
+        run_calibration()/apply() -- there is no special-cased path for any
+        summary name, including 'weight'/'bias' (constant per-layer parameters,
+        still captured via a forward hook) and 'input_activation'/
+        'output_activation' (raw concatenated activations).
+
+        Args:
+            criteria: Filter criteria for target schemes (same format as apply()).
+            summaries: Non-empty list of summary names (see SUPPORTED_SUMMARIES).
+            shifted_model: Optional second model used by shifted/cross summaries.
+            max_batches: Maximum calibration batches to process.
+            device: Device to move batches to.
+            offload_to_cpu: If True, accumulate calibration tensors on CPU.
+            verbose: If True, print progress.
+            show_progress: If True, show calibration batch progress.
+
+        Returns:
+            Nested dict {scheme.path: {summary_name: value}}.
+        """
+        if not summaries:
+            raise ValueError("summaries must be a non-empty list of summary names.")
+
+        unknown = set(summaries) - set(SUPPORTED_SUMMARIES)
+        if unknown:
+            raise ValueError(
+                f"Unsupported summaries: {sorted(unknown)}. Supported summaries are: {SUPPORTED_SUMMARIES}."
+            )
+
+        schemes = list(self.iter_filtered(criteria=criteria))
+        if not schemes:
+            return {}
+
+        target_stages = [[(scheme, tuple(summaries)) for scheme in schemes]]
+        run_compression_calibration(
+            model=self.model,
+            calibration_data=self.calibration_data,
+            target_stages=target_stages,
+            shifted_model=shifted_model,
+            loss_fn=self.calibration_loss_fn,
+            max_batches=max_batches,
+            device=device,
+            offload_to_cpu=offload_to_cpu,
+            verbose=verbose,
+            show_progress=show_progress,
+        )
+
+        return {
+            scheme.path: {name: scheme.calibration_data.get(name) for name in summaries}
+            for scheme in schemes
+        }
 
     def clear_calibration(self, criteria=None):
         """

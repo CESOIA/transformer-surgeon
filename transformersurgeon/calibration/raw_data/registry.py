@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .activation import ActivationCollector, ShiftedActivationCollector, OutputActivationCollector
 from .weight_grad import WeightGradCollector
+from .params import WeightCollector, BiasCollector
 
 
 RAW_DATA_REGISTRY = {
@@ -15,6 +16,9 @@ RAW_DATA_REGISTRY = {
     "output_activation": OutputActivationCollector,
     # Weight-gradient stream used by gradient-aware pruning methods.
     "weight_grad": WeightGradCollector,
+    # Raw weight/bias parameter streams used by the 'weight'/'bias' summaries.
+    "weight": WeightCollector,
+    "bias": BiasCollector,
 }
 SUPPORTED_RAW_DATA = tuple(RAW_DATA_REGISTRY.keys())
 
