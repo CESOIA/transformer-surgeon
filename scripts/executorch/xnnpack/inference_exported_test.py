@@ -106,6 +106,12 @@ def main():
             args.head_dim = meta.get("head_dim")
         if args.max_cache_len is None:
             args.max_cache_len = meta.get("max_cache_len")
+        if meta.get("attn_impl") == "custom_sdpa":
+            # Registers the llama::custom_sdpa/update_cache runtime kernels
+            # (torch.ops.llama.* meta registration alone, done at export time in
+            # a different process, isn't enough -- this process's operator
+            # registry needs the same import before loading the .pte's method).
+            from executorch.extension.llm.custom_ops import custom_ops  # noqa: F401
     if args.cache_impl is None:
         args.cache_impl = "mutable"
 

@@ -436,6 +436,26 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         return output
     
 CACHE_IMPLS = ("mutable", "io_scatter", "io_concat")
+ATTN_IMPLS = ("manual", "sdpa", "custom_sdpa")
+
+
+def _ensure_custom_sdpa_ops():
+    """Import ExecuTorch's LLM custom-ops extension, registering
+    torch.ops.llama.custom_sdpa / update_cache as a side effect of the
+    module-level torch.ops.load_library(...) inside custom_ops.py. Must run
+    before torch.export() traces the model -- MHACausal.__init__ always runs
+    (via convert_for_export) well before any backend exporter calls
+    torch_export(), so this ordering is naturally satisfied.
+    """
+    try:
+        import executorch.extension.llm.custom_ops.custom_ops  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "attn_impl='custom_sdpa' requires ExecuTorch's LLM custom-ops "
+            "extension (torch.ops.llama.custom_sdpa / update_cache). Install "
+            "the `executorch` extra so `executorch.extension.llm.custom_ops` "
+            "is importable."
+        ) from e
 
 
 class MHACausal(MHABase): # Causal MHA with caching for decoder use
@@ -497,6 +517,40 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             persistent=False
         )
 
+        # attn_impl selects the attention kernel: "manual" (explicit GQA-aware
+        # softmax/matmul, the default), "sdpa" (torch.nn.functional.scaled_dot_
+        # product_attention, equivalent to the old use_sdpa=True), or
+        # "custom_sdpa" (ExecuTorch's fused CPU custom ops -- optimized for
+        # XNNPACK/portable-CPU export, untested with QNN/TensorRT). Derives
+        # from use_sdpa when not given explicitly, so existing callers that
+        # only pass use_sdpa are unaffected.
+        self.attn_impl = kwargs.get("attn_impl", None) or ("sdpa" if self.use_sdpa else "manual")
+        if self.attn_impl not in ATTN_IMPLS:
+            raise ValueError(f"Unsupported attn_impl {self.attn_impl!r}; expected one of {ATTN_IMPLS}")
+
+        if self.attn_impl == "custom_sdpa":
+            if self.cache_impl != "mutable":
+                raise ValueError(
+                    "attn_impl='custom_sdpa' requires cache_impl='mutable': "
+                    "torch.ops.llama.update_cache in-place-mutates a dedicated "
+                    "batched fp32 cache buffer, which has no functional "
+                    "(io_scatter/io_concat) equivalent."
+                )
+            _ensure_custom_sdpa_ops()
+            # Dedicated fp32, batched (bsz=1) caches -- torch.ops.llama.custom_sdpa/
+            # update_cache require rank-4 (bsz, seqlen, kv_heads, head_dim) float32
+            # tensors, unlike this class's existing unbatched, model-dtype buffers.
+            self.register_buffer(
+                "custom_sdpa_key_cache",
+                torch.zeros(1, self.max_cache_length, self.kv_num_heads, self.key_head_dim, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "custom_sdpa_value_cache",
+                torch.zeros(1, self.max_cache_length, self.kv_num_heads, self.value_head_dim, dtype=torch.float32),
+                persistent=False,
+            )
+
     def _ensure_cache_geometry(self):
         """Reallocate the internal (mutable-path) KV buffers if q/k pruning has
         changed the key head_dim since construction. No-op once sized correctly."""
@@ -510,6 +564,28 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                 self.max_cache_length, self.kv_num_heads, self.value_head_dim,
                 dtype=self.value_cache.dtype, device=self.value_cache.device,
             )
+
+        if self.attn_impl == "custom_sdpa":
+            q_head_dim = self.q_proj.out_features // self.num_heads
+            if q_head_dim != self.value_head_dim:
+                raise RuntimeError(
+                    "attn_impl='custom_sdpa' requires q_head_dim == value_head_dim "
+                    "(torch.ops.llama.custom_sdpa sizes its output like `query`, "
+                    f"not `value`); got q_head_dim={q_head_dim}, value_head_dim="
+                    f"{self.value_head_dim}. This happens when RoPE-linked "
+                    "structured pruning shrank q/k's head_dim while v_proj stayed "
+                    "unpruned -- use attn_impl='manual' or 'sdpa' for such models."
+                )
+            if self.custom_sdpa_key_cache.shape[-1] != self.key_head_dim:
+                self.custom_sdpa_key_cache = torch.zeros(
+                    1, self.max_cache_length, self.kv_num_heads, self.key_head_dim,
+                    dtype=torch.float32, device=self.custom_sdpa_key_cache.device,
+                )
+            if self.custom_sdpa_value_cache.shape[-1] != self.value_head_dim:
+                self.custom_sdpa_value_cache = torch.zeros(
+                    1, self.max_cache_length, self.kv_num_heads, self.value_head_dim,
+                    dtype=torch.float32, device=self.custom_sdpa_value_cache.device,
+                )
 
     def _write_mutable(self, k, v, write_index, key_cache, value_cache):
         """In-place write on the internal buffers (QNN peak path)."""
@@ -533,6 +609,43 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         key_cache = torch.where(sel, k_row, key_cache)
         value_cache = torch.where(sel, v_row, value_cache)
         return key_cache, value_cache
+
+    def _forward_custom_sdpa(self, q, k, v, pos_id, attn_mask):
+        """attn_impl == 'custom_sdpa': ExecuTorch's fused CPU custom ops.
+        float32-only, batched (bsz=1) layout -- see _ensure_cache_geometry for
+        the q_head_dim==value_head_dim precondition and __init__ for the
+        cache_impl=='mutable' constraint this path requires.
+        """
+        orig_dtype = q.dtype
+        start_pos = pos_id[0].item()
+
+        q_b = q.unsqueeze(0).to(torch.float32)  # (1, in_seq_len, num_heads, q_head_dim)
+        k_b = k.unsqueeze(0).to(torch.float32)  # (1, in_seq_len, kv_num_heads, key_head_dim)
+        v_b = v.unsqueeze(0).to(torch.float32)  # (1, in_seq_len, kv_num_heads, value_head_dim)
+
+        _ = torch.ops.llama.update_cache(k_b, self.custom_sdpa_key_cache, start_pos)
+        _ = torch.ops.llama.update_cache(v_b, self.custom_sdpa_value_cache, start_pos)
+
+        q_head_dim = self.q_proj.out_features // self.num_heads
+        scale = 1.0 / math.sqrt(q_head_dim)  # matches attention()'s own convention
+
+        # attn_mask carries extra leading singleton dims from tensor-indexed
+        # pos_id (full[pos_id] keeps the index dim) plus the unsqueeze(0) below
+        # it in forward() -- custom_sdpa requires *exactly* rank 2, unlike
+        # attention()/F.scaled_dot_product_attention which broadcast happily,
+        # so collapse down to (in_seq_len, kv_len) here.
+        attn_mask_2d = attn_mask.reshape(1, -1).to(torch.float32)
+
+        attn_output = torch.ops.llama.custom_sdpa(
+            q_b, self.custom_sdpa_key_cache, self.custom_sdpa_value_cache,
+            0,                          # start_pos: unused, explicit mask is provided
+            attn_mask_2d,
+            0.0,                        # dropout
+            False,                      # is_causal
+            scale,
+        )  # (1, in_seq_len, num_heads, value_head_dim)
+
+        return attn_output.squeeze(0).to(orig_dtype).transpose(0, 1)  # (num_heads, in_seq_len, value_head_dim)
 
     def forward(self, x, pos_id, pos_id_list, mask_penalty,
                 key_cache=None, value_cache=None, rope=None):
@@ -579,27 +692,33 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             q = apply_rope_multihead(q, cos_q, sin_q)
             k = apply_rope_multihead(k, cos_k, sin_k)
 
-        # Write new K/V into the fixed-size cache (mechanism per cache_impl).
-        write_index = torch.clamp(pos_id, 0, self.max_cache_length-1).long()
-        if self.cache_impl == "mutable":
-            key_cache, value_cache = self._write_mutable(k, v, write_index, key_cache, value_cache)
-        elif self.cache_impl == "io_scatter":
-            key_cache, value_cache = self._write_scatter(k, v, write_index, key_cache, value_cache)
-        else:  # io_concat
-            key_cache, value_cache = self._write_concat(k, v, write_index, key_cache, value_cache)
-
         # On-the-fly attention mask
         q_pos, k_pos = pos_id_list
         attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pos_id].unsqueeze(0) # (1, max_cache_len)
 
-        # Call mha operation (SDPA or custom attention)
-        if self.use_sdpa:
-            q = q.transpose(0, 1) # (num_heads, in_seq_len, head_dim)
-            k = key_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
-            v = value_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
-            attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
+        if self.attn_impl == "custom_sdpa":
+            # custom_sdpa owns its own dedicated fp32 cache (see __init__/
+            # _ensure_cache_geometry) and writes it via torch.ops.llama.update_cache
+            # inside _forward_custom_sdpa -- the unbatched key_cache/value_cache
+            # buffers above are left untouched/unused on this path.
+            attn_output = self._forward_custom_sdpa(q, k, v, pos_id, attn_mask)
         else:
-            attn_output = attention(q, key_cache, value_cache, attn_mask)
+            # Write new K/V into the fixed-size cache (mechanism per cache_impl).
+            write_index = torch.clamp(pos_id, 0, self.max_cache_length-1).long()
+            if self.cache_impl == "mutable":
+                key_cache, value_cache = self._write_mutable(k, v, write_index, key_cache, value_cache)
+            elif self.cache_impl == "io_scatter":
+                key_cache, value_cache = self._write_scatter(k, v, write_index, key_cache, value_cache)
+            else:  # io_concat
+                key_cache, value_cache = self._write_concat(k, v, write_index, key_cache, value_cache)
+
+            if self.attn_impl == "sdpa":
+                q_t = q.transpose(0, 1) # (num_heads, in_seq_len, head_dim)
+                k_t = key_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
+                v_t = value_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
+                attn_output = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
+            else:
+                attn_output = attention(q, key_cache, value_cache, attn_mask)
 
         # Concatenate heads and project output. Width is num_heads * value_head_dim
         # (== embed_dim unless v_proj was hard-pruned, in which case out_proj's
@@ -616,4 +735,5 @@ __all__ = [
     "MHACausal",
     "MHAEncoderFusedProj",
     "CACHE_IMPLS",
+    "ATTN_IMPLS",
     ]

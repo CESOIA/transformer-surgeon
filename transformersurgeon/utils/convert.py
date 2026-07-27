@@ -304,6 +304,7 @@ def convert_for_export(model, options=None, verbose=False):
 
         if indexing['structure'] == 'transformer_decoder':
             use_sdpa = options.get('use_sdpa', False)
+            attn_impl = options.get('attn_impl', None)
             max_cache_len = options.get('max_cache_len', 2048)
             cache_impl = options.get('cache_impl', 'mutable')
 
@@ -325,6 +326,7 @@ def convert_for_export(model, options=None, verbose=False):
                 compression_config=converted_compression_config,
                 bias_required=bias_required_config,
                 use_sdpa=use_sdpa,
+                attn_impl=attn_impl,
                 max_cache_len=max_cache_len,
                 cache_impl=cache_impl,
             )

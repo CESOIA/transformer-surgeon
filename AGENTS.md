@@ -93,6 +93,7 @@ Where to look when you need to change something:
 | Change what parameters are valid for a compression type | `compression/registry.py` → `COMPRESSION_REGISTRY` |
 | Change backend-export machinery shared by all backends (quant-metadata extraction, PT2E calibration, weight-mismatch checks) | `export/common.py` |
 | Add/change a backend exporter | `export/registry.py` → `EXPORT_ROUTINES`, plus the backend's own subpackage (`export/executorch_exporters/xnnpack/`, `export/executorch_exporters/qnn/`, `export/tensorrt/`) |
+| Change which attention kernel `MHACausal` uses at export (`manual`/`sdpa`/`custom_sdpa`) | `blocks/mha.py::MHACausal`, threaded via `attn_impl` in `convert_options` (`utils/convert.py`, `blocks/config.py`, `blocks/decoder.py`) |
 
 ---
 
@@ -122,6 +123,20 @@ Device placement is normalized internally (`resolve_components_and_wrapper` trac
 `export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)` — use `export_to_backend`.
 
 TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live in `test/e2e/test_export_pipelines.py` (capability-gated, skips without torch-tensorrt/CUDA); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
+
+### XNNPACK: `attn_impl` — optimized causal attention
+
+`MHACausal` (`blocks/mha.py`) supports three attention kernels via `attn_impl` in `convert_options`, orthogonal to `cache_impl`:
+
+| `attn_impl` | Kernel | Notes |
+|---|---|---|
+| `"manual"` (default) | Explicit GQA-aware softmax/matmul (`attention()` in `mha.py`) | Always available, any backend |
+| `"sdpa"` | `torch.nn.functional.scaled_dot_product_attention` | Equivalent to the legacy `use_sdpa=True` |
+| `"custom_sdpa"` | ExecuTorch's fused CPU custom ops (`torch.ops.llama.custom_sdpa` / `update_cache`) | XNNPACK-only; ~30% faster decode in benchmarking (Qwen2-0.5B, CPU). Requires `cache_impl="mutable"` and `q_head_dim == value_head_dim` — both validated at construction/forward time rather than silently producing wrong output |
+
+`custom_sdpa` needs ExecuTorch's `executorch.extension.llm.custom_ops` extension importable both at **export** time (`MHACausal.__init__` imports it lazily, guarded with a clear `RuntimeError` if unavailable) and at **inference** time in whatever process later loads the `.pte` — the AOT registration from the export process does not carry over to a separate process. `scripts/executorch/xnnpack/inference_exported_test.py` handles this by conditionally re-importing the extension, keyed off an `attn_impl` field in the `.cache_meta.json` sidecar written by `exporter_function_test.py`.
+
+CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,sdpa,custom_sdpa}`. Tests: `test/unit/test_mha_causal_custom_sdpa.py` (numeric parity vs `"manual"`, plus the validation guards), `test/e2e/test_export_pipelines.py::test_export_xnnpack_custom_sdpa` — both gated by `test/_helpers/capabilities.py::requires_custom_sdpa` (narrower than `requires_executorch`: a minimal ExecuTorch install may lack the LLM custom-ops extension).
 
 ---
 
@@ -274,6 +289,8 @@ Things the codebase silently relies on. Breaking these causes silent wrong behav
 6. **`calibration_store` is a plain `dict`** owned by each `CompressionScheme`. `CalibrationSummary` implementations write to it; `Compressor` implementations read from it. Don't write to it from anywhere else.
 
 7. **`INDEXING["path_template"]` must be a Python format string** with `{block_index}` and `{path}` — the manager calls `.format(block_index=..., path=...)` to resolve full module paths. Missing either placeholder breaks all scheme lookups.
+
+8. **`attn_impl="custom_sdpa"` (`MHACausal`) requires `cache_impl="mutable"` and `q_head_dim == value_head_dim`.** Both are validated (`ValueError` at construction, `RuntimeError` at forward) rather than silently producing wrong output — `torch.ops.llama.custom_sdpa`'s kernel sizes its output like `query`, not `value`, so RoPE-linked structured pruning that shrinks q/k's head_dim while `v_proj` stays unpruned is incompatible with this kernel (use `"manual"` or `"sdpa"` instead).
 
 ---
 

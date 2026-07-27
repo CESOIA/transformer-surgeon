@@ -23,6 +23,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         compression_config=None,
         bias_required=None,
         use_sdpa=False,
+        attn_impl=None,
         max_cache_len=2048,
         cache_impl="mutable",
         indexing=None,
@@ -41,6 +42,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         self.mlp_type = mlp_type
         self.norm_type = norm_type
         self.use_sdpa = use_sdpa
+        self.attn_impl = attn_impl
         self.max_cache_len = max_cache_len
         self.cache_impl = cache_impl
         self.bias_required = bias_required or {"attn": {}, "mlp": {}}
@@ -63,6 +65,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         compression_config=None,
         bias_required=None,
         use_sdpa=False,
+        attn_impl=None,
         max_cache_len=2048,
         cache_impl="mutable",
     ):
@@ -107,6 +110,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
                 "mlp_type",
                 "norm_type",
                 "use_sdpa",
+                "attn_impl",
                 "max_cache_len",
                 "cache_impl",
             }
@@ -129,6 +133,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
             compression_config=compression_config or {},
             bias_required=bias_required or {"attn": {}, "mlp": {}},
             use_sdpa=use_sdpa,
+            attn_impl=attn_impl,
             max_cache_len=max_cache_len,
             cache_impl=cache_impl,
             indexing=converted_indexing,

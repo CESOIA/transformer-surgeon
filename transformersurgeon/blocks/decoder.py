@@ -30,6 +30,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.mlp_type = config.mlp_type
         self.norm_type = config.norm_type
         self.use_sdpa = config.use_sdpa
+        self.attn_impl = getattr(config, "attn_impl", None)
         self.max_cache_len = config.max_cache_len
         self.cache_impl = getattr(config, "cache_impl", "mutable")
         self.dtype = config.dtype
@@ -68,6 +69,7 @@ class TransformerDecoderBlock(torch.nn.Module):
                 kv_num_heads=self.kv_num_heads,
                 compression_config=self.compression_config["attn"],
                 use_sdpa=self.use_sdpa,
+                attn_impl=self.attn_impl,
                 max_cache_len=self.max_cache_len,
                 cache_impl=self.cache_impl,
                 dtype=self.dtype)
