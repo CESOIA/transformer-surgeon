@@ -132,11 +132,16 @@ def test_causal_pruned_kv_cache_dims(cache_impl):
 
     for pos in range(3):
         pid = torch.tensor([pos])
-        args = (torch.randn(1, 32), pid, (q_pos, k_pos), mask_penalty)
+        attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pid].unsqueeze(0)
+        args = (torch.randn(1, 32), pid, attn_mask)
+        # MHACausal now expects rope already indexed by pos_id (the TransformerDecoder
+        # does this once per token, shared across layers) rather than indexing
+        # internally -- pre-index here to match.
+        rope_pos = (cos[pid], sin[pid])
         if cache_impl == "mutable":
-            out = m(*args, rope=(cos, sin))
+            out = m(*args, rope=rope_pos)
         else:
-            out, kc, vc = m(*args, key_cache=kc, value_cache=vc, rope=(cos, sin))
+            out, kc, vc = m(*args, key_cache=kc, value_cache=vc, rope=rope_pos)
         assert torch.isfinite(out).all()
 
     assert m.key_cache.shape[-1] == 4

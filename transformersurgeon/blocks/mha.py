@@ -647,7 +647,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         return attn_output.squeeze(0).to(orig_dtype).transpose(0, 1)  # (num_heads, in_seq_len, value_head_dim)
 
-    def forward(self, x, pos_id, pos_id_list, mask_penalty,
+    def forward(self, x, pos_id, attn_mask,
                 key_cache=None, value_cache=None, rope=None):
         """
         Forward pass of the causal Multi-Head Attention with caching.
@@ -655,6 +655,11 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         Args:
             x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
             pos_id (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
+            attn_mask (torch.Tensor): Precomputed additive causal mask for this
+                decode step, shape (1, max_cache_len). Callers (TransformerDecoder)
+                compute this once per forward() call and pass the same tensor to
+                every layer -- it depends only on pos_id, not on layer-specific
+                state, so it must not be re-derived per layer.
             key_cache/value_cache (torch.Tensor, optional): Incoming fixed-size
                 caches for the ``io_*`` modes. If omitted, the internal buffers
                 are used as the initial cache.
@@ -684,17 +689,14 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         k = self.k_proj(x).view(in_seq_len, self.kv_num_heads, self.key_head_dim) # (in_seq_len, kv_num_heads, k_head_dim)
         v = self.v_proj(x).view(in_seq_len, self.kv_num_heads, self.value_head_dim) # (in_seq_len, kv_num_heads, v_head_dim)
 
-        # Apply RoPE
+        # Apply RoPE. `rope` is already indexed by pos_id (done once per decode
+        # step by TransformerDecoder, shared across all layers) -- each layer
+        # only applies its own (possibly pruning-projected) split on top.
         if rope is not None:
-            cos = rope[0][pos_id]
-            sin = rope[1][pos_id]
+            cos, sin = rope
             cos_q, sin_q, cos_k, sin_k = self._project_rope(cos, sin)
             q = apply_rope_multihead(q, cos_q, sin_q)
             k = apply_rope_multihead(k, cos_k, sin_k)
-
-        # On-the-fly attention mask
-        q_pos, k_pos = pos_id_list
-        attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pos_id].unsqueeze(0) # (1, max_cache_len)
 
         if self.attn_impl == "custom_sdpa":
             # custom_sdpa owns its own dedicated fp32 cache (see __init__/

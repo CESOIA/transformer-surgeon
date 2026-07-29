@@ -57,8 +57,9 @@ def test_causal_custom_sdpa_matches_manual():
     for pos in range(5):
         pid = torch.tensor([pos])
         x = torch.randn(1, 32)
-        out_manual = m_manual(x, pid, (q_pos, k_pos), mask_penalty)
-        out_custom = m_custom(x, pid, (q_pos, k_pos), mask_penalty)
+        attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pid].unsqueeze(0)
+        out_manual = m_manual(x, pid, attn_mask)
+        out_custom = m_custom(x, pid, attn_mask)
         torch.testing.assert_close(out_manual, out_custom, atol=1e-4, rtol=1e-3)
 
 
@@ -92,6 +93,7 @@ def test_custom_sdpa_rejects_pruned_q_head_dim_mismatch():
     q_pos = k_pos = torch.arange(16)
     mask_penalty = torch.full((16, 16), float("-inf"))
     pid = torch.tensor([0])
+    attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pid].unsqueeze(0)
 
     with pytest.raises(RuntimeError, match="q_head_dim == value_head_dim"):
-        m(torch.randn(1, 32), pid, (q_pos, k_pos), mask_penalty)
+        m(torch.randn(1, 32), pid, attn_mask)

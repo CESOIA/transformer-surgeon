@@ -103,8 +103,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             self,
             x,
             pos_id,
-            pos_id_list,
-            mask_penalty,
+            attn_mask,
             key_cache=None,
             value_cache=None,
             rope=None,
@@ -115,8 +114,10 @@ class TransformerDecoderBlock(torch.nn.Module):
         Args:
             x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
             pos_id (torch.LongTensor): Current position id, shape (1,).
-            pos_id_list (tuple): Precomputed (q_pos, k_pos) index grids for masking.
-            mask_penalty (torch.Tensor): Additive penalty applied to masked positions.
+            attn_mask (torch.Tensor): Precomputed additive attention mask for this
+                decode step, shape (1, max_cache_len). Computed once per forward()
+                call by TransformerDecoder (identical for every block/layer) rather
+                than re-derived here.
             key_cache/value_cache (torch.Tensor, optional): Incoming fixed-size KV
                 caches for the ``io_*`` cache implementations (ignored by ``mutable``).
             rope (tuple(torch.Tensor, torch.Tensor), optional): Precomputed RoPE cos/sin tensors.
@@ -130,8 +131,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         attn_out = self.attn(   # multihead self attention
             x,
             pos_id=pos_id,
-            pos_id_list=pos_id_list,
-            mask_penalty=mask_penalty,
+            attn_mask=attn_mask,
             key_cache=key_cache,
             value_cache=value_cache,
             rope=rope,
@@ -218,15 +218,31 @@ class TransformerDecoder(torch.nn.Module):
             io modes: (output, new_key_caches, new_value_caches) where the caches
                 are per-block Lists of length ``depth``.
         """
+        # The causal mask depends only on (pos_id, q_pos, k_pos, mask_penalty) --
+        # none of which vary across blocks -- so it is computed once per forward()
+        # call here instead of being re-derived independently inside every block's
+        # MHACausal.forward (previously depth-many redundant (max_cache_len,
+        # max_cache_len) compare/where/index calls per token, most of which fall
+        # outside the XNNPACK delegate and pay full ExecuTorch op-dispatch
+        # overhead per call).
+        attn_mask = torch.where(
+            self.q_pos < self.k_pos, self.mask_penalty, torch.zeros_like(self.mask_penalty)
+        )[pos_id].unsqueeze(0)  # (1, max_cache_len)
+
+        # Likewise, the base RoPE cos/sin lookup by pos_id is identical for every
+        # block (each block only differs in the *further*, per-layer pruning
+        # projection applied on top via _project_rope) -- index once here instead
+        # of depth-many times inside MHACausal.forward.
+        rope_pos = (self.rope_cos[pos_id], self.rope_sin[pos_id])
+
         # Decode
         if self.cache_impl == "mutable":
             for block in self.blocks:
                 x = block(
                     x,               # (in_seq_len, embed_dim)
                     pos_id=pos_id,   # (1,)
-                    pos_id_list=(self.q_pos, self.k_pos),
-                    mask_penalty=self.mask_penalty,
-                    rope=(self.rope_cos, self.rope_sin),
+                    attn_mask=attn_mask,
+                    rope=rope_pos,
                 )
             x = self.norm(x)
             return x
@@ -239,11 +255,10 @@ class TransformerDecoder(torch.nn.Module):
             x, kc_out, vc_out = block(
                 x,
                 pos_id=pos_id,
-                pos_id_list=(self.q_pos, self.k_pos),
-                mask_penalty=self.mask_penalty,
+                attn_mask=attn_mask,
                 key_cache=kc,
                 value_cache=vc,
-                rope=(self.rope_cos, self.rope_sin),
+                rope=rope_pos,
             )
             new_key_caches.append(kc_out)
             new_value_caches.append(vc_out)
