@@ -138,6 +138,32 @@ TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a C
 
 CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,sdpa,custom_sdpa}`. Tests: `test/unit/test_mha_causal_custom_sdpa.py` (numeric parity vs `"manual"`, plus the validation guards), `test/e2e/test_export_pipelines.py::test_export_xnnpack_custom_sdpa` — both gated by `test/_helpers/capabilities.py::requires_custom_sdpa` (narrower than `requires_executorch`: a minimal ExecuTorch install may lack the LLM custom-ops extension).
 
+### XNNPACK: `add_batch_dim` — experimental leading batch dimension
+
+`add_batch_dim` (`convert_options`, default `False`) makes `LLMWrapper`'s `input_ids`
+and every component's hidden states carry an explicit leading batch dim
+(`(1, in_seq_len, ...)`) instead of the framework's usual bare `(in_seq_len,
+...)` contract — matching ExecuTorch's own llama exporter's convention, on the
+hypothesis that XNNPACK may select faster GEMM/FC microkernels or weight
+packing for batched shapes (see `XNNPACK_DECODE_SPEED_FIX.md` for the
+investigation this came out of). Threaded through `blocks/config.py`,
+`utils/convert.py`, `blocks/decoder.py` exactly like `attn_impl`/`cache_impl`.
+
+Scoped narrowly to minimize risk: `MHACausal` absorbs the batch dim
+immediately after q/k/v projection (`.view(in_seq_len, ...)` on a
+leading-1-dim tensor is a no-op reshape) and re-attaches it only after
+`out_proj`, so **attention math, KV-cache read/write, and `custom_sdpa` are
+completely unaffected either way** — only the surrounding Linear/RMSNorm/MLP
+"glue" ops actually see a batch dim. `MHAEncoder` (encoder-only models) is not
+touched by this option at all.
+
+This is opt-in and off by default specifically so QNN/TensorRT and every
+existing XNNPACK export are 100% unaffected unless a caller explicitly passes
+`"add_batch_dim": True` in `convert_options`. It has not been validated against
+QNN's or TensorRT's partitioners/converters — the extra leading dim may not be
+supported by every op converter on those backends, so treat it as
+**XNNPACK-only until proven otherwise elsewhere**.
+
 ---
 
 ## Compression Parameter Reference

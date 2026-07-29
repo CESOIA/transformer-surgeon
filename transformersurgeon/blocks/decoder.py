@@ -33,6 +33,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.attn_impl = getattr(config, "attn_impl", None)
         self.max_cache_len = config.max_cache_len
         self.cache_impl = getattr(config, "cache_impl", "mutable")
+        self.add_batch_dim = getattr(config, "add_batch_dim", False)
         self.dtype = config.dtype
 
         # Extract configuration (optional)
@@ -72,6 +73,7 @@ class TransformerDecoderBlock(torch.nn.Module):
                 attn_impl=self.attn_impl,
                 max_cache_len=self.max_cache_len,
                 cache_impl=self.cache_impl,
+                add_batch_dim=self.add_batch_dim,
                 dtype=self.dtype)
         else:
             raise ValueError(f"Unsupported MHA type: {self.mha_type}")
@@ -172,6 +174,7 @@ class TransformerDecoder(torch.nn.Module):
 
         self.max_cache_len = config.max_cache_len
         self.cache_impl = getattr(config, "cache_impl", "mutable")
+        self.add_batch_dim = getattr(config, "add_batch_dim", False)
 
         # Precompute position ids useful for attention mask generation
         q_pos = torch.arange(self.max_cache_len, dtype=torch.long)[:, None] # (max_cache_len, 1)

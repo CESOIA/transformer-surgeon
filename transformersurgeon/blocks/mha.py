@@ -488,6 +488,17 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                 f"Unsupported cache_impl {self.cache_impl!r}; expected one of {CACHE_IMPLS}"
             )
 
+        # add_batch_dim: accept a leading (size-1) batch dim on `x` (and thus on
+        # q/k/v right after projection) instead of the framework's usual bare
+        # (in_seq_len, embed_dim) contract -- see forward() for how it's absorbed
+        # immediately after q/k/v projection (attention/cache internals below are
+        # completely unaffected: they still only ever see unbatched tensors) and
+        # re-attached on the output so the residual stream carries a batch dim
+        # end to end. Opt-in and False by default so QNN/TensorRT and existing
+        # XNNPACK exports are unaffected; see AGENTS.md for the export config
+        # option (`add_batch_dim` in convert_options) that threads this through.
+        self.add_batch_dim = kwargs.get("add_batch_dim", False)
+
         # Initialize key and value caches
         self.max_cache_length=kwargs.get("max_cache_len", 2048)
 
@@ -653,7 +664,8 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         Forward pass of the causal Multi-Head Attention with caching.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim).
+            x (torch.Tensor): Input tensor of shape (in_seq_len, embed_dim), or
+                (1, in_seq_len, embed_dim) when ``self.add_batch_dim``.
             pos_id (int): Current length of the cache (number of tokens already in cache). This is used to determine where to write the new keys and values in the cache.
             attn_mask (torch.Tensor): Precomputed additive causal mask for this
                 decode step, shape (1, max_cache_len). Callers (TransformerDecoder)
@@ -668,7 +680,10 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         Returns:
             output (mutable mode) or (output, key_cache, value_cache) (io modes).
         """
-        in_seq_len, embed_dim = x.size()
+        if self.add_batch_dim:
+            _, in_seq_len, embed_dim = x.size()
+        else:
+            in_seq_len, embed_dim = x.size()
 
         # Match the internal buffers to the current (possibly pruned) key head_dim.
         self._ensure_cache_geometry()
@@ -685,6 +700,16 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # keeps value_head_dim. The key cache follows the pruned key_head_dim (set
         # by _ensure_cache_geometry / build_zero_caches), so a hard-pruned k_proj
         # writes into a matching cache.
+        #
+        # When add_batch_dim, q_proj/k_proj/v_proj (LinearCompressed) see a
+        # batched (1, in_seq_len, embed_dim) input and produce a batched
+        # (1, in_seq_len, out_features) output -- but since the leading dim is
+        # always exactly 1, .view(in_seq_len, heads, head_dim) below absorbs it
+        # directly (same total element count either way), so q/k/v end up
+        # unbatched from this point on regardless of add_batch_dim. Everything
+        # downstream (RoPE, attention, cache read/write, custom_sdpa) is
+        # therefore identical in both modes -- only the *projections themselves*
+        # (and the final out_proj below) actually see a batch dim.
         q = self.q_proj(x).view(in_seq_len, self.num_heads, self.q_proj.out_features // self.num_heads) # (in_seq_len, num_heads, q_head_dim)
         k = self.k_proj(x).view(in_seq_len, self.kv_num_heads, self.key_head_dim) # (in_seq_len, kv_num_heads, k_head_dim)
         v = self.v_proj(x).view(in_seq_len, self.kv_num_heads, self.value_head_dim) # (in_seq_len, kv_num_heads, v_head_dim)
@@ -724,8 +749,15 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         # Concatenate heads and project output. Width is num_heads * value_head_dim
         # (== embed_dim unless v_proj was hard-pruned, in which case out_proj's
-        # in_features was cascade-pruned to match).
-        attn_output = attn_output.transpose(0, 1).reshape(in_seq_len, self.num_heads * self.value_head_dim)
+        # in_features was cascade-pruned to match). Re-attach the batch dim here
+        # (if add_batch_dim) so out_proj -- and everything downstream in the
+        # residual stream (norm/mlp/next layer) -- sees a batched input/output,
+        # same as q/k/v's projections above.
+        out_shape = (
+            (1, in_seq_len, self.num_heads * self.value_head_dim) if self.add_batch_dim
+            else (in_seq_len, self.num_heads * self.value_head_dim)
+        )
+        attn_output = attn_output.transpose(0, 1).reshape(out_shape)
         output = self.out_proj(attn_output)
 
         if self.cache_impl == "mutable":

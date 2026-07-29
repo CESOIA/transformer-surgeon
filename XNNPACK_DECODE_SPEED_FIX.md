@@ -147,11 +147,90 @@ hence the bigger percentage win (+15.9% vs +7.2%). This is consistent with
 removing non-delegated per-op dispatch overhead, which doesn't scale with the
 delegated matmul FLOP count.
 
+## Second experiment: `add_batch_dim` — testing (and refuting) the batch-dimension theory
+
+`FRAMEWORK_PROBLEMS.md`'s strongest *remaining* lead for the leftover 1.34x/2.09x
+gap was that tsurgeon's graph runs everything unbatched `(seq, dim)` end to end,
+unlike ExecuTorch's own `(1, seq, dim)` convention — hypothesizing that XNNPACK
+might select faster GEMM/FC microkernels or weight-packing for batched shapes.
+This was tested directly rather than left as a guess.
+
+**Design, scoped to minimize risk.** A naive fix would thread a batch dim
+through every module's shape contract. Instead: `LinearCompressed` already
+flattens arbitrary leading dims internally and restores the caller's original
+shape on output, and `RMSNorm`/`MLP`/`AtomicSum` all reduce only over the last
+dim — so they're already shape-agnostic. That means a batch dim can be threaded
+through the **residual stream only** (embedding → q/k/v/out_proj → mlp → next
+layer) while leaving attention math, KV-cache read/write, and `custom_sdpa`
+**completely untouched**: `MHACausal.forward` absorbs the batch dim immediately
+after q/k/v projection (`.view(in_seq_len, heads, head_dim)` on a leading-1-dim
+tensor is a no-op reshape — total element count is unchanged) and re-attaches
+it only after `out_proj`. This tests the hypothesis for the bulk of the
+XNNPACK-delegated Linear ops without touching cache/attention internals at all.
+
+**Implementation:** new `add_batch_dim` option (default `False`), threaded
+through `blocks/config.py` → `utils/convert.py` → `blocks/decoder.py` →
+`blocks/mha.py`, exactly like the existing `attn_impl`/`cache_impl` options
+(see AGENTS.md's "`add_batch_dim`" section for the full writeup). `export/common.py`'s
+`LLMWrapper`/`build_example_inputs`/`calibrate_pt2e_observers` were updated to
+build/consume a `(1, 1)`-shaped `input_ids` instead of `(1,)` when set, and to
+keep the batch dim on the final logits (matching ExecuTorch's own `(1, vocab)`
+output convention) instead of indexing it away.
+
+**Opt-in and off by default specifically because of QNN.** This has not been
+validated against QNN's or TensorRT's op converters — the extra leading dim may
+not be supported by every converter on those backends. Because it's a
+convert_options flag defaulting to `False`, every existing QNN/TensorRT/XNNPACK
+export is provably unaffected (confirmed: `pytest test/unit test/e2e` — 40/40
+unit incl. 5 new tests, 57/57 e2e — unaffected before/after).
+
+**Correctness:** new `test/unit/test_add_batch_dim.py` (5 tests) checks
+numeric parity against the default unbatched path for all three `attn_impl`
+values, under per-kv-group pruned RoPE specifically (confirming `add_batch_dim`
+doesn't interfere with `_project_rope`'s per-layer pruning projection — see
+below), and at the full `TransformerDecoder` level. Re-exported both TinyLlama
+variants with `add_batch_dim=True`: `fp32` `max_abs_err=6.0e-5` (tighter than
+the unbatched export's `1.4e-4`), `w4` `max_abs_err=2.15` (in the same 4-bit
+noise range as unbatched's `2.07`) — both consistent with a correct, working
+export.
+
+**Aside, since it came up while discussing this experiment:** `add_batch_dim`
+only affects the *shared*, pruning-independent RoPE lookup
+(`rope_cos[pos_id]`/`rope_sin[pos_id]`, identical for every layer regardless of
+pruning) hoisted in the first fix above — it does not touch `_project_rope`,
+which still runs once per layer using that layer's own `rope_freq_proj` buffer
+and still produces different projected `cos`/`sin` per layer when different
+layers keep different rotary frequencies under structured pruning. The new
+pruned-RoPE parametrized test above is exactly what verifies this.
+
+**Result: the hypothesis does not hold on this CPU/environment — batched is
+slightly *slower*, not faster:**
+
+| Variant | Unbatched decode (tok/s) | Batched decode (tok/s) | Speedup | stdev (unbatched / batched) |
+|---|---:|---:|---:|---:|
+| fp32 | 20.82 | 20.58 | **-1.1%** (0.989x) | 0.15 / 0.12 |
+| w4 | 39.93 | 38.66 | **-3.2%** (0.968x) | 0.32 / 0.40 |
+
+(Interleaved A/B methodology as above, 15 trials, 8 discarded warm-up
+iterations each — low variance on both sides, so this is a real, reproducible
+regression, not noise.) The extra `.view`/`.reshape` needed to re-attach the
+batch dim after `out_proj` is a real (if tiny) cost with no offsetting
+kernel-selection benefit observed — this specific CPU/XNNPACK build does not
+appear to pick a faster microkernel or packing routine for batched vs.
+unbatched Linear inputs at this scale. **The option is kept in the codebase
+(fully tested, documented, opt-in, zero effect on default behavior) since the
+answer could differ on other hardware (e.g. ARM NEON) or larger batch sizes,
+but it should not be enabled for this model/CPU combination.**
+
+This rules out the leading candidate explanation for the remaining gap.
+
 ## What this does *not* fix
 
-The remaining ~1.34x/2.09x gaps are not attributed to any single newly
-identified cause in this pass. `FRAMEWORK_PROBLEMS.md`'s other findings are
-untouched and still open:
+The remaining ~1.34x/2.09x gaps (fp32/w4, from the first fix above) are still
+not attributed to any specific identified cause — both the redundant-glue-code
+theory (fixed, see above) and the batch-dimension theory (tested and refuted,
+see above) are now ruled out or addressed. `FRAMEWORK_PROBLEMS.md`'s other
+findings are untouched and still open:
 - **P2** — batched/dynamic-shape prefill and multi-token KV-cache writes are
   still unsupported (prefill is still a token-by-token loop).
 - **P3** — embedding-table and `lm_head` hard quantization export bugs are
@@ -161,14 +240,30 @@ untouched and still open:
 Fully explaining what's left of the gap still needs ETDump per-op profiling
 (requires an ExecuTorch build with `EXECUTORCH_ENABLE_EVENT_TRACER`,
 unavailable in this environment) to see inside the XNNPACK delegate blobs
-themselves — the fixes in this pass only addressed the non-delegated
-"glue" computation around them.
+themselves — both fixes/experiments in this pass only ever addressed the
+non-delegated "glue" computation and the shapes feeding the delegate, not what
+happens inside it. Candidate leads for whoever picks this up next, in rough
+order of how easy they'd be to check without ETDump:
+- `RMSNorm` (`blocks/norm.py`) does a non-standard extra
+  max-abs-normalize-then-clamp step before the usual variance/rsqrt — three
+  extra elementwise ops, twice per layer (44x per token), that a reference
+  RMSNorm doesn't have. Worth checking whether ExecuTorch's own model uses a
+  plain/fused RMSNorm and whether XNNPACK delegates either version whole.
+- Thread-pool/intra-op parallelism configuration differences between the two
+  exports (this was not compared).
+- XNNPACK weight-packing/caching behavior — whether tsurgeon's export enables
+  the same packed-weight reuse across forward calls that ExecuTorch's own
+  export does.
 
 ## Files changed
 
-- `transformersurgeon/blocks/decoder.py` — hoist mask/RoPE-index computation.
-- `transformersurgeon/blocks/mha.py` — `MHACausal.forward` consumes precomputed values.
+- `transformersurgeon/blocks/decoder.py` — hoist mask/RoPE-index computation; `add_batch_dim` plumbing.
+- `transformersurgeon/blocks/mha.py` — `MHACausal.forward` consumes precomputed values; `add_batch_dim` support.
+- `transformersurgeon/blocks/config.py`, `transformersurgeon/utils/convert.py` — `add_batch_dim` config option.
+- `transformersurgeon/export/common.py` — `LLMWrapper`/`build_example_inputs`/`calibrate_pt2e_observers` batch-dim awareness.
 - `test/unit/test_mha_causal_custom_sdpa.py`, `test/unit/test_gqa_rope_pruning.py` — updated calling convention.
+- `test/unit/test_add_batch_dim.py` — new, `add_batch_dim` correctness tests.
+- `AGENTS.md` — documents the new `add_batch_dim` option and its QNN/TensorRT caveat.
 
 ## Reproduce
 
@@ -179,10 +274,14 @@ cd /workspace/transformer-surgeon && pytest test/unit test/e2e -q   # correctnes
 cd /workspace/executorch_llama
 python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant fp32 --out-dir pte_fixed
 python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant w4   --out-dir pte_fixed
+python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant fp32 --add-batch-dim --out-dir pte_fixed
+python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant w4   --add-batch-dim --out-dir pte_fixed
 
 # interleaved A/B (script written for this investigation, kept alongside the
 # other benchmark scripts in this sibling dir for provenance -- see FRAMEWORK_PROBLEMS.md's
 # convention of keeping repro scripts in /workspace/executorch_llama/, outside this repo)
 python interleaved_ab.py pte/tsurgeon_llama_fp32.pte pte_fixed/tsurgeon_llama_fp32.pte 15
 python interleaved_ab.py pte/tsurgeon_llama_w4.pte   pte_fixed/tsurgeon_llama_w4.pte   15
+python interleaved_ab.py pte_fixed/tsurgeon_llama_fp32.pte pte_fixed/tsurgeon_llama_fp32_batched.pte 15
+python interleaved_ab.py pte_fixed/tsurgeon_llama_w4.pte   pte_fixed/tsurgeon_llama_w4_batched.pte   15
 ```

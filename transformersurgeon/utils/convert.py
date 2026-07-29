@@ -307,6 +307,7 @@ def convert_for_export(model, options=None, verbose=False):
             attn_impl = options.get('attn_impl', None)
             max_cache_len = options.get('max_cache_len', 2048)
             cache_impl = options.get('cache_impl', 'mutable')
+            add_batch_dim = options.get('add_batch_dim', False)
 
             converted_indexing = _build_converted_decoder_indexing(indexing)
             converted_compression_config = _build_converted_compression_config(
@@ -329,6 +330,7 @@ def convert_for_export(model, options=None, verbose=False):
                 attn_impl=attn_impl,
                 max_cache_len=max_cache_len,
                 cache_impl=cache_impl,
+                add_batch_dim=add_batch_dim,
             )
 
             new_model = TransformerDecoder(config=converted_config)
