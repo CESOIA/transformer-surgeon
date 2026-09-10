@@ -476,6 +476,49 @@ list from the independent re-verification pass:
 | `2d8afad` | Hoist per-layer mask/RoPE computation to once-per-token (fp32 +7%, w4 +16%) |
 | `25712fa` | Add opt-in `add_batch_dim`; test and **refute** the batch-dim theory |
 | `3242f6c` | **`custom_sdpa` `is_causal`+`start_pos`** (fp32 1.51x, w4 2.35x) + causal-mask test fix |
+| `d513b8e` | Independent 20-trial re-verification vs Meta's `.pte` (docs only) |
+| `11d46a8` | Rule out thread-pool and XNNPACK partitioner config as causes (docs only) |
+| `0e2645f` | Full write-up of the root-cause investigation (docs only) |
+
+Only `2d8afad`, `25712fa` and `3242f6c` touch code; the rest are documentation.
+Net code footprint across all of them is small — `blocks/mha.py` plus config/plumbing
+for the opt-in flag, and the test corrections:
+
+```
+ test/unit/test_add_batch_dim.py          | 14 ++++++++----    (new file, earlier commit)
+ test/unit/test_gqa_rope_pruning.py       |  7 +++++--
+ test/unit/test_mha_causal_custom_sdpa.py | 31 ++++++++++++++++++-------
+ transformersurgeon/blocks/mha.py         | 35 +++++++++++++++++++++---------
+```
+
+## Does the RoPE hoist still respect per-layer structured pruning?
+
+Asked during review, answered by reading the code rather than by testing, since the
+concern was that per-layer pruning gives each layer its *own* positional-embedding
+geometry:
+
+- `rope_cos`/`rope_sin` are built **once per decoder** in `TransformerDecoder.__init__`
+  from the *unpruned* `head_dim` and a single `base=1e6`. There is only one such table.
+  The pre-hoist code passed those same two buffers to every block, so `rope[0][pos_id]`
+  was already producing an identical tensor in all layers — the hoist evaluates that
+  same expression once instead of `depth` times and changes no value.
+- The per-layer part is `MHABase._project_rope`, which reads `self.rope_freq_proj`, a
+  **per-`MHACausal`-instance** buffer built by `finalize_rope_pruning()`. That is invoked
+  *inside* the per-block loop in `utils/convert.py`, so every layer derives its own
+  projection from its own `rope_prune_mask`. The hoist does not touch it.
+- Heterogeneous per-layer geometry therefore still works: `_project_rope` maps the shared
+  full-size `(1, 1, half)` table down to `(1, num_groups, kept)` using *that layer's*
+  `rope_freq_proj.shape`, so layers keeping different rotary frequencies — or different
+  counts — each project independently off the same base table.
+
+Constraint worth recording: this relies on the *base* table being layer-invariant. Per-layer
+pruning **selection** is fine; a per-layer *base frequency* or *base head_dim* would not be.
+Neither is expressible in `CustomDecoderConfigCompress` (single `head_dim`, single `base`),
+so there is no regression today — but that is the assumption to re-check if per-layer RoPE
+bases are ever added.
+
+`test_add_batch_dim.py::test_add_batch_dim_matches_unbatched_under_pruned_rope` exercises
+exactly this path with two kv-groups keeping *different* rotary frequencies.
 
 ## Reproduce
 
