@@ -21,6 +21,28 @@ pytestmark = caps.requires_custom_sdpa
 
 HEAD_DIM = 8
 HALF = HEAD_DIM // 2
+MAX_CACHE = 16
+
+
+def _causal_mask_row(pos_id, max_cache_len=MAX_CACHE, penalty=-10000.0):
+    """Build the additive causal mask row for ``pos_id``, exactly the way
+    TransformerDecoder does it (blocks/decoder.py).
+
+    NB: q_pos/k_pos must be shaped (L, 1) and (1, L) so that ``q_pos < k_pos``
+    broadcasts into a real (L, L) causal matrix. An earlier version of these
+    tests used two *identical 1-D* ``arange(L)`` tensors, which compares
+    elementwise to all-False and silently produced an all-zeros (i.e. no-op)
+    mask -- so the "custom_sdpa matches manual" parity check was passing
+    without either path ever doing causal masking. Keep this 2-D.
+    """
+    q_pos = torch.arange(max_cache_len, dtype=torch.long)[:, None]
+    k_pos = torch.arange(max_cache_len, dtype=torch.long)[None, :]
+    full = torch.where(
+        q_pos < k_pos,
+        torch.tensor(penalty, dtype=torch.float32),
+        torch.tensor(0.0, dtype=torch.float32),
+    )
+    return full[pos_id].unsqueeze(0)  # (1, 1, max_cache_len)
 
 
 def _head_mask(freqs):
@@ -51,13 +73,10 @@ def test_causal_custom_sdpa_matches_manual():
     # excluded from state_dict -- this only copies q/k/v/out_proj weights.
     m_custom.load_state_dict(m_manual.state_dict())
 
-    q_pos = k_pos = torch.arange(16)
-    mask_penalty = torch.full((16, 16), float("-inf"))
-
     for pos in range(5):
         pid = torch.tensor([pos])
         x = torch.randn(1, 32)
-        attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pid].unsqueeze(0)
+        attn_mask = _causal_mask_row(pid)
         out_manual = m_manual(x, pid, attn_mask)
         out_custom = m_custom(x, pid, attn_mask)
         torch.testing.assert_close(out_manual, out_custom, atol=1e-4, rtol=1e-3)
@@ -90,10 +109,8 @@ def test_custom_sdpa_rejects_pruned_q_head_dim_mismatch():
     assert m.key_head_dim == 4
     assert m.value_head_dim == HEAD_DIM
 
-    q_pos = k_pos = torch.arange(16)
-    mask_penalty = torch.full((16, 16), float("-inf"))
     pid = torch.tensor([0])
-    attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pid].unsqueeze(0)
+    attn_mask = _causal_mask_row(pid)
 
     with pytest.raises(RuntimeError, match="q_head_dim == value_head_dim"):
         m(torch.randn(1, 32), pid, attn_mask)

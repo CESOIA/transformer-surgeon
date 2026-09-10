@@ -640,19 +640,34 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         q_head_dim = self.q_proj.out_features // self.num_heads
         scale = 1.0 / math.sqrt(q_head_dim)  # matches attention()'s own convention
 
-        # attn_mask carries extra leading singleton dims from tensor-indexed
-        # pos_id (full[pos_id] keeps the index dim) plus the unsqueeze(0) below
-        # it in forward() -- custom_sdpa requires *exactly* rank 2, unlike
-        # attention()/F.scaled_dot_product_attention which broadcast happily,
-        # so collapse down to (in_seq_len, kv_len) here.
-        attn_mask_2d = attn_mask.reshape(1, -1).to(torch.float32)
-
+        # Let the kernel derive the causal mask itself from start_pos
+        # (is_causal=True, attn_mask=None) instead of handing it an explicit
+        # full-length mask with start_pos=0.
+        #
+        # This is not just a style difference, it changes the amount of work:
+        # with start_pos=0 + explicit mask the kernel has no way to know which
+        # cache slots are live, so it scores the query against *all*
+        # max_cache_len slots and then masks the invalid ones away. Told the
+        # real start_pos with is_causal=True, it only scores positions
+        # [0, start_pos + in_seq_len) -- at decode step p that is O(p) instead
+        # of O(max_cache_len) per layer per token. This is exactly what
+        # ExecuTorch's own llama exporter does (see SDPACustom.forward in
+        # executorch/examples/models/llama/source_transformation/sdpa.py, the
+        # use_attention_mask=False branch, which is its default).
+        #
+        # Semantically identical: `attn_mask` as built by TransformerDecoder is
+        # plain causal (mask out k_pos > q_pos), which is precisely what
+        # is_causal=True generates. The only numeric difference is that the
+        # explicit mask used a finite -10000.0 penalty while the kernel uses a
+        # true -inf/skip, i.e. the kernel result is if anything slightly more
+        # exact. `attn_mask` is therefore intentionally unused on this path --
+        # it is still built for (and used by) the "manual"/"sdpa" kernels.
         attn_output = torch.ops.llama.custom_sdpa(
             q_b, self.custom_sdpa_key_cache, self.custom_sdpa_value_cache,
-            0,                          # start_pos: unused, explicit mask is provided
-            attn_mask_2d,
+            start_pos,                  # real position: bounds the kernel's scan
+            None,                       # no explicit mask -- derived from is_causal
             0.0,                        # dropout
-            False,                      # is_causal
+            True,                       # is_causal
             scale,
         )  # (1, in_seq_len, num_heads, value_head_dim)
 

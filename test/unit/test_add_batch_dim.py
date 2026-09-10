@@ -39,8 +39,11 @@ def test_add_batch_dim_matches_unbatched(attn_impl):
     m_batched = MHACausal(32, 4, add_batch_dim=True, **kwargs).eval()
     m_batched.load_state_dict(m_unbatched.state_dict())
 
-    q_pos = k_pos = torch.arange(16)
-    mask_penalty = torch.full((16, 16), float("-inf"))
+    # (L, 1) / (1, L) so this broadcasts into a real causal matrix -- two
+    # identical 1-D aranges compare to all-False and give a no-op mask.
+    q_pos = torch.arange(16, dtype=torch.long)[:, None]
+    k_pos = torch.arange(16, dtype=torch.long)[None, :]
+    mask_penalty = torch.tensor(-10000.0)
 
     for pos in range(5):
         pid = torch.tensor([pos])
@@ -83,8 +86,11 @@ def test_add_batch_dim_matches_unbatched_under_pruned_rope():
 
     inv = precompute_rope_inv_freqs(head_dim=HEAD_DIM, base=1e4)
     cos, sin = precompute_rope_cos_sin_half(inv, torch.tensor(16), torch.tensor(0))
-    q_pos = k_pos = torch.arange(16)
-    mask_penalty = torch.full((16, 16), float("-inf"))
+    # (L, 1) / (1, L) so this broadcasts into a real causal matrix -- two
+    # identical 1-D aranges compare to all-False and give a no-op mask.
+    q_pos = torch.arange(16, dtype=torch.long)[:, None]
+    k_pos = torch.arange(16, dtype=torch.long)[None, :]
+    mask_penalty = torch.tensor(-10000.0)
 
     for pos in range(3):
         pid = torch.tensor([pos])
