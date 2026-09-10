@@ -353,6 +353,17 @@ Fixed in all three affected files (`test_mha_causal_custom_sdpa.py`,
 does. The parity test now passes against a *real* causal mask, which makes it a strictly
 stronger check than before.
 
+### Correctness
+
+- `pytest test/unit` — **40/40 pass**, including the now-genuinely-causal parity test.
+- `pytest test/e2e` — **57/57 pass, 4 skipped** (TensorRT/QNN unavailable, pre-existing),
+  covering `test_export_xnnpack` and `test_export_xnnpack_custom_sdpa`.
+- Export-time inference stats on the final build: fp32 `max_abs_err=8.0e-5`
+  (vs `1.4e-4` before the change — slightly *tighter*, consistent with `-inf` vs
+  `-10000.0` masking), w4 `max_abs_err=1.34` (within the 4-bit noise band).
+- The op itself was probed in isolation both ways (`start_pos=0`+mask vs
+  `start_pos=p`+`is_causal`) against a hand-written reference: **both agree to 1.2e-7**.
+
 ### Results
 
 | Variant | Before (fix 1 only) | After | Speedup |
