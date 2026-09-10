@@ -433,6 +433,21 @@ wants to push further:
   longer blocking, since the previously-unexplained gap turned out to be in the
   `custom_sdpa` call arguments rather than inside the delegate.
 
+Two more candidates were checked (by reading the installed ExecuTorch source directly, no
+ETDump needed) and ruled out as differentiators, closing off the "what else could it be"
+list from the independent re-verification pass:
+- **Thread-pool sizing** isn't an exporter-side setting at all — both `.pte` files run
+  through the same `_load_for_executorch` runtime in the same process/environment, so
+  they share whatever default thread pool ExecuTorch's C++ runtime picks. Nothing for
+  either export to configure differently.
+- **XNNPACK partitioner config**: Meta's `--xnnpack-extended-ops` flag
+  (`export_llama_lib.py::_to_edge_and_lower_llama_xnnpack`) only controls whether a
+  second, greedy `XnnpackPartitioner()` runs *in addition to* a dynamic-quant-only
+  partitioner — needed on Meta's side because without it, an unquantized fp32 model
+  would get zero delegation (the dynamic-quant-only partitioner has nothing to claim).
+  tsurgeon's exporter (`xnnpack_export.py`) already calls the full greedy
+  `XnnpackPartitioner()` directly and unconditionally — functionally equivalent, not a gap.
+
 ## Files changed
 
 - `transformersurgeon/blocks/mha.py` — **`custom_sdpa` `is_causal`+`start_pos` fix (the big one)**; `MHACausal.forward` consumes precomputed mask/RoPE; `add_batch_dim` support.
