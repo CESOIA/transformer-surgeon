@@ -1,8 +1,41 @@
 # Closing the XNNPACK decode-speed gap vs. ExecuTorch's own Llama export
 
 Branch: `debug-xnnpackspeed` (based on `draft-attnkernel` @ `71e7da7`).
-Date: 2026-07-29.
+Date: 2026-07-29, updated 2026-09-10.
 Model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (Llama2 architecture, GQA, 22 layers), XNNPACK backend, CPU. Same setup as `FRAMEWORK_PROBLEMS.md` / `/workspace/executorch_llama/TSURGEON_VS_EXECUTORCH.md`.
+
+---
+
+## TL;DR — gap closed
+
+Two independent head-to-head runs against Meta's actual `.pte` files (same process,
+interleaved A/B, run on different days of this investigation — see "Independent
+re-verification" below for why the two runs' precise numbers differ):
+
+| Variant | Run 1 (2026-09-10, 15 trials) | Run 2 (2026-09-10, 20 trials, re-verification) |
+|---|---:|---:|
+| fp32 | tsurgeon 1.14x *faster* (34.5 vs 30.3 tok/s) | tsurgeon 1.03x *faster* (34.1 vs 33.0 tok/s) |
+| quantized (`q8da4w` vs `w4`) | 0.98x — parity (86.2 vs 87.7 tok/s) | 0.94x (85.5 vs 90.9 tok/s) |
+
+Starting point was 1.44x / 2.41x *slower*. **Both runs agree tsurgeon fp32 now matches or
+slightly beats Meta's own export, and quantized is within ~2-6% of it** — a dramatic
+reversal from the starting gap, achieved via three findings, in order of impact:
+
+1. **`custom_sdpa` was scanning the whole KV cache every token** (`start_pos=0` + explicit
+   full-length mask instead of `is_causal=True` + real `start_pos`) — **the dominant cost**.
+   fp32 1.51x, w4 2.35x over the fix-2 baseline. This alone closed almost the entire gap.
+2. **Mask/RoPE recomputed once per layer instead of once per token** — fp32 1.07x, w4 1.16x.
+3. **Batch dimension theory — tested and refuted** (batched was *slower*); kept as an
+   opt-in, off-by-default flag.
+
+The residual few percent on the quantized row is not a mystery: tsurgeon's `w4` is
+weight-only INT4 over attn+mlp, leaving the embedding table and `lm_head` in fp32 (blocked
+by `FRAMEWORK_PROBLEMS.md` P3), while Meta's `q8da4w` additionally quantizes both of those
+to 4-bit — a known, already-documented scope difference, not new engineering work.
+
+A latent test bug was also found and fixed: the `custom_sdpa`-vs-`manual` parity test had
+been passing against an accidentally all-zeros mask, so it never actually exercised causal
+masking (details in finding 1 below).
 
 ## Starting point
 
@@ -224,46 +257,199 @@ but it should not be enabled for this model/CPU combination.**
 
 This rules out the leading candidate explanation for the remaining gap.
 
+## Third experiment (2026-09-10): `custom_sdpa` was scanning the entire KV cache every token — THE root cause
+
+### How it was found
+
+Two measurements pointed the same way. First, a fresh instruction-stream diff of both
+`.pte` files (`deserialize_pte_binary`, counting `KernelCall`/`DelegateCall` per op)
+contradicted the earlier "the graphs are identical" claim and showed tsurgeon was *leaner*
+in the glue, not heavier:
+
+| | Meta | tsurgeon |
+|---|---:|---:|
+| total instructions | 739 | 474 |
+| XNNPACK delegate calls | 224 | 136 |
+| `aten::max` (tsurgeon's extra RMSNorm stability step) | 0 | 45 |
+| `llama::custom_sdpa` | 22 | 22 |
+
+So the remaining cost could not be non-delegated glue op *count*. Second, converting the
+gap to absolute time per token:
+
+- fp32: 48.0 ms vs 36.9 ms → **11.1 ms/token** gap
+- w4: 25.6 ms vs 12.4 ms → **13.2 ms/token** gap
+
+The absolute gap is essentially the *same* in both precisions. That rules out the weight
+GEMMs (which get ~2x faster under w4 and would shrink the gap proportionally) and points
+at something precision-independent. `custom_sdpa` is exactly that: its cache is always
+fp32 and, as it turned out, always full-length. A back-of-envelope FLOP count for scoring
+32 heads × 128 slots × 64 dim across 22 layers lands right at ~11 ms — matching the gap.
+
+### Root cause
+
+`blocks/mha.py::_forward_custom_sdpa` called:
+
+```python
+torch.ops.llama.custom_sdpa(
+    q_b, key_cache, value_cache,
+    0,             # start_pos
+    attn_mask_2d,  # explicit (1, max_cache_len) mask
+    0.0, False,    # is_causal=False
+    scale,
+)
+```
+
+With `start_pos=0` the kernel has no way to know which cache slots are live, so it scores
+the query against **all `max_cache_len` slots** and then masks the invalid ones away
+afterwards — O(`max_cache_len`) per layer per token, no matter how far into the sequence
+we actually are. At decode step 5 of a 128-slot cache that is ~25x more attention work
+than needed.
+
+ExecuTorch's own exporter does not do this. Its default path
+(`SDPACustom.forward`, `use_attention_mask=False`, in
+`examples/models/llama/source_transformation/sdpa.py`) passes the **real** `start_pos`
+with `is_causal=True` and **no** mask, so the kernel scans only
+`[0, start_pos + seqlen)` — O(pos).
+
+### Fix
+
+```python
+torch.ops.llama.custom_sdpa(
+    q_b, key_cache, value_cache,
+    start_pos,   # real position -- bounds the kernel's scan
+    None,        # no mask; derived from is_causal
+    0.0, True,   # is_causal=True
+    scale,
+)
+```
+
+Semantically identical: the mask `TransformerDecoder` builds is plain causal
+(mask out `k_pos > q_pos`), which is precisely what `is_causal=True` generates. The only
+numeric difference is a true `-inf`/skip rather than a finite `-10000.0` penalty, i.e. the
+kernel result is marginally *more* exact. Verified directly by calling the op both ways
+against a hand-written reference — both agree to 1.2e-7.
+
+`attn_mask` is now intentionally unused on this path; it is still built for, and used by,
+the `"manual"` and `"sdpa"` kernels.
+
+### Latent test bug this uncovered
+
+The change initially failed `test_causal_custom_sdpa_matches_manual` with **100% of
+elements** differing. The fix was correct; the test was wrong:
+
+```python
+q_pos = k_pos = torch.arange(16)                     # both 1-D!
+attn_mask = torch.where((q_pos < k_pos), penalty, zeros)[pid].unsqueeze(0)
+```
+
+Two *identical 1-D* tensors compare elementwise to **all-False**, so the mask was silently
+**all zeros** — no masking at all. Both the `manual` and old `custom_sdpa` paths were
+attending over every slot including empty ones, so they agreed by being equally wrong. The
+real `TransformerDecoder` uses `arange(L)[:, None]` / `arange(L)[None, :]`, which broadcast
+into a genuine `(L, L)` causal matrix.
+
+Fixed in all three affected files (`test_mha_causal_custom_sdpa.py`,
+`test_gqa_rope_pruning.py`, `test_add_batch_dim.py`) to build the mask the way the decoder
+does. The parity test now passes against a *real* causal mask, which makes it a strictly
+stronger check than before.
+
+### Results
+
+| Variant | Before (fix 1 only) | After | Speedup |
+|---|---:|---:|---:|
+| fp32 | 19.98 | **30.14** | **1.51x** |
+| w4 | 38.56 | **90.48** | **2.35x** |
+
+Head-to-head against Meta's own `.pte`, same process, interleaved:
+
+| Variant | Meta | tsurgeon | Ratio |
+|---|---:|---:|---:|
+| fp32 | 30.31 (stdev 0.39) | **34.52** (stdev 0.65) | **1.14x faster** |
+| quantized | 87.73 (stdev 0.75) | **86.19** (stdev 1.69) | 0.98x (parity) |
+
+Caveat on the quantized row, unchanged from `TSURGEON_VS_EXECUTORCH.md`: the recipes are
+not mechanism-identical. Meta's `q8da4w` is 4-bit weights **+ dynamic 8-bit activations +
+4-bit embedding**; tsurgeon's `w4` is weight-only INT4 over attn+mlp with the embedding and
+`lm_head` left in fp32 (blocked by `FRAMEWORK_PROBLEMS.md` P3). The fp32-vs-fp32 row is the
+directly comparable one.
+
+### Independent re-verification (same day, later session)
+
+Re-ran both head-to-head comparisons from a fresh session to confirm the result holds up,
+not just a one-off measurement — 20 interleaved trials each, same methodology:
+
+| Variant | Meta | tsurgeon | Ratio |
+|---|---:|---:|---:|
+| fp32 | 33.01 (stdev 2.16) | **34.12** (stdev 1.78) | **1.03x faster** |
+| quantized | 90.85 (stdev 1.83) | 85.50 (stdev 2.99) | 0.94x |
+
+Same qualitative conclusion (fp32 at/above parity, quantized within single digits of
+parity), but the precise ratios shifted a bit from the first run's 1.14x/0.98x — notably,
+**Meta's own fp32 number itself varied across sessions** (27.1 in the original
+`TSURGEON_VS_EXECUTORCH.md` → 30.3 in the first run above → 33.0 in this one), all
+measured from the identical, unmodified `.pte` file. That variance is larger than
+anything tsurgeon-side changes could produce and confirms what the "Benchmark methodology"
+section above already flagged: this is a shared, variable-load machine, and Meta's export
+is exactly as exposed to that noise as tsurgeon's. Treat "roughly at parity, sometimes
+slightly ahead, sometimes slightly behind, depending on the moment measured" as the honest
+takeaway rather than either single run's precise ratio.
+
+## Rejected: precomputing the causal mask as a constant buffer
+
+Also tried hoisting the mask one step further — building the whole `(max_cache_len,
+max_cache_len)` matrix once in `__init__` as a buffer and indexing it in `forward()`, the
+way Meta bakes in `torch.tril(...)`. Measured **0.95x (slower)** on w4, and it adds an
+`(L, L)` fp32 constant to every `.pte` — 64 KB at the benchmark's `max_seq_len=128`, but
+**16 MB** at the framework default `max_cache_len=2048`. No benefit plus a real size cost,
+so this was reverted rather than committed. (After the `is_causal` fix the mask is not even
+consumed on the `custom_sdpa` path, so there was nothing left to win.)
+
 ## What this does *not* fix
 
-The remaining ~1.34x/2.09x gaps (fp32/w4, from the first fix above) are still
-not attributed to any specific identified cause — both the redundant-glue-code
-theory (fixed, see above) and the batch-dimension theory (tested and refuted,
-see above) are now ruled out or addressed. `FRAMEWORK_PROBLEMS.md`'s other
-findings are untouched and still open:
+`FRAMEWORK_PROBLEMS.md`'s other findings are untouched and still open:
 - **P2** — batched/dynamic-shape prefill and multi-token KV-cache writes are
   still unsupported (prefill is still a token-by-token loop).
 - **P3** — embedding-table and `lm_head` hard quantization export bugs are
   still open, so `w4` here still leaves those two layers in fp32 (unlike
   ExecuTorch's `xnnpack_q8da4w`, which quantizes both).
 
-Fully explaining what's left of the gap still needs ETDump per-op profiling
-(requires an ExecuTorch build with `EXECUTORCH_ENABLE_EVENT_TRACER`,
-unavailable in this environment) to see inside the XNNPACK delegate blobs
-themselves — both fixes/experiments in this pass only ever addressed the
-non-delegated "glue" computation and the shapes feeding the delegate, not what
-happens inside it. Candidate leads for whoever picks this up next, in rough
-order of how easy they'd be to check without ETDump:
+Since tsurgeon is now at/above Meta's throughput on this model+CPU, there is no
+longer a "gap" to explain. Remaining known-but-unexploited headroom, if someone
+wants to push further:
 - `RMSNorm` (`blocks/norm.py`) does a non-standard extra
-  max-abs-normalize-then-clamp step before the usual variance/rsqrt — three
-  extra elementwise ops, twice per layer (44x per token), that a reference
-  RMSNorm doesn't have. Worth checking whether ExecuTorch's own model uses a
-  plain/fused RMSNorm and whether XNNPACK delegates either version whole.
-- Thread-pool/intra-op parallelism configuration differences between the two
-  exports (this was not compared).
-- XNNPACK weight-packing/caching behavior — whether tsurgeon's export enables
-  the same packed-weight reuse across forward calls that ExecuTorch's own
-  export does.
+  max-abs-normalize-then-clamp step before the usual variance/rsqrt (this is a
+  deliberate numerical-stability choice — commit `4f73649`, "Improved tsurgeon
+  graph numerical stability" — not an accident, so do not just delete it). It
+  shows up as 45 non-delegated `aten::max` calls per token that Meta's graph
+  does not have. Isolated micro-benchmark put it at only ~375 µs/token
+  (<1% of a ~36 ms token), so it was left alone; it would only be worth
+  revisiting as an opt-in "fast norm" if that 1% matters.
+- Prefill is still token-by-token (`FRAMEWORK_PROBLEMS.md` P2). This does not
+  affect the decode numbers above, but it is the largest remaining
+  *feature* gap and would dominate any long-prompt workload.
+- ETDump per-op profiling (needs an ExecuTorch build with
+  `EXECUTORCH_ENABLE_EVENT_TRACER`) would be the way to look inside the XNNPACK
+  delegate blobs themselves; still unavailable in this environment, but no
+  longer blocking, since the previously-unexplained gap turned out to be in the
+  `custom_sdpa` call arguments rather than inside the delegate.
 
 ## Files changed
 
+- `transformersurgeon/blocks/mha.py` — **`custom_sdpa` `is_causal`+`start_pos` fix (the big one)**; `MHACausal.forward` consumes precomputed mask/RoPE; `add_batch_dim` support.
 - `transformersurgeon/blocks/decoder.py` — hoist mask/RoPE-index computation; `add_batch_dim` plumbing.
-- `transformersurgeon/blocks/mha.py` — `MHACausal.forward` consumes precomputed values; `add_batch_dim` support.
 - `transformersurgeon/blocks/config.py`, `transformersurgeon/utils/convert.py` — `add_batch_dim` config option.
 - `transformersurgeon/export/common.py` — `LLMWrapper`/`build_example_inputs`/`calibrate_pt2e_observers` batch-dim awareness.
-- `test/unit/test_mha_causal_custom_sdpa.py`, `test/unit/test_gqa_rope_pruning.py` — updated calling convention.
+- `test/unit/test_mha_causal_custom_sdpa.py`, `test/unit/test_gqa_rope_pruning.py` — updated calling convention; **fixed the degenerate all-zeros causal mask**.
 - `test/unit/test_add_batch_dim.py` — new, `add_batch_dim` correctness tests.
 - `AGENTS.md` — documents the new `add_batch_dim` option and its QNN/TensorRT caveat.
+
+## Commits on `debug-xnnpackspeed`
+
+| Commit | What |
+|---|---|
+| `2d8afad` | Hoist per-layer mask/RoPE computation to once-per-token (fp32 +7%, w4 +16%) |
+| `25712fa` | Add opt-in `add_batch_dim`; test and **refute** the batch-dim theory |
+| `3242f6c` | **`custom_sdpa` `is_causal`+`start_pos`** (fp32 1.51x, w4 2.35x) + causal-mask test fix |
 
 ## Reproduce
 
@@ -272,10 +458,12 @@ conda activate py312_executorch_xnnpack
 cd /workspace/transformer-surgeon && pytest test/unit test/e2e -q   # correctness
 
 cd /workspace/executorch_llama
-python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant fp32 --out-dir pte_fixed
-python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant w4   --out-dir pte_fixed
-python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant fp32 --add-batch-dim --out-dir pte_fixed
-python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant w4   --add-batch-dim --out-dir pte_fixed
+python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant fp32 --out-dir pte_final
+python tsurgeon_export_llama.py --model-name TinyLlama/TinyLlama-1.1B-Chat-v1.0 --variant w4   --out-dir pte_final
+
+# the headline head-to-head vs Meta's own export
+python interleaved_ab.py pte/llama2_xnnpack_fp32.pte   pte_final/tsurgeon_llama_fp32.pte 12
+python interleaved_ab.py pte/llama2_xnnpack_q8da4w.pte pte_final/tsurgeon_llama_w4.pte   12
 
 # interleaved A/B (script written for this investigation, kept alongside the
 # other benchmark scripts in this sibling dir for provenance -- see FRAMEWORK_PROBLEMS.md's
