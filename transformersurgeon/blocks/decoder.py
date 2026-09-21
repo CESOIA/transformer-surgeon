@@ -34,6 +34,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.max_cache_len = config.max_cache_len
         self.cache_impl = getattr(config, "cache_impl", "mutable")
         self.add_batch_dim = getattr(config, "add_batch_dim", False)
+        self.rmsnorm_prescale = getattr(config, "rmsnorm_prescale", True)
         self.dtype = config.dtype
 
         # Extract configuration (optional)
@@ -56,8 +57,8 @@ class TransformerDecoderBlock(torch.nn.Module):
 
         # Instantiate normalization modules
         if self.norm_type == "rmsnorm":
-            self.norm_in = RMSNorm(self.embed_dim, dtype=self.dtype)
-            self.norm_out = RMSNorm(self.embed_dim, dtype=self.dtype)
+            self.norm_in = RMSNorm(self.embed_dim, dtype=self.dtype, prescale=self.rmsnorm_prescale)
+            self.norm_out = RMSNorm(self.embed_dim, dtype=self.dtype, prescale=self.rmsnorm_prescale)
         else:
             raise ValueError(f"Unsupported norm type: {self.norm_type}")
 
@@ -169,7 +170,8 @@ class TransformerDecoder(torch.nn.Module):
         self.blocks = torch.nn.ModuleList(
             [TransformerDecoderBlock(config, block_index=i) for i in range(self.depth)]
             )
-        self.norm = RMSNorm(config.hidden_size, self.dtype)
+        self.rmsnorm_prescale = getattr(config, "rmsnorm_prescale", True)
+        self.norm = RMSNorm(config.hidden_size, self.dtype, prescale=self.rmsnorm_prescale)
         head_dim = config.hidden_size // config.num_attention_heads
 
         self.max_cache_len = config.max_cache_len

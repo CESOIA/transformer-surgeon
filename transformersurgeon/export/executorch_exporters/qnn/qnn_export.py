@@ -1,4 +1,5 @@
 import importlib.util
+import warnings
 import os
 import _operator
 from dataclasses import dataclass
@@ -242,6 +243,21 @@ class QNNExportConfig(ExecutorchExporterConfig):
     is_online_prepare: bool = False
     use_fp16: bool = True
     num_shards: int = 1
+    # Rewrite aten.linear into an equivalent 1x1 conv2d before lowering, which is
+    # what Qualcomm's own LLM examples do
+    # (executorch/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+    # calls convert_linear_to_conv2d on the whole decoder).
+    #
+    # Opt-in, not default, for two reasons. It showed no measurable change in the
+    # HTP compiler's DDR bandwidth summary on this model -- it swaps 14 linears
+    # for 14 convolutions plus 28 reshape/permute pairs that LayoutTransform is
+    # expected to fold, so any win is in kernel selection, which cannot be
+    # confirmed without on-device timing. And ExecuTorch 1.3.1's pass has real
+    # gaps: see _resolve_linear_to_conv2d for the two it can detect, plus a
+    # non-leaf-tensor deepcopy failure that shows up on the full fp32 decoder
+    # pipeline and does not reproduce on a synthetic decoder of the same shape.
+    # Turn it on once that pass is fixed upstream, or for models it can handle.
+    convert_linear_to_conv2d: bool = False
 
 
 def _resolve_qcom_chipset(soc_model: Any):
@@ -269,6 +285,72 @@ def _resolve_qcom_chipset(soc_model: Any):
     raise TypeError(
         "soc_model must be a QcomChipset value or chipset string (for example 'SM8650')."
     )
+
+
+def _resolve_linear_to_conv2d(wrapper: nn.Module, config: QNNExportConfig) -> bool:
+    """Decide whether ExecuTorch's ConvertLinearToConv2d pass can run on this model.
+
+    The pass gives HTP a faster lowering for the tall/skinny matrices a decode
+    step produces, and it is what Qualcomm's own LLM examples use. But as shipped
+    in ExecuTorch 1.3.1 it has two preconditions it does not check itself, and
+    violating either fails deep inside lowering with an error that says nothing
+    about linear layers:
+
+      * **float32 weights only.** ``_reshape_weight`` re-wraps its result in
+        ``nn.Parameter`` only when ``weight.dtype == torch.float``; for float16 it
+        stores a bare tensor where the export machinery asserts a Parameter
+        ("expected torch.nn.Parameter for PARAMETER attr_kind, got
+        <class 'torch.Tensor'>").
+      * **no tied weights.** When a weight has more than one user — the usual
+        embedding/lm_head tie, which the pass's own comment claims to handle — it
+        registers a reshaped *fake* tensor as a buffer. That tensor is not a graph
+        leaf, so the later ``deepcopy`` of the partitioned submodule raises "Only
+        Tensors created explicitly by the user (graph leaves) support the deepcopy
+        protocol".
+
+    Both are ExecuTorch-side limitations. Rather than let the export die, detect
+    them up front, fall back to plain FullyConnected lowering, and say why.
+    Exporting in float32 is the usual QNN flow anyway: HTP's own precision comes
+    from ``generate_htp_compiler_spec(use_fp16=...)``, not from the dtype of the
+    graph's constants.
+    """
+    if not config.convert_linear_to_conv2d:
+        return False
+
+    linears = [m for m in wrapper.modules() if isinstance(m, nn.Linear)]
+
+    dtypes = {m.weight.dtype for m in linears} - {torch.float32}
+    if dtypes:
+        warnings.warn(
+            "convert_linear_to_conv2d is disabled for this export: ExecuTorch's "
+            "ConvertLinearToConv2d pass only supports float32 linear weights, but "
+            f"this model has {sorted(str(d) for d in dtypes)}. Re-export with "
+            "float_type=torch.float32 to get the conv2d lowering — HTP precision is "
+            "controlled by use_fp16 in the compiler spec, not by the graph dtype.",
+            stacklevel=2,
+        )
+        return False
+
+    # The tie that matters in practice is lm_head <-> tok_embeddings, i.e. an
+    # nn.Linear sharing storage with an nn.Embedding, so both types are scanned.
+    seen: dict[int, str] = {}
+    for name, m in wrapper.named_modules():
+        if not isinstance(m, (nn.Linear, nn.Embedding)):
+            continue
+        key = id(m.weight)
+        other = seen.get(key)
+        if other is not None:
+            warnings.warn(
+                "convert_linear_to_conv2d is disabled for this export: ExecuTorch's "
+                "ConvertLinearToConv2d pass mishandles weights shared by more than "
+                f"one layer, and {name!r} shares its weight with {other!r} (the "
+                "usual embedding/lm_head tie). Untie the weights to get the conv2d "
+                "lowering.",
+                stacklevel=2,
+            )
+            return False
+        seen[key] = name
+    return True
 
 
 def export_with_qnn(
@@ -516,6 +598,7 @@ def export_with_qnn(
         model_for_edge,
         example_inputs,
         compiler_spec,
+        convert_linear_to_conv2d=_resolve_linear_to_conv2d(wrapper, config),
         **edge_kwargs,
     )
 

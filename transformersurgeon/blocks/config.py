@@ -27,6 +27,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         max_cache_len=2048,
         cache_impl="mutable",
         add_batch_dim=False,
+        rmsnorm_prescale=True,
         indexing=None,
         **kwargs,
     ):
@@ -47,6 +48,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         self.max_cache_len = max_cache_len
         self.cache_impl = cache_impl
         self.add_batch_dim = add_batch_dim
+        self.rmsnorm_prescale = rmsnorm_prescale
         self.bias_required = bias_required or {"attn": {}, "mlp": {}}
 
         if indexing is None:
@@ -71,6 +73,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         max_cache_len=2048,
         cache_impl="mutable",
         add_batch_dim=False,
+        rmsnorm_prescale=True,
     ):
         """Build converted decoder config from source HF config using indexing metadata."""
 
@@ -117,6 +120,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
                 "max_cache_len",
                 "cache_impl",
                 "add_batch_dim",
+                "rmsnorm_prescale",
             }
         }
 
@@ -141,6 +145,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
             max_cache_len=max_cache_len,
             cache_impl=cache_impl,
             add_batch_dim=add_batch_dim,
+            rmsnorm_prescale=rmsnorm_prescale,
             indexing=converted_indexing,
             **passthrough_kwargs,
         )

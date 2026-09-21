@@ -164,6 +164,28 @@ QNN's or TensorRT's partitioners/converters — the extra leading dim may not be
 supported by every op converter on those backends, so treat it as
 **XNNPACK-only until proven otherwise elsewhere**.
 
+### QNN: decode-speed options
+
+See [QNN_DECODE_SPEED_FIX.md](QNN_DECODE_SPEED_FIX.md) for the investigation and
+measurements, and [QNN_SPEED_SUMMARY.md](QNN_SPEED_SUMMARY.md) for the plain-language
+version.
+
+| Option | Where | Default | Notes |
+|---|---|---|---|
+| `rmsnorm_prescale` | `convert_options` → `blocks/config.py` → `decoder.py` → `blocks/norm.py::RMSNorm` | `True` | `False` drops the max-abs rescale in front of each RMSNorm so ExecuTorch folds it into one `aten.rms_norm` (as Qualcomm's reference does), saving ~245 HTP dispatches/token. Not bit-identical — rescaling changes how `eps` enters the variance — so keep it on where fp16 overflow is a real risk. CLI: `--no-rmsnorm-prescale` |
+| `convert_linear_to_conv2d` | `QNNExportConfig` | `False` | Vendor-recommended 1×1-conv lowering. Off because it showed no measurable DDR change here and ExecuTorch 1.3.1's pass breaks on fp16 weights and on tied weights — `_resolve_linear_to_conv2d` detects both and warns instead of failing deep in lowering. CLI: `--linear-to-conv2d` |
+
+`MHACausal`'s `attn_impl="manual"` kernel (`attention()` in `blocks/mha.py`) computes
+GQA by **broadcast**, not by materialising a `repeat_interleave`'d KV cache, and
+permutes the cache *before* the group expansion rather than after. Do not reorder
+those two steps: expanding first makes the permute run over a `group_size`-times
+larger tensor, which overflows VTCM and cost 537 MB of spill/fill per token on
+Qwen2-0.5B. The math is unchanged either way.
+
+`config.max_seq_len` now seeds `convert_options["max_cache_len"]` in
+`export_to_backend` when the caller did not set it explicitly — before, the KV cache
+was always 2048 slots regardless of `--max-sequence-length`.
+
 ---
 
 ## Compression Parameter Reference

@@ -171,8 +171,7 @@ class LLMWrapper(nn.Module):
     ):
         if self.cache_impl == "mutable":
             hidden = self.decoder(self.embedding(input_ids), pos_id=pos_id_tensor)
-            last = hidden[:, -1, :] if self.add_batch_dim else hidden[-1, :]
-            return self.final_layer(last)
+            return self._head(hidden)
 
         hidden, new_key_caches, new_value_caches = self.decoder(
             self.embedding(input_ids),
@@ -180,9 +179,25 @@ class LLMWrapper(nn.Module):
             key_caches=key_caches,
             value_caches=value_caches,
         )
-        last = hidden[:, -1, :] if self.add_batch_dim else hidden[-1, :]
-        logits = self.final_layer(last)
-        return logits, new_key_caches, new_value_caches
+        return self._head(hidden), new_key_caches, new_value_caches
+
+    def _head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Take the last token's hidden state and project it to logits.
+
+        The slice deliberately keeps a leading dim (``hidden[-1:, :]`` rather
+        than ``hidden[-1, :]``) so ``final_layer`` always sees a rank-2 input,
+        and the rank is dropped again afterwards. The output contract is
+        unchanged -- ``(vocab,)`` unbatched, ``(1, vocab)`` with add_batch_dim --
+        but a rank-1 linear input breaks QNN lowering: ExecuTorch's
+        ConvertLinearToConv2d reshapes a rank-1 input to rank 2 and then applies
+        a 4-element permutation to it, which raises "input.dim() = 2 is not equal
+        to len(dims) = 4". Rank-2 is also the shape QNN's FullyConnected builder
+        handles most robustly, which is why LinearCompressed flattens to rank 2
+        for its own inputs.
+        """
+        if self.add_batch_dim:
+            return self.final_layer(hidden[:, -1, :])
+        return self.final_layer(hidden[-1:, :])[0]
 
 
 def _normalize_component_devices(
