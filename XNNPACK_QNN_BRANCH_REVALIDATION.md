@@ -41,18 +41,30 @@ a win from any specific edit.
 Tests on `debug-qnnspeed`: **unit 40/40 pass**, **e2e 57 passed / 4 skipped**,
 the same four pre-existing TensorRT/QNN-SDK/dual-tower-VL skips as before.
 
-## One thing that did move, and is not explained
+## The export-time self-check is run-to-run noise
 
-Export-time numerical self-check is looser on this branch:
+An earlier draft of this document flagged the export-time numerical self-check
+as having loosened on this branch, and named the `_head` change as the likely
+cause. **That was wrong**, and the reasoning behind it was wrong too.
 
-| | `debug-xnnpackspeed` | `debug-qnnspeed` |
-|---|---|---|
-| fp32 `max_abs_err` | 8.0e-5 | 2.16e-4 |
-| w4 `max_abs_err` | 1.34 | 2.21 |
+A second export of the same model on the same commit, with the same config,
+settles it:
 
-Both still export with `mismatch_count: 0`, both pass the full test suite, and
-the fp32 figure is small in absolute terms. But it moved in the same direction
-at both precisions, which argues against it being noise. The `_head` change is
-the obvious suspect, since it is the one unconditional graph edit. This has not
-been run down and is worth a look before these numbers are quoted as a
-correctness baseline.
+| | `debug-xnnpackspeed` | `debug-qnnspeed` run 1 | `debug-qnnspeed` run 2 |
+|---|---|---|---|
+| fp32 `max_abs_err` | 8.0e-5 | 2.16e-4 | 2.38e-5 |
+| w4 `max_abs_err` | 1.34 | 2.21 | 1.34 |
+
+Run 2 is *tighter* than the old branch at fp32 and identical to it at w4. Two
+runs of identical code differ by roughly 10x at fp32, so this statistic is
+sampling-dependent and cannot resolve a difference of this size.
+
+The original inference — "it moved in the same direction at both precisions,
+which argues against noise" — does not hold with one sample per branch. Two
+measurements moving together is exactly what uncorrelated noise looks like half
+the time. The `_head` change is not implicated.
+
+Practical consequence: **do not use `inference_stats.max_abs_err` from a single
+export to compare two builds.** It is a smoke test for "did this export come out
+catastrophically wrong", not a regression metric. Comparing builds needs either
+a fixed input set or several repeats per build.
