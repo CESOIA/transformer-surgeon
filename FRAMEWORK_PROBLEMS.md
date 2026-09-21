@@ -210,7 +210,9 @@ bugs**, not two symptoms of one root cause — do not conflate them.
 
 **Mechanism:** the function calls torchao's `quantize_(module, config)`. In
 torchao 0.17.0, `quantize_()` only knows how to patch `nn.Linear` submodules
-in place. `EmbeddingCompressed` subclasses `nn.Embedding`, not `nn.Linear`, so
+in place. `EmbeddingCompressed` is a plain `nn.Module` (not an `nn.Linear`, and
+not an `nn.Embedding` subclass either — it holds the table as a `Parameter` in
+`nn.Embedding`'s native `[num_embeddings, embedding_dim]` layout), so
 `quantize_()` does nothing to it. The function detects that nothing changed
 (`quantized_any` stays `False`) and raises loudly instead of returning a model
 that looks quantized but isn't:
@@ -224,7 +226,21 @@ raise NotImplementedError(
 ```
 
 This guard is *correct behavior*, not the bug — the actual gap is that there's
-no alternative code path for embeddings at all. **Fix would be:** add a
+no alternative code path for embeddings at all. Marked as a TODO on the class
+itself in `blocks/embedding_compressed.py`.
+
+**Impact, measured** (`../xnnpack-models/`, 2026-09-21): the embedding table and
+the tied/untied `lm_head` are the only large tensors a tsurgeon `w4` export still
+leaves in fp32, and the cost scales with vocabulary size. Qwen2.5-0.5B (~151k
+vocab) exports to **1211 MB at w4 for a 0.49B-parameter model** — only ~2x
+smaller than its own fp32 build, where TinyLlama-1.1B (32k vocab) gets ~4.4x.
+This is also the leading explanation for tsurgeon's remaining **~5% decode
+deficit** against ExecuTorch's `q8da4w` (median 0.952x over 5 runs), which does
+quantize both via `--embedding-quantize 4,32`. At fp32, where neither side
+quantizes these tensors, the two exports are at parity (1.025x). So P3 is now
+the single highest-value item for closing the quantized gap.
+
+**Fix would be:** add a
 separate embedding-quantization path — either a torchao config that actually
 targets `nn.Embedding` (check newer torchao versions for an
 `IntxWeightOnlyConfig`-equivalent embedding path) or a hand-rolled int-pack +
