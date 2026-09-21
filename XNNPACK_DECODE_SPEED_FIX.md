@@ -6,7 +6,45 @@ Model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (Llama2 architecture, GQA, 22 layers
 
 ---
 
+> ## CORRECTION (2026-09-21) — read before quoting any ratio below
+>
+> The vs-Meta ratios in this document are **overstated**, and the headline "1.14x
+> faster" in particular should not be used.
+>
+> Every figure here came from one or two process runs of the interleaved A/B
+> harness. That harness's *within-run* stdev is tiny (often <1 tok/s on a 34 tok/s
+> measurement), which made single runs look far more authoritative than they were.
+> The real variance is **between processes**: a decode benchmark spins up ~68
+> threads across a 2-socket / 2-NUMA-node machine, and thread placement is drawn
+> fresh on every launch.
+>
+> Five consecutive runs of each pair (`xnnpack-models/ab_repeat.sh`, 2026-09-21,
+> re-exported on `debug-qnnspeed`):
+>
+> | precision | runs | median |
+> |---|---|---|
+> | fp32 | 1.026, 1.025, 1.026, 1.001, 1.017 | **1.025x** |
+> | quantized | 0.952, 0.982, 0.944, 0.968, 0.883 | **0.952x** |
+>
+> **Corrected conclusion: tsurgeon reached parity at fp32 and sits ~5% behind at
+> quantized. It does not beat Meta's export at either precision.** The quantized
+> ratio never once reached parity across five runs, so that deficit is real rather
+> than a sampling artifact — consistent with the P3 embedding/`lm_head` scope gap
+> described below.
+>
+> What is unaffected: the *internal* before/after measurements (fp32 1.51x, w4
+> 2.35x against tsurgeon's own prior state) compare builds under the same
+> conditions and still stand. The `is_causal` finding was a large, real win that
+> closed a gap which genuinely started at 1.44x/2.41x slower. "Caught up" is
+> supported; "beat" is not.
+>
+> Methodology rule added as a result: never quote a ratio from a single process
+> run; use 5+ repeats and report the spread. See
+> `../xnnpack-models/AGENTS.md` §4.
+
 ## TL;DR — gap closed
+
+*(Original text preserved below; ratios superseded by the correction above.)*
 
 Two independent head-to-head runs against Meta's actual `.pte` files (same process,
 interleaved A/B, run on different days of this investigation — see "Independent

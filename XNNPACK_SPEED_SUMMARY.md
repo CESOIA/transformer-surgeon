@@ -8,9 +8,16 @@ but defines every non-obvious term along the way.*
 
 We started with transformer-surgeon's on-device export running **1.4x to
 2.4x slower** than Meta's own official export of the same model on the same
-hardware, and ended with it running **at parity or slightly faster**, by
-fixing one specific, high-impact bug in how the model reads its own
-attention cache.
+hardware, and ended with it running **at parity** — by fixing one specific,
+high-impact bug in how the model reads its own attention cache.
+
+> **Corrected 2026-09-21.** This page previously said "at parity or slightly
+> faster". Repeating the comparison five times instead of once showed the
+> "slightly faster" readings were luck: fp32 lands at **1.02x** (parity) and
+> quantized at **0.95x** (about 5% *behind* Meta). The fix was still a large
+> genuine win — it closed a gap that started at 1.4–2.4x slower — but tsurgeon
+> matches Meta's export rather than beating it. Details and the reason single
+> runs mislead here: `../xnnpack-models/AGENTS.md` §4.
 
 ---
 

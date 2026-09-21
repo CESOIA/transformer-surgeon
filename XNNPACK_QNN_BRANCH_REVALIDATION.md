@@ -30,13 +30,23 @@ trials + 12 timed, both models alternating inside one process), TinyLlama-1.1B,
 
 | | `debug-xnnpackspeed` (2 runs) | `debug-qnnspeed` |
 |---|---|---|
-| fp32 vs Meta | 1.139x / 1.03x | **1.099x** (31.98 → 35.14 tok/s median) |
-| quantized vs Meta | 0.979x / 0.94x | **1.005x** (90.62 → 91.06 tok/s median) |
+| fp32 vs Meta | 1.139x / 1.03x | 1.099x (31.98 → 35.14 tok/s median) |
+| quantized vs Meta | 0.979x / 0.94x | 1.005x (90.62 → 91.06 tok/s median) |
 
-fp32 stays in the same band across all three runs. The quantized case moved from
-slightly behind to parity — plausibly the `_head` change, but the shift is close
-enough to run-to-run spread on a shared machine that it should not be claimed as
-a win from any specific edit.
+**These are all single-run figures and none of them should be quoted.** Repeating
+each comparison five times (`xnnpack-models/ab_repeat.sh`) gives fp32 **1.025x**
+(1.001–1.026) and quantized **0.952x** (0.883–0.982). The apparent movement of
+the quantized case "from behind to parity" was sampling, not the `_head` change
+or any other edit.
+
+The conclusion that matters here survives intact and is what this document is
+for: the QNN commit **does not regress the XNNPACK path**. fp32 is at parity and
+quantized a few percent behind, on this branch as on the previous one.
+
+Why single runs mislead: a decode benchmark here spins up ~68 threads across a
+2-socket / 2-NUMA-node machine, and thread placement is drawn fresh per process
+launch. Within-run stdev stays under 1 tok/s, which makes one run look far more
+conclusive than it is. Full writeup: `../xnnpack-models/AGENTS.md` §4.
 
 Tests on `debug-qnnspeed`: **unit 40/40 pass**, **e2e 57 passed / 4 skipped**,
 the same four pre-existing TensorRT/QNN-SDK/dual-tower-VL skips as before.
