@@ -26,17 +26,18 @@ class RMSNorm(torch.nn.Module):
     are nearly free; it takes precedence over ``prescale``.
     """
 
-    def __init__(self, hidden_size, dtype=None, prescale=True, upcast=False):
+    def __init__(self, hidden_size, dtype=None, prescale=True, upcast=False, eps=1e-5):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.prescale = prescale
         self.upcast = upcast
+        self.eps = eps
 
     def forward(self, x):
         if self.upcast:
             input_dtype = x.dtype
             x = x.to(torch.float32)
-            x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-5)
+            x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
             return self.weight * x.to(input_dtype)
 
         if self.prescale:
@@ -49,7 +50,7 @@ class RMSNorm(torch.nn.Module):
         variance = x.pow(2).mean(dim=-1, keepdim=True)
 
         # Normalize with variance
-        x = x * torch.rsqrt(variance + 1e-5)
+        x = x * torch.rsqrt(variance + self.eps)
 
         # Multiply element-wise with the learned weights
         x = self.weight * x

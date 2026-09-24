@@ -9,9 +9,9 @@ compatibility and adds the parts that genuinely depend on ExecuTorch:
 
   * ExecuTorchExportResult  – result with a ``pte_path`` alias
   * ExecutorchExporterConfig – exporter config base (adds dynamic_shapes)
-  * build_quantizer_from_layer_info / _LinearOnlyQuantizer – XNNPACK PT2E quantizer
+  * build_quantizer_from_layer_info – XNNPACK qconfigs on the shared LinearOnlyQuantizer
   * run_simple_inference_stats – error stats via the ExecuTorch runtime
-  * finalize_export_result – ExecuTorch-flavoured wrapper over the generic one
+  * finalize_executorch_result – ExecuTorch-flavoured wrapper over the generic finalize_export_result
 """
 
 import warnings
@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.fx
 import torch.nn as nn
 
 # Re-export the backend-agnostic helpers so existing
@@ -39,7 +38,9 @@ from ..common import (  # noqa: F401
     calibrate_pt2e_observers,
     dequant_from_exported_state_dict,
     find_weight_mismatches,
-    finalize_export_result as _finalize_export_result,
+    logit_error_stats,
+    reference_logits,
+    finalize_export_result,
 )
 
 
@@ -65,57 +66,23 @@ class ExecutorchExporterConfig(ExporterConfig):
 # XNNPACK PT2E quantizer construction
 # ---------------------------------------------------------------------------
 
-class _LinearOnlyQuantizer:
-    """Thin wrapper around XNNPACKQuantizer that restricts annotation to
-    linear (and linear_relu) patterns only.
-
-    The default XNNPACKQuantizer also annotates cat/add/mul patterns, but
-    their annotators ignore the per-module filter_fn (a known limitation of
-    the upstream implementation).  This causes attention ops (ROPE sub/add,
-    KV-cache cat) to receive observers whose calibration data is degenerate
-    (all-negative outputs → zp=127 → clips all positive activations to 0).
-    By restricting to linear patterns only we avoid annotating non-linear ops
-    in unrelated modules while still enabling INT8 weight+activation fusion
-    for the targeted MLP projections.
-    """
-
-    def __init__(self, base: "XNNPACKQuantizer"):
-        self._base = base
-        # Monkey-patch SUPPORTED_PATTERNS to linear-only for the duration of annotate()
-        from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import QuantPattern, LINEAR_TARGETS
-        self._linear_only_patterns = [
-            QuantPattern("linear", True, False, LINEAR_TARGETS),
-            QuantPattern("linear_relu", False, False, LINEAR_TARGETS),
-        ]
-
-    def __getattr__(self, name):
-        return getattr(self._base, name)
-
-    def annotate(self, model):
-        original = self._base.__class__.SUPPORTED_PATTERNS
-        self._base.__class__.SUPPORTED_PATTERNS = self._linear_only_patterns
-        try:
-            result = self._base.annotate(model)
-        finally:
-            self._base.__class__.SUPPORTED_PATTERNS = original
-        return result
-
-
 def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
-    """Build a per-module XNNPACKQuantizer driven by compression metadata.
+    """Build a per-module linear-only quantizer driven by compression metadata,
+    with ExecuTorch's XNNPACK quantization configs.
 
     Each layer in layer_info gets its own qconfig; layers absent from
-    layer_info are not quantised (they remain float).
+    layer_info are not quantised (they remain float). Only linear nodes are
+    annotated (see linear_quantizer.py for why the stock XNNPACKQuantizer,
+    which also annotates attention's add/mul/cat, is not used).
 
     Layers with stored activation calibration data use static quantization
     (is_dynamic=False); others use dynamic weight-only (is_dynamic=True).
     """
-    from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
-        XNNPACKQuantizer,
-        get_symmetric_quantization_config,
-    )
+    from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import get_symmetric_quantization_config
 
-    base = XNNPACKQuantizer()
+    from ..linear_quantizer import LinearOnlyQuantizer
+
+    quantizer = LinearOnlyQuantizer()
     for layer_name, info in layer_info.items():
         qrange = _PRECISION_TO_QRANGE.get(info["precision"])
         if qrange is None:
@@ -132,9 +99,9 @@ def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
             is_dynamic=is_dynamic,
             **qrange,
         )
-        base.set_module_name(layer_name, qconfig)
+        quantizer.set_module_name(layer_name, qconfig)
 
-    return _LinearOnlyQuantizer(base)
+    return quantizer
 
 
 # ---------------------------------------------------------------------------
@@ -159,12 +126,7 @@ def run_simple_inference_stats(
         )
         return None
 
-    wrapper.eval()
-    with torch.no_grad():
-        y_ref = wrapper(*inference_inputs)
-    # io cache modes return (logits, new_key_caches, new_value_caches); compare logits.
-    if isinstance(y_ref, (tuple, list)):
-        y_ref = y_ref[0]
+    y_ref = reference_logits(wrapper, inference_inputs)
 
     # Load and run the exported program.
     runtime = Runtime.get()
@@ -190,18 +152,7 @@ def run_simple_inference_stats(
         else:
             flat_inputs.append(arg)
 
-    y_et = program.load_method(method_name).execute(flat_inputs)[0]
-    if not isinstance(y_et, torch.Tensor):
-        y_et = torch.tensor(y_et)
-
-    err = (y_ref - y_et).abs()
-    mse = ((y_ref - y_et) ** 2).mean()
-    return {
-        "max_abs_err":  float(err.max().item()),
-        "mean_abs_err": float(err.mean().item()),
-        "mse":          float(mse.item()),
-        "rmse":         float(torch.sqrt(mse).item()),
-    }
+    return logit_error_stats(y_ref, program.load_method(method_name).execute(flat_inputs))
 
 
 def _get_method_names(program: Any) -> list[str]:
@@ -211,7 +162,7 @@ def _get_method_names(program: Any) -> list[str]:
     return list(attr) if attr is not None else []
 
 
-def finalize_export_result(
+def finalize_executorch_result(
     *,
     pte_path: str,
     backend: str,
@@ -219,13 +170,14 @@ def finalize_export_result(
     wrapper: nn.Module,
     example_inputs: tuple[Any, ...],
     exported_for_mismatch: Any | None,
+    model_config: Any | None = None,
     run_weight_mismatch_check: bool,
     weight_mismatch_eps: float,
     verbose: bool,
 ) -> ExecuTorchExportResult:
     """ExecuTorch-flavoured finalize: runs the generic checks and computes
     inference stats through the ExecuTorch runtime."""
-    return _finalize_export_result(
+    return finalize_export_result(
         output_path=pte_path,
         backend=backend,
         precision=precision,
@@ -236,4 +188,5 @@ def finalize_export_result(
         verbose=verbose,
         inference_stats_fn=lambda: run_simple_inference_stats(wrapper, pte_path, example_inputs),
         result_cls=ExecuTorchExportResult,
+        model_config=model_config,
     )

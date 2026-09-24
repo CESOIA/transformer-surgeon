@@ -1,4 +1,22 @@
+import warnings
+
 import torch
+
+
+def rope_theta_from_config(config, default: float = 1e6) -> float:
+    """RoPE base of an HF-style config.
+
+    transformers 5 keeps it in ``config.rope_parameters["rope_theta"]``; older
+    configs have ``config.rope_theta``. ``default`` (the historical tsurgeon
+    value) only applies when neither is present. Only plain RoPE is
+    implemented, so scaled variants (e.g. Llama 3's "llama3") are reported.
+    """
+    params = getattr(config, "rope_parameters", None) or {}
+    rope_type = params.get("rope_type", "default")
+    if rope_type not in ("default", None):
+        warnings.warn(f"RoPE scaling '{rope_type}' is not implemented; using plain RoPE.", stacklevel=2)
+    theta = params.get("rope_theta", getattr(config, "rope_theta", None))
+    return float(default if theta is None else theta)
 
 
 def precompute_mrope_inv_freqs(
@@ -301,6 +319,7 @@ def build_rope_prune_projection(
 
 
 __all__ = [
+    "rope_theta_from_config",
     "precompute_mrope_inv_freqs",
     "precompute_mrope_cos_sin_half",
     "precompute_rope_inv_freqs",

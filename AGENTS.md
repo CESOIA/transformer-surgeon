@@ -91,7 +91,8 @@ Where to look when you need to change something:
 | Change HuggingFace export | `hf/hf_export.py` |
 | Change export graph conversion | `utils/convert.py` |
 | Change what parameters are valid for a compression type | `compression/registry.py` → `COMPRESSION_REGISTRY` |
-| Change backend-export machinery shared by all backends (quant-metadata extraction, PT2E calibration, weight-mismatch checks) | `export/common.py` |
+| Change backend-export machinery shared by all backends (quant-metadata extraction, PT2E calibration, weight-mismatch checks, error stats, the export manifest) | `export/common.py` |
+| Change which layers get PT2E Q/DQ (linear-only annotation, shared by XNNPACK and TensorRT) | `export/linear_quantizer.py` |
 | Add/change a backend exporter | `export/registry.py` → `EXPORT_ROUTINES`, plus the backend's own subpackage (`export/executorch_exporters/xnnpack/`, `export/executorch_exporters/qnn/`, `export/tensorrt/`) |
 | Change which attention kernel `MHACausal` uses at export (`manual`/`sdpa`/`custom_sdpa`) | `blocks/mha.py::MHACausal`, threaded via `attn_impl` in `convert_options` (`utils/convert.py`, `blocks/config.py`, `blocks/decoder.py`) |
 | Change the KV-cache mechanism (`cache_impl`, incl. the in-place `io_inplace` + its custom op) | `blocks/mha.py::MHACausal` (`cache_shape`, `_write_*`), `blocks/kv_cache_ops.py`, `blocks/decoder.py` (multi-token mask/RoPE) |
@@ -108,7 +109,7 @@ Where to look when you need to change something:
 |---|---|---|---|
 | `xnnpack` | `XNNPACKExportConfig` | `export/executorch_exporters/xnnpack/` | ExecuTorch `.pte` |
 | `qnn` | `QNNExportConfig` | `export/executorch_exporters/qnn/` | ExecuTorch `.pte` (Qualcomm NPU) |
-| `tensorrt` | `TensorRTExportConfig` | `export/tensorrt/tensorrt_export.py` | torch-tensorrt engine / exported program (`.engine_path`) |
+| `tensorrt` (deprecated) | `TensorRTExportConfig` | `export/tensorrt/tensorrt_export.py` | torch-tensorrt engine / exported program (`.engine_path`); use `tensorrt_onnx` |
 | `onnx` | `ONNXExportConfig` | `export/onnx/` | Portable `model.onnx` + `model.manifest.json` (I/O contract) |
 | `tensorrt_onnx` | `TensorRTONNXExportConfig` | `export/tensorrt/onnx_backend.py` | `onnx` output + plain TensorRT engine built from it (Jetson path) |
 
@@ -116,16 +117,20 @@ All of them share the backend-agnostic machinery in `export/common.py`: `resolve
 
 ```python
 from transformersurgeon.export import export_to_backend
-from transformersurgeon.export.tensorrt import TensorRTExportConfig
+from transformersurgeon.export.tensorrt import TensorRTONNXExportConfig
 
-config = TensorRTExportConfig(output_path="model.pt2", backend="tensorrt", device="cuda:0")
+config = TensorRTONNXExportConfig(output_path="out/model.onnx", backend="tensorrt_onnx", max_input_len=512,
+                                  convert_options={"cache_impl": "io_inplace", "max_cache_len": 1024,
+                                                   "rmsnorm_prescale": False, "rmsnorm_upcast": True})
 result = export_to_backend(model, config=config)   # model can be a full HF model or {embedding, decoder, final_layer}
-print(result.engine_path)
+print(result.onnx_path, result.manifest_path, result.engine_path)
 ```
 
 Device placement is normalized internally (`resolve_components_and_wrapper` traces on CPU regardless of the input model's device; TensorRT then compiles the traced graph onto `config.device`), so callers don't need to manage component devices themselves.
 
 `export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)` — use `export_to_backend`.
+
+Every backend writes `<artifact stem>.manifest.json` next to its artifact (`result.manifest_path`, built by `common.build_llm_manifest`): cache implementation, layout and dtype, and per-layer key/value cache shapes (they differ per layer after pruning). Runners load it with `common.load_llm_manifest` and allocate caches with `common.zero_caches_from_manifest` instead of passing geometry by hand — see `scripts/*/inference_exported_test.py`.
 
 TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live in `test/e2e/test_export_pipelines.py` (capability-gated, skips without torch-tensorrt/CUDA); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
 

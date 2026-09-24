@@ -8,40 +8,29 @@ backends use (prepare_pt2e → calibrate → inject exact surgeon scales →
 convert_pt2e), but with a quantizer built purely from ``torchao`` primitives so
 this backend has no ExecuTorch dependency.
 
-Only the linear layers named in ``layer_info`` are annotated; every other op —
-and every unlisted linear — stays float, which is what makes mixed-precision
-export work.  The observers produced here duck-type as PT2E observers
+Only the linear layers named in ``layer_info`` are annotated (shared
+``linear_quantizer.LinearOnlyQuantizer``); every other op -- and every
+unlisted linear -- stays float, which is what makes mixed-precision export
+work.  The observers produced here duck-type as PT2E observers
 (``calculate_qparams``), so the shared
 ``common.inject_scales_into_pt2e_observers`` overrides them with the exact
 scales computed by the transformer-surgeon calibration manager.
 """
 
 import warnings
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
-import torch.fx
 
 from torchao.quantization.pt2e.observer import (
     HistogramObserver,
     MinMaxObserver,
     PerChannelMinMaxObserver,
 )
-from torchao.quantization.pt2e.quantizer import (
-    QuantizationConfig,
-    QuantizationSpec,
-    Quantizer,
-    annotate_input_qspec_map,
-    annotate_output_qspec,
-    get_bias_qspec,
-    get_input_act_qspec,
-    get_module_name_filter,
-    get_output_act_qspec,
-    get_weight_qspec,
-)
-from torchao.quantization.pt2e.quantizer.utils import Q_ANNOTATION_KEY
+from torchao.quantization.pt2e.quantizer import QuantizationConfig, QuantizationSpec
 
 from ..common import _PRECISION_TO_QRANGE
+from ..linear_quantizer import LinearOnlyQuantizer
 
 
 # Weight/activation quantized-storage dtype for PT2E.  Sub-byte precisions (INT4)
@@ -105,86 +94,14 @@ def _build_qconfig(precision: int, per_channel: bool, static: bool) -> Optional[
     )
 
 
-def _is_annotated(node: torch.fx.Node) -> bool:
-    annotation = node.meta.get(Q_ANNOTATION_KEY, None)
-    return annotation is not None and annotation._annotated
-
-
-def _mark_annotated(nodes: list[torch.fx.Node]) -> None:
-    for node in nodes:
-        annotation = node.meta.get(Q_ANNOTATION_KEY, None)
-        if annotation is not None:
-            annotation._annotated = True
-
-
-def _annotate_linear(
-    gm: torch.fx.GraphModule,
-    quantization_config: QuantizationConfig,
-    filter_fn: Optional[Callable[[torch.fx.Node], bool]] = None,
-) -> None:
-    """Annotate ``aten.linear`` nodes (optionally filtered by module name) with
-    the given qconfig.  Mirrors the reference XNNPACK annotator but uses only
-    torchao helpers so no ExecuTorch import is needed."""
-    input_act_qspec = get_input_act_qspec(quantization_config)
-    output_act_qspec = get_output_act_qspec(quantization_config)
-    weight_qspec = get_weight_qspec(quantization_config)
-    bias_qspec = get_bias_qspec(quantization_config)
-
-    for node in gm.graph.nodes:
-        if node.op != "call_function" or node.target != torch.ops.aten.linear.default:
-            continue
-        if filter_fn is not None and not filter_fn(node):
-            continue
-        if _is_annotated(node):
-            continue
-
-        act_node = node.args[0]
-        weight_node = node.args[1]
-        bias_node = node.args[2] if len(node.args) > 2 else None
-
-        if input_act_qspec is not None:
-            annotate_input_qspec_map(node, act_node, input_act_qspec)
-        annotate_input_qspec_map(node, weight_node, weight_qspec)
-        nodes_to_mark = [node, weight_node]
-        if bias_node is not None and bias_qspec is not None:
-            annotate_input_qspec_map(node, bias_node, bias_qspec)
-            nodes_to_mark.append(bias_node)
-        if output_act_qspec is not None:
-            annotate_output_qspec(node, output_act_qspec)
-        _mark_annotated(nodes_to_mark)
-
-
-class TensorRTLinearQuantizer(Quantizer):
-    """PT2E quantizer that annotates only the linear layers registered via
-    ``set_module_name``.  Each layer carries its own QuantizationConfig, so
-    different layers can use different precisions (mixed quantization) and any
-    layer left unregistered stays float."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._module_qconfigs: dict[str, QuantizationConfig] = {}
-
-    def set_module_name(self, name: str, qconfig: QuantizationConfig) -> "TensorRTLinearQuantizer":
-        self._module_qconfigs[name] = qconfig
-        return self
-
-    def annotate(self, model: torch.fx.GraphModule) -> torch.fx.GraphModule:
-        for module_name, qconfig in self._module_qconfigs.items():
-            _annotate_linear(model, qconfig, get_module_name_filter(module_name))
-        return model
-
-    def validate(self, model: torch.fx.GraphModule) -> None:
-        pass
-
-
-def build_tensorrt_quantizer(layer_info: dict[str, dict[str, Any]]) -> TensorRTLinearQuantizer:
-    """Build a per-module TensorRTLinearQuantizer from compression metadata.
+def build_tensorrt_quantizer(layer_info: dict[str, dict[str, Any]]) -> LinearOnlyQuantizer:
+    """Build a per-module LinearOnlyQuantizer from compression metadata.
 
     Each layer in ``layer_info`` gets its own qconfig; layers absent from it are
     not quantised (they remain float).  Layers with stored activation
     calibration use static quantization; others are weight-only.
     """
-    quantizer = TensorRTLinearQuantizer()
+    quantizer = LinearOnlyQuantizer()
     for layer_name, info in layer_info.items():
         static = info["act_scale"] is not None
         qconfig = _build_qconfig(info["precision"], info["per_channel"], static)

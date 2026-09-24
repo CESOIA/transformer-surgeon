@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import random
 
@@ -145,28 +144,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def _write_cache_metadata(output_path: str, model_config, args: argparse.Namespace) -> str:
-    """Write a JSON sidecar with the KV-cache geometry next to the exported .pte.
-
-    inference_exported_test.py needs num_layers/kv_num_heads/head_dim/max_cache_len
-    to build the io_* cache tensors; without this file those have to be typed in
-    by hand (and get out of sync with whatever model/--max-sequence-length the
-    engine was actually exported with).
-    """
-    meta = {
-        "cache_impl": args.cache_impl,
-        "attn_impl": args.attn_impl,
-        "num_layers": int(model_config.num_hidden_layers),
-        "kv_num_heads": int(model_config.num_key_value_heads),
-        "head_dim": int(model_config.hidden_size // model_config.num_attention_heads),
-        "max_cache_len": int(args.max_sequence_length),
-    }
-    meta_path = os.path.splitext(output_path)[0] + ".cache_meta.json"
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    return meta_path
-
-
 def _build_pte_stem(args: argparse.Namespace) -> str:
     if args.quant_mlp:
         act_tag = f"_a{args.act_precision}" if args.calibrate else ""
@@ -300,11 +277,10 @@ def main():
         config=export_config,
     )
 
-    meta_path = _write_cache_metadata(result.pte_path, model.config, args)
 
     print("\nExport result:")
     print(f"  pte_path         : {result.pte_path}")
-    print(f"  cache_meta_path  : {meta_path}")
+    print(f"  manifest_path    : {result.manifest_path}")
     print(f"  attn_impl        : {args.attn_impl}")
     print(f"  backend          : {result.backend}")
     print(f"  precision        : {result.precision}")

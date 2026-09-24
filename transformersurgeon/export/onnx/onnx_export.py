@@ -21,24 +21,22 @@ consumers should bind each present_* to the same buffer as its past_* (TensorRT
 requires it -- it aliases them and updates in place).
 """
 
-import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
-import torch.nn as nn
 
 from ..common import (
+    MANIFEST_FORMAT,
     BackendExportResult,
     ExporterConfig,
+    build_llm_manifest,
     extract_layer_quant_info,
     finalize_export_result,
     resolve_components_and_wrapper,
 )
 from .quantization import apply_weight_quantization
-
-MANIFEST_FORMAT = "tsurgeon-llm-onnx/1"
 
 
 def _tensor_scatter(cache, update, write_index):
@@ -57,8 +55,6 @@ def default_translations() -> dict[Any, Callable]:
 @dataclass
 class ONNXExportResult(BackendExportResult):
     """``output_path`` is the .onnx file; ``manifest_path`` its I/O contract."""
-
-    manifest_path: str = ""
 
     @property
     def onnx_path(self) -> str:
@@ -105,42 +101,6 @@ def io_names(num_layers: int) -> tuple[list[str], list[str]]:
     outputs += [f"present_key_{i}" for i in range(num_layers)]
     outputs += [f"present_value_{i}" for i in range(num_layers)]
     return inputs, outputs
-
-
-def _build_manifest(wrapper: nn.Module, model_config: Any, config: ONNXExportConfig, onnx_file: str,
-                    logits_dtype: torch.dtype, quantized: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    decoder = wrapper.decoder
-    caches = []
-    for i, block in enumerate(decoder.blocks):
-        attn = block.attn
-        caches.append({
-            "layer": i,
-            "key": {"input": f"past_key_{i}", "output": f"present_key_{i}", "shape": list(attn.cache_shape("key"))},
-            "value": {"input": f"past_value_{i}", "output": f"present_value_{i}", "shape": list(attn.cache_shape("value"))},
-        })
-    eos = getattr(model_config, "eos_token_id", None)
-    return {
-        "format": MANIFEST_FORMAT,
-        "onnx_file": onnx_file,
-        "opset": config.opset,
-        "cache_impl": decoder.cache_impl,
-        "cache_layout": "BHSD" if decoder.cache_impl == "io_inplace" else "SHD",
-        "cache_dtype": str(decoder.dtype).replace("torch.", ""),
-        "cache_inplace": decoder.cache_impl == "io_inplace",
-        "max_cache_len": int(decoder.max_cache_len),
-        "max_input_len": int(config.max_input_len),
-        "num_layers": len(decoder.blocks),
-        "vocab_size": int(getattr(model_config, "vocab_size", 0) or 0),
-        "logits_dtype": str(logits_dtype).replace("torch.", ""),
-        "eos_token_id": eos if isinstance(eos, list) else ([eos] if eos is not None else []),
-        "inputs": {
-            "input_ids": {"shape": ["seq"], "dtype": "int64"},
-            "pos_id": {"shape": [1], "dtype": "int64"},
-        },
-        "caches": caches,
-        "quantized_layers": {name: {"precision": q["precision"], "granularity": q["granularity"]}
-                             for name, q in quantized.items()},
-    }
 
 
 def export_with_onnx(model_or_graph: Any, *, config: ONNXExportConfig) -> ONNXExportResult:
@@ -195,8 +155,17 @@ def export_with_onnx(model_or_graph: Any, *, config: ONNXExportConfig) -> ONNXEx
 
     quantized = (apply_weight_quantization(model, layer_info, int4_block_size=config.int4_block_size)
                  if layer_info else {})
-    manifest = _build_manifest(wrapper, model_config, config, os.path.basename(config.output_path),
-                               logits_dtype, quantized)
+    manifest = build_llm_manifest(
+        wrapper, model_config, backend=config.backend, artifact=config.output_path,
+        precision="mixed" if quantized else "full",
+        onnx_file=os.path.basename(config.output_path),
+        opset=config.opset,
+        max_input_len=int(config.max_input_len),
+        logits_dtype=str(logits_dtype).replace("torch.", ""),
+        inputs={"input_ids": {"shape": ["seq"], "dtype": "int64"}, "pos_id": {"shape": [1], "dtype": "int64"}},
+        quantized_layers={name: {"precision": q["precision"], "granularity": q["granularity"]}
+                          for name, q in quantized.items()},
+    )
     for graph_pass in config.graph_passes:
         graph_pass(model, manifest)
 
@@ -207,11 +176,7 @@ def export_with_onnx(model_or_graph: Any, *, config: ONNXExportConfig) -> ONNXEx
                     all_tensors_to_one_file=True, location=data_file, size_threshold=1024)
     onnx.checker.check_model(config.output_path)
 
-    manifest_path = os.path.splitext(config.output_path)[0] + ".manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-
-    result = finalize_export_result(
+    return finalize_export_result(
         output_path=config.output_path,
         backend=config.backend,
         precision="mixed" if quantized else "full",
@@ -221,9 +186,9 @@ def export_with_onnx(model_or_graph: Any, *, config: ONNXExportConfig) -> ONNXEx
         weight_mismatch_eps=config.weight_mismatch_eps,
         verbose=config.verbose,
         result_cls=ONNXExportResult,
+        model_config=model_config,
+        manifest=manifest,
     )
-    result.manifest_path = manifest_path
-    return result
 
 
 __all__ = [

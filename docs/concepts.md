@@ -292,19 +292,21 @@ standard (non-VCON) module.
 
 ## Export Backends
 
-`transformersurgeon.export.export_to_backend(model, config)` lowers a model to a deployment backend. It dispatches through `EXPORT_ROUTINES` (`export/registry.py`) to one of three registered backends:
+`transformersurgeon.export.export_to_backend(model, config)` lowers a model to a deployment backend. It dispatches through `EXPORT_ROUTINES` (`export/registry.py`) to one of the registered backends:
 
 | Backend | Config class | Output |
 |---|---|---|
 | `xnnpack` | `XNNPACKExportConfig` | ExecuTorch `.pte` |
 | `qnn` | `QNNExportConfig` | ExecuTorch `.pte` (Qualcomm NPU) |
-| `tensorrt` | `TensorRTExportConfig` | TensorRT engine / exported program |
+| `tensorrt` (deprecated) | `TensorRTExportConfig` | torch-tensorrt engine / exported program |
+| `onnx` | `ONNXExportConfig` | Portable ONNX + manifest (I/O contract) |
+| `tensorrt_onnx` | `TensorRTONNXExportConfig` | ONNX + plain TensorRT engine built from it |
 
-All three backends share the machinery in `export/common.py` rather than each reimplementing it:
+All backends share the machinery in `export/common.py` rather than each reimplementing it:
 
 1. `resolve_components_and_wrapper()` — normalizes the input (full HF model, `{embedding, decoder, final_layer}` dict, or tuple) into a wrapper module plus example inputs.
 2. `extract_layer_quant_info()` — reads per-layer compression metadata (hard-quantized weights, calibrated activation scales) directly off the model's `LinearCompressed` layers. There is no separate quantization config to author — a layer is quantized in the exported artifact if and only if it was already quantized on the model.
-3. `prepare_pt2e(...)` with a backend-specific `Quantizer` that annotates only the linear layers named in the compression metadata — everything else stays float.
+3. `prepare_pt2e(...)` with the shared `LinearOnlyQuantizer` (`export/linear_quantizer.py`) fed backend-specific quantization configs; it annotates only the linear layers named in the compression metadata — everything else stays float. (The ONNX path instead rewrites quantized weights directly as `DequantizeLinear`, see `export/onnx/quantization.py`.)
 4. `calibrate_pt2e_observers()` — a calibration forward pass so activation observers collect representative statistics.
 5. `inject_scales_into_pt2e_observers()` — overrides the PT2E observers with the *exact* surgeon scales (no re-calibration drift), then `convert_pt2e()`.
 6. `finalize_export_result()` — runs the optional weight-mismatch check and packages a `BackendExportResult` (backend-specific subclasses add aliases like `.pte_path` or `.engine_path`).
@@ -313,16 +315,22 @@ This is what makes **mixed-precision export** work: a model with some layers har
 
 ```python
 from transformersurgeon.export import export_to_backend
-from transformersurgeon.export.tensorrt import TensorRTExportConfig
+from transformersurgeon.export.tensorrt import TensorRTONNXExportConfig
 
-config = TensorRTExportConfig(output_path="model.ep", backend="tensorrt", device="cuda:0")
+# Portable ONNX + manifest, and a TensorRT engine for the local GPU
+# (for a Jetson, set build_engine=False and build the engine on the device).
+config = TensorRTONNXExportConfig(
+    output_path="out/model.onnx", backend="tensorrt_onnx", max_input_len=512,
+    convert_options={"cache_impl": "io_inplace", "max_cache_len": 1024,
+                     "rmsnorm_prescale": False, "rmsnorm_upcast": True},
+)
 result = export_to_backend(model, config=config)
-print(result.engine_path)
+print(result.onnx_path, result.engine_path)
 ```
 
 `export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)`.
 
-TensorRT is the newest backend. It needs the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests live in `test/e2e/test_export_pipelines.py` (capability-gated) and the CLI runner is `scripts/tensorrt/run_export.sh`, mirroring the ExecuTorch backends there.
+For TensorRT, use `tensorrt_onnx`: the ONNX file + manifest are the portable artifact and the engine is built where it runs (`python -m transformersurgeon.export.tensorrt.onnx_backend model.manifest.json` on a Jetson). The torch-tensorrt `tensorrt` backend is deprecated. Tests live in `test/e2e/test_export_pipelines.py` (capability-gated).
 
 ---
 

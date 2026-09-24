@@ -31,7 +31,6 @@ Requires a CUDA device and the ``torch_tensorrt`` package.
 """
 
 import argparse
-import json
 import os
 import random
 
@@ -100,27 +99,6 @@ def parse_args():
              "on TensorRT).",
     )
     return parser.parse_args()
-
-
-def _write_cache_metadata(output_path: str, model_config, args: argparse.Namespace) -> str:
-    """Write a JSON sidecar with the KV-cache geometry next to the exported engine.
-
-    inference_exported_test.py needs num_layers/kv_num_heads/head_dim/max_cache_len
-    to build the io_* cache tensors; without this file those have to be typed in
-    by hand (and get out of sync with whatever model/--max-sequence-length the
-    engine was actually exported with).
-    """
-    meta = {
-        "cache_impl": args.cache_impl,
-        "num_layers": int(model_config.num_hidden_layers),
-        "kv_num_heads": int(model_config.num_key_value_heads),
-        "head_dim": int(model_config.hidden_size // model_config.num_attention_heads),
-        "max_cache_len": int(args.max_sequence_length),
-    }
-    meta_path = os.path.splitext(output_path)[0] + ".cache_meta.json"
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    return meta_path
 
 
 def _build_hf_to_conv_map(num_blocks: int) -> dict[str, str]:
@@ -306,11 +284,10 @@ def main():
         config=export_config,
     )
 
-    meta_path = _write_cache_metadata(result.engine_path, model.config, args)
 
     print("\nExport result:")
     print(f"  engine_path      : {result.engine_path}")
-    print(f"  cache_meta_path  : {meta_path}")
+    print(f"  manifest_path    : {result.manifest_path}")
     print(f"  backend          : {result.backend}")
     print(f"  precision        : {result.precision}")
     print(f"  mismatch_count   : {len(result.weight_mismatches)}")

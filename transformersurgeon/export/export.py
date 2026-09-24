@@ -59,7 +59,6 @@ def _resolve_model_components_for_export(
                 options=convert_options,
                 verbose=verbose,
             )
-            print(converted)
             decoder = converted.get("text")
 
 

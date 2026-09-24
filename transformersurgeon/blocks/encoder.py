@@ -5,6 +5,7 @@ from .mha import MHAEncoder, MHAEncoderFusedProj
 from .mlp import MLP, MLPGated
 from .norm import RMSNorm
 from .rope import (
+    rope_theta_from_config,
     precompute_mrope_cos_sin_half,
     precompute_mrope_inv_freqs,
     precompute_rope_cos_sin_half,
@@ -45,8 +46,9 @@ class TransformerEncoderBlock(torch.nn.Module):
         self.bias_required = getattr(config, "bias_required", {"attn": {}, "mlp": {}})
 
         if self.norm_type == "rmsnorm":
-            self.norm_in = RMSNorm(self.embed_dim)
-            self.norm_out = RMSNorm(self.embed_dim)
+            eps = getattr(config, "rms_norm_eps", 1e-5)
+            self.norm_in = RMSNorm(self.embed_dim, eps=eps)
+            self.norm_out = RMSNorm(self.embed_dim, eps=eps)
         elif self.norm_type == "layernorm":
             self.norm_in = torch.nn.LayerNorm(self.embed_dim)
             self.norm_out = torch.nn.LayerNorm(self.embed_dim)
@@ -153,7 +155,7 @@ class TransformerEncoder(torch.nn.Module):
 
         if getattr(config, "use_final_norm", True):
             if config.norm_type == "rmsnorm":
-                self.norm = RMSNorm(self.embed_dim)
+                self.norm = RMSNorm(self.embed_dim, eps=getattr(config, "rms_norm_eps", 1e-5))
             elif config.norm_type == "layernorm":
                 self.norm = torch.nn.LayerNorm(self.embed_dim)
             else:
@@ -167,7 +169,7 @@ class TransformerEncoder(torch.nn.Module):
             self.inv_freq = torch.nn.Parameter(
                 precompute_rope_inv_freqs(
                     head_dim=head_dim,
-                    base=float(getattr(config, "rope_theta", 1e6)),
+                    base=rope_theta_from_config(config),
                 ),
                 requires_grad=False,
             )
@@ -180,7 +182,7 @@ class TransformerEncoder(torch.nn.Module):
                     for freq in precompute_mrope_inv_freqs(
                         head_dim=head_dim,
                         section_dims=mrope_section_dims,
-                        base=float(getattr(config, "rope_theta", 1e6)),
+                        base=rope_theta_from_config(config),
                         section_bases=mrope_section_bases,
                     )
                 ]

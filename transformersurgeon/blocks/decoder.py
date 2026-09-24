@@ -4,6 +4,7 @@ from .mlp import MLP
 from .mlp import MLPGated
 from .norm import RMSNorm
 from .rope import (
+    rope_theta_from_config,
     precompute_rope_inv_freqs,
     precompute_rope_cos_sin_half,
 )
@@ -36,6 +37,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.add_batch_dim = getattr(config, "add_batch_dim", False)
         self.rmsnorm_prescale = getattr(config, "rmsnorm_prescale", True)
         self.rmsnorm_upcast = getattr(config, "rmsnorm_upcast", False)
+        self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
         self.dtype = config.dtype
 
         # Extract configuration (optional)
@@ -58,8 +60,10 @@ class TransformerDecoderBlock(torch.nn.Module):
 
         # Instantiate normalization modules
         if self.norm_type == "rmsnorm":
-            self.norm_in = RMSNorm(self.embed_dim, dtype=self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast)
-            self.norm_out = RMSNorm(self.embed_dim, dtype=self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast)
+            norm_kwargs = dict(dtype=self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast,
+                               eps=self.rms_norm_eps)
+            self.norm_in = RMSNorm(self.embed_dim, **norm_kwargs)
+            self.norm_out = RMSNorm(self.embed_dim, **norm_kwargs)
         else:
             raise ValueError(f"Unsupported norm type: {self.norm_type}")
 
@@ -173,7 +177,8 @@ class TransformerDecoder(torch.nn.Module):
             )
         self.rmsnorm_prescale = getattr(config, "rmsnorm_prescale", True)
         self.rmsnorm_upcast = getattr(config, "rmsnorm_upcast", False)
-        self.norm = RMSNorm(config.hidden_size, self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast)
+        self.norm = RMSNorm(config.hidden_size, self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast,
+                            eps=getattr(config, "rms_norm_eps", 1e-5))
         head_dim = config.hidden_size // config.num_attention_heads
 
         self.max_cache_len = config.max_cache_len
@@ -189,7 +194,7 @@ class TransformerDecoder(torch.nn.Module):
         # Precompute RoPE once for all position in kv_cache (up to max_cache_len)
         inv_freq = precompute_rope_inv_freqs(
             head_dim=head_dim,
-            base=1e6,
+            base=rope_theta_from_config(config),
         )
         rope = precompute_rope_cos_sin_half(
             inv_freq,

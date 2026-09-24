@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import time
 
@@ -12,14 +11,9 @@ except ImportError:
 
 from transformers import Qwen2TokenizerFast
 
+from transformersurgeon.export.common import load_llm_manifest, to_device, zero_caches_from_manifest
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-_DTYPE_MAP = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-}
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -55,45 +49,7 @@ def parse_args():
         default=0.0,
         help="Sampling temperature. <= 0 uses greedy decoding.",
     )
-    parser.add_argument(
-        "--cache-impl",
-        type=str,
-        default=None,
-        choices=["mutable", "io_scatter", "io_concat"],
-        help="KV-cache implementation the engine was exported with. 'mutable' keeps the "
-             "legacy (input_ids, pos_id) -> logits contract; 'io_scatter'/'io_concat' "
-             "expose the cache as explicit inout graph buffers, so the geometry args "
-             "below are then required. Defaults to the value in <engine-path "
-             "stem>.cache_meta.json if that sidecar (written by "
-             "exporter_function_test.py) exists next to --engine-path, else 'mutable'.",
-    )
-    parser.add_argument("--num-layers", type=int, default=None,
-                        help="Decoder layers (required for io_* cache modes; falls back to cache_meta.json).")
-    parser.add_argument("--kv-num-heads", type=int, default=None,
-                        help="KV heads per layer (required for io_* cache modes; falls back to cache_meta.json).")
-    parser.add_argument("--head-dim", type=int, default=None,
-                        help="Head dimension (required for io_* cache modes; falls back to cache_meta.json).")
-    parser.add_argument("--max-cache-len", type=int, default=None,
-                        help="Fixed cache length (required for io_* cache modes; falls back to cache_meta.json).")
-    parser.add_argument(
-        "--cache-dtype",
-        type=str,
-        default="float16",
-        choices=["float16", "bfloat16", "float32"],
-        help="Dtype for the zero-initialized inout KV-cache buffers. Must match the "
-             "dtype the engine was exported/compiled with (see --float-type on "
-             "exporter_function_test.py).",
-    )
     return parser.parse_args()
-
-
-def _load_cache_metadata(engine_path: str) -> dict | None:
-    """Load the geometry sidecar written by exporter_function_test.py, if present."""
-    meta_path = os.path.splitext(engine_path)[0] + ".cache_meta.json"
-    if not os.path.isfile(meta_path):
-        return None
-    with open(meta_path) as f:
-        return json.load(f)
 
 
 def logits_to_next_id(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -119,17 +75,6 @@ def _module_device(module) -> torch.device | None:
     return next((p.device for p in getattr(module, "parameters", lambda: [])()), None)
 
 
-def _to_device(x, device):
-    # Caches are lists of tensors; torch_tensorrt's runtime wrapper auto-moves
-    # top-level Tensor args to the engine's device but does not recurse into
-    # list/tuple args, so inout cache buffers must be moved explicitly.
-    if isinstance(x, torch.Tensor):
-        return x.to(device)
-    if isinstance(x, (list, tuple)):
-        return type(x)(_to_device(e, device) for e in x)
-    return x
-
-
 def main():
     args = parse_args()
 
@@ -138,22 +83,9 @@ def main():
             f"Engine file not found at '{args.engine_path}'. Run exporter_function_test.py first."
         )
 
-    meta = _load_cache_metadata(args.engine_path)
-    if meta is not None:
-        meta_path = os.path.splitext(args.engine_path)[0] + ".cache_meta.json"
-        print(f"Loaded KV-cache geometry from {meta_path}")
-        if args.cache_impl is None:
-            args.cache_impl = meta.get("cache_impl", "mutable")
-        if args.num_layers is None:
-            args.num_layers = meta.get("num_layers")
-        if args.kv_num_heads is None:
-            args.kv_num_heads = meta.get("kv_num_heads")
-        if args.head_dim is None:
-            args.head_dim = meta.get("head_dim")
-        if args.max_cache_len is None:
-            args.max_cache_len = meta.get("max_cache_len")
-    if args.cache_impl is None:
-        args.cache_impl = "mutable"
+    # Cache implementation and per-layer cache shapes/dtype come from the
+    # manifest the exporter writes next to the engine.
+    manifest = load_llm_manifest(args.engine_path)
 
     module = load_engine_module(args.engine_path)
 
@@ -173,23 +105,9 @@ def main():
     generated_tokens = 0
 
     # For io_* modes, the KV cache is explicit graph I/O: host holds it and feeds
-    # the returned cache back each step. Initialize zero caches from geometry.
-    io_mode = args.cache_impl != "mutable"
-    kv_state = None
-    if io_mode:
-        missing = [n for n, v in (
-            ("--num-layers", args.num_layers),
-            ("--kv-num-heads", args.kv_num_heads),
-            ("--head-dim", args.head_dim),
-            ("--max-cache-len", args.max_cache_len),
-        ) if v is None]
-        if missing:
-            raise ValueError(f"cache_impl={args.cache_impl} requires geometry args: {', '.join(missing)}")
-        cache_dtype = _DTYPE_MAP[args.cache_dtype]
-        shape = (args.max_cache_len, args.kv_num_heads, args.head_dim)
-        key_caches = [torch.zeros(shape, dtype=cache_dtype) for _ in range(args.num_layers)]
-        value_caches = [torch.zeros(shape, dtype=cache_dtype) for _ in range(args.num_layers)]
-        kv_state = (key_caches, value_caches)
+    # the returned cache back each step.
+    io_mode = manifest["cache_io"]
+    kv_state = zero_caches_from_manifest(manifest) if io_mode else None
 
     module_device = _module_device(module)
 
@@ -197,7 +115,7 @@ def main():
 
     def _execute_static(next_input_ids: torch.Tensor, effective_len: int) -> torch.Tensor:
         nonlocal kv_state
-        # Static wrapper expects a 1-based effective KV length for the current token.
+        # Cache slot (0-based position) of the token being fed.
         #
         # Inputs stay on CPU: the reloaded graph mixes plain torch ops (KV-cache /
         # position-id bookkeeping, whose buffers were traced on CPU) with the
@@ -220,8 +138,8 @@ def main():
         # tensor args above) they are not auto-moved by the runtime wrapper.
         key_caches, value_caches = kv_state
         if module_device is not None and module_device.type == "cuda":
-            key_caches = _to_device(key_caches, module_device)
-            value_caches = _to_device(value_caches, module_device)
+            key_caches = to_device(key_caches, module_device)
+            value_caches = to_device(value_caches, module_device)
 
         with torch.no_grad():
             out = module(next_input_ids, effective_len_tensor, key_caches, value_caches)
@@ -247,17 +165,19 @@ def main():
         if next_id.item() == tokenizer.eos_token_id:
             break
 
-        logits = _execute_static(next_id, output_ids.size(0))
+        # next_id is the last element of output_ids: its cache slot is size - 1.
+        logits = _execute_static(next_id, output_ids.size(0) - 1)
 
     total_time_s = time.perf_counter() - t_start
     tokens_per_s = generated_tokens / max(total_time_s, 1e-12)
     avg_token_time_ms = (total_time_s / max(generated_tokens, 1)) * 1000.0
 
-    generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+    # output_ids is 1-D: decode it as one sequence (batch_decode would split it per token).
+    generated_text = tokenizer.decode(output_ids, skip_special_tokens=True)
 
     print("\nGeneration result")
     print(f"  engine_path         : {args.engine_path}")
-    print(f"  cache_impl          : {args.cache_impl}")
+    print(f"  cache_impl          : {manifest['cache_impl']}")
     print(f"  model_name          : {args.model_name}")
     print(f"  prompt              : {args.prompt}")
     print(f"  generated_tokens    : {generated_tokens}")

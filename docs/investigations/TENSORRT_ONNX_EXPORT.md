@@ -138,9 +138,12 @@ INT8 weight-only brings nothing on TensorRT (folded to fp16).
 - Teacher-forced over 24 steps vs HF fp32: argmax identical at every step,
   logit error flat (0.08–0.22, no drift) — decode path, positions and in-place
   cache are correct.
-- The residual error vs HF is tsurgeon's conversion, not TensorRT: tsurgeon in
-  eager **fp32** already differs from HF fp32 by 0.07–0.10 (RMSNorm `eps=1e-5`
-  hardcoded vs Qwen2's 1e-6; RoPE tables stored in the model dtype).
+- The residual error vs HF was tsurgeon's conversion, not TensorRT: tsurgeon in
+  eager **fp32** differed from HF fp32 by 0.07–0.10 because RMSNorm `eps` was
+  hardcoded to 1e-5 (Qwen2 uses 1e-6). **Fixed** (eps and RoPE theta now come
+  from the HF config): fp32 error is now 1e-5 with `rmsnorm_upcast` (0.006 with
+  the default prescale norm). The §5 benchmarks predate the fix; it does not
+  change the graph's cost.
 - TensorRT W4 vs eager tsurgeon W4: max 0.14 (fp16 noise). Plugin W4 vs plain
   W4: 17/17 and 14/15 identical greedy tokens.
 - Quantization quality note: tsurgeon's per-channel round-to-nearest INT4 is
@@ -167,9 +170,8 @@ tests re-run in the ExecuTorch env: pass.
 3. **Attention over the used span only**, for large `max_cache_len`
    (bucketed shape input + one CUDA graph per bucket; §3 shows the trade-off),
    or reuse Edge-LLM's `AttentionPlugin` the same way as the INT4 plugin.
-4. **Conversion numerics**: plumb `rms_norm_eps` and `rope_theta` from the HF
-   config instead of the hardcoded `1e-5` / `1e6` (the latter is wrong for
-   Llama-family models).
+4. **RoPE scaling variants** (e.g. Llama 3's `rope_type: llama3`) are not
+   implemented; conversion now warns instead of silently using plain RoPE.
 5. **AWQ/GPTQ-quality INT4** in tsurgeon (per-group scales, activation-aware).
 
 ## 8. Reproduce
