@@ -108,6 +108,35 @@ prefill = one call over N prompt tokens (ms). Raw rows: `trt-models/results/`.
 For reference, the unmodified `io_scatter` graph exported through ONNX ran a
 decode step in ~5.5 ms (trtexec GPU time).
 
+### 5.0 Confirmation run (after the fixes and cleanup)
+
+All six engines rebuilt from `3ad9eb3` (after the eps/RoPE fixes and the
+removal of the torch-tensorrt backend), benchmarked on an idle L4 with vendor
+and tsurgeon **interleaved** round by round (5 rounds, one process per
+measurement), so both see the same thermal/power state. Median between-process
+spread 1.0%, worst 6.0%. Raw data: `trt-models/results/final_l4_gpu1.json`.
+
+| impl | model | decode 16 | decode 256 | decode 900 | prefill 128 | prefill 512 |
+|---|---|---:|---:|---:|---:|---:|
+| Edge-LLM | FP16 | 4.708 (212) | 4.766 (210) | 4.879 (205) | 5.63 | 11.48 |
+| **tsurgeon** | **FP16** | **4.664 (214)** | **4.679 (214)** | **4.676 (214)** | 8.01 | 20.81 |
+| Edge-LLM | INT4 AWQ | 2.617 (382) | 2.680 (373) | 2.793 (358) | 4.76 | 10.13 |
+| Edge-LLM | INT4 GPTQ | 2.636 (379) | 2.702 (370) | 2.814 (355) | 4.99 | 10.85 |
+| **tsurgeon** | **W4 + Edge-LLM plugin** | **2.588 (386)** | **2.609 (383)** | **2.595 (385)** | 5.12 | 14.95 |
+| tsurgeon | W4, plain TensorRT | 4.638 (216) | 4.668 (214) | 4.669 (214) | 5.82 | 15.94 |
+
+A first attempt of this run was discarded: another user job started on the
+same GPU mid-run and slowed every later measurement by ~10% (it read as a
+tsurgeon regression). Benchmark on a GPU verified idle, and interleave.
+
+**What can be claimed.** On an NVIDIA L4, tsurgeon's ONNX→TensorRT export of
+Qwen2-0.5B-Instruct matches NVIDIA TensorRT Edge-LLM on single-stream decode:
+FP16 with stock TensorRT (1–4% faster) and INT4 when using Edge-LLM's INT4
+GEMM plugin (1–8% faster than Edge-LLM AWQ/GPTQ). Prompt prefill is 1.4–1.8×
+slower. Not yet covered: the Orin itself, INT4 accuracy vs AWQ/GPTQ
+(tsurgeon's per-channel RTN is less accurate), larger KV caches (tsurgeon
+scans the full cache), other models, batch > 1.
+
 ### 5.1 Decode: parity
 FP16 and INT4 decode match or slightly beat Edge-LLM. Caveat on the flat
 tsurgeon curve: our attention always scans the whole 1024-slot cache while
