@@ -13,7 +13,7 @@ from torch.export import export as torch_export
 from ..common import (
     ExecutorchExporterConfig,
     ExecuTorchExportResult,
-    finalize_export_result,
+    finalize_executorch_result,
     resolve_components_and_wrapper,
     extract_layer_quant_info,
     inject_scales_into_pt2e_observers,
@@ -614,12 +614,13 @@ def export_with_qnn(
 
     result_precision = "mixed" if layer_info else "full"
 
-    return finalize_export_result(
+    return finalize_executorch_result(
         pte_path=config.output_path,
         backend="qnn",
         precision=result_precision,
         wrapper=wrapper,
         example_inputs=example_inputs,
+        model_config=model_config,
         exported_for_mismatch=exported_for_mismatch,
         run_weight_mismatch_check=config.run_weight_mismatch_check,
         weight_mismatch_eps=config.weight_mismatch_eps,

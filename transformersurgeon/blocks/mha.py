@@ -4,9 +4,10 @@ import math
 import torch
 import torch.nn.functional as F
 from .rope import apply_rope_multihead, build_rope_prune_projection
-from . import LinearCompressed  
+from .kv_cache_ops import kv_cache_update
+from . import LinearCompressed
 
-def attention(query, key, value, attn_mask=None):
+def attention(query, key, value, attn_mask=None, kv_layout="shd"):
     """
     Explicit implementation of scaled dot-product attention.
     This is needed for cases where torch's built-in SDPA is not suited for model export (e.g., ONNX).
@@ -15,15 +16,24 @@ def attention(query, key, value, attn_mask=None):
 
     Args:
         query: Tensor of shape (q_seq_length, q_head_num, q_head_dim)
-        key:   Tensor of shape (kv_seq_length, kv_head_num, k_head_dim)
-        value: Tensor of shape (kv_seq_length, kv_head_num, v_head_dim)
+        key:   Tensor of shape (kv_seq_length, kv_head_num, k_head_dim), or
+               (kv_head_num, kv_seq_length, k_head_dim) with kv_layout="hsd"
+        value: Tensor of shape (kv_seq_length, kv_head_num, v_head_dim), or
+               (kv_head_num, kv_seq_length, v_head_dim) with kv_layout="hsd"
         attn_mask: Optional additive mask broadcastable against the scores'
             trailing (q_seq_length, kv_seq_length) dims -- e.g. (1, kv_seq_length)
             as built by TransformerDecoder, or (1, 1, q_seq_length, kv_seq_length).
+        kv_layout: "shd" (sequence-major, the unbatched caches) or "hsd"
+            (head-major, the io_inplace BHSD cache with its batch dim dropped).
+            Both reduce to the same contraction below; the two transposes
+            compose into one permute that exporters fold into the matmul.
 
     Returns:
         Tensor of shape (q_head_num, q_seq_length, v_head_dim).
     """
+    if kv_layout == "hsd":
+        key = key.transpose(0, 1)
+        value = value.transpose(0, 1)
     q_seq_len, q_head_num, q_head_dim = query.size()
     _, kv_head_num, k_head_dim = key.size()
     _, _, v_head_dim = value.size()
@@ -70,25 +80,6 @@ def attention(query, key, value, attn_mask=None):
 
     attn_output = torch.matmul(scores.to(dtype), value)  # (kv_head_num, group, q_seq_len, v_head_dim)
     attn_output = attn_output.reshape(q_head_num, q_seq_len, v_head_dim)
-
-    # -------------------------------------------------------------------------
-    # ALTERNATIVE — einsum GQA (also avoids KV materialization).
-    # To use: comment out the block above and uncomment this one.
-    # -------------------------------------------------------------------------
-    # query = query.transpose(0, 1).reshape(kv_head_num, group_size, -1, q_head_dim)
-    # key   = key.transpose(0, 1)    # (kv_heads, kv_len, k_head_dim)
-    # value = value.transpose(0, 1)  # (kv_heads, kv_len, v_head_dim)
-    #
-    # scores = torch.einsum("hgsd,hkd->hgsk", query, key) * scale
-    #
-    # if attn_mask is not None:
-    #     scores = scores + attn_mask
-    #
-    # scores = torch.nn.functional.softmax(scores, dim=-1)
-    #
-    # attn_output = torch.einsum("hgsk,hkd->hgsd", scores.to(dtype), value)
-    # attn_output = attn_output.reshape(q_head_num, q_seq_len, v_head_dim)
-    # -------------------------------------------------------------------------
 
     return attn_output.to(dtype)  # (q_head_num, q_seq_len, v_head_dim)
 
@@ -444,7 +435,7 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         
         return output
     
-CACHE_IMPLS = ("mutable", "io_scatter", "io_concat")
+CACHE_IMPLS = ("mutable", "io_scatter", "io_concat", "io_inplace")
 ATTN_IMPLS = ("manual", "sdpa", "custom_sdpa")
 
 
@@ -481,11 +472,17 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
     - ``"io_concat"`` : scatter-free functional write built from a positional
                         mask + ``where`` (Concat/select family). Universal
                         fallback for backends lacking an index_put converter.
+    - ``"io_inplace"``: cache as graph I/O in BHSD layout ``(1, kv_num_heads,
+                        max_cache_len, head_dim)``, written by
+                        ``tsurgeon::kv_cache_update`` (ONNX ``TensorScatter``,
+                        which TensorRT executes in place on the aliased
+                        input buffer). The only mode that accepts
+                        ``in_seq_len > 1``, i.e. a whole prompt in one call.
 
-    All three produce an updated **fixed-size** ``(max_cache_len, kv_num_heads,
-    head_dim)`` cache and then run the identical mask + attention code, so the
-    three paths are numerically equivalent. The framework feeds one token at a
-    time (``in_seq_len == 1``); the writers assume that.
+    All of them produce an updated **fixed-size** cache and then run the
+    identical mask + attention code, so the paths are numerically equivalent.
+    Except for ``io_inplace``, the framework feeds one token at a time
+    (``in_seq_len == 1``) and the writers assume that.
     """
 
     def __init__(self, *args, **kwargs):
@@ -518,24 +515,8 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # value_head_dim. At construction these equal head_dim (weights are loaded
         # -- and possibly resized -- afterwards), so the mutable path re-checks
         # geometry lazily in forward via _ensure_cache_geometry.
-        self.register_buffer(
-            "key_cache",
-            torch.zeros(
-                self.max_cache_length,
-                self.kv_num_heads,
-                self.key_head_dim,
-                dtype=self.dtype),
-            persistent=False
-        )
-        self.register_buffer(
-            "value_cache",
-            torch.zeros(
-                self.max_cache_length,
-                self.kv_num_heads,
-                self.value_head_dim,
-                dtype=self.dtype),
-            persistent=False
-        )
+        self.register_buffer("key_cache", torch.zeros(self.cache_shape("key"), dtype=self.dtype), persistent=False)
+        self.register_buffer("value_cache", torch.zeros(self.cache_shape("value"), dtype=self.dtype), persistent=False)
 
         # attn_impl selects the attention kernel: "manual" (explicit GQA-aware
         # softmax/matmul, the default), "sdpa" (torch.nn.functional.scaled_dot_
@@ -571,18 +552,28 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                 persistent=False,
             )
 
+    def cache_shape(self, which):
+        """Shape of the ``which`` ("key" or "value") cache for this cache_impl.
+
+        Follows the current (possibly pruned) key/value head_dim, so it is the
+        single source for the internal buffers and for exporters that build
+        the io_* caches fed as graph inputs.
+        """
+        head_dim = self.key_head_dim if which == "key" else self.value_head_dim
+        if self.cache_impl == "io_inplace":
+            return (1, self.kv_num_heads, self.max_cache_length, head_dim)
+        return (self.max_cache_length, self.kv_num_heads, head_dim)
+
     def _ensure_cache_geometry(self):
         """Reallocate the internal (mutable-path) KV buffers if q/k pruning has
         changed the key head_dim since construction. No-op once sized correctly."""
-        if self.key_cache.shape[-1] != self.key_head_dim:
+        if tuple(self.key_cache.shape) != self.cache_shape("key"):
             self.key_cache = torch.zeros(
-                self.max_cache_length, self.kv_num_heads, self.key_head_dim,
-                dtype=self.key_cache.dtype, device=self.key_cache.device,
+                self.cache_shape("key"), dtype=self.key_cache.dtype, device=self.key_cache.device,
             )
-        if self.value_cache.shape[-1] != self.value_head_dim:
+        if tuple(self.value_cache.shape) != self.cache_shape("value"):
             self.value_cache = torch.zeros(
-                self.max_cache_length, self.kv_num_heads, self.value_head_dim,
-                dtype=self.value_cache.dtype, device=self.value_cache.device,
+                self.cache_shape("value"), dtype=self.value_cache.dtype, device=self.value_cache.device,
             )
 
         if self.attn_impl == "custom_sdpa":
@@ -618,6 +609,13 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         """Functional scatter -> updated fixed-size cache (aten.index_put)."""
         key_cache = key_cache.index_put((write_index,), k)
         value_cache = value_cache.index_put((write_index,), v)
+        return key_cache, value_cache
+
+    def _write_inplace(self, k, v, write_index, key_cache, value_cache):
+        """BHSD cache write of all in_seq_len rows starting at write_index
+        (ONNX TensorScatter; in place under TensorRT)."""
+        key_cache = kv_cache_update(key_cache, k.transpose(0, 1).unsqueeze(0), write_index)
+        value_cache = kv_cache_update(value_cache, v.transpose(0, 1).unsqueeze(0), write_index)
         return key_cache, value_cache
 
     def _write_concat(self, k, v, write_index, key_cache, value_cache):
@@ -760,16 +758,23 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                 key_cache, value_cache = self._write_mutable(k, v, write_index, key_cache, value_cache)
             elif self.cache_impl == "io_scatter":
                 key_cache, value_cache = self._write_scatter(k, v, write_index, key_cache, value_cache)
+            elif self.cache_impl == "io_inplace":
+                key_cache, value_cache = self._write_inplace(k, v, write_index, key_cache, value_cache)
             else:  # io_concat
                 key_cache, value_cache = self._write_concat(k, v, write_index, key_cache, value_cache)
 
+            # io_inplace caches are BHSD: drop the batch dim to get (kv_heads, L, dim).
+            kv_layout = "hsd" if self.cache_impl == "io_inplace" else "shd"
+            key_read = key_cache[0] if kv_layout == "hsd" else key_cache
+            value_read = value_cache[0] if kv_layout == "hsd" else value_cache
+
             if self.attn_impl == "sdpa":
                 q_t = q.transpose(0, 1) # (num_heads, in_seq_len, head_dim)
-                k_t = key_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
-                v_t = value_cache.transpose(0, 1) # (kv_num_heads, pos_id, head_dim)
+                k_t = key_read if kv_layout == "hsd" else key_read.transpose(0, 1) # (kv_num_heads, L, head_dim)
+                v_t = value_read if kv_layout == "hsd" else value_read.transpose(0, 1) # (kv_num_heads, L, head_dim)
                 attn_output = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
             else:
-                attn_output = attention(q, key_cache, value_cache, attn_mask)
+                attn_output = attention(q, key_read, value_read, attn_mask, kv_layout=kv_layout)
 
         # Concatenate heads and project output. Width is num_heads * value_head_dim
         # (== embed_dim unless v_proj was hard-pruned, in which case out_proj's

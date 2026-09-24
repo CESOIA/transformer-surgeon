@@ -1,11 +1,12 @@
 import argparse
-import json
 import os
 import time
 
 import torch
 from executorch.runtime import Runtime
 from transformers import Qwen2TokenizerFast
+
+from transformersurgeon.export.common import load_llm_manifest, zero_caches_from_manifest
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -44,35 +45,7 @@ def parse_args():
         default=0.0,
         help="Sampling temperature. <= 0 uses greedy decoding.",
     )
-    parser.add_argument(
-        "--cache-impl",
-        type=str,
-        default=None,
-        choices=["mutable", "io_scatter", "io_concat"],
-        help="KV-cache implementation the .pte was exported with. io_* modes thread "
-             "the cache through graph I/O; the geometry args below are then required. "
-             "Defaults to the value in <pte-path stem>.cache_meta.json if that sidecar "
-             "(written by exporter_function_test.py) exists next to --pte-path, else "
-             "'mutable'.",
-    )
-    parser.add_argument("--num-layers", type=int, default=None,
-                        help="Decoder layers (required for io_* cache modes; falls back to cache_meta.json).")
-    parser.add_argument("--kv-num-heads", type=int, default=None,
-                        help="KV heads per layer (required for io_* cache modes; falls back to cache_meta.json).")
-    parser.add_argument("--head-dim", type=int, default=None,
-                        help="Head dimension (required for io_* cache modes; falls back to cache_meta.json).")
-    parser.add_argument("--max-cache-len", type=int, default=None,
-                        help="Fixed cache length (required for io_* cache modes; falls back to cache_meta.json).")
     return parser.parse_args()
-
-
-def _load_cache_metadata(pte_path: str) -> dict | None:
-    """Load the geometry sidecar written by exporter_function_test.py, if present."""
-    meta_path = os.path.splitext(pte_path)[0] + ".cache_meta.json"
-    if not os.path.isfile(meta_path):
-        return None
-    with open(meta_path) as f:
-        return json.load(f)
 
 
 def logits_to_next_id(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -92,28 +65,15 @@ def main():
             f"PTE file not found at '{args.pte_path}'. Run exporter_function_test.py first."
         )
 
-    meta = _load_cache_metadata(args.pte_path)
-    if meta is not None:
-        meta_path = os.path.splitext(args.pte_path)[0] + ".cache_meta.json"
-        print(f"Loaded KV-cache geometry from {meta_path}")
-        if args.cache_impl is None:
-            args.cache_impl = meta.get("cache_impl", "mutable")
-        if args.num_layers is None:
-            args.num_layers = meta.get("num_layers")
-        if args.kv_num_heads is None:
-            args.kv_num_heads = meta.get("kv_num_heads")
-        if args.head_dim is None:
-            args.head_dim = meta.get("head_dim")
-        if args.max_cache_len is None:
-            args.max_cache_len = meta.get("max_cache_len")
-        if meta.get("attn_impl") == "custom_sdpa":
-            # Registers the llama::custom_sdpa/update_cache runtime kernels
-            # (torch.ops.llama.* meta registration alone, done at export time in
-            # a different process, isn't enough -- this process's operator
-            # registry needs the same import before loading the .pte's method).
-            from executorch.extension.llm.custom_ops import custom_ops  # noqa: F401
-    if args.cache_impl is None:
-        args.cache_impl = "mutable"
+    # Cache implementation and per-layer cache shapes/dtype come from the
+    # manifest the exporter writes next to the .pte.
+    manifest = load_llm_manifest(args.pte_path)
+    if manifest.get("attn_impl") == "custom_sdpa":
+        # Registers the llama::custom_sdpa/update_cache runtime kernels
+        # (torch.ops.llama.* meta registration alone, done at export time in
+        # a different process, isn't enough -- this process's operator
+        # registry needs the same import before loading the .pte's method).
+        from executorch.extension.llm.custom_ops import custom_ops  # noqa: F401
 
     runtime = Runtime.get()
     program = runtime.load_program(args.pte_path)
@@ -135,29 +95,16 @@ def main():
     generated_tokens = 0
 
     # For io_* modes, the KV cache is explicit graph I/O: host holds it and feeds
-    # the returned cache back each step. Initialize zero caches from geometry.
-    io_mode = args.cache_impl != "mutable"
-    kv_state = None
-    num_layers = args.num_layers
-    if io_mode:
-        missing = [n for n, v in (
-            ("--num-layers", args.num_layers),
-            ("--kv-num-heads", args.kv_num_heads),
-            ("--head-dim", args.head_dim),
-            ("--max-cache-len", args.max_cache_len),
-        ) if v is None]
-        if missing:
-            raise ValueError(f"cache_impl={args.cache_impl} requires geometry args: {', '.join(missing)}")
-        shape = (args.max_cache_len, args.kv_num_heads, args.head_dim)
-        key_caches = [torch.zeros(shape, dtype=torch.float32) for _ in range(num_layers)]
-        value_caches = [torch.zeros(shape, dtype=torch.float32) for _ in range(num_layers)]
-        kv_state = (key_caches, value_caches)
+    # the returned cache back each step.
+    io_mode = manifest["cache_io"]
+    num_layers = manifest["num_layers"]
+    kv_state = zero_caches_from_manifest(manifest) if io_mode else None
 
     t_start = time.perf_counter()
 
     def _execute_static(next_input_ids: torch.Tensor, effective_len: int) -> torch.Tensor:
         nonlocal kv_state
-        # Static wrapper expects a 1-based effective KV length for the current token.
+        # Cache slot (0-based position) of the token being fed.
         effective_len_tensor = torch.tensor([effective_len], dtype=torch.long)
         if not io_mode:
             out = method.execute([next_input_ids, effective_len_tensor])[0]
@@ -194,16 +141,19 @@ def main():
         if next_id.item() == tokenizer.eos_token_id:
             break
 
-        logits = _execute_static(next_id, output_ids.size(0))
+        # next_id is the last element of output_ids: its cache slot is size - 1.
+        logits = _execute_static(next_id, output_ids.size(0) - 1)
 
     total_time_s = time.perf_counter() - t_start
     tokens_per_s = generated_tokens / max(total_time_s, 1e-12)
     avg_token_time_ms = (total_time_s / max(generated_tokens, 1)) * 1000.0
 
-    generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+    # output_ids is 1-D: decode it as one sequence (batch_decode would split it per token).
+    generated_text = tokenizer.decode(output_ids, skip_special_tokens=True)
 
     print("\nGeneration result")
     print(f"  pte_path            : {args.pte_path}")
+    print(f"  cache_impl          : {manifest['cache_impl']}")
     print(f"  model_name          : {args.model_name}")
     print(f"  prompt              : {args.prompt}")
     print(f"  generated_tokens    : {generated_tokens}")

@@ -40,10 +40,13 @@ Export pipeline (followed by each backend exporter):
   5. convert_pt2e / torch.export   [quantised models only]
 
   6. finalize_export_result()
-       Optional weight-mismatch check and inference stats, then wraps
-       everything into a BackendExportResult (or a backend subclass of it).
+       Optional weight-mismatch check and inference stats, writes the
+       ``<artifact>.manifest.json`` runtime contract (build_llm_manifest), then
+       wraps everything into a BackendExportResult (or a backend subclass).
 """
 
+import json
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass
@@ -104,6 +107,7 @@ class BackendExportResult:
     precision: str
     weight_mismatches: list[dict[str, Any]]
     inference_stats: dict[str, float] | None = None
+    manifest_path: str = ""  # <artifact stem>.manifest.json (see build_llm_manifest)
 
 
 @dataclass
@@ -130,10 +134,8 @@ def build_zero_caches(decoder: nn.Module) -> tuple[list[torch.Tensor], list[torc
     for block in decoder.blocks:
         attn = block.attn
         # Key cache follows the (possibly pruned) key head_dim; value keeps its own.
-        key_shape = (attn.max_cache_length, attn.kv_num_heads, attn.key_head_dim)
-        value_shape = (attn.max_cache_length, attn.kv_num_heads, attn.value_head_dim)
-        key_caches.append(torch.zeros(key_shape, dtype=attn.dtype))
-        value_caches.append(torch.zeros(value_shape, dtype=attn.dtype))
+        key_caches.append(torch.zeros(attn.cache_shape("key"), dtype=attn.dtype))
+        value_caches.append(torch.zeros(attn.cache_shape("value"), dtype=attn.dtype))
     return key_caches, value_caches
 
 
@@ -824,7 +826,8 @@ def calibrate_pt2e_observers(
             for _ in range(32):
                 rand_shape = (1, 1) if add_batch_dim else (1,)
                 rand_ids = torch.randint(0, vocab_size, rand_shape, dtype=torch.long)
-                rand_pos = torch.randint(1, max_pos + 1, (1,), dtype=torch.long)
+                # Cache slots are 0 .. max_seq_len - 1 (randint's high is exclusive).
+                rand_pos = torch.randint(0, max_pos, (1,), dtype=torch.long)
                 prepared(rand_ids, rand_pos, *_fresh_caches())
 
 
@@ -922,6 +925,116 @@ def find_weight_mismatches(
     return mismatches
 
 
+def to_device(x: Any, device: torch.device | str) -> Any:
+    """Move a tensor, or a (nested) list/tuple of tensors, to ``device``.
+
+    Needed for the io_* cache modes, whose KV caches are nested list args.
+    """
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    if isinstance(x, (list, tuple)):
+        return type(x)(to_device(e, device) for e in x)
+    return x
+
+
+def reference_logits(wrapper: nn.Module, inputs: tuple[Any, ...]) -> torch.Tensor:
+    """Float-wrapper logits for ``inputs`` (the first output in io_* cache modes)."""
+    wrapper.eval()
+    with torch.no_grad():
+        y = wrapper(*inputs)
+    return y[0] if isinstance(y, (tuple, list)) else y
+
+
+def logit_error_stats(y_ref: torch.Tensor, y_out: Any) -> dict[str, float]:
+    """max/mean absolute error, MSE and RMSE of a backend's logits vs the reference."""
+    if isinstance(y_out, (tuple, list)):
+        y_out = y_out[0]
+    if not isinstance(y_out, torch.Tensor):
+        y_out = torch.tensor(y_out)
+    y_out = y_out.to(y_ref.device, y_ref.dtype)
+    err = (y_ref - y_out).abs()
+    mse = ((y_ref - y_out) ** 2).mean()
+    return {
+        "max_abs_err":  float(err.max().item()),
+        "mean_abs_err": float(err.mean().item()),
+        "mse":          float(mse.item()),
+        "rmse":         float(torch.sqrt(mse).item()),
+    }
+
+
+MANIFEST_FORMAT = "tsurgeon-llm/1"
+
+
+def manifest_path_for(artifact_path: str) -> str:
+    """``<artifact stem>.manifest.json`` next to an exported artifact."""
+    return os.path.splitext(artifact_path)[0] + ".manifest.json"
+
+
+def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend: str,
+                       artifact: str, **extra: Any) -> dict[str, Any]:
+    """Describe an exported LLM's runtime contract, for any backend.
+
+    Runners use it instead of re-deriving geometry: the cache implementation,
+    layout and dtype, and one entry per layer with the key/value cache shapes
+    (which differ per layer after structured pruning) and their graph I/O names.
+    Backend-specific fields go in ``extra``.
+    """
+    decoder = wrapper.decoder
+    cache_impl = getattr(decoder, "cache_impl", "mutable")
+    caches = [
+        {
+            "layer": i,
+            "key": {"input": f"past_key_{i}", "output": f"present_key_{i}",
+                    "shape": list(block.attn.cache_shape("key"))},
+            "value": {"input": f"past_value_{i}", "output": f"present_value_{i}",
+                      "shape": list(block.attn.cache_shape("value"))},
+        }
+        for i, block in enumerate(decoder.blocks)
+    ]
+    eos = getattr(model_config, "eos_token_id", None) if model_config is not None else None
+    return {
+        "format": MANIFEST_FORMAT,
+        "backend": backend,
+        "artifact": os.path.basename(artifact),
+        "cache_impl": cache_impl,
+        "cache_io": cache_impl != "mutable",
+        "cache_inplace": cache_impl == "io_inplace",
+        "cache_layout": "BHSD" if cache_impl == "io_inplace" else "SHD",
+        # The allocated cache buffer, not config.dtype (None for configs without one).
+        "cache_dtype": str(decoder.blocks[0].attn.key_cache.dtype).replace("torch.", ""),
+        "max_cache_len": int(decoder.max_cache_len),
+        "num_layers": len(decoder.blocks),
+        "add_batch_dim": bool(getattr(wrapper, "add_batch_dim", False)),
+        "attn_impl": getattr(decoder.blocks[0].attn, "attn_impl", None) if len(decoder.blocks) else None,
+        "vocab_size": int(getattr(model_config, "vocab_size", 0) or 0) if model_config is not None else 0,
+        "eos_token_id": eos if isinstance(eos, list) else ([eos] if eos is not None else []),
+        "caches": caches,
+        **extra,
+    }
+
+
+def load_llm_manifest(artifact_path: str) -> dict[str, Any]:
+    """Load the manifest written next to an exported artifact (or given directly)."""
+    path = artifact_path if artifact_path.endswith(".manifest.json") else manifest_path_for(artifact_path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No export manifest at '{path}'. Re-export with this version of transformer-surgeon "
+            "(every backend now writes <artifact>.manifest.json)."
+        )
+    with open(path) as f:
+        return json.load(f)
+
+
+def zero_caches_from_manifest(
+    manifest: dict[str, Any], device: torch.device | str = "cpu"
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Per-layer zero (key, value) caches with the exported shapes and dtype."""
+    dtype = getattr(torch, manifest["cache_dtype"])
+    keys = [torch.zeros(layer["key"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]]
+    values = [torch.zeros(layer["value"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]]
+    return keys, values
+
+
 def finalize_export_result(
     *,
     output_path: str,
@@ -934,13 +1047,17 @@ def finalize_export_result(
     verbose: bool,
     inference_stats_fn: Callable[[], dict[str, float] | None] | None = None,
     result_cls: type = BackendExportResult,
+    model_config: Any | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> BackendExportResult:
-    """Run post-export sanity checks and assemble the final result object.
+    """Run post-export sanity checks, write the manifest, and assemble the result.
 
     This is backend-agnostic.  Backends supply an ``inference_stats_fn`` closure
     (capturing whatever runtime handle they need) to compute float-vs-exported
     error statistics, and may pass a ``result_cls`` subclass of
-    BackendExportResult for backend-flavoured field aliases.
+    BackendExportResult for backend-flavoured field aliases.  The manifest
+    (``manifest`` if given, else ``build_llm_manifest``) is written next to
+    the artifact as ``<stem>.manifest.json``.
     """
 
     # --- Weight mismatch check ---
@@ -976,10 +1093,20 @@ def finalize_export_result(
             print(f"  mse         : {stats['mse']:.10f}")
             print(f"  rmse        : {stats['rmse']:.8f}")
 
+    if manifest is None and hasattr(wrapper, "decoder"):
+        manifest = build_llm_manifest(wrapper, model_config, backend=backend, artifact=output_path,
+                                      precision=precision)
+    written_manifest = ""
+    if manifest is not None:
+        written_manifest = manifest_path_for(output_path)
+        with open(written_manifest, "w") as f:
+            json.dump(manifest, f, indent=2)
+
     return result_cls(
         output_path=output_path,
         backend=backend,
         precision=precision,
         weight_mismatches=mismatches,
         inference_stats=stats,
+        manifest_path=written_manifest,
     )

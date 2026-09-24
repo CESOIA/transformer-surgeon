@@ -21,16 +21,8 @@ SCORE_FUNCTIONS = {
     "random": score_random,
 }
 
-# Legacy score+mask helpers (kept for backward compatibility).
-METHOD_FUNCTIONS = {
-    "magnitude": mask_magnitude,
-    "gradient": mask_gradient,
-    "random": mask_random,
-}
-
 __all__ = [
     "SCORE_FUNCTIONS",
-    "METHOD_FUNCTIONS",
     "build_structured_mask",
     "effective_num_pruned",
     "effective_out_features",

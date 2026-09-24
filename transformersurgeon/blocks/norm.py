@@ -18,14 +18,28 @@ class RMSNorm(torch.nn.Module):
     are known to stay in range; keep the prescale when fp16 overflow is a real
     risk. Note the two are not bit-identical: rescaling changes how ``eps``
     enters the variance.
+
+    ``upcast=True`` is the third option, and the Hugging Face / TensorRT
+    Edge-LLM formulation: normalize in float32 and cast back, then apply the
+    weight. It needs no prescale (float32 cannot overflow here) and is the
+    numerically faithful choice for fp16 models on GPUs, where the two casts
+    are nearly free; it takes precedence over ``prescale``.
     """
 
-    def __init__(self, hidden_size, dtype=None, prescale=True):
+    def __init__(self, hidden_size, dtype=None, prescale=True, upcast=False, eps=1e-5):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.prescale = prescale
+        self.upcast = upcast
+        self.eps = eps
 
     def forward(self, x):
+        if self.upcast:
+            input_dtype = x.dtype
+            x = x.to(torch.float32)
+            x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+            return self.weight * x.to(input_dtype)
+
         if self.prescale:
             # Normalize by max absolute value for stability
             max_x = torch.max(x.abs(), dim=-1, keepdim=True).values
@@ -36,7 +50,7 @@ class RMSNorm(torch.nn.Module):
         variance = x.pow(2).mean(dim=-1, keepdim=True)
 
         # Normalize with variance
-        x = x * torch.rsqrt(variance + 1e-5)
+        x = x * torch.rsqrt(variance + self.eps)
 
         # Multiply element-wise with the learned weights
         x = self.weight * x

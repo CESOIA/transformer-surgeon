@@ -46,11 +46,6 @@ pytest test/e2e/test_export_pipelines.py -v
 pytest test/e2e/test_model_families.py::test_lrd_soft_apply_and_restore -v
 ```
 
-Legacy per-model CLI scripts (pre-dating this hardened suite) live under
-`test/test_deprecated/` — kept for reference only, not collected by default
-(`pytest.ini` sets `testpaths = test/unit test/e2e`). See its README for why
-they were retired.
-
 ---
 
 ## Architecture in 30 Seconds
@@ -91,9 +86,13 @@ Where to look when you need to change something:
 | Change HuggingFace export | `hf/hf_export.py` |
 | Change export graph conversion | `utils/convert.py` |
 | Change what parameters are valid for a compression type | `compression/registry.py` → `COMPRESSION_REGISTRY` |
-| Change backend-export machinery shared by all backends (quant-metadata extraction, PT2E calibration, weight-mismatch checks) | `export/common.py` |
+| Change backend-export machinery shared by all backends (quant-metadata extraction, PT2E calibration, weight-mismatch checks, error stats, the export manifest) | `export/common.py` |
+| Change which layers get PT2E Q/DQ (linear-only annotation, shared by XNNPACK and TensorRT) | `export/linear_quantizer.py` |
 | Add/change a backend exporter | `export/registry.py` → `EXPORT_ROUTINES`, plus the backend's own subpackage (`export/executorch_exporters/xnnpack/`, `export/executorch_exporters/qnn/`, `export/tensorrt/`) |
 | Change which attention kernel `MHACausal` uses at export (`manual`/`sdpa`/`custom_sdpa`) | `blocks/mha.py::MHACausal`, threaded via `attn_impl` in `convert_options` (`utils/convert.py`, `blocks/config.py`, `blocks/decoder.py`) |
+| Change the KV-cache mechanism (`cache_impl`, incl. the in-place `io_inplace` + its custom op) | `blocks/mha.py::MHACausal` (`cache_shape`, `_write_*`), `blocks/kv_cache_ops.py`, `blocks/decoder.py` (multi-token mask/RoPE) |
+| Change the ONNX export (I/O contract, manifest, weight Q/DQ) | `export/onnx/onnx_export.py`, `export/onnx/quantization.py` |
+| Change the plain-TensorRT build / runtime / Edge-LLM INT4 plugin pass | `export/tensorrt/tensorrt_export.py`, `engine.py`, `session.py`, `edgellm_int4.py` |
 
 ---
 
@@ -105,24 +104,38 @@ Where to look when you need to change something:
 |---|---|---|---|
 | `xnnpack` | `XNNPACKExportConfig` | `export/executorch_exporters/xnnpack/` | ExecuTorch `.pte` |
 | `qnn` | `QNNExportConfig` | `export/executorch_exporters/qnn/` | ExecuTorch `.pte` (Qualcomm NPU) |
-| `tensorrt` | `TensorRTExportConfig` | `export/tensorrt/` | TensorRT engine / exported program (`.engine_path`) |
+| `onnx` | `ONNXExportConfig` | `export/onnx/` | Portable `model.onnx` + `model.manifest.json` (I/O contract) |
+| `tensorrt` | `TensorRTExportConfig` | `export/tensorrt/tensorrt_export.py` | `onnx` output + plain TensorRT engine built from it (Jetson path) |
 
-All three share the backend-agnostic machinery in `export/common.py`: `resolve_components_and_wrapper()` builds the model wrapper and example inputs, `extract_layer_quant_info()` reads per-layer compression metadata straight off the model (no separate quant config needed), and `inject_scales_into_pt2e_observers()` overrides PT2E-calibrated observers with the exact surgeon scales before `convert_pt2e()`. This is what makes **mixed-precision export** work: a model with some `LinearCompressed` layers hard-quantized to INT8/INT4 and others left float exports to a single engine/program with only the quantized layers getting Q/DQ ops.
+All of them share the backend-agnostic machinery in `export/common.py`: `resolve_components_and_wrapper()` builds the model wrapper and example inputs, `extract_layer_quant_info()` reads per-layer compression metadata straight off the model (no separate quant config needed), and `inject_scales_into_pt2e_observers()` overrides PT2E-calibrated observers with the exact surgeon scales before `convert_pt2e()`. This is what makes **mixed-precision export** work: a model with some `LinearCompressed` layers hard-quantized to INT8/INT4 and others left float exports to a single engine/program with only the quantized layers getting Q/DQ ops.
 
 ```python
 from transformersurgeon.export import export_to_backend
 from transformersurgeon.export.tensorrt import TensorRTExportConfig
 
-config = TensorRTExportConfig(output_path="model.pt2", backend="tensorrt", device="cuda:0")
+config = TensorRTExportConfig(output_path="out/model.onnx", backend="tensorrt", max_input_len=512,
+                                  convert_options={"cache_impl": "io_inplace", "max_cache_len": 1024,
+                                                   "rmsnorm_prescale": False, "rmsnorm_upcast": True})
 result = export_to_backend(model, config=config)   # model can be a full HF model or {embedding, decoder, final_layer}
-print(result.engine_path)
+print(result.onnx_path, result.manifest_path, result.engine_path)
 ```
 
-Device placement is normalized internally (`resolve_components_and_wrapper` traces on CPU regardless of the input model's device; TensorRT then compiles the traced graph onto `config.device`), so callers don't need to manage component devices themselves.
+Device placement is normalized internally (`resolve_components_and_wrapper` traces on CPU regardless of the input model's device), so callers don't need to manage component devices themselves.
 
-`export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)` — use `export_to_backend`.
+Every backend writes `<artifact stem>.manifest.json` next to its artifact (`result.manifest_path`, built by `common.build_llm_manifest`): cache implementation, layout and dtype, and per-layer key/value cache shapes (they differ per layer after pruning). Runners load it with `common.load_llm_manifest` and allocate caches with `common.zero_caches_from_manifest` instead of passing geometry by hand — see `scripts/executorch/xnnpack/inference_exported_test.py` and `export/tensorrt/session.py`.
 
-TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a CUDA device. Tests live in `test/e2e/test_export_pipelines.py` (capability-gated, skips without torch-tensorrt/CUDA); the CLI runner is `scripts/tensorrt/run_export.sh` (mirroring `scripts/executorch/{xnnpack,qnn}/`).
+### ONNX → plain TensorRT (`onnx`, `tensorrt`) — the Jetson path
+
+A TensorRT engine only runs on the GPU architecture + TensorRT version it was built with, so for edge targets (Jetson Orin) the artifact is the ONNX file; the engine is built on the device (`python -m transformersurgeon.export.tensorrt.tensorrt_export model.manifest.json`). Needs `pip install -e ".[onnx]"` plus the `tensorrt` Python package matching the CUDA version (e.g. `tensorrt-cu13`). CLI: `scripts/tensorrt/export_and_generate.py`. Measured at parity with NVIDIA's TensorRT Edge-LLM for decode — see `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
+
+- **Cache:** convert with `cache_impl="io_inplace"`: BHSD `(1, kv_heads, max_cache_len, head_dim)` caches as graph I/O, written by `tsurgeon::kv_cache_update` (`blocks/kv_cache_ops.py`) which exports as opset-24 `TensorScatter`. TensorRT aliases each `present_*` output to its `past_*` input and updates it in place — bind both to the same buffer. `mutable` is rejected (ONNX has no state).
+- **Prefill:** `max_input_len > 1` makes `input_ids` `(seq,)` dynamic; only `io_inplace` accepts `in_seq_len > 1`. The engine gets two optimization profiles: 0 = decode (seq 1), 1 = prefill.
+- **Numerics:** use `rmsnorm_upcast=True` (float32 RMSNorm, HF semantics) for fp16 GPU exports; `rmsnorm_prescale=False` alone overflows in fp16.
+- **Quantization:** weight-only. INT4 → blocked `DequantizeLinear` (per-channel scales tiled over 128/64/32 blocks, exact). Plain TensorRT 10.16 has no fast single-token INT4 GEMV, so INT4 decode runs at fp16 speed unless `int4_backend="edgellm_plugin"` (opt-in): eligible layers become TensorRT Edge-LLM's `Int4GroupwiseGemmPluginV2`, and the engine then needs `libNvInfer_edgellm_plugin.so` (`EDGELLM_PLUGIN_PATH`; recorded in the manifest under `plugins`). INT8 weight-only gives no speedup on TensorRT (it folds to fp16).
+- **Runtime:** `export/tensorrt/session.py::TensorRTLLMSession` (prefill + CUDA-graph greedy decode, manifest-driven); `export/tensorrt/engine.py` (engine build/run helpers).
+- **Extending to a new target:** `ONNXExportConfig.custom_translations` (torch op → onnxscript) and `graph_passes` (post-export `(model, manifest)` rewrites) — `edgellm_int4.py` is the worked example.
+
+Tests: `test/unit/test_io_inplace_cache.py`, `test/unit/test_onnx_tensorrt_export.py`, `test/e2e/test_export_pipelines.py::test_export_tensorrt` (gated by `requires_onnx` / `requires_tensorrt` / `requires_edgellm_plugin`). Benchmark workspace with the Edge-LLM vendor baseline: `../trt-models/`.
 
 ### XNNPACK: `attn_impl` — optimized causal attention
 

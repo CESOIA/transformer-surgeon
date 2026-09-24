@@ -53,9 +53,17 @@ def _qnn_available() -> bool:
 
 HAS_CUDA = _cuda_available()
 HAS_EXECUTORCH = _module_available("executorch")
-HAS_TORCH_TENSORRT = _module_available("torch_tensorrt")
-HAS_TENSORRT = HAS_TORCH_TENSORRT and HAS_CUDA
 HAS_QNN = _qnn_available()
+# ONNX export path (export/onnx): onnx + onnxscript (torch.onnx's dynamo exporter).
+HAS_ONNX = _module_available("onnx") and _module_available("onnxscript")
+# TensorRT (ONNX -> engine, export/tensorrt/): the `tensorrt` Python package + CUDA.
+HAS_TENSORRT = _module_available("tensorrt") and HAS_CUDA
+# TensorRT Edge-LLM's plugin library + Python package (opt-in INT4 plugin path).
+HAS_EDGELLM_PLUGIN = (
+    HAS_TENSORRT
+    and _module_available("tensorrt_edgellm")
+    and os.path.isfile(os.environ.get("EDGELLM_PLUGIN_PATH", ""))
+)
 # Narrower than HAS_EXECUTORCH: a minimal ExecuTorch install may lack the LLM
 # custom-ops extension (torch.ops.llama.custom_sdpa / update_cache).
 HAS_EXECUTORCH_CUSTOM_SDPA = _module_available("executorch.extension.llm.custom_ops.custom_ops")
@@ -71,8 +79,13 @@ requires_cuda = pytest.mark.skipif(not HAS_CUDA, reason="requires a CUDA device"
 requires_executorch = pytest.mark.skipif(
     not HAS_EXECUTORCH, reason="requires the `executorch` extra"
 )
+requires_onnx = pytest.mark.skipif(not HAS_ONNX, reason="requires onnx + onnxscript")
 requires_tensorrt = pytest.mark.skipif(
-    not HAS_TENSORRT, reason="requires torch-tensorrt and a CUDA device"
+    not (HAS_ONNX and HAS_TENSORRT), reason="requires onnx, the `tensorrt` package and a CUDA device"
+)
+requires_edgellm_plugin = pytest.mark.skipif(
+    not (HAS_ONNX and HAS_EDGELLM_PLUGIN),
+    reason="requires tensorrt_edgellm and EDGELLM_PLUGIN_PATH (libNvInfer_edgellm_plugin.so)",
 )
 requires_qnn = pytest.mark.skipif(
     not HAS_QNN, reason="requires the Qualcomm QNN SDK (QNN_SDK_ROOT)"
@@ -89,6 +102,7 @@ requires_hub = pytest.mark.skipif(
 def summary() -> str:
     return (
         f"cuda={HAS_CUDA} executorch={HAS_EXECUTORCH} "
-        f"tensorrt={HAS_TENSORRT} qnn={HAS_QNN} "
+        f"tensorrt={HAS_TENSORRT} onnx={HAS_ONNX} "
+        f"edgellm_plugin={HAS_EDGELLM_PLUGIN} qnn={HAS_QNN} "
         f"executorch_custom_sdpa={HAS_EXECUTORCH_CUSTOM_SDPA} hf_offline={HF_OFFLINE}"
     )

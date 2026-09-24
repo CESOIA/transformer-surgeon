@@ -163,20 +163,26 @@ manager.apply(hard=False)
 
 ### Export to a deployment backend (ExecuTorch / TensorRT)
 
-`export_to_backend` lowers a model (compressed or not) to `xnnpack`/`qnn` (ExecuTorch `.pte`) or `tensorrt`, driving mixed-precision export entirely from each layer's compression metadata:
+`export_to_backend` lowers a model (compressed or not) to `xnnpack`/`qnn` (ExecuTorch `.pte`), `onnx`, or TensorRT via ONNX (`tensorrt`), driving mixed-precision export entirely from each layer's compression metadata:
 
 ```python
 from transformersurgeon.export import export_to_backend
 from transformersurgeon.export.tensorrt import TensorRTExportConfig
 
-config = TensorRTExportConfig(output_path="model.ep", backend="tensorrt", device="cuda:0")
+# Portable ONNX + manifest, and a TensorRT engine for the local GPU
+# (for a Jetson, set build_engine=False and build the engine on the device).
+config = TensorRTExportConfig(
+    output_path="out/model.onnx", backend="tensorrt", max_input_len=512,
+    convert_options={"cache_impl": "io_inplace", "max_cache_len": 1024,
+                     "rmsnorm_prescale": False, "rmsnorm_upcast": True},
+)
 result = export_to_backend(model, config=config)
-print(result.engine_path)
+print(result.onnx_path, result.engine_path)
 ```
 
-Device placement is handled internally — `model` can live on CPU or CUDA; components are traced on CPU and the compiled engine is placed on `config.device` automatically.
+Device placement is handled internally — `model` can live on CPU or CUDA; components are traced on CPU.
 
-> TensorRT requires `pip install -e ".[tensorrt]"` and a CUDA device. See `scripts/tensorrt/run_export.sh` for a CLI runner and `test/e2e/test_export_pipelines.py` for end-to-end examples covering `xnnpack`/`tensorrt`/`qnn`.
+> The ONNX path needs `pip install -e ".[onnx]"`; building/running engines also needs the `tensorrt` Python package matching your CUDA (e.g. `tensorrt-cu13`) and a CUDA device. `TensorRTLLMSession` (`export/tensorrt/session.py`) runs the engine (prefill + CUDA-graph decode). CLI: `scripts/tensorrt/export_and_generate.py`. End-to-end examples: `test/e2e/test_export_pipelines.py`; details: `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
 
 ## 🎯 Filtering Layers with `criteria`
 

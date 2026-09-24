@@ -8,7 +8,7 @@ from torch.export import export as torch_export
 from ..common import (
     ExecutorchExporterConfig,
     ExecuTorchExportResult,
-    finalize_export_result,
+    finalize_executorch_result,
     resolve_components_and_wrapper,
     build_quantizer_from_layer_info,
     extract_layer_quant_info,
@@ -94,12 +94,13 @@ def export_with_xnnpack(
     # Summarize precision from layer metadata for the result object.
     result_precision = "mixed" if layer_info else "full"
 
-    return finalize_export_result(
+    return finalize_executorch_result(
         pte_path=config.output_path,
         backend="xnnpack",
         precision=result_precision,
         wrapper=wrapper,
         example_inputs=example_inputs,
+        model_config=model_config,
         exported_for_mismatch=exported_for_mismatch,
         run_weight_mismatch_check=config.run_weight_mismatch_check,
         weight_mismatch_eps=config.weight_mismatch_eps,
