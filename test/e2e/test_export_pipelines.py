@@ -188,6 +188,57 @@ def test_export_tensorrt_cuda_resident_model(qwen_classes, out_dir):
     assert os.path.isfile(result.engine_path) and os.path.getsize(result.engine_path) > 0
 
 
+@caps.requires_tensorrt_py
+@pytest.mark.parametrize("int4_backend", [None, "dequantize", "edgellm_plugin"])
+def test_export_tensorrt_onnx(qwen_classes, out_dir, int4_backend):
+    """ONNX -> plain TensorRT (the Jetson path): in-place KV cache, prefill +
+    CUDA-graph decode through TensorRTLLMSession, greedy tokens vs eager."""
+    if int4_backend == "edgellm_plugin" and not caps.HAS_EDGELLM_PLUGIN:
+        pytest.skip("requires tensorrt_edgellm and EDGELLM_PLUGIN_PATH")
+    ModelCls, ManagerCls, convert_for_export = qwen_classes
+    from transformersurgeon.export import export_to_backend
+    from transformersurgeon.export.common import build_wrapper, build_zero_caches
+    from transformersurgeon.export.tensorrt import TensorRTONNXExportConfig
+    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+
+    model = _load_float_model(ModelCls)
+    if int4_backend is not None:
+        mgr = ManagerCls(model)
+        crit = ["self_attn", "mlp"]
+        mgr.set("quantization", "precision", 4, criteria=crit)
+        mgr.set("quantization", "granularity", "per_channel", criteria=crit)
+        mgr.apply(hard=True, criteria=crit)
+    options = {"use_sdpa": False, "cache_impl": "io_inplace", "max_cache_len": 128,
+               "rmsnorm_prescale": False, "rmsnorm_upcast": True}
+    cfg = TensorRTONNXExportConfig(output_path=os.path.join(out_dir, "model.onnx"), backend="tensorrt_onnx",
+                                   max_input_len=32, convert_options=options,
+                                   int4_backend=int4_backend or "dequantize")
+    result = export_to_backend(model, config=cfg)
+    assert os.path.isfile(result.engine_path)
+
+    session = TensorRTLLMSession(result.manifest_path)
+    prompt = torch.tensor([9707, 11, 1246, 525, 498, 30])  # "Hello, how are you?"
+    tokens = session.generate(prompt, 8, stop_at_eos=False)
+    assert len(tokens) == 8
+
+    # Eager reference for the first token (same conversion options).
+    ref_model = _load_float_model(ModelCls)
+    if int4_backend is not None:
+        mgr = ManagerCls(ref_model)
+        mgr.set("quantization", "precision", 4, criteria=crit)
+        mgr.set("quantization", "granularity", "per_channel", criteria=crit)
+        mgr.apply(hard=True, criteria=crit)
+    wrapper = build_wrapper({"embedding": ref_model.get_input_embeddings(),
+                             "decoder": convert_for_export(ref_model, options=options)["text"],
+                             "final_layer": ref_model.lm_head}, model_config=ref_model.config).cuda().eval()
+    from transformersurgeon.export.common import extract_layer_quant_info
+    extract_layer_quant_info(wrapper)  # same dequantized weights the exporter sees
+    keys, values = build_zero_caches(wrapper.decoder)
+    with torch.no_grad():
+        ref = wrapper(prompt.cuda(), torch.tensor([0]).cuda(), [k.cuda() for k in keys], [v.cuda() for v in values])[0]
+    assert tokens[0] == int(ref.argmax())
+
+
 @caps.requires_qnn
 def test_export_qnn(qwen_classes, out_dir):
     ModelCls, ManagerCls, convert_for_export = qwen_classes

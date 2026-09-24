@@ -35,6 +35,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.cache_impl = getattr(config, "cache_impl", "mutable")
         self.add_batch_dim = getattr(config, "add_batch_dim", False)
         self.rmsnorm_prescale = getattr(config, "rmsnorm_prescale", True)
+        self.rmsnorm_upcast = getattr(config, "rmsnorm_upcast", False)
         self.dtype = config.dtype
 
         # Extract configuration (optional)
@@ -57,8 +58,8 @@ class TransformerDecoderBlock(torch.nn.Module):
 
         # Instantiate normalization modules
         if self.norm_type == "rmsnorm":
-            self.norm_in = RMSNorm(self.embed_dim, dtype=self.dtype, prescale=self.rmsnorm_prescale)
-            self.norm_out = RMSNorm(self.embed_dim, dtype=self.dtype, prescale=self.rmsnorm_prescale)
+            self.norm_in = RMSNorm(self.embed_dim, dtype=self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast)
+            self.norm_out = RMSNorm(self.embed_dim, dtype=self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast)
         else:
             raise ValueError(f"Unsupported norm type: {self.norm_type}")
 
@@ -171,7 +172,8 @@ class TransformerDecoder(torch.nn.Module):
             [TransformerDecoderBlock(config, block_index=i) for i in range(self.depth)]
             )
         self.rmsnorm_prescale = getattr(config, "rmsnorm_prescale", True)
-        self.norm = RMSNorm(config.hidden_size, self.dtype, prescale=self.rmsnorm_prescale)
+        self.rmsnorm_upcast = getattr(config, "rmsnorm_upcast", False)
+        self.norm = RMSNorm(config.hidden_size, self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast)
         head_dim = config.hidden_size // config.num_attention_heads
 
         self.max_cache_len = config.max_cache_len
@@ -230,15 +232,27 @@ class TransformerDecoder(torch.nn.Module):
         # max_cache_len) compare/where/index calls per token, most of which fall
         # outside the XNNPACK delegate and pay full ExecuTorch op-dispatch
         # overhead per call).
-        attn_mask = torch.where(
-            self.q_pos < self.k_pos, self.mask_penalty, torch.zeros_like(self.mask_penalty)
-        )[pos_id].unsqueeze(0)  # (1, max_cache_len)
+        if self.cache_impl == "io_inplace":
+            # Multi-token capable: the in_seq_len new tokens sit at positions
+            # pos_id .. pos_id + in_seq_len - 1. Build the (in_seq_len,
+            # max_cache_len) causal mask directly rather than indexing rows of
+            # a (max_cache_len, max_cache_len) matrix.
+            in_seq_len = x.shape[1] if self.add_batch_dim else x.shape[0]
+            positions = pos_id + torch.arange(in_seq_len, device=pos_id.device)
+            attn_mask = torch.where(
+                self.k_pos > positions[:, None], self.mask_penalty, torch.zeros_like(self.mask_penalty)
+            ).unsqueeze(0)  # (1, in_seq_len, max_cache_len)
+        else:
+            positions = pos_id
+            attn_mask = torch.where(
+                self.q_pos < self.k_pos, self.mask_penalty, torch.zeros_like(self.mask_penalty)
+            )[pos_id].unsqueeze(0)  # (1, max_cache_len)
 
         # Likewise, the base RoPE cos/sin lookup by pos_id is identical for every
         # block (each block only differs in the *further*, per-layer pruning
         # projection applied on top via _project_rope) -- index once here instead
         # of depth-many times inside MHACausal.forward.
-        rope_pos = (self.rope_cos[pos_id], self.rope_sin[pos_id])
+        rope_pos = (self.rope_cos[positions], self.rope_sin[positions])
 
         # Decode
         if self.cache_impl == "mutable":

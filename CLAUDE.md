@@ -64,4 +64,6 @@ for reference only, not collected by default.
 
 `export_to_backend(model, config)` lowers a model to `xnnpack`/`qnn` (ExecuTorch) or `tensorrt`. See [Export Backends in AGENTS.md](AGENTS.md#export-backends).
 
+For Jetson/edge GPUs use the ONNX path (`onnx` / `tensorrt_onnx` backends, `cache_impl="io_inplace"`): portable ONNX + manifest, engine built on the device, in-place KV cache. See the ONNX → plain TensorRT section of AGENTS.md.
+
 For XNNPACK, `MHACausal`'s attention kernel is selectable via `attn_impl` in `convert_options`: `"manual"` (default), `"sdpa"`, or `"custom_sdpa"` (ExecuTorch's fused CPU kernel; requires `cache_impl="mutable"` and unpruned `q_head_dim == value_head_dim`). See the XNNPACK section of AGENTS.md.
