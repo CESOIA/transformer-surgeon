@@ -131,6 +131,17 @@ def parse_args():
              "cache as internal graph state; 'io_scatter'/'io_concat' expose it as "
              "explicit graph I/O (portable to functional runtimes).",
     )
+    parser.add_argument(
+        "--attn-impl",
+        type=str,
+        default="manual",
+        choices=["manual", "sdpa", "custom_sdpa"],
+        help="Attention kernel for the exported model. 'manual' is the explicit "
+             "GQA-aware softmax/matmul path (default). 'sdpa' uses "
+             "torch.nn.functional.scaled_dot_product_attention. 'custom_sdpa' uses "
+             "ExecuTorch's fused CPU custom ops (torch.ops.llama.custom_sdpa / "
+             "update_cache) -- XNNPACK-optimized, requires cache-impl=mutable.",
+    )
     return parser.parse_args()
 
 
@@ -144,6 +155,7 @@ def _write_cache_metadata(output_path: str, model_config, args: argparse.Namespa
     """
     meta = {
         "cache_impl": args.cache_impl,
+        "attn_impl": args.attn_impl,
         "num_layers": int(model_config.num_hidden_layers),
         "kv_num_heads": int(model_config.num_key_value_heads),
         "head_dim": int(model_config.hidden_size // model_config.num_attention_heads),
@@ -249,6 +261,7 @@ def main():
 
     convert_options = {
         "use_sdpa": False,
+        "attn_impl": args.attn_impl,
         "cache_impl": args.cache_impl,
         "max_cache_len": args.max_sequence_length,
     }
@@ -292,6 +305,7 @@ def main():
     print("\nExport result:")
     print(f"  pte_path         : {result.pte_path}")
     print(f"  cache_meta_path  : {meta_path}")
+    print(f"  attn_impl        : {args.attn_impl}")
     print(f"  backend          : {result.backend}")
     print(f"  precision        : {result.precision}")
     print(f"  mismatch_count   : {len(result.weight_mismatches)}")

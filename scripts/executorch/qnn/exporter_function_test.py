@@ -154,6 +154,23 @@ def parse_args():
              "cache as internal graph state (QNN peak); 'io_scatter'/'io_concat' "
              "expose it as explicit graph I/O (portable to TensorRT etc.).",
     )
+    parser.add_argument(
+        "--rmsnorm-prescale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Divide by max|x| before each RMSNorm for fp16 stability "
+             "(--rmsnorm-prescale / --no-rmsnorm-prescale, default: enabled). "
+             "Disabling it lets ExecuTorch fold each norm into a single "
+             "aten.rms_norm, as Qualcomm's own LLM reference does, at the cost of "
+             "the fp16 overflow guard.",
+    )
+    parser.add_argument(
+        "--linear-to-conv2d",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Lower aten.linear as 1x1 conv2d (QNN's ConvertLinearToConv2d pass). "
+             "Off by default; see QNNExportConfig for the ExecuTorch limitations.",
+    )
     # --- ATen diagnostics (QNN-specific; helps debug unsupported ops) ---
     parser.add_argument(
         "--aten-log-file",
@@ -344,7 +361,8 @@ def main():
     else:
         converted = convert_for_export(
             model,
-            options={"use_sdpa": False, "cache_impl": args.cache_impl},
+            options={"use_sdpa": False, "cache_impl": args.cache_impl,
+                     "rmsnorm_prescale": args.rmsnorm_prescale},
             verbose=False,
         )
         model_input = {
@@ -368,7 +386,9 @@ def main():
         use_fp16=args.fp16,
         num_shards=args.num_shards,
         max_seq_len=args.max_sequence_length,
-        convert_options={"use_sdpa": False, "cache_impl": args.cache_impl},
+        convert_linear_to_conv2d=args.linear_to_conv2d,
+        convert_options={"use_sdpa": False, "cache_impl": args.cache_impl,
+                         "rmsnorm_prescale": args.rmsnorm_prescale},
         verbose=args.verbose,
     )
 

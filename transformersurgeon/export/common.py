@@ -154,6 +154,13 @@ class LLMWrapper(nn.Module):
         self.decoder = decoder
         self.final_layer = final_layer
         self.cache_impl = getattr(decoder, "cache_impl", "mutable")
+        # See blocks/mha.py MHACausal's add_batch_dim docstring: opt-in, False
+        # by default. When set, input_ids carries a leading (size-1) batch dim
+        # ((1, in_seq_len) instead of (in_seq_len,)) and every component's
+        # hidden states/output follow suit -- only the final "take the last
+        # token" slice needs to change here to keep the batch dim instead of
+        # indexing it away.
+        self.add_batch_dim = getattr(decoder, "add_batch_dim", False)
 
     def forward(
         self,
@@ -164,7 +171,7 @@ class LLMWrapper(nn.Module):
     ):
         if self.cache_impl == "mutable":
             hidden = self.decoder(self.embedding(input_ids), pos_id=pos_id_tensor)
-            return self.final_layer(hidden[-1, :])
+            return self._head(hidden)
 
         hidden, new_key_caches, new_value_caches = self.decoder(
             self.embedding(input_ids),
@@ -172,8 +179,25 @@ class LLMWrapper(nn.Module):
             key_caches=key_caches,
             value_caches=value_caches,
         )
-        logits = self.final_layer(hidden[-1, :])
-        return logits, new_key_caches, new_value_caches
+        return self._head(hidden), new_key_caches, new_value_caches
+
+    def _head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Take the last token's hidden state and project it to logits.
+
+        The slice deliberately keeps a leading dim (``hidden[-1:, :]`` rather
+        than ``hidden[-1, :]``) so ``final_layer`` always sees a rank-2 input,
+        and the rank is dropped again afterwards. The output contract is
+        unchanged -- ``(vocab,)`` unbatched, ``(1, vocab)`` with add_batch_dim --
+        but a rank-1 linear input breaks QNN lowering: ExecuTorch's
+        ConvertLinearToConv2d reshapes a rank-1 input to rank 2 and then applies
+        a 4-element permutation to it, which raises "input.dim() = 2 is not equal
+        to len(dims) = 4". Rank-2 is also the shape QNN's FullyConnected builder
+        handles most robustly, which is why LinearCompressed flattens to rank 2
+        for its own inputs.
+        """
+        if self.add_batch_dim:
+            return self.final_layer(hidden[:, -1, :])
+        return self.final_layer(hidden[-1:, :])[0]
 
 
 def _normalize_component_devices(
@@ -205,10 +229,16 @@ def build_wrapper(components: Any, *, model_config: Any | None) -> nn.Module:
     return LLMWrapper(embedding, decoder, final_layer)
 
 
-def build_example_inputs(model_config: Any | None, *, config: Any) -> tuple[Any, ...]:
-    """Build a single-token example input for tracing / calibration."""
+def build_example_inputs(
+    model_config: Any | None, *, config: Any, add_batch_dim: bool = False
+) -> tuple[Any, ...]:
+    """Build a single-token example input for tracing / calibration.
+
+    ``add_batch_dim`` shapes input_ids as (1, 1) (batch=1, seq=1) instead of
+    the framework's usual bare (1,) -- see MHACausal.add_batch_dim.
+    """
     vocab_size = int(getattr(model_config, "vocab_size", 100)) if model_config is not None else 100
-    input_ids  = torch.randint(0, vocab_size, (1,), dtype=torch.long)
+    input_ids  = torch.randint(0, vocab_size, (1, 1) if add_batch_dim else (1,), dtype=torch.long)
     pos_ids    = torch.tensor([1], dtype=torch.long)
 
     max_seq_len = getattr(config, "max_seq_len", None)
@@ -252,7 +282,9 @@ def resolve_components_and_wrapper(
     wrapper = build_wrapper(components, model_config=model_config)
     wrapper.eval()
 
-    example_inputs = build_example_inputs(model_config, config=config)
+    example_inputs = build_example_inputs(
+        model_config, config=config, add_batch_dim=getattr(wrapper, "add_batch_dim", False)
+    )
     # For io_* cache modes, the KV cache is explicit graph I/O: append per-block
     # zero caches to the example inputs so torch.export traces the full contract.
     if getattr(wrapper, "cache_impl", "mutable") != "mutable":
@@ -757,6 +789,10 @@ def calibrate_pt2e_observers(
     model_name = getattr(model_config, '_name_or_path', None) if model_config else None
     vocab_size = int(getattr(model_config, 'vocab_size', 32000)) if model_config else 32000
     max_pos = max(1, min(512, getattr(config, 'max_seq_len', 512)))
+    # Match input_ids' shape to whatever resolve_components_and_wrapper actually
+    # built it as (see build_example_inputs' add_batch_dim) rather than
+    # re-deciding independently here.
+    add_batch_dim = bool(example_inputs is not None and example_inputs[0].dim() == 2)
 
     # io cache template (empty tuple for mutable / legacy contract).
     cache_template: tuple[Any, ...] = ()
@@ -781,12 +817,13 @@ def calibrate_pt2e_observers(
         if token_batches:
             for ids in token_batches:
                 for token_id in ids:
-                    inp = torch.tensor([token_id], dtype=torch.long)
+                    inp = torch.tensor([[token_id]] if add_batch_dim else [token_id], dtype=torch.long)
                     pos = torch.tensor([1], dtype=torch.long)
                     prepared(inp, pos, *_fresh_caches())
         else:
             for _ in range(32):
-                rand_ids = torch.randint(0, vocab_size, (1,), dtype=torch.long)
+                rand_shape = (1, 1) if add_batch_dim else (1,)
+                rand_ids = torch.randint(0, vocab_size, rand_shape, dtype=torch.long)
                 rand_pos = torch.randint(1, max_pos + 1, (1,), dtype=torch.long)
                 prepared(rand_ids, rand_pos, *_fresh_caches())
 

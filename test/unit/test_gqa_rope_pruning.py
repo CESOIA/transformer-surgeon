@@ -125,18 +125,26 @@ def test_causal_pruned_kv_cache_dims(cache_impl):
 
     inv = precompute_rope_inv_freqs(head_dim=HEAD_DIM, base=1e4)
     cos, sin = precompute_rope_cos_sin_half(inv, torch.tensor(16), torch.tensor(0))
-    q_pos = k_pos = torch.arange(16)
-    mask_penalty = torch.full((16, 16), float("-inf"))
+    # (L, 1) / (1, L) so the comparison broadcasts into a real causal matrix --
+    # two identical 1-D aranges compare to all-False and give a no-op mask.
+    q_pos = torch.arange(16, dtype=torch.long)[:, None]
+    k_pos = torch.arange(16, dtype=torch.long)[None, :]
+    mask_penalty = torch.tensor(-10000.0)
     kc = torch.zeros(m.max_cache_length, m.kv_num_heads, m.key_head_dim)
     vc = torch.zeros(m.max_cache_length, m.kv_num_heads, m.value_head_dim)
 
     for pos in range(3):
         pid = torch.tensor([pos])
-        args = (torch.randn(1, 32), pid, (q_pos, k_pos), mask_penalty)
+        attn_mask = torch.where((q_pos < k_pos), mask_penalty, torch.zeros_like(mask_penalty))[pid].unsqueeze(0)
+        args = (torch.randn(1, 32), pid, attn_mask)
+        # MHACausal now expects rope already indexed by pos_id (the TransformerDecoder
+        # does this once per token, shared across layers) rather than indexing
+        # internally -- pre-index here to match.
+        rope_pos = (cos[pid], sin[pid])
         if cache_impl == "mutable":
-            out = m(*args, rope=(cos, sin))
+            out = m(*args, rope=rope_pos)
         else:
-            out, kc, vc = m(*args, key_cache=kc, value_cache=vc, rope=(cos, sin))
+            out, kc, vc = m(*args, key_cache=kc, value_cache=vc, rope=rope_pos)
         assert torch.isfinite(out).all()
 
     assert m.key_cache.shape[-1] == 4

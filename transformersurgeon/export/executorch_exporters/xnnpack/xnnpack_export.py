@@ -75,7 +75,19 @@ def export_with_xnnpack(
         partitioner=[XnnpackPartitioner()],
     )
 
-    et_program = edge.to_executorch()
+    # alloc_graph_input=False keeps graph inputs caller-owned (zero-copy) instead
+    # of the MemoryPlanningPass default (alloc_graph_input=True), which copies the
+    # input tensor into an internal buffer on every forward() call. ExecuTorch's
+    # own llama exporter (extension/llm/export/builder.py) sets this explicitly
+    # for the same reason - see FRAMEWORK_PROBLEMS.md P1.
+    from executorch.exir import ExecutorchBackendConfig
+    from executorch.exir.passes import MemoryPlanningPass
+
+    et_program = edge.to_executorch(
+        config=ExecutorchBackendConfig(
+            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
+        )
+    )
     with open(config.output_path, "wb") as f:
         f.write(et_program.buffer)
 

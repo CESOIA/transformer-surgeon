@@ -56,6 +56,9 @@ HAS_EXECUTORCH = _module_available("executorch")
 HAS_TORCH_TENSORRT = _module_available("torch_tensorrt")
 HAS_TENSORRT = HAS_TORCH_TENSORRT and HAS_CUDA
 HAS_QNN = _qnn_available()
+# Narrower than HAS_EXECUTORCH: a minimal ExecuTorch install may lack the LLM
+# custom-ops extension (torch.ops.llama.custom_sdpa / update_cache).
+HAS_EXECUTORCH_CUSTOM_SDPA = _module_available("executorch.extension.llm.custom_ops.custom_ops")
 
 # Network access to the Hugging Face Hub. Controlled by an env var so CI can force
 # offline runs; defaults to "assume reachable" (tests still skip on actual failure).
@@ -74,6 +77,10 @@ requires_tensorrt = pytest.mark.skipif(
 requires_qnn = pytest.mark.skipif(
     not HAS_QNN, reason="requires the Qualcomm QNN SDK (QNN_SDK_ROOT)"
 )
+requires_custom_sdpa = pytest.mark.skipif(
+    not HAS_EXECUTORCH_CUSTOM_SDPA,
+    reason="requires ExecuTorch's llm custom_ops extension (torch.ops.llama.custom_sdpa/update_cache)",
+)
 requires_hub = pytest.mark.skipif(
     HF_OFFLINE, reason="requires Hugging Face Hub access (offline mode set)"
 )
@@ -82,5 +89,6 @@ requires_hub = pytest.mark.skipif(
 def summary() -> str:
     return (
         f"cuda={HAS_CUDA} executorch={HAS_EXECUTORCH} "
-        f"tensorrt={HAS_TENSORRT} qnn={HAS_QNN} hf_offline={HF_OFFLINE}"
+        f"tensorrt={HAS_TENSORRT} qnn={HAS_QNN} "
+        f"executorch_custom_sdpa={HAS_EXECUTORCH_CUSTOM_SDPA} hf_offline={HF_OFFLINE}"
     )

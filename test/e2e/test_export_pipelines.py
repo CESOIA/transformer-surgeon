@@ -119,6 +119,35 @@ def test_export_xnnpack(qwen_classes, out_dir):
     assert os.path.isfile(pte) and os.path.getsize(pte) > 0
 
 
+@caps.requires_executorch
+@caps.requires_custom_sdpa
+def test_export_xnnpack_custom_sdpa(qwen_classes, out_dir):
+    """Same as test_export_xnnpack, but with attn_impl='custom_sdpa' -- ExecuTorch's
+    fused CPU custom ops (torch.ops.llama.custom_sdpa/update_cache) instead of the
+    default manual attention kernel."""
+    ModelCls, ManagerCls, convert_for_export = qwen_classes
+    from transformersurgeon.export import export_to_backend
+    from transformersurgeon.export.executorch_exporters.xnnpack import XNNPACKExportConfig
+
+    model = _quantize_two_mlp_layers(_load_float_model(ModelCls), ManagerCls)
+    converted = convert_for_export(
+        model, options={"use_sdpa": False, "attn_impl": "custom_sdpa", "cache_impl": "mutable"}
+    )
+    comps = {
+        "embedding": model.get_input_embeddings(),
+        "decoder": converted["text"],
+        "final_layer": model.lm_head,
+        "config": model.config,
+    }
+
+    pte = os.path.join(out_dir, "qwen2_xnnpack_custom_sdpa.pte")
+    cfg = XNNPACKExportConfig(output_path=pte, backend="xnnpack", max_seq_len=128,
+                              convert_options={"use_sdpa": False, "attn_impl": "custom_sdpa", "cache_impl": "mutable"},
+                              run_weight_mismatch_check=False, verbose=False)
+    export_to_backend(comps, config=cfg)
+    assert os.path.isfile(pte) and os.path.getsize(pte) > 0
+
+
 @caps.requires_tensorrt
 def test_export_tensorrt(qwen_classes, out_dir):
     ModelCls, ManagerCls, convert_for_export = qwen_classes

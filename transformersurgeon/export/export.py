@@ -85,10 +85,21 @@ def export_to_backend(
     if config is None:
         raise ValueError("config must be provided for backend export.")
 
+    # config.max_seq_len is the export's sequence budget, but convert_for_export
+    # reads the KV-cache size from convert_options["max_cache_len"] and otherwise
+    # falls back to its own 2048 default. Without this, setting max_seq_len (what
+    # the CLI's --max-sequence-length feeds) silently had no effect on the
+    # exported cache, and every model shipped with a 2048-slot cache regardless.
+    # An explicit max_cache_len in convert_options still wins.
+    convert_options = dict(config.convert_options or {"use_sdpa": False})
+    max_seq_len = getattr(config, "max_seq_len", None)
+    if "max_cache_len" not in convert_options and isinstance(max_seq_len, int) and max_seq_len > 0:
+        convert_options["max_cache_len"] = max_seq_len
+
     # Conversion is backend-agnostic, so normalize to export-ready components here.
     embedding, decoder, final_layer, model_config = _resolve_model_components_for_export(
         model_or_graph,
-        convert_options=config.convert_options,
+        convert_options=convert_options,
         verbose=config.verbose,
     )
 

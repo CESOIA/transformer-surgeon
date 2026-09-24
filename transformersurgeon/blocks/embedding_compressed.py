@@ -7,6 +7,31 @@ from torch.nn.parameter import Parameter
 
 
 class EmbeddingCompressed(nn.Module):
+    # TODO: add a weight-quantization path for this module (FRAMEWORK_PROBLEMS.md
+    # P3a). There is none today: `Quantizer`'s hard path goes through torchao's
+    # `quantize_()`, which only patches `nn.Linear` submodules -- this class is a
+    # plain `nn.Module`, so nothing happens and the guard in
+    # `_apply_torchao_hard_quantization` raises NotImplementedError rather than
+    # returning a model that looks quantized but isn't. The guard is correct; the
+    # missing alternative path is the gap.
+    #
+    # Why this is worth doing, with numbers (xnnpack-models/, 2026-09-21): the
+    # embedding table and the tied/untied lm_head are the *only* large tensors a
+    # tsurgeon `w4` export still leaves in fp32, and the cost scales with vocab
+    # size. Qwen2.5-0.5B (~151k vocab) exports to 1211 MB at w4 for a 0.49B-param
+    # model -- only ~2x smaller than its own fp32 build, where TinyLlama-1.1B
+    # (32k vocab) gets ~4.4x. It is also the leading explanation for tsurgeon's
+    # remaining ~5% decode deficit vs ExecuTorch's `q8da4w`, which does quantize
+    # both (`--embedding-quantize 4,32`); at fp32, where neither side quantizes
+    # anything, the two are at parity.
+    #
+    # Two plausible implementations: a torchao config that actually targets
+    # embeddings (check newer torchao for an `IntxWeightOnlyConfig`-equivalent
+    # embedding path -- 0.17.0 here has none), or a hand-rolled int-pack + scale
+    # mirroring executorch/examples/models/llama/source_transformation/quantize.py.
+    # Note `lm_head` is a *separate* bug (P3b, PT2E scale injection at export
+    # time) -- fixing this one does not fix that one, and on tied-embedding models
+    # both must land before the tensor stops being fp32 anywhere.
     """
     Embedding lookup table with support for low-rank decomposition.
 
