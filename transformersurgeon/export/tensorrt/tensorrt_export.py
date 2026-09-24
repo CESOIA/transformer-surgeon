@@ -1,254 +1,152 @@
 """
-TensorRT backend exporter (torch-tensorrt). Deprecated in favour of the
-ONNX path (``onnx_backend.py``, backend "tensorrt_onnx").
+TensorRT via ONNX: export a portable ONNX + manifest, and build the engine.
 
-Mirrors the ExecuTorch backends' export pipeline but lowers to a TensorRT
-engine via ``torch-tensorrt``'s Dynamo path.  All the backend-agnostic
-machinery (model wrapper, per-layer quant-metadata extraction, PT2E scale
-injection / calibration, weight-mismatch checks, result assembly) is reused
-from ``transformersurgeon.export.common``; only the quantizer
-(``tensorrt.quantizer``) and the compile/save step are TensorRT-specific.
+The ONNX export is target-agnostic (``export/onnx``); this module only adds the
+TensorRT build. Because an engine only runs on the GPU architecture and
+TensorRT version it was built with, the ONNX + manifest pair is the artifact
+to ship; build the engine where it will run, e.g. on the Jetson:
 
-Mixed quantization works exactly as for the ExecuTorch backends: quantization is
-driven entirely by per-layer compression metadata, so a model can mix INT8/INT4
-quantized linears with float ones in a single engine.
+    python -m transformersurgeon.export.tensorrt.tensorrt_export model.manifest.json
+
+Optimization profiles follow the manifest: profile 0 is decode (seq = 1, so
+TensorRT tunes for single-token GEMV), profile 1 -- present when the graph was
+exported with max_input_len > 1 -- is prompt prefill (seq = 1..max_input_len).
 """
 
+import argparse
+import dataclasses
+import json
 import os
-import warnings
 from dataclasses import dataclass
-from typing import Any
 
-import torch
-import torch.nn as nn
-from torch.export import export as torch_export
+from ..onnx import ONNXExportConfig, ONNXExportResult, export_with_onnx
+from .edgellm_int4 import edgellm_int4_pass, resolve_plugin_libraries
+from .engine import EngineBuildConfig, OptimizationProfile, build_engine
 
-from ..common import (
-    ExporterConfig,
-    BackendExportResult,
-    resolve_components_and_wrapper,
-    extract_layer_quant_info,
-    inject_scales_into_pt2e_observers,
-    calibrate_pt2e_observers,
-    finalize_export_result,
-    logit_error_stats,
-    reference_logits,
-    to_device,
-)
-from .quantizer import build_tensorrt_quantizer
+DECODE_PROFILE = 0
+PREFILL_PROFILE = 1
 
 
 @dataclass
-class TensorRTExportResult(BackendExportResult):
-    """Backend result with an ``engine_path`` alias for the on-disk artifact."""
-
-    @property
-    def engine_path(self) -> str:
-        return self.output_path
+class TensorRTExportResult(ONNXExportResult):
+    engine_path: str | None = None
 
 
 @dataclass
-class TensorRTExportConfig(ExporterConfig):
-    """Configuration for the TensorRT exporter.
+class TensorRTExportConfig(ONNXExportConfig):
+    """ONNXExportConfig plus the (optional) local TensorRT build.
 
-    use_fp16          - allow FP16 kernels for the un-quantized parts of the graph.
-    min_block_size    - smallest number of ops TensorRT will accept as a subgraph.
-    workspace_size    - TensorRT builder workspace in bytes (0 = library default).
-    truncate_double   - downcast float64 constants to float32 (TensorRT has no f64).
+    build_engine       - also build an engine for the local GPU. Leave False
+                         when the target is another device (build it there).
+    engine_path        - default: <onnx stem>.engine next to the ONNX file.
     optimization_level - TensorRT builder optimization level (None = default).
-    output_format     - torch-tensorrt save format: "exported_program" | "torchscript".
-    device            - target device string for compilation ("cuda:0" by default).
-    use_explicit_typing - torch-tensorrt "strong typing" mode. Must stay False for mixed
-                          fp16/int8 graphs: newer torch-tensorrt versions require
-                          enabled_precisions == {float32} when this is True, which is
-                          incompatible with the fp16/int8 mix this exporter builds.
+    workspace_bytes    - builder workspace limit (0 = TensorRT default).
+    timing_cache_path  - persisted timing cache for faster rebuilds.
+    plugin_libraries   - TensorRT plugin .so files needed by custom ONNX ops.
+    int4_backend       - "dequantize" (plain TensorRT DequantizeLinear, no
+                         extra dependency) or "edgellm_plugin" (TensorRT
+                         Edge-LLM's INT4 GEMM plugin for eligible layers: fast
+                         single-token INT4, but the engine then needs
+                         libNvInfer_edgellm_plugin.so; see edgellm_int4.py).
     """
 
-    use_fp16: bool = True
-    min_block_size: int = 1
-    workspace_size: int = 0
-    truncate_double: bool = True
+    build_engine: bool = True
+    int4_backend: str = "dequantize"
+    engine_path: str | None = None
     optimization_level: int | None = None
-    output_format: str = "exported_program"
-    device: str = "cuda:0"
-    use_explicit_typing: bool = False
+    workspace_bytes: int = 0
+    timing_cache_path: str | None = None
+    plugin_libraries: tuple[str, ...] = ()
 
 
-def _detect_float_dtype(wrapper: nn.Module) -> torch.dtype:
-    """Return the model's native floating dtype (first 2-D float parameter)."""
-    for _, tensor in wrapper.state_dict().items():
-        if tensor.ndim >= 2 and type(tensor) is torch.Tensor and tensor.is_floating_point():
-            return tensor.dtype
-    return torch.float32
+def engine_profiles(manifest: dict) -> list[OptimizationProfile]:
+    """Decode profile (+ prefill profile when the graph has a dynamic seq)."""
+    profiles = [OptimizationProfile(shapes={"input_ids": ((1,), (1,), (1,))})]
+    max_input_len = int(manifest.get("max_input_len", 1))
+    if max_input_len > 1:
+        opt = min(128, max_input_len)
+        profiles.append(OptimizationProfile(shapes={"input_ids": ((1,), (opt,), (max_input_len,))}))
+    return profiles
 
 
-def _compile_tensorrt(exported_program: Any, example_inputs: tuple[Any, ...], *, config: "TensorRTExportConfig", enabled_precisions: set):
-    """Call torch-tensorrt's Dynamo compile, tolerating the arg_inputs/inputs rename."""
-    import torch_tensorrt
-
-    compile_kwargs: dict[str, Any] = {
-        "enabled_precisions": enabled_precisions,
-        "min_block_size": config.min_block_size,
-        "truncate_double": config.truncate_double,
-        "device": config.device,
-        "use_explicit_typing": config.use_explicit_typing,
-    }
-    if config.workspace_size:
-        compile_kwargs["workspace_size"] = config.workspace_size
-    if config.optimization_level is not None:
-        compile_kwargs["optimization_level"] = config.optimization_level
-
-    # torch-tensorrt renamed `inputs` → `arg_inputs`; support both.
-    try:
-        return torch_tensorrt.dynamo.compile(
-            exported_program, arg_inputs=list(example_inputs), **compile_kwargs
-        )
-    except TypeError:
-        return torch_tensorrt.dynamo.compile(
-            exported_program, inputs=list(example_inputs), **compile_kwargs
-        )
-
-
-def _save_tensorrt(trt_module: Any, output_path: str, example_inputs: tuple[Any, ...], *, output_format: str) -> None:
-    import torch_tensorrt
-
-    # io_* cache modes append a list[Tensor] per cache (key_caches, value_caches)
-    # to example_inputs. torch_tensorrt.save's default retrace=True path requires
-    # arg_inputs to be a flat Sequence[Tensor | Input] (it validates every element
-    # individually and errors on nested lists) even though the compiled module's
-    # own forward signature — and torch.export itself — accept the nested pytree
-    # just fine (dynamo.compile's arg_inputs typing is looser and traces correctly).
-    # retrace=False (the "legacy exporter": pure graph surgery on the already-
-    # compiled module, no re-tracing) has no such restriction and doesn't consume
-    # arg_inputs at all, so it works unchanged for both flat and nested contracts.
-    has_nested_inputs = any(isinstance(x, (list, tuple)) for x in example_inputs)
-    if has_nested_inputs:
-        torch_tensorrt.save(
-            trt_module, output_path, output_format=output_format, retrace=False
-        )
-        return
-
-    try:
-        torch_tensorrt.save(
-            trt_module, output_path, arg_inputs=list(example_inputs), output_format=output_format
-        )
-    except TypeError:
-        torch_tensorrt.save(
-            trt_module, output_path, inputs=list(example_inputs), output_format=output_format
-        )
-
-
-def _run_trt_inference_stats(
-    wrapper: nn.Module,
-    trt_module: Any,
-    inference_inputs: tuple[Any, ...],
-) -> dict[str, float] | None:
-    """Compare a float wrapper forward pass against the compiled TensorRT module.
-
-    Returns None if the TensorRT module cannot be executed here (e.g. no CUDA
-    device available), matching the ExecuTorch runtime-absent behaviour.
-    """
-    try:
-        y_ref = reference_logits(wrapper, inference_inputs)
-        device = next((p.device for p in getattr(trt_module, "parameters", lambda: [])()), None)
-        trt_inputs = inference_inputs
-        if device is not None and device.type == "cuda":
-            trt_inputs = to_device(inference_inputs, device)
-        return logit_error_stats(y_ref, trt_module(*trt_inputs))
-    except Exception as exc:  # noqa: BLE001 — stats are best-effort
-        import warnings
-        warnings.warn(f"TensorRT inference stats skipped: {exc}", stacklevel=2)
-        return None
-
-
-def export_with_tensorrt(
-    model_or_graph: Any,
+def build_engine_from_manifest(
+    manifest_path: str,
+    engine_path: str | None = None,
     *,
-    config: TensorRTExportConfig,
-) -> TensorRTExportResult:
-    warnings.warn(
-        "The torch-tensorrt 'tensorrt' backend is deprecated: its engine only runs on the build GPU, "
-        "its mutable KV cache executes in PyTorch on the CPU, and it relies on weak typing (removed "
-        "in TensorRT 11). Use backend='tensorrt_onnx' (TensorRTONNXExportConfig) instead.",
-        DeprecationWarning,
-        stacklevel=2,
+    optimization_level: int | None = None,
+    workspace_bytes: int = 0,
+    timing_cache_path: str | None = None,
+    plugin_libraries: tuple[str, ...] = (),
+    verbose: bool = False,
+) -> str:
+    """Build the engine for an exported ONNX (on the machine that will run it)."""
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    plugin_libraries = resolve_plugin_libraries(manifest, tuple(plugin_libraries))
+    onnx_path = os.path.join(os.path.dirname(os.path.abspath(manifest_path)), manifest["onnx_file"])
+    engine_path = engine_path or os.path.splitext(onnx_path)[0] + ".engine"
+    serialized = build_engine(onnx_path, EngineBuildConfig(
+        profiles=engine_profiles(manifest),
+        optimization_level=optimization_level,
+        workspace_bytes=workspace_bytes,
+        timing_cache_path=timing_cache_path,
+        plugin_libraries=tuple(plugin_libraries),
+        verbose=verbose,
+    ))
+    with open(engine_path, "wb") as f:
+        f.write(serialized)
+    return engine_path
+
+
+def export_with_tensorrt(model_or_graph, *, config: TensorRTExportConfig) -> TensorRTExportResult:
+    if config.int4_backend not in ("dequantize", "edgellm_plugin"):
+        raise ValueError(f"Unsupported int4_backend {config.int4_backend!r}")
+    if config.int4_backend == "edgellm_plugin":
+        config = dataclasses.replace(config, graph_passes=[*config.graph_passes, edgellm_int4_pass])
+    onnx_result = export_with_onnx(model_or_graph, config=config)
+    result = TensorRTExportResult(**vars(onnx_result))
+    if config.build_engine:
+        result.engine_path = build_engine_from_manifest(
+            onnx_result.manifest_path,
+            config.engine_path,
+            optimization_level=config.optimization_level,
+            workspace_bytes=config.workspace_bytes,
+            timing_cache_path=config.timing_cache_path,
+            plugin_libraries=config.plugin_libraries,
+            verbose=config.verbose,
+        )
+    return result
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Build a TensorRT engine from a tsurgeon ONNX manifest.")
+    parser.add_argument("manifest", help="<model>.manifest.json written by the ONNX exporter")
+    parser.add_argument("--engine", default=None, help="output engine path (default: next to the ONNX)")
+    parser.add_argument("--optimization-level", type=int, default=None)
+    parser.add_argument("--timing-cache", default=None)
+    parser.add_argument("--plugin", action="append", default=[], help="TensorRT plugin library (repeatable)")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args(argv)
+    path = build_engine_from_manifest(
+        args.manifest, args.engine,
+        optimization_level=args.optimization_level,
+        timing_cache_path=args.timing_cache,
+        plugin_libraries=tuple(args.plugin),
+        verbose=args.verbose,
     )
-    os.makedirs(os.path.dirname(config.output_path) or ".", exist_ok=True)
+    print(path)
 
-    wrapper, model_config, example_inputs = resolve_components_and_wrapper(
-        model_or_graph,
-        config=config,
-    )
 
-    # Detect per-layer compression metadata (hard / soft quantized layers).
-    # Quantization is driven entirely by model metadata — config precision fields
-    # only tune the float parts of the graph.
-    layer_info = extract_layer_quant_info(wrapper)
+if __name__ == "__main__":
+    main()
 
-    exported = torch_export(wrapper, example_inputs)
 
-    # Base precisions for the un-quantized parts of the graph.
-    float_dtype = _detect_float_dtype(wrapper)
-    enabled_precisions: set = {torch.float32}
-    if config.use_fp16 or float_dtype == torch.float16:
-        enabled_precisions.add(torch.float16)
-
-    program_for_trt = exported
-    exported_for_mismatch = None
-
-    if layer_info:
-        from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
-
-        quantizer = build_tensorrt_quantizer(layer_info)
-        prepared = prepare_pt2e(exported.module(), quantizer)
-
-        # Calibration pass with real text so activation observers collect
-        # representative statistics (see common.calibrate_pt2e_observers).
-        calibrate_pt2e_observers(prepared, model_config, config, example_inputs=example_inputs)
-
-        # Override observer results with exact surgeon scales (hard weights +
-        # calibrated activations).
-        inject_scales_into_pt2e_observers(prepared, layer_info)
-
-        converted = convert_pt2e(prepared)
-        quantized_exported = torch_export(converted, example_inputs)
-        program_for_trt = quantized_exported
-        exported_for_mismatch = quantized_exported
-
-        # The quantized linears already carry explicit Q/DQ ops (from convert_pt2e),
-        # which is what lets TensorRT build INT8/INT4 layers for them. Do NOT also
-        # add torch.int8 to enabled_precisions: that flag asks the builder for
-        # *implicit*, network-wide INT8 quantization, which requires a calibrator
-        # (or explicit dynamic range) on every tensor in the graph, not just the
-        # already-quantized ones — and fails with "Calibration failure occurred
-        # with no scaling factors detected" for the untouched float layers.
-
-    trt_module = _compile_tensorrt(
-        program_for_trt,
-        example_inputs,
-        config=config,
-        enabled_precisions=enabled_precisions,
-    )
-
-    _save_tensorrt(
-        trt_module,
-        config.output_path,
-        example_inputs,
-        output_format=config.output_format,
-    )
-
-    result_precision = "mixed" if layer_info else "full"
-
-    return finalize_export_result(
-        output_path=config.output_path,
-        backend="tensorrt",
-        precision=result_precision,
-        wrapper=wrapper,
-        exported_for_mismatch=exported_for_mismatch,
-        run_weight_mismatch_check=config.run_weight_mismatch_check,
-        weight_mismatch_eps=config.weight_mismatch_eps,
-        verbose=config.verbose,
-        inference_stats_fn=lambda: _run_trt_inference_stats(wrapper, trt_module, example_inputs),
-        result_cls=TensorRTExportResult,
-        model_config=model_config,
-    )
+__all__ = [
+    "DECODE_PROFILE",
+    "PREFILL_PROFILE",
+    "TensorRTExportConfig",
+    "TensorRTExportResult",
+    "build_engine_from_manifest",
+    "engine_profiles",
+    "export_with_tensorrt",
+]

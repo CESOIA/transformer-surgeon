@@ -5,8 +5,7 @@ This is the TensorRT half of the ONNX export path (``export/onnx``): the ONNX
 file is the portable artifact, and an engine is built from it *on the machine
 that will run it* (a TensorRT engine is tied to the GPU architecture and the
 TensorRT version it was built with -- an x86 build does not run on a Jetson).
-Nothing here depends on torch-tensorrt; only the ``tensorrt`` Python package
-and torch (for device buffers) are needed.
+Only the ``tensorrt`` Python package and torch (for device buffers) are needed.
 
   * build_engine()        ONNX -> serialized engine (strongly typed).
   * TensorRTEngineRunner   Binds torch CUDA tensors to an engine's I/O, runs it,

@@ -7,7 +7,7 @@ module degrades gracefully:
     HF roundtrip   -> always runnable (needs Hub access)
     convert graph  -> always runnable
     XNNPACK (.pte) -> requires the `executorch` extra
-    TensorRT       -> requires torch-tensorrt + CUDA
+    TensorRT       -> requires onnx, the `tensorrt` package + CUDA (ONNX -> engine)
     QNN (.pte)     -> requires the Qualcomm QNN SDK (skipped in most environments)
 
 All exports are marked ``slow`` (they compile/lower a real graph).
@@ -149,48 +149,8 @@ def test_export_xnnpack_custom_sdpa(qwen_classes, out_dir):
 
 
 @caps.requires_tensorrt
-def test_export_tensorrt(qwen_classes, out_dir):
-    ModelCls, ManagerCls, convert_for_export = qwen_classes
-    from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTExportConfig
-
-    model = _quantize_two_mlp_layers(_load_float_model(ModelCls), ManagerCls)
-    comps = _components(model, convert_for_export)  # components stay on CPU
-
-    ep = os.path.join(out_dir, "qwen2_trt.pt2")
-    cfg = TensorRTExportConfig(output_path=ep, backend="tensorrt", device="cuda:0",
-                               convert_options={"use_sdpa": False},
-                               run_weight_mismatch_check=False, verbose=False)
-    result = export_to_backend(comps, config=cfg)
-    assert getattr(result, "engine_path", None)
-    assert os.path.isfile(result.engine_path)
-
-
-@caps.requires_tensorrt
-def test_export_tensorrt_cuda_resident_model(qwen_classes, out_dir):
-    """docs/investigations/FRAMEWORK_PROBLEMS.md #4: the documented one-liner must also work when
-    the caller's model is already CUDA-resident, not just CPU-resident."""
-    ModelCls, ManagerCls, _ = qwen_classes
-    from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTExportConfig
-
-    model = _quantize_two_mlp_layers(_load_float_model(ModelCls), ManagerCls)
-    model = model.to("cuda")  # the natural thing to do on a GPU box; previously fatal
-
-    ep = os.path.join(out_dir, "qwen2_trt_cuda_resident.pt2")
-    cfg = TensorRTExportConfig(output_path=ep, backend="tensorrt", device="cuda:0",
-                               convert_options={"use_sdpa": False},
-                               run_weight_mismatch_check=False, verbose=False)
-    # Pass the raw, CUDA-resident HF model directly -- exactly the documented
-    # README.md / AGENTS.md one-liner, no manual CPU-keeping discipline needed.
-    result = export_to_backend(model, config=cfg)
-    assert getattr(result, "engine_path", None)
-    assert os.path.isfile(result.engine_path) and os.path.getsize(result.engine_path) > 0
-
-
-@caps.requires_tensorrt_py
 @pytest.mark.parametrize("int4_backend", [None, "dequantize", "edgellm_plugin"])
-def test_export_tensorrt_onnx(qwen_classes, out_dir, int4_backend):
+def test_export_tensorrt(qwen_classes, out_dir, int4_backend):
     """ONNX -> plain TensorRT (the Jetson path): in-place KV cache, prefill +
     CUDA-graph decode through TensorRTLLMSession, greedy tokens vs eager."""
     if int4_backend == "edgellm_plugin" and not caps.HAS_EDGELLM_PLUGIN:
@@ -198,7 +158,7 @@ def test_export_tensorrt_onnx(qwen_classes, out_dir, int4_backend):
     ModelCls, ManagerCls, convert_for_export = qwen_classes
     from transformersurgeon.export import export_to_backend
     from transformersurgeon.export.common import build_wrapper, build_zero_caches
-    from transformersurgeon.export.tensorrt import TensorRTONNXExportConfig
+    from transformersurgeon.export.tensorrt import TensorRTExportConfig
     from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
 
     model = _load_float_model(ModelCls)
@@ -210,7 +170,7 @@ def test_export_tensorrt_onnx(qwen_classes, out_dir, int4_backend):
         mgr.apply(hard=True, criteria=crit)
     options = {"use_sdpa": False, "cache_impl": "io_inplace", "max_cache_len": 128,
                "rmsnorm_prescale": False, "rmsnorm_upcast": True}
-    cfg = TensorRTONNXExportConfig(output_path=os.path.join(out_dir, "model.onnx"), backend="tensorrt_onnx",
+    cfg = TensorRTExportConfig(output_path=os.path.join(out_dir, "model.onnx"), backend="tensorrt",
                                    max_input_len=32, convert_options=options,
                                    int4_backend=int4_backend or "dequantize")
     result = export_to_backend(model, config=cfg)

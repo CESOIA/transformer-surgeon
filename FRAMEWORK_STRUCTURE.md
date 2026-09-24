@@ -150,13 +150,17 @@ An indexing block can opt entirely out of cascade calibration with `'no_cascade_
 - `hf/hf_export.py`
 	- Saves/publishes compressed models to Hugging Face Hub (`export_to_hf`).
 - `export/export.py`
-	- `export_to_backend(model_or_graph, config)` — the generic backend-export entry point. Resolves the model into `{embedding, decoder, final_layer, config}`, then delegates to the backend named in `config.backend` via `export/registry.py`'s `EXPORT_ROUTINES`. `export_to_executorch(...)` is a deprecated alias.
+	- `export_to_backend(model_or_graph, config)` — the generic backend-export entry point. Resolves the model into `{embedding, decoder, final_layer, config}`, then delegates to the backend named in `config.backend` via `export/registry.py`'s `EXPORT_ROUTINES`.
 - `export/common.py`
 	- Backend-agnostic machinery shared by every backend exporter: model wrapper construction, per-layer compression-metadata extraction (`extract_layer_quant_info`), PT2E scale injection/calibration, weight-mismatch checks, and result assembly (`finalize_export_result`).
 - `export/executorch_exporters/{xnnpack,qnn}/`
 	- ExecuTorch backend exporters (`XNNPACKExportConfig`/`export_with_xnnpack`, `QNNExportConfig`/`export_with_qnn`), each producing a `.pte` file. Mixed INT8/INT4 + float export is driven entirely by per-layer compression metadata already on the model.
 - `export/tensorrt/`
-	- TensorRT backend exporter (`TensorRTExportConfig`/`export_with_tensorrt`), lowering via `torch-tensorrt`'s Dynamo path to a TensorRT engine/exported program. Reuses `export/common.py` for everything except the quantizer and compile/save step. Requires the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests under `test/e2e/test_export_pipelines.py`, CLI runner at `scripts/tensorrt/run_export.sh`.
+	- TensorRT via ONNX (`TensorRTExportConfig`/`export_with_tensorrt`): the `export/onnx/` export (portable ONNX + manifest) plus an engine build (`tensorrt_export.py`, also a CLI for building on the target device), engine helpers (`engine.py`), a generation runtime (`session.py`, `TensorRTLLMSession`) and the opt-in TensorRT Edge-LLM INT4 plugin pass (`edgellm_int4.py`). Needs the `onnx` extra, the `tensorrt` package and a CUDA device; CLI at `scripts/tensorrt/export_and_generate.py`.
+- `export/onnx/`
+	- Target-agnostic ONNX exporter (`ONNXExportConfig`/`export_with_onnx`): in-place KV cache (`TensorScatter`), optional prompt prefill, weight-only Q/DQ.
+- `export/linear_quantizer.py`
+	- Linear-only PT2E quantizer shared by the PT2E backends; each backend supplies its own per-layer quantization configs.
 
 ## End-to-End Data Flow
 

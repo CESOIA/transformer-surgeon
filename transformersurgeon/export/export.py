@@ -1,4 +1,3 @@
-import warnings
 from typing import Any
 
 import torch.nn as nn
@@ -121,17 +120,7 @@ def export_to_backend(
     export_routine = EXPORT_ROUTINES[config.backend]["export"]
     return export_routine(normalized_model_or_graph, config=config)
 
-# Deprecated
-def export_to_executorch(*args, **kwargs):
-    """Deprecated alias for export_to_backend."""
-    warnings.warn(
-        "export_to_executorch is deprecated. Use export_to_backend instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return export_to_backend(*args, **kwargs)
 
 __all__ = [
     "export_to_backend",
-    "export_to_executorch",
 ]

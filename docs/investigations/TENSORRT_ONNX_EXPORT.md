@@ -14,10 +14,11 @@ Orin run is future work (see §7).
 
 - **Not TensorRT-LLM.** Since 1.2 it has no TensorRT backend at all (PyTorch is
   its only runtime), and it never properly supported Orin Nano.
-- **Not the existing `tensorrt` backend (torch-tensorrt).** Its artifact is an
-  engine compiled for the build GPU (does not run on a Jetson), it keeps the
+- **Not the previous torch-tensorrt `tensorrt` backend** (since removed; the
+  ONNX path now owns the `tensorrt` name). Its artifact was an
+  engine compiled for the build GPU (did not run on a Jetson), it kept the
   mutable KV cache in PyTorch on the CPU (graph splits + host↔device copies
-  per token), and it relies on weak typing (removed in TensorRT 11).
+  per token), and it relied on weak typing (removed in TensorRT 11).
 - **ONNX + engine built on the target.** An engine is tied to GPU arch +
   TensorRT version, so the portable artifact is ONNX; the engine is built on
   the device. This is also exactly what NVIDIA's own edge stack does.
@@ -75,10 +76,10 @@ MatMul/Softmax over the (Orin-sized, 1024-slot) cache.
   names, cache shapes/layout/dtype, eos ids, quantized layers, plugin needs);
   weight-only Q/DQ (`quantization.py`); extension points `custom_translations`
   and `graph_passes`.
-- **`tensorrt_onnx` backend** (`export/tensorrt/onnx_backend.py`): onnx export
+- **`tensorrt` backend** (`export/tensorrt/tensorrt_export.py`): onnx export
   + optional local engine build (strongly typed; decode and prefill
   optimization profiles). CLI for on-device builds:
-  `python -m transformersurgeon.export.tensorrt.onnx_backend model.manifest.json`.
+  `python -m transformersurgeon.export.tensorrt.tensorrt_export model.manifest.json`.
 - **Runtime** (`export/tensorrt/engine.py`, `session.py`): engine build/run on
   torch CUDA tensors, profile-sharing runners, CUDA-graph capture;
   `TensorRTLLMSession` does chunked prefill + CUDA-graph greedy decode (engine
@@ -154,7 +155,7 @@ INT8 weight-only brings nothing on TensorRT (folded to fp16).
   block spanning the whole row returns NaNs (per-channel INT4 uses ≥ 2 blocks).
 
 Tests: `test/unit/test_io_inplace_cache.py`, `test/unit/test_onnx_tensorrt_export.py`,
-`test/e2e/test_export_pipelines.py::test_export_tensorrt_onnx` (FP16, W4,
+`test/e2e/test_export_pipelines.py::test_export_tensorrt` (FP16, W4,
 W4+plugin on the real checkpoint). Full suite: 107 passed; XNNPACK/custom-SDPA
 tests re-run in the ExecuTorch env: pass.
 

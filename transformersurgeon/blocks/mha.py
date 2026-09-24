@@ -81,25 +81,6 @@ def attention(query, key, value, attn_mask=None, kv_layout="shd"):
     attn_output = torch.matmul(scores.to(dtype), value)  # (kv_head_num, group, q_seq_len, v_head_dim)
     attn_output = attn_output.reshape(q_head_num, q_seq_len, v_head_dim)
 
-    # -------------------------------------------------------------------------
-    # ALTERNATIVE — einsum GQA (also avoids KV materialization).
-    # To use: comment out the block above and uncomment this one.
-    # -------------------------------------------------------------------------
-    # query = query.transpose(0, 1).reshape(kv_head_num, group_size, -1, q_head_dim)
-    # key   = key.transpose(0, 1)    # (kv_heads, kv_len, k_head_dim)
-    # value = value.transpose(0, 1)  # (kv_heads, kv_len, v_head_dim)
-    #
-    # scores = torch.einsum("hgsd,hkd->hgsk", query, key) * scale
-    #
-    # if attn_mask is not None:
-    #     scores = scores + attn_mask
-    #
-    # scores = torch.nn.functional.softmax(scores, dim=-1)
-    #
-    # attn_output = torch.einsum("hgsk,hkd->hgsd", scores.to(dtype), value)
-    # attn_output = attn_output.reshape(q_head_num, q_seq_len, v_head_dim)
-    # -------------------------------------------------------------------------
-
     return attn_output.to(dtype)  # (q_head_num, q_seq_len, v_head_dim)
 
 class MHABase(torch.nn.Module):

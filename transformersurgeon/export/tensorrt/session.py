@@ -20,7 +20,7 @@ import torch
 
 from .edgellm_int4 import resolve_plugin_libraries
 from .engine import TensorRTEngineRunner
-from .onnx_backend import DECODE_PROFILE, PREFILL_PROFILE
+from .tensorrt_export import DECODE_PROFILE, PREFILL_PROFILE
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 

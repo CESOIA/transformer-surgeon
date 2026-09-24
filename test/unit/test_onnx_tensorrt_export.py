@@ -1,4 +1,4 @@
-"""ONNX export ("onnx") and plain-TensorRT ("tensorrt_onnx") backends on a tiny
+"""ONNX export ("onnx") and plain-TensorRT ("tensorrt") backends on a tiny
 random-weight Qwen2 -- no downloads. TensorRT tests are capability-gated.
 
 See docs/investigations/TENSORRT_ONNX_EXPORT.md for why this path exists.
@@ -108,14 +108,14 @@ def test_weight_quantization_pass_is_exact(precision):
     np.testing.assert_allclose(q_out * s_out, w.astype(np.float32), rtol=1e-3)
 
 
-@caps.requires_tensorrt_py
+@caps.requires_tensorrt
 def test_tensorrt_session_matches_eager(tmp_path):
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTONNXExportConfig
+    from transformersurgeon.export.tensorrt import TensorRTExportConfig
     from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
 
     model = _tiny(torch.float16)
-    cfg = TensorRTONNXExportConfig(output_path=str(tmp_path / "model.onnx"), backend="tensorrt_onnx",
+    cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), backend="tensorrt",
                                    max_input_len=8, convert_options=CONVERT)
     result = export_to_backend(model, config=cfg)
     session = TensorRTLLMSession(result.manifest_path)
@@ -138,7 +138,7 @@ def test_tensorrt_session_matches_eager(tmp_path):
 @caps.requires_edgellm_plugin
 def test_edgellm_int4_plugin_matches_dequantize_backend(tmp_path):
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTONNXExportConfig
+    from transformersurgeon.export.tensorrt import TensorRTExportConfig
     from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
     from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 
@@ -151,7 +151,7 @@ def test_edgellm_int4_plugin_matches_dequantize_backend(tmp_path):
         manager.set("quantization", "precision", 4, criteria=crit)
         manager.set("quantization", "granularity", "per_channel", criteria=crit)
         manager.apply(hard=True, criteria=crit)
-        cfg = TensorRTONNXExportConfig(output_path=str(tmp_path / backend / "model.onnx"), backend="tensorrt_onnx",
+        cfg = TensorRTExportConfig(output_path=str(tmp_path / backend / "model.onnx"), backend="tensorrt",
                                        max_input_len=8, convert_options=CONVERT, int4_backend=backend)
         result = export_to_backend(model, config=cfg)
         manifest = json.load(open(result.manifest_path))

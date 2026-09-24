@@ -61,6 +61,7 @@ nav:
       - Common (shared machinery): api/export/common.md
       - XNNPACK: api/export/xnnpack.md
       - QNN: api/export/qnn.md
+      - ONNX: api/export/onnx.md
       - TensorRT: api/export/tensorrt.md
 
 markdown_extensions:

@@ -1,14 +1,20 @@
 # TensorRT Export
 
-Lowers to a TensorRT engine via `torch-tensorrt`'s Dynamo path. Reuses all the
-backend-agnostic machinery in [`export.common`](common.md); only the PT2E
-quantizer and the compile/save step are TensorRT-specific.
+Exports through [ONNX](onnx.md) and builds a strongly typed TensorRT engine from
+it. The ONNX file plus its manifest are the portable artifact; build the engine
+on the device that will run it
+(`python -m transformersurgeon.export.tensorrt.tensorrt_export model.manifest.json`).
 
 !!! note "Requirements"
-    Requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) and a CUDA
-    device. Tests live under `test/e2e/test_export_pipelines.py`; CLI runner at
-    `scripts/tensorrt/run_export.sh`.
+    `pip install -e ".[onnx]"`, the `tensorrt` Python package matching your CUDA
+    (e.g. `tensorrt-cu13`) and a CUDA device. CLI:
+    `scripts/tensorrt/export_and_generate.py`. Background and benchmarks:
+    `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
 
 ::: transformersurgeon.export.tensorrt.tensorrt_export
 
-::: transformersurgeon.export.tensorrt.quantizer
+::: transformersurgeon.export.tensorrt.engine
+
+::: transformersurgeon.export.tensorrt.session
+
+::: transformersurgeon.export.tensorrt.edgellm_int4
