@@ -132,7 +132,7 @@ TensorRT requires the `tensorrt` extra (`pip install -e ".[tensorrt]"`) plus a C
 |---|---|---|
 | `"manual"` (default) | Explicit GQA-aware softmax/matmul (`attention()` in `mha.py`) | Always available, any backend |
 | `"sdpa"` | `torch.nn.functional.scaled_dot_product_attention` | Equivalent to the legacy `use_sdpa=True` |
-| `"custom_sdpa"` | ExecuTorch's fused CPU custom ops (`torch.ops.llama.custom_sdpa` / `update_cache`) | XNNPACK-only; ~30% faster decode in benchmarking (Qwen2-0.5B, CPU). Requires `cache_impl="mutable"` and `q_head_dim == value_head_dim` — both validated at construction/forward time rather than silently producing wrong output |
+| `"custom_sdpa"` | ExecuTorch's fused CPU custom ops (`torch.ops.llama.custom_sdpa` / `update_cache`) | XNNPACK-only. Requires `cache_impl="mutable"` and `q_head_dim == value_head_dim` — both validated at construction/forward time rather than silently producing wrong output |
 
 `custom_sdpa` needs ExecuTorch's `executorch.extension.llm.custom_ops` extension importable both at **export** time (`MHACausal.__init__` imports it lazily, guarded with a clear `RuntimeError` if unavailable) and at **inference** time in whatever process later loads the `.pte` — the AOT registration from the export process does not carry over to a separate process. `scripts/executorch/xnnpack/inference_exported_test.py` handles this by conditionally re-importing the extension, keyed off an `attn_impl` field in the `.cache_meta.json` sidecar written by `exporter_function_test.py`.
 
@@ -145,7 +145,7 @@ and every component's hidden states carry an explicit leading batch dim
 (`(1, in_seq_len, ...)`) instead of the framework's usual bare `(in_seq_len,
 ...)` contract — matching ExecuTorch's own llama exporter's convention, on the
 hypothesis that XNNPACK may select faster GEMM/FC microkernels or weight
-packing for batched shapes (see `XNNPACK_DECODE_SPEED_FIX.md` for the
+packing for batched shapes (see `docs/investigations/XNNPACK_DECODE_SPEED_FIX.md` for the
 investigation this came out of). Threaded through `blocks/config.py`,
 `utils/convert.py`, `blocks/decoder.py` exactly like `attn_impl`/`cache_impl`.
 
@@ -166,8 +166,8 @@ supported by every op converter on those backends, so treat it as
 
 ### QNN: decode-speed options
 
-See [QNN_DECODE_SPEED_FIX.md](QNN_DECODE_SPEED_FIX.md) for the investigation and
-measurements, and [QNN_SPEED_SUMMARY.md](QNN_SPEED_SUMMARY.md) for the plain-language
+See [QNN_DECODE_SPEED_FIX.md](docs/investigations/QNN_DECODE_SPEED_FIX.md) for the investigation and
+measurements, and [QNN_SPEED_SUMMARY.md](docs/investigations/QNN_SPEED_SUMMARY.md) for the plain-language
 version.
 
 | Option | Where | Default | Notes |
@@ -187,6 +187,15 @@ Qwen2-0.5B. The math is unchanged either way.
 was always 2048 slots regardless of `--max-sequence-length`.
 
 ---
+
+## Open TODOs
+
+Known gaps, flagged in the code with a greppable `TODO(<tag>)` (comment + docstring) — `git grep -n 'TODO('`:
+
+| Tag | Where | Gap |
+|---|---|---|
+| `TODO(P3a)` | `blocks/embedding_compressed.py::EmbeddingCompressed` | No weight-quantization path: embeddings (and tied `lm_head`) stay fp32 in quantized exports, dominating `.pte` size on large-vocab models. See `docs/investigations/FRAMEWORK_PROBLEMS.md` P3a/P3b. |
+| `TODO(custom_sdpa-encoder)` | `blocks/mha.py::MHAEncoder` | `attn_impl="custom_sdpa"` only exists on `MHACausal`; encoder-only models can't use the fused ExecuTorch kernel yet. |
 
 ## Compression Parameter Reference
 

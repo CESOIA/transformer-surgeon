@@ -39,7 +39,7 @@ MODERNBERT_C_INDEXING = {
         # already lives inside one matrix, and the framework's coupled/shared
         # -mask pruning operates on whole Linear rows across modules. Coupled
         # structured pruning is therefore not wired for this family, mirroring
-        # the fused `attn.qkv` vision tower in qwen2_vl_c (FRAMEWORK_PROBLEMS.md #6).
+        # the fused `attn.qkv` vision tower in qwen2_vl_c (docs/investigations/FRAMEWORK_PROBLEMS.md #6).
         'pruning': {
             'output_dependence': {},
             'coupled_masks': [],
@@ -54,7 +54,7 @@ MODERNBERT_C_INDEXING = {
         # (`_attach_position_embeddings_if_configured`) does not model -- it
         # calls the configured rotary module the same way for every block.
         # Cascade calibration is therefore unsupported here, same as bert_c
-        # (see FRAMEWORK_PROBLEMS.md #1 and `no_cascade_calibration` there).
+        # (see docs/investigations/FRAMEWORK_PROBLEMS.md #1 and `no_cascade_calibration` there).
         'no_cascade_calibration': True,
         'path_template': "model.layers.{block_index}.{path}",
         'qkv_paths': ['attn.Wqkv'],

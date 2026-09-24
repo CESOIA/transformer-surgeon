@@ -3,7 +3,7 @@
 BERT is marked ``no_cascade_calibration=True`` in
 ``models/bert_c/indexing_bert_c.py`` because its grouped/bidirectional layer
 layout is not compatible with the block-wise cascade algorithm in
-``utils/cascade.py`` (see FRAMEWORK_PROBLEMS.md). That flag used to be silently
+``utils/cascade.py`` (see docs/investigations/FRAMEWORK_PROBLEMS.md). That flag used to be silently
 ignored: ``apply_cascade`` built a ``selected_by_block`` dict but never
 populated it (a leftover from a prior refactor that dropped the
 ``scheme.block_name`` population loop because that attribute doesn't exist),

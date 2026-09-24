@@ -8,7 +8,7 @@ for causal LMs, ``convert_for_export``.
 
 These run in-process with zero downloads and are the fast backbone of the suite.
 Families with a known, still-open framework bug are xfailed with a pointer to
-``FRAMEWORK_PROBLEMS.md`` so a regression that *fixes* them shows up as XPASS.
+``docs/investigations/FRAMEWORK_PROBLEMS.md`` so a regression that *fixes* them shows up as XPASS.
 """
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ def test_quantization_int8_apply(name):
     """int8 quantization applies (precision as the integer 8) and forward runs.
 
     NB: precision is the integer 8, not the string "int8" — the latter is what the
-    docs show but the validator rejects it (FRAMEWORK_PROBLEMS.md #2).
+    docs show but the validator rejects it (docs/investigations/FRAMEWORK_PROBLEMS.md #2).
     """
     spec = _spec(name)
     model, mgr = _build_manager(spec)
@@ -107,14 +107,14 @@ def test_structured_prune_hard_mlp(name):
     Coupled MLP projections (gate/up in gated MLPs) are pruned together with a
     shared mask so the elementwise product stays shape-consistent and the cascade
     into down_proj matches. Pruning only one of a coupled pair silently produces a
-    broken model (FRAMEWORK_PROBLEMS.md #3) — this test deliberately does it right.
+    broken model (docs/investigations/FRAMEWORK_PROBLEMS.md #3) — this test deliberately does it right.
     """
     spec = _spec(name)
     if spec.known_broken:
         pytest.xfail(spec.known_broken)
     if not spec.struct_prune_supported:
         pytest.skip("structured MLP pruning not wired for this family "
-                    "(dual-tower VL, FRAMEWORK_PROBLEMS.md #6)")
+                    "(dual-tower VL, docs/investigations/FRAMEWORK_PROBLEMS.md #6)")
     model = spec.build().eval()
     mgr = spec.manager(model)
 

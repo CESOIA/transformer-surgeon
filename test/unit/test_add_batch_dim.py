@@ -1,7 +1,7 @@
 """add_batch_dim (MHACausal / TransformerDecoder): numeric parity against the
 default unbatched contract, including under per-kv-group pruned RoPE, plus a
 full TransformerDecoder-level shape check. See AGENTS.md's "add_batch_dim"
-section and XNNPACK_DECODE_SPEED_FIX.md for why this option exists.
+section and docs/investigations/XNNPACK_DECODE_SPEED_FIX.md for why this option exists.
 """
 from __future__ import annotations
 

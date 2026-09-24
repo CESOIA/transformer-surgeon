@@ -79,7 +79,7 @@ def export_with_xnnpack(
     # of the MemoryPlanningPass default (alloc_graph_input=True), which copies the
     # input tensor into an internal buffer on every forward() call. ExecuTorch's
     # own llama exporter (extension/llm/export/builder.py) sets this explicitly
-    # for the same reason - see FRAMEWORK_PROBLEMS.md P1.
+    # for the same reason - see docs/investigations/FRAMEWORK_PROBLEMS.md P1.
     from executorch.exir import ExecutorchBackendConfig
     from executorch.exir.passes import MemoryPlanningPass
 

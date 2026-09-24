@@ -44,7 +44,7 @@ def _load_float_model(ModelCls):
     """Load the checkpoint on CPU in float16. Kept on CPU: the backend exporters
     build fake-tensor example inputs on CPU and place the graph on the target
     device themselves (moving the whole model to CUDA first breaks torch.export —
-    see FRAMEWORK_PROBLEMS.md #4)."""
+    see docs/investigations/FRAMEWORK_PROBLEMS.md #4)."""
     try:
         return ModelCls.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).eval()
     except Exception as exc:  # network / auth failure -> skip, don't fail
@@ -168,7 +168,7 @@ def test_export_tensorrt(qwen_classes, out_dir):
 
 @caps.requires_tensorrt
 def test_export_tensorrt_cuda_resident_model(qwen_classes, out_dir):
-    """FRAMEWORK_PROBLEMS.md #4: the documented one-liner must also work when
+    """docs/investigations/FRAMEWORK_PROBLEMS.md #4: the documented one-liner must also work when
     the caller's model is already CUDA-resident, not just CPU-resident."""
     ModelCls, ManagerCls, _ = qwen_classes
     from transformersurgeon.export import export_to_backend

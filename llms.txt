@@ -12,7 +12,7 @@
 ## Export
 
 - `transformersurgeon.export.export_to_backend(model, config)`: backend-agnostic export to `xnnpack`/`qnn` (ExecuTorch, `.pte`) or `tensorrt` (TensorRT engine/exported program, needs the `tensorrt` extra + CUDA). Mixed-precision export is driven entirely by per-layer compression metadata already on the model — see `export/common.py` and the Export Backends section of [AGENTS.md](AGENTS.md).
-- XNNPACK causal attention supports an optional fused ExecuTorch kernel (`attn_impl="custom_sdpa"` in `convert_options`, ~30% faster decode vs the default manual kernel in benchmarking) — see the "XNNPACK: attn_impl" subsection of [AGENTS.md](AGENTS.md).
+- XNNPACK causal attention supports an optional fused ExecuTorch kernel (`attn_impl="custom_sdpa"` in `convert_options`) — see the "XNNPACK: attn_impl" subsection of [AGENTS.md](AGENTS.md).
 
 ## Examples
 

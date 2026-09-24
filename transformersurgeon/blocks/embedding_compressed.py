@@ -7,8 +7,8 @@ from torch.nn.parameter import Parameter
 
 
 class EmbeddingCompressed(nn.Module):
-    # TODO: add a weight-quantization path for this module (FRAMEWORK_PROBLEMS.md
-    # P3a). There is none today: `Quantizer`'s hard path goes through torchao's
+    # TODO(P3a): add a weight-quantization path for this module.
+    # See docs/investigations/FRAMEWORK_PROBLEMS.md P3a. There is none today: `Quantizer`'s hard path goes through torchao's
     # `quantize_()`, which only patches `nn.Linear` submodules -- this class is a
     # plain `nn.Module`, so nothing happens and the guard in
     # `_apply_torchao_hard_quantization` raises NotImplementedError rather than
@@ -52,6 +52,11 @@ class EmbeddingCompressed(nn.Module):
     ``out_features``/dim 0) -- it's dim 1. ``StructuredPruner``
     (``compression/structured_pruning.py``) has small, explicit branches for
     this module type to account for that.
+
+    TODO(P3a): no weight-quantization path yet -- ``Quantizer`` hard
+    quantization raises ``NotImplementedError`` on this module, so embeddings
+    (and tied ``lm_head``) stay fp32 in exported models. See the TODO comment
+    above this docstring.
     """
     def __init__(self,
                  num_embeddings: int,

@@ -311,11 +311,11 @@ class MHABase(torch.nn.Module):
         return cos_q, sin_q, cos_g, sin_g
 
 class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
-    # TODO: extend attn_impl="custom_sdpa" (torch.ops.llama.custom_sdpa, see
-    # MHACausal) to this class too. Currently only "manual"/use_sdpa=False
+    # TODO(custom_sdpa-encoder): extend attn_impl="custom_sdpa" to this class.
+    # (torch.ops.llama.custom_sdpa, see MHACausal.) Currently only "manual"/use_sdpa=False
     # (attention()) and use_sdpa=True (F.scaled_dot_product_attention) are
     # available here -- the fused ExecuTorch kernel that gave MHACausal its
-    # decode speedup (see XNNPACK_DECODE_SPEED_FIX.md) has no encoder-side
+    # decode speedup (docs/investigations/XNNPACK_DECODE_SPEED_FIX.md) has no encoder-side
     # equivalent yet. custom_sdpa's op schema does support is_causal=False for
     # plain (non-causal, no-cache) self-attention, so this is plausibly a
     # straightforward addition -- but note MHACausal's is_causal=True bug/fix
@@ -324,6 +324,12 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
     # attention every call); the potential win is purely from using the fused
     # kernel instead of attention()/F.scaled_dot_product_attention, not from
     # avoiding a wasted cache scan.
+    """Multi-head self-attention for encoder-only models (no cache, no causal mask).
+
+    TODO(custom_sdpa-encoder): ``attn_impl="custom_sdpa"`` is not supported
+    here yet -- only ``MHACausal`` has it. See the TODO comment above this
+    docstring.
+    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

@@ -1,7 +1,7 @@
 """Regression tests that pin currently-open framework bugs.
 
 Each test asserts the *correct* (documented / expected) behavior and is marked
-``xfail`` with a pointer to ``FRAMEWORK_PROBLEMS.md``. When the underlying bug is
+``xfail`` with a pointer to ``docs/investigations/FRAMEWORK_PROBLEMS.md``. When the underlying bug is
 fixed the test XPASSes, which surfaces in the summary and is the signal to remove
 the ``xfail`` marker. Keep ``strict=False`` so a fix never turns the suite red.
 
