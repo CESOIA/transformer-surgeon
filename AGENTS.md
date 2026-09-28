@@ -177,6 +177,42 @@ QNN's or TensorRT's partitioners/converters — the extra leading dim may not be
 supported by every op converter on those backends, so treat it as
 **XNNPACK-only until proven otherwise elsewhere**.
 
+### XNNPACK: `quant_path` — how quantized linears are lowered
+
+`XNNPACKExportConfig.quant_path`: `"pt2e"` (legacy; per-tensor/per-channel
+only; the linear-only PT2E quantizer always used dynamic activations) or
+`"torchao"` (ExecuTorch's own LLM recipe): each quantized linear becomes an
+`IntxUnpackedToInt8Tensor` from tsurgeon's exact integers/scales, lowered with
+`XnnpackDynamicallyQuantizedPartitioner` then `XnnpackPartitioner` →
+qd8-f32-qc4w/qb4w/qc8w kernels (= vendor 8da4w/8da8w). Quantize with
+`method_activation="dynamic_per_token"`; weight-only layers warn (XNNPACK has no
+fp32×intN GEMM). Keep XNNPACK exports **fp32**: fp16 XNNPACK kernels drift
+(KL ≈ 4e-3 vs HF on Qwen2.5-1.5B; ARM fp16 GEMMs accumulate in fp16), and the
+fp16 qd8×int4 kernel does not exist on x86 hosts (`xnn_status_unsupported_hardware`).
+
+### QNN: `quant_scope`
+
+`QNNExportConfig.quant_scope="linear"` (legacy) annotates only compressed
+linears → every quantized/float seam splits the HTP graph (measured on SM8850,
+Qwen2.5-0.5B: 169 partitions + CPU mul/add/sigmoid, ~20 tok/s vs 41 tok/s fp16,
+incoherent output). `"all"` is the vendor recipe: every op 16-bit MinMax
+activations, W4 → 16a4w, W8 → 16a8w (tsurgeon's exact per-channel scales),
+float linears 16a16w → one partition. `keep_reference_module=True` returns the
+PT2E fake-quant model the .pte was lowered from (`result.reference_module`) —
+the host parity reference, because the x86 HTP simulator costs ~8 min/token at 1.5B.
+
+### Numerics caveats found on Qwen2.5-1.5B (large attention logits)
+
+- Causal-mask penalty was `-10000`; Qwen2.5 logits exceed ±1e4 (k biases ≈300),
+  so masked slots got weight (KL 2.6e-3 vs HF in fp32). Now `-65504`
+  (`blocks/decoder.py`). Any mask constant must exceed the model's logit range.
+- q·kᵀ partial sums overflow fp16 (≈1.9e5) → any backend kernel that
+  accumulates attention scores in fp16 produces inf/NaN (TensorRT 10.16's fused
+  attention did: token 659 @ pos 0). TensorRT export needs the scores in fp32
+  (see compression-benchmark `bench/trt_passes.py`, candidate for a default pass).
+- `manager.prepare_for_save()` upcasts fp16 LinearCompressed to fp32 and
+  dequantizes; call it only before `save_pretrained`, never before export.
+
 ### QNN: decode-speed options
 
 See [QNN_DECODE_SPEED_FIX.md](docs/investigations/QNN_DECODE_SPEED_FIX.md) for the investigation and
@@ -316,15 +352,36 @@ Pruning masks survive `restore()` for STE fine-tuning. Call `manager.remove_mask
 
 | param | default | valid values |
 |---|---|---|
-| `method` | `"vanilla"` | `"vanilla"`, `"gptq"` |
-| `precision` | `"full"` | `"full"`, `"binary"`, or `int` in `[2, 16]` (e.g. `8`, `4`, `2` — NOT the strings `"int8"`/`"int4"`/`"int2"`) |
-| `granularity` | `"per_tensor"` | `"per_tensor"`, `"per_channel"` |
+| `method` | `"vanilla"` | `"vanilla"` (symmetric max-abs RTN), `"gptq"` (needs `"covariance"` calibration), `"hqq"` (scale-only half-quadratic, calibration-free) |
+| `precision` | `"full"` | `"full"`, `"binary"`, or `int` in `[2, 16]` (e.g. `8`, `4`, `2` — NOT the strings `"int8"`/`"int4"`/`"int2"`); hard apply: `int` in `[2, 8]` |
+| `granularity` | `"per_tensor"` | `"per_tensor"`, `"per_channel"`, `"per_group"` |
+| `group_size` | `128` | positive `int` dividing `in_features` (used by `"per_group"`) |
 | `sparsity` | `0.0` | `float` in `[0, 1)` |
 | `sparse_method` | `"magnitude"` | `"magnitude"`, `"random"` |
 | `precision_activation` | `"full"` | same as `precision` |
-| `method_activation` | `"maxmin"` | `"maxmin"` |
+| `method_activation` | `"maxmin"` | `"maxmin"` (static, calibrated hooks), `"dynamic_per_token"` (int8 asym per-token at run time; hard only, no calibration) |
 | `scheme_activation` | `"asymmetric"` | `"symmetric"`, `"asymmetric"` |
 | `eps` | `1e-6` | `float > 0` |
+
+**Hard apply is computed by tsurgeon, not torchao** (`_apply_hard_quantization`).
+`METHOD_FUNCTIONS[method]` produces the integers and scales; torchao's
+`IntxUnpackedToInt8Tensor` is only the container (scale stored in the weight
+dtype, zero point 0). Every exporter reads those exact numbers back
+(`export/common.py::extract_layer_quant_info` → `scale`, `precision`,
+`per_channel`, `group_size`, `act_dynamic`), so eager == exported up to kernel
+arithmetic. Before 2026-09 the hard path called torchao's own RTN regardless
+of `method` (hard GPTQ was silently RTN) — do not reintroduce `quantize_()` there.
+LRD layers quantize both factors (U with the covariance projected through V);
+LRD+quant used to be exported *float* silently — now a stale pre-LRD scale raises.
+`method_activation="dynamic_per_token"` is stored on the weight tensor
+(`activation_quantization=INT8_ASYM_PER_TOKEN`), so the eager model simulates
+exactly what XNNPACK's qd8 kernels compute.
+
+Per-backend expressibility (see `export/`): TensorRT/ONNX: INT8 per-channel,
+INT4 per-channel or per-group (exact block DQ); INT8 per-group raises (no
+TensorRT INT8 block DQ). XNNPACK (`quant_path="torchao"`): any of the above for
+4/8 bit with dynamic int8 activations. QNN: per-channel only (HTP block quant is
+LPBQ, which cannot hold arbitrary group scales; per-group raises).
 
 ---
 
