@@ -258,6 +258,20 @@ class QNNExportConfig(ExecutorchExporterConfig):
     # pipeline and does not reproduce on a synthetic decoder of the same shape.
     # Turn it on once that pass is fixed upstream, or for models it can handle.
     convert_linear_to_conv2d: bool = False
+    # Which ops a quantized export annotates:
+    #   "linear" - (legacy) only the compressed linears; every other op stays fp16.
+    #              Each quantized/float seam splits the graph: 169 HTP partitions +
+    #              CPU mul/add/sigmoid on Qwen2.5-0.5B, measured on SM8850 at
+    #              ~20 tok/s vs 41 tok/s fp16.
+    #   "all"    - vendor recipe (ExecuTorch Qwen2.5 static-LLM recipes): every op
+    #              gets 16-bit activations (MinMax, per-tensor), quantized linears
+    #              use tsurgeon's exact per-channel scales (W4 -> 16a4w, W8 -> 16a8w)
+    #              and linears the model left float are carried as 16a16w, so the
+    #              decoder lowers to a single HTP partition.
+    quant_scope: str = "linear"
+    # Keep a deep copy of the quantized torch model the .pte is lowered from
+    # (PT2E fake-quant graph for quantized exports) as result.reference_module.
+    keep_reference_module: bool = False
 
 
 def _resolve_qcom_chipset(soc_model: Any):
@@ -403,8 +417,10 @@ def export_with_qnn(
         # use_16a4w: 16-bit activations + 4-bit weights.
         _PREC_TO_QDTYPE = {
             4: QuantDtype.use_16a4w,
-            8: QuantDtype.use_8a8w,
+            8: QuantDtype.use_16a8w if config.quant_scope == "all" else QuantDtype.use_8a8w,
         }
+        if config.quant_scope not in ("linear", "all"):
+            raise ValueError(f"QNNExportConfig.quant_scope must be 'linear' or 'all', got {config.quant_scope!r}.")
 
         def _make_layer_predicate(layer_names: frozenset) -> Any:
             def _pred(node: torch.fx.Node) -> bool:
@@ -433,17 +449,30 @@ def export_with_qnn(
                 _qdtype_to_layers[_qdtype].add(_name)
 
         _qconfig_list = []
+        _act_observer = None
+        if config.quant_scope == "all":
+            from torchao.quantization.pt2e import MinMaxObserver as _MinMaxObserver
+            _act_observer = _MinMaxObserver
         for _qdtype, _layers in _qdtype_to_layers.items():
-            _qconfig = ModuleQConfig(quant_dtype=_qdtype, is_linear_per_channel=True)
+            _qconfig = ModuleQConfig(quant_dtype=_qdtype, is_linear_per_channel=True, act_observer=_act_observer)
             _qconfig_list.append((_make_layer_predicate(frozenset(_layers)), _qconfig))
 
-        # Layers not matched by any predicate stay at the default_quant_config.
-        # Set the default to a sentinel that has empty use_per_channel_weight_quant_ops
-        # so _get_quant_config returns None (no annotation) for unmatched nodes.
-        _float_config = ModuleQConfig()
-        _float_config.use_per_channel_weight_quant_ops = {}
-        _float_config.quant_config = None
-        quantizer.default_quant_config = _float_config
+        if config.quant_scope == "all":
+            # Every other op (and any linear the model left float) gets 16-bit
+            # activations; float linears get 16-bit per-channel weights.
+            quantizer.set_default_quant_config(
+                quant_dtype=QuantDtype.use_16a16w,
+                is_linear_per_channel=True,
+                act_observer=_act_observer,
+            )
+        else:
+            # Layers not matched by any predicate stay at the default_quant_config.
+            # Set the default to a sentinel that has empty use_per_channel_weight_quant_ops
+            # so _get_quant_config returns None (no annotation) for unmatched nodes.
+            _float_config = ModuleQConfig()
+            _float_config.use_per_channel_weight_quant_ops = {}
+            _float_config.quant_config = None
+            quantizer.default_quant_config = _float_config
 
         quantizer.set_submodule_qconfig_list(_qconfig_list)
 
@@ -460,6 +489,13 @@ def export_with_qnn(
             )
         model_for_edge = converted
         exported_for_mismatch = quantized_exported
+
+    # Lowering may rewrite the module in place: keep an untouched copy of the
+    # quantized torch model when the caller wants it as a parity reference.
+    reference_module = None
+    if config.keep_reference_module:
+        import copy
+        reference_module = copy.deepcopy(model_for_edge)
 
     try:
         from executorch.backends.qualcomm.utils.utils import (
@@ -617,7 +653,7 @@ def export_with_qnn(
 
     result_precision = "mixed" if layer_info else "full"
 
-    return finalize_executorch_result(
+    result = finalize_executorch_result(
         pte_path=config.output_path,
         backend="qnn",
         precision=result_precision,
@@ -629,3 +665,8 @@ def export_with_qnn(
         weight_mismatch_eps=config.weight_mismatch_eps,
         verbose=config.verbose,
     )
+    # The quantized torch model this .pte was lowered from (PT2E fake-quant graph
+    # for quantized exports, the float wrapper otherwise): the host-side reference
+    # for on-device parity, since HTP cannot run here at useful speed.
+    result.reference_module = reference_module
+    return result
