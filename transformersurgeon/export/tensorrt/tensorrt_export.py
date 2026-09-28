@@ -57,6 +57,10 @@ class TensorRTExportConfig(ONNXExportConfig):
     workspace_bytes: int = 0
     timing_cache_path: str | None = None
     plugin_libraries: tuple[str, ...] = ()
+    # Run MatMul(q, k^T) -> Add(mask) -> Softmax in fp32: TensorRT 10.16 fuses it
+    # into an fp16-accumulating kernel that overflows on models with large
+    # attention logits (Qwen2.5: NaN logits). See attention_passes.py.
+    fp32_attention_scores: bool = True
 
 
 def engine_profiles(manifest: dict) -> list[OptimizationProfile]:
@@ -103,6 +107,9 @@ def export_with_tensorrt(model_or_graph, *, config: TensorRTExportConfig) -> Ten
         raise ValueError(f"Unsupported int4_backend {config.int4_backend!r}")
     if config.int4_backend == "edgellm_plugin":
         config = dataclasses.replace(config, graph_passes=[*config.graph_passes, edgellm_int4_pass])
+    if config.fp32_attention_scores:
+        from .attention_passes import fp32_attention_scores
+        config = dataclasses.replace(config, graph_passes=[fp32_attention_scores, *config.graph_passes])
     onnx_result = export_with_onnx(model_or_graph, config=config)
     result = TensorRTExportResult(**vars(onnx_result))
     if config.build_engine:
