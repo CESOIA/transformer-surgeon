@@ -425,6 +425,9 @@ def export_with_qnn(
         from collections import defaultdict as _defaultdict
         _qdtype_to_layers: dict[QuantDtype, set] = _defaultdict(set)
         for _name, _info in layer_info.items():
+            if _info.get("group_size") is not None:
+                raise NotImplementedError(
+                    f"QNN export: '{_name}' is per-group quantized; not supported by this exporter yet.")
             _qdtype = _PREC_TO_QDTYPE.get(_info["precision"])
             if _qdtype is not None:
                 _qdtype_to_layers[_qdtype].add(_name)

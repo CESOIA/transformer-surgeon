@@ -93,6 +93,10 @@ def build_quantizer_from_layer_info(layer_info: dict[str, dict[str, Any]]):
             )
             continue
 
+        if info.get("group_size") is not None:
+            raise NotImplementedError(
+                f"XNNPACK PT2E quantizer: '{layer_name}' is per-group quantized; the PT2E "
+                "path only expresses per-tensor/per-channel weights.")
         is_dynamic = info["act_scale"] is None  # True → weight-only (fp activations); False → static (calibrated activations)
         qconfig = get_symmetric_quantization_config(
             is_per_channel=info["per_channel"],

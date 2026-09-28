@@ -28,6 +28,7 @@ from .quantization import (
     validate_sparse_method,
     validate_quantization_eps,
     validate_quantization_granularity,
+    validate_quantization_group_size,
     validate_activation_scheme,
 )
 
@@ -100,6 +101,8 @@ COMPRESSION_REGISTRY = {
         "sparse_method": dict(default="magnitude", validator=validate_sparse_method,),
         "eps": dict(default=1e-6, validator=validate_quantization_eps),
         "granularity": dict(default="per_tensor", validator=validate_quantization_granularity),
+        # group_size: input columns sharing one scale when granularity="per_group".
+        "group_size": dict(default=128, validator=validate_quantization_group_size),
         "precision_activation": dict(default="full", validator=validate_precision),
         "method_activation": dict(default="maxmin", validator=validate_activation_method),
         "scheme_activation": dict(default="asymmetric", validator=validate_activation_scheme),

@@ -16,7 +16,8 @@ _QUANT_BUFFER_SUFFIXES = (
     "_torchao_scale",
 )
 _QUANT_PLAIN_ATTRS = (
-    "_torchao_precision", "_torchao_per_channel", "_soft_quant_precision",
+    "_torchao_precision", "_torchao_per_channel", "_torchao_group_size", "_torchao_act_dynamic",
+    "_soft_quant_precision",
     "_act_quant_precision", "_act_quant_method", "_act_quant_scheme",
     "_act_out_quant_precision", "_act_out_quant_method", "_act_out_quant_scheme",
 )
@@ -140,7 +141,8 @@ def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> 
 
         # Derive _torchao_per_channel from the scale buffer (authoritative source).
         if "_torchao_scale" in new_submod._buffers:
-            new_submod._torchao_per_channel = new_submod._torchao_scale.numel() > 1
+            new_submod._torchao_per_channel = (
+                new_submod._torchao_scale.numel() > 1 and not hasattr(new_submod, "_torchao_group_size"))
 
 
 def _flatten_layer_matching(indexing, source_paths):

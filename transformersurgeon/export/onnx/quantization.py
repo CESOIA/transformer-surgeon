@@ -76,7 +76,25 @@ def apply_weight_quantization(model, layer_info: dict[str, dict[str, Any]], *, i
         qmin, qmax = _QRANGE[precision]
         float_dtype = numpy_helper.to_array(init).dtype
 
-        if info.get("scale") is not None:
+        group_size = info.get("group_size")
+        if group_size is not None:
+            # Hard per-group layer: reuse tsurgeon's exact (out, in/g) scales.
+            if precision != 4:
+                raise NotImplementedError(
+                    f"ONNX/TensorRT export: {layer_name} is INT{precision} per-group; TensorRT "
+                    "block DequantizeLinear supports INT4 only.")
+            gscale = np.maximum(info["scale"].detach().float().cpu().numpy().reshape(out_features, -1), _SCALE_FLOOR)
+            if gscale.shape[1] * group_size != in_features:
+                raise ValueError(f"{layer_name}: group scales {gscale.shape} do not tile in_features {in_features}.")
+            if gscale.shape[1] == 1:
+                raise ValueError(f"{layer_name}: a single INT4 block spanning the row returns NaNs on TensorRT 10.16.")
+            q = np.clip(np.rint(w / np.repeat(gscale, group_size, axis=1)), qmin, qmax)
+            q_init = numpy_helper.from_array(q.astype(ml_dtypes.int4), weight_name + "_q")
+            scale_init = numpy_helper.from_array(gscale.astype(float_dtype), weight_name + "_scale")
+            dq = helper.make_node("DequantizeLinear", [q_init.name, scale_init.name], [weight_name + "_dq"],
+                                  axis=1, block_size=group_size, name=weight_name + "_DequantizeLinear")
+            granularity = f"group{group_size}"
+        elif info.get("scale") is not None:
             scale = info["scale"].detach().float().cpu().numpy().reshape(-1)
             if scale.size == 1:
                 scale = np.full(out_features, scale.item(), np.float32)
@@ -84,7 +102,9 @@ def apply_weight_quantization(model, layer_info: dict[str, dict[str, Any]], *, i
         else:
             scale = np.maximum(np.abs(w).max(axis=1) / qmax, _SCALE_FLOOR)
 
-        if precision == 8:
+        if group_size is not None:
+            pass
+        elif precision == 8:
             q = np.clip(np.rint(w / scale[:, None]), qmin, qmax).astype(np.int8)
             q_init = numpy_helper.from_array(q, weight_name + "_q")
             scale_init = numpy_helper.from_array(scale.astype(float_dtype), weight_name + "_scale")

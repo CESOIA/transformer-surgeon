@@ -8,11 +8,13 @@ from .unstructured_pruning_methods import METHOD_FUNCTIONS as SPARSITY_FUNCTIONS
 from .unstructured_pruning import validate_unstructured_pruning_ratio
 
 
-VALID_METHODS = ["vanilla", "gptq"]
-VALID_ACT_METHODS = ["maxmin"]
+VALID_METHODS = ["vanilla", "gptq", "hqq"]
+# "dynamic_per_token": int8 asymmetric per-token scales computed at run time
+# (no calibration) -- the activation scheme of ExecuTorch/XNNPACK 8daXw kernels.
+VALID_ACT_METHODS = ["maxmin", "dynamic_per_token"]
 VALID_SPARSE_METHODS = ["magnitude", "random"]
 VALID_ACTIVATION_SCHEMES = ["symmetric", "asymmetric"]
-VALID_GRANULARITIES = ["per_tensor", "per_channel"]
+VALID_GRANULARITIES = ["per_tensor", "per_channel", "per_group"]
 CALIBRATED_METHOD_DICT = {
     "gptq": ("covariance",),
 }
@@ -27,6 +29,7 @@ class Quantizer(Compressor):
         self.sparse_method = self.config["sparse_method"]
         self.eps = self.config["eps"]
         self.granularity = self.config["granularity"]
+        self.group_size = self.config.get("group_size", 128)
         self.precision_activation = self.config["precision_activation"]
         self.method_activation = self.config["method_activation"]
         self.scheme_activation = self.config["scheme_activation"]
@@ -37,7 +40,7 @@ class Quantizer(Compressor):
 
     def needs_calibration(self):
         summaries = list(CALIBRATED_METHOD_DICT.get(self.method, ()))
-        if self.precision_activation != "full":
+        if self.precision_activation != "full" and self.method_activation != "dynamic_per_token":
             if "activation_range" not in summaries:
                 summaries.append("activation_range")
             if "output_activation_range" not in summaries:
@@ -79,7 +82,12 @@ class Quantizer(Compressor):
 
             # Hard-path: use torchao's native quantize_() API, bypassing soft-quant.
             if hard:
-                _apply_torchao_hard_quantization(module, precision, granularity)
+                _apply_hard_quantization(
+                    module, method, precision, granularity, self.group_size, eps,
+                    self._calibration_kwargs(method),
+                    dynamic_activation=(precision_activation != "full"
+                                        and method_activation == "dynamic_per_token"),
+                )
             elif not soft_applied:
                 # Soft-path: fake-quant via dequantize.
                 for name, param in module.named_parameters():
@@ -105,6 +113,10 @@ class Quantizer(Compressor):
                         C = calibration_kwargs["covariance"].float()
                         calibration_kwargs = {**calibration_kwargs, "covariance": V @ C @ V.T}
 
+                    if granularity == "per_group":
+                        if method != "vanilla":
+                            raise NotImplementedError("per_group granularity is only implemented for method='vanilla'.")
+                        calibration_kwargs["group_size"] = self.group_size
                     qdata, scale, dequantize_fn = METHOD_FUNCTIONS[method](
                         param.data, precision, eps, granularity, **calibration_kwargs
                     )
@@ -125,6 +137,13 @@ class Quantizer(Compressor):
                     else:
                         param.data.copy_(qweight)
                 module._soft_quant_precision = precision
+
+        if precision_activation != "full" and method_activation == "dynamic_per_token":
+            if precision_activation != 8:
+                raise ValueError("dynamic_per_token activation quantization is int8 only.")
+            if not hard:
+                raise NotImplementedError("dynamic_per_token activations require hard=True.")
+            return  # carried by the quantized weight tensor itself (no hooks, no calibration)
 
         # Input activation fake-quant emulation via forward pre-hook.
         if precision_activation != "full":
@@ -184,12 +203,21 @@ class Quantizer(Compressor):
                 _make_output_activation_fake_quant_hook(out_scale, out_zero_point, precision_activation, scheme_activation)
             )
 
+    def _calibration_kwargs(self, method):
+        kw = {}
+        if method in CALIBRATED_METHOD_DICT and self.calibration_store:
+            for key in CALIBRATED_METHOD_DICT[method]:
+                if key in self.calibration_store:
+                    kw[key] = self.calibration_store[key]
+        return kw
+
     def restore(self, module):
         self.config["method"] = "vanilla"
         self.config["precision"] = "full"
         self.config["sparsity"] = 0.0
         self.config["sparse_method"] = "magnitude"
         self.config["granularity"] = "per_tensor"
+        self.config["group_size"] = 128
         self.config["precision_activation"] = "full"
         self.config["method_activation"] = "maxmin"
         self.config["scheme_activation"] = "asymmetric"
@@ -223,6 +251,8 @@ class Quantizer(Compressor):
             "_soft_quant_precision",
             "_torchao_precision",
             "_torchao_per_channel",
+            "_torchao_group_size",
+            "_torchao_act_dynamic",
             "_torchao_scale",
         ):
             if hasattr(module, attr):
@@ -305,7 +335,73 @@ def _extract_aqt_scale(w: torch.Tensor) -> torch.Tensor | None:
     return None
 
 
-def _apply_torchao_hard_quantization(module, precision, granularity: str) -> None:
+def _apply_hard_quantization(module, method, precision, granularity, group_size, eps,
+                             calibration_kwargs, dynamic_activation=False) -> None:
+    """Hard quantization computed by tsurgeon's own method functions.
+
+    The integer weights and scales come from METHOD_FUNCTIONS[method] (vanilla
+    RTN, GPTQ, HQQ); torchao is only the *container*: each weight becomes an
+    ``IntxUnpackedToInt8Tensor`` holding exactly those integers/scales (scale
+    stored in the weight dtype), so the eager model and every exporter see the
+    same numbers. For an LRD layer both factors are quantized (the U factor
+    with the covariance projected through V, as in the soft path).
+    ``dynamic_activation`` marks the tensor for int8 asymmetric per-token
+    dynamic activation quantization (eager simulation == XNNPACK 8daXw).
+    """
+    from torchao.quantization.quantize_.workflows.intx.intx_unpacked_to_int8_tensor import (
+        IntxUnpackedToInt8Tensor,
+        IntxUnpackedToInt8TensorActivationQuantization as _Act,
+    )
+
+    if not (isinstance(precision, int) and 2 <= precision <= 8):
+        raise ValueError(f"Hard quantization needs an int precision in [2, 8]; got {precision!r}.")
+    if method == "gptq" and granularity == "per_group":
+        raise NotImplementedError("GPTQ with per_group granularity is not implemented.")
+
+    targets = [(module, "weight", calibration_kwargs)]
+    V = getattr(module, "linear_V", None)
+    if V is not None:
+        kw_u = dict(calibration_kwargs)
+        if "covariance" in kw_u:
+            v = V.weight.data.float()
+            kw_u["covariance"] = v @ kw_u["covariance"].float().to(v.device) @ v.T
+        targets = [(module, "weight", kw_u), (V, "weight", calibration_kwargs)]
+
+    for mod, attr, kw in targets:
+        w = getattr(mod, attr).data
+        if type(w) is not torch.Tensor:
+            raise RuntimeError(f"{type(mod).__name__}.{attr} is already quantized.")
+        extra = dict(kw)
+        if granularity == "per_group":
+            extra["group_size"] = group_size
+        qdata, scale, _ = METHOD_FUNCTIONS[method](w, precision, eps, granularity, **extra)
+        n, k = w.shape
+        if granularity == "per_group":
+            scale2d, block = scale.reshape(n, k // group_size), (1, group_size)
+        elif granularity == "per_channel":
+            scale2d, block = scale.reshape(n, 1), (1, k)
+        else:
+            scale2d, block = scale.reshape(1, 1), (n, k)
+        scale2d = scale2d.to(w.dtype).clamp_min(torch.finfo(w.dtype).tiny).contiguous()
+        qw = IntxUnpackedToInt8Tensor(
+            qdata=qdata.to(torch.int8).contiguous(),
+            scale=scale2d,
+            zero_point=torch.zeros_like(scale2d, dtype=torch.int8),
+            target_dtype=getattr(torch, f"int{precision}"),
+            block_size=block,
+            dtype=w.dtype,
+            activation_quantization=_Act.INT8_ASYM_PER_TOKEN if dynamic_activation else None,
+        )
+        setattr(mod, attr, nn.Parameter(qw, requires_grad=False))
+        mod._torchao_precision = precision
+        mod.register_buffer("_torchao_scale", scale2d.clone())
+        mod._torchao_per_channel = granularity == "per_channel"
+        if granularity == "per_group":
+            mod._torchao_group_size = int(group_size)
+        mod._torchao_act_dynamic = bool(dynamic_activation)
+
+
+def _apply_torchao_hard_quantization(module, precision, granularity: str, group_size: int = 128) -> None:
     """Apply torchao native weight-only quantization to *module* in-place."""
     try:
         from torchao.quantization import (
@@ -313,7 +409,7 @@ def _apply_torchao_hard_quantization(module, precision, granularity: str) -> Non
             Int8WeightOnlyConfig,
             IntxWeightOnlyConfig,
         )
-        from torchao.quantization.granularity import PerRow, PerTensor, PerAxis
+        from torchao.quantization.granularity import PerRow, PerTensor, PerAxis, PerGroup
     except ImportError as exc:
         raise ImportError(
             "torchao is required for hard quantization. "
@@ -337,7 +433,18 @@ def _apply_torchao_hard_quantization(module, precision, granularity: str) -> Non
             f"Hard quantization requires precision ≤ 8; got {precision}."
         )
 
-    if precision == 8:
+    if granularity == "per_group":
+        # Symmetric max-abs scale per (output row, group of `group_size` inputs).
+        if not (isinstance(precision, int) and 2 <= precision <= 8):
+            raise ValueError(f"per_group hard quantization needs an int precision in [2, 8]; got {precision!r}.")
+        in_features = module.weight.shape[-1]
+        if in_features % group_size:
+            raise ValueError(f"per_group: in_features {in_features} is not divisible by group_size {group_size}.")
+        config = IntxWeightOnlyConfig(
+            weight_dtype=getattr(torch, f"int{precision}"),
+            granularity=PerGroup(group_size),
+        )
+    elif precision == 8:
         config = Int8WeightOnlyConfig(
             granularity=ao_granularity_row if per_channel else ao_granularity_tensor
         )
@@ -371,6 +478,9 @@ def _apply_torchao_hard_quantization(module, precision, granularity: str) -> Non
         if scale is not None:
             m.register_buffer("_torchao_scale", scale)
             m._torchao_per_channel = scale.numel() > 1
+            if granularity == "per_group":
+                # scale is (out_features, in_features // group_size)
+                m._torchao_group_size = int(group_size)
 
     if not quantized_any and not isinstance(module, nn.Linear):
         # torchao's quantize_() only dispatches to nn.Linear submodules in this
@@ -428,6 +538,10 @@ def validate_quantization_granularity(granularity: str) -> None:
             f"Quantization granularity must be one of {VALID_GRANULARITIES}, but got '{granularity}'."
         )
 
+def validate_quantization_group_size(group_size: int) -> None:
+    if not isinstance(group_size, int) or isinstance(group_size, bool) or group_size <= 0:
+        raise ValueError(f"Quantization group_size must be a positive int, but got {group_size!r}.")
+
 def validate_activation_scheme(scheme: str) -> None:
     if scheme not in VALID_ACTIVATION_SCHEMES:
         raise ValueError(
@@ -441,5 +555,6 @@ __all__ = [
     "validate_precision",
     "validate_sparse_method",
     "validate_quantization_granularity",
+    "validate_quantization_group_size",
     "validate_activation_scheme",
 ]

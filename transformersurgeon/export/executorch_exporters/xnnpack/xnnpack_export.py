@@ -1,4 +1,5 @@
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +20,81 @@ from ..common import (
 
 @dataclass
 class XNNPACKExportConfig(ExecutorchExporterConfig):
-    pass
+    """quant_path:
+      "pt2e"   - (default) PT2E Q/DQ via the linear-only XNNPACK quantizer;
+                 per-tensor/per-channel weights only.
+      "torchao"- ExecuTorch's LLM recipe: every hard-quantized linear becomes a
+                 torchao IntxUnpackedToInt8Tensor built from tsurgeon's exact
+                 integer weights and scales (per-channel or per-group), with
+                 int8 asymmetric per-token dynamic activations (8da4w / 8da8w),
+                 lowered with the dynamically-quantized XNNPACK partitioner
+                 first. Supports per-group scales and the final layer (lm_head).
+    """
+    quant_path: str = "pt2e"
+
+
+def _torchao_quantize_linears(wrapper, layer_info: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """Swap each quantized linear's (already dequantized) weight for an
+    IntxUnpackedToInt8Tensor carrying tsurgeon's exact scales. Returns
+    {layer_name: granularity} for the layers converted."""
+    import torch.nn as nn
+    from torchao.quantization.quantize_.workflows.intx.intx_unpacked_to_int8_tensor import (
+        IntxUnpackedToInt8Tensor,
+        IntxUnpackedToInt8TensorActivationQuantization,
+    )
+
+    modules = dict(wrapper.named_modules())
+    done = {}
+    for name, info in layer_info.items():
+        if info.get("act_scale") is not None:
+            raise NotImplementedError(
+                f"XNNPACK torchao path: '{name}' has static activation calibration; only dynamic "
+                "per-token int8 activations are supported on this path.")
+        if not info.get("hard") or info.get("scale") is None:
+            raise NotImplementedError(f"XNNPACK torchao path: '{name}' is not hard-quantized.")
+        if not info.get("act_dynamic"):
+            warnings.warn(
+                f"XNNPACK torchao path: '{name}' is weight-only (no dynamic int8 activations); "
+                "XNNPACK has no fp32 x intN weight-only GEMM, so this layer may not be delegated.",
+                stacklevel=2)
+        bits = int(info["precision"])
+        if not 2 <= bits <= 8:
+            raise ValueError(f"XNNPACK torchao path: unsupported precision {bits} for '{name}'.")
+        mod = modules[name]
+        w = mod.weight.detach()
+        n, k = w.shape
+        scale = info["scale"].detach().to(w.dtype)
+        g = info.get("group_size")
+        if g is not None:
+            scale = scale.reshape(n, k // g)
+            block = (1, g)
+            gran = f"group{g}"
+        elif info.get("per_channel"):
+            scale = scale.reshape(n, 1)
+            block = (1, k)
+            gran = "per_channel"
+        else:
+            scale = scale.reshape(1, 1).expand(n, 1).contiguous()
+            block = (1, k)
+            gran = "per_tensor"
+        qmax = 2 ** (bits - 1) - 1
+        qmin = -qmax - 1
+        qdata = torch.clamp(
+            torch.round(w.float() / scale.float().repeat_interleave(block[1], dim=1)), qmin, qmax
+        ).to(torch.int8)
+        qw = IntxUnpackedToInt8Tensor(
+            qdata=qdata,
+            scale=scale,
+            zero_point=torch.zeros_like(scale, dtype=torch.int8),
+            target_dtype=getattr(torch, f"int{bits}"),
+            block_size=block,
+            dtype=w.dtype,
+            activation_quantization=(IntxUnpackedToInt8TensorActivationQuantization.INT8_ASYM_PER_TOKEN
+                                     if info.get("act_dynamic") else None),
+        )
+        mod.weight = nn.Parameter(qw, requires_grad=False)
+        done[name] = gran
+    return done
 
 
 def export_with_xnnpack(
@@ -37,6 +112,11 @@ def export_with_xnnpack(
     # Detect per-layer compression metadata (hard / soft quantized layers).
     # Quantization is driven entirely by model metadata — config.precision is not consulted.
     layer_info = extract_layer_quant_info(wrapper)
+
+    if config.quant_path == "torchao":
+        return _export_torchao(wrapper, model_config, example_inputs, layer_info, config)
+    if config.quant_path != "pt2e":
+        raise ValueError(f"Unknown XNNPACK quant_path {config.quant_path!r}.")
 
     exported = torch_export(
         wrapper,
@@ -106,3 +186,41 @@ def export_with_xnnpack(
         weight_mismatch_eps=config.weight_mismatch_eps,
         verbose=config.verbose,
     )
+
+
+def _export_torchao(wrapper, model_config, example_inputs, layer_info, config: XNNPACKExportConfig):
+    """ExecuTorch-LLM-style lowering: torchao 8daXw linears, dynamic-quant partitioner first."""
+    from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+        XnnpackDynamicallyQuantizedPartitioner,
+        XnnpackPartitioner,
+    )
+    from executorch.exir import EdgeCompileConfig, ExecutorchBackendConfig, to_edge_transform_and_lower
+    from executorch.exir.passes import MemoryPlanningPass
+
+    converted = _torchao_quantize_linears(wrapper, layer_info) if layer_info else {}
+    with torch.no_grad():
+        exported = torch_export(wrapper, example_inputs)
+    edge = to_edge_transform_and_lower(
+        exported,
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+        partitioner=[XnnpackDynamicallyQuantizedPartitioner(), XnnpackPartitioner()],
+    )
+    et_program = edge.to_executorch(
+        config=ExecutorchBackendConfig(memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False))
+    )
+    with open(config.output_path, "wb") as f:
+        f.write(et_program.buffer)
+    result = finalize_executorch_result(
+        pte_path=config.output_path,
+        backend="xnnpack",
+        precision="mixed" if layer_info else "full",
+        wrapper=wrapper,
+        example_inputs=example_inputs,
+        model_config=model_config,
+        exported_for_mismatch=None,
+        run_weight_mismatch_check=False,
+        weight_mismatch_eps=config.weight_mismatch_eps,
+        verbose=config.verbose,
+    )
+    result.quantized_layers = converted
+    return result

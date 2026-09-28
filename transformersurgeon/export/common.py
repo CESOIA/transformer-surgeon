@@ -363,15 +363,23 @@ def _extract_weight_quant_info(
     if has_torchao_tag and (is_live_aqt or has_stashed_scale):
         # Hard-quantised layer.
         #
-        # If LRD was applied after quantization, the stashed scale belongs to
-        # the original full weight W[out, in].  After LRD the layer holds two
-        # factors: weight[out, rank] and linear_V.weight[rank, in].  PT2E's
-        # quantizer would scope both under the same qconfig and try to apply
-        # the out-channel scale to linear_V.weight, causing a shape mismatch.
-        # Skip such layers — their weights are already dequantised floats and
-        # the old scale is no longer valid for the decomposed factors.
-        if getattr(module, 'linear_V', None) is not None:
-            return None
+        # LRD factors are quantized separately (quantization runs after LRD):
+        # this module's own weight is the U factor [out, rank] and its stashed
+        # scale has one row per output row; linear_V is visited as its own
+        # nn.Linear. A stash whose rows do not match the weight belongs to a
+        # pre-LRD weight -- refuse instead of exporting the layer float.
+        w_rows = module.weight.shape[0]
+        if has_stashed_scale and module._torchao_scale.dim() == 2 and module._torchao_scale.shape[0] not in (1, w_rows):
+            raise RuntimeError(
+                f"{module}: stashed quantization scale {tuple(module._torchao_scale.shape)} does not match "
+                f"weight {tuple(module.weight.shape)} (quantized before LRD?).")
+
+        if has_stashed_scale and not is_live_aqt:
+            w = module.weight
+            if hasattr(w, "dequantize") and type(w) is not torch.Tensor and type(w) is not nn.Parameter:
+                module.weight = nn.Parameter(w.dequantize(), requires_grad=False)
+            elif isinstance(w, nn.Parameter) and hasattr(w.data, "dequantize") and type(w.data) is not torch.Tensor:
+                module.weight = nn.Parameter(w.data.dequantize(), requires_grad=False)
 
         if is_live_aqt:
             # Weight is still a torchao AffineQuantizedTensor (direct model pass).
@@ -386,11 +394,16 @@ def _extract_weight_quant_info(
             scale       = module._torchao_scale.detach().clone()
             per_channel = getattr(module, '_torchao_per_channel', scale.numel() > 1)
 
+        group_size = getattr(module, '_torchao_group_size', None)
         return {
             "scale":       scale,
             "precision":   module._torchao_precision,
             "hard":        True,
-            "per_channel": per_channel,
+            "per_channel": per_channel and group_size is None,
+            # per-group: scale is (out_features, in_features // group_size)
+            "group_size":  group_size,
+            # int8 asymmetric per-token dynamic activations (XNNPACK 8daXw)
+            "act_dynamic": bool(getattr(module, '_torchao_act_dynamic', False)),
         }
 
     if hasattr(module, '_soft_quant_precision'):
@@ -405,6 +418,8 @@ def _extract_weight_quant_info(
             "precision":   module._soft_quant_precision,
             "hard":        False,
             "per_channel": True,  # soft-quant always uses per-channel observers
+            "group_size":  None,
+            "act_dynamic": False,
         }
 
     return None  # unquantised — skip
