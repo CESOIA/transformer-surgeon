@@ -204,8 +204,12 @@ class TransformerDecoder(torch.nn.Module):
         self.register_buffer("rope_cos", rope[0].to(config.dtype), persistent=True)
         self.register_buffer("rope_sin", rope[1].to(config.dtype), persistent=True)
 
-        # Store the penalty value as a proper 1-element tensor buffer
-        self.register_buffer('mask_penalty', torch.tensor(-10000.0, dtype=config.dtype), persistent=True)
+        # Additive causal-mask penalty, a 1-element buffer. It must exceed any real
+        # attention logit: a finite -1e4 is NOT enough -- Qwen2.5 (k biases ~300)
+        # produces logits beyond +-1e4 at some positions, so empty cache slots got
+        # attention weight (KL 2.6e-3 vs HF even in fp32). -65504 is the most
+        # negative fp16 value, so it is representable in every model dtype.
+        self.register_buffer('mask_penalty', torch.tensor(-65504.0, dtype=config.dtype), persistent=True)
 
 
     def forward(

@@ -665,7 +665,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # Semantically identical: `attn_mask` as built by TransformerDecoder is
         # plain causal (mask out k_pos > q_pos), which is precisely what
         # is_causal=True generates. The only numeric difference is that the
-        # explicit mask used a finite -10000.0 penalty while the kernel uses a
+        # explicit mask uses a finite -65504 penalty while the kernel uses a
         # true -inf/skip, i.e. the kernel result is if anything slightly more
         # exact. `attn_mask` is therefore intentionally unused on this path --
         # it is still built for (and used by) the "manual"/"sdpa" kernels.
