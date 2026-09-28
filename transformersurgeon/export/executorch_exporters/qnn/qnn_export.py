@@ -272,6 +272,9 @@ class QNNExportConfig(ExecutorchExporterConfig):
     # Keep a deep copy of the quantized torch model the .pte is lowered from
     # (PT2E fake-quant graph for quantized exports) as result.reference_module.
     keep_reference_module: bool = False
+    # quant_scope="all" only: keep the attention core (RoPE, KV cache, scores,
+    # mask, softmax, A.V) in fp16 instead of 16-bit fixed point.
+    float_attention_core: bool = False
 
 
 def _resolve_qcom_chipset(soc_model: Any):
@@ -365,6 +368,32 @@ def _resolve_linear_to_conv2d(wrapper: nn.Module, config: QNNExportConfig) -> bo
             return False
         seen[key] = name
     return True
+
+
+def _float_attention_nodes(graph_module) -> list[str]:
+    """Nodes kept fp16 inside a quant_scope="all" graph: the attention core of every
+    MHACausal (RoPE, KV-cache read/write, scores, mask, softmax, A.V -- everything
+    in the attention module except its q/k/v/out linears) and the decoder-level
+    mask/RoPE-table slicing. These are rooted in float buffers (RoPE tables,
+    mutable KV cache, causal mask) that the QNN quantizer does not observe, which
+    makes HTP reject the ops (fp16 input, fixed-point output); and the attention
+    scores (|logit| up to ~1e4 plus a -65504 mask) cannot be held by a per-tensor
+    16-bit scale anyway. PT2E inserts explicit Q/DQ at the boundaries."""
+    names = []
+    for node in graph_module.graph.nodes:
+        if node.op != "call_function":
+            continue
+        stack = list(node.meta.get("nn_module_stack", {}).values())
+        if not stack:
+            continue
+        types = [str(t[1]) if isinstance(t, tuple) else str(t) for t in stack]
+        inner = types[-1]
+        in_attn = any("MHACausal" in t for t in types)
+        is_linear = "Linear" in inner  # q/k/v/out projections (LinearCompressed / nn.Linear)
+        at_decoder_root = inner.endswith("TransformerDecoder'>") or inner.endswith("TransformerDecoder")
+        if (in_attn and not is_linear) or at_decoder_root:
+            names.append(node.name)
+    return names
 
 
 def export_with_qnn(
@@ -475,6 +504,10 @@ def export_with_qnn(
             quantizer.default_quant_config = _float_config
 
         quantizer.set_submodule_qconfig_list(_qconfig_list)
+
+        if config.quant_scope == "all" and config.float_attention_core:
+            _discard = _float_attention_nodes(sanitized_module)
+            quantizer.add_discard_nodes(_discard)
 
         prepared = prepare_pt2e(sanitized_module, quantizer)
 

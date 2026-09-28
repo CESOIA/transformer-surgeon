@@ -549,6 +549,9 @@ def _layer_names_from_output_observer(
     return []  # direct predecessor is not a known linear → input observer
 
 
+_LINEAR_TARGETS = (torch.ops.aten.linear.default,)
+
+
 def inject_scales_into_pt2e_observers(
     prepared_model: nn.Module,
     layer_info: dict[str, dict[str, Any]],
@@ -593,7 +596,14 @@ def inject_scales_into_pt2e_observers(
             continue
 
         input_node = node.args[0] if node.args else None
-        is_weight_obs = input_node is not None and input_node.op == 'get_attr'
+        # A weight observer observes a constant AND feeds a linear's weight
+        # argument directly. Other constants (e.g. RMSNorm weights, observed when
+        # a backend quantizes every op) must not receive a linear's scales.
+        is_weight_obs = (
+            input_node is not None and input_node.op == 'get_attr'
+            and any(u.op == 'call_function' and u.target in _LINEAR_TARGETS
+                    and len(u.args) > 1 and u.args[1] is node for u in node.users)
+        )
 
         if is_weight_obs:
             names = _layer_names_from_observer(node, layer_info, stop_at_first=True, _diagnosed=_diag)
