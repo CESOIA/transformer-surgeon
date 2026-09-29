@@ -94,6 +94,10 @@ LLAMA_C_INDEXING = {
         'attn_type': 'mha_causal',
         'mlp_type': 'mlp_gated',
         'norm_type': 'rmsnorm',
+        # RoPE variant for the converted decoder (blocks/rope.py ROPE_INV_FREQ).
+        # 'auto' = the config's rope_type: 'llama3' for Llama 3.x (frequency
+        # scaling), 'default' for Llama 2 / TinyLlama.
+        'rope_type': 'auto',
         'layer_matching': {
             'input_layernorm': 'norm_in',
             'self_attn': ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.out_proj'],

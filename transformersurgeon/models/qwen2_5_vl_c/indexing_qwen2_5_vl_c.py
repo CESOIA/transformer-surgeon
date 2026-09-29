@@ -159,6 +159,9 @@ QWEN2_5_VL_C_INDEXING = {
         'attn_type': 'mha_causal',
         'mlp_type': 'mlp_gated',
         'norm_type': 'rmsnorm',
+        # RoPE variant for the converted text decoder (blocks/rope.py). Text-only
+        # decoding has equal t/h/w positions, where M-RoPE equals plain RoPE.
+        'rope_type': 'default',
         'layer_matching': {
             'input_layernorm': 'norm_in',
             'self_attn': ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.out_proj'],

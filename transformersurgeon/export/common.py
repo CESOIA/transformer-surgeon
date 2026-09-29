@@ -1031,6 +1031,8 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         "num_layers": len(decoder.blocks),
         "add_batch_dim": bool(getattr(wrapper, "add_batch_dim", False)),
         "attn_impl": getattr(decoder.blocks[0].attn, "attn_impl", None) if len(decoder.blocks) else None,
+        # RoPE variant baked into the graph's cos/sin tables (indexing 'rope_type').
+        "rope_type": getattr(getattr(decoder, "config", None), "rope_type", "default"),
         "vocab_size": int(getattr(model_config, "vocab_size", 0) or 0) if model_config is not None else 0,
         "eos_token_id": eos if isinstance(eos, list) else ([eos] if eos is not None else []),
         "caches": caches,

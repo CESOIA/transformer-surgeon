@@ -76,6 +76,7 @@ Where to look when you need to change something:
 | Change cross-layer input pruning (coupling) | `compression/coupled_pruning.py` (invoked in cascade by the structured pruner) |
 | Change scheme grouping (shared masks) | `utils/grouping.py` (`SchemeGroup`) + `utils/manager.py` (`create_group`/`delete_group`/`auto_groups`) |
 | Add a new model family | `models/newmodel_c/indexing_newmodel_c.py` + `models/newmodel_c/define_newmodel_c.py` |
+| Add / change a RoPE variant (e.g. Llama 3 frequency scaling) | `blocks/rope.py` (`ROPE_INV_FREQ`, `resolve_rope_type`) + the model's indexing `rope_type` |
 | Change what layers get compressed / pruning coupling in a model | `models/qwen2_c/indexing_qwen2_c.py` (or the relevant model's `indexing_*.py`) — `path_list` and the `pruning` block |
 | Change layer filtering / criteria logic | `utils/manager.py` → `iter_filtered()` |
 | Change calibration data collection hooks | `calibration/raw_data/activation.py` or `weight_grad.py` |
@@ -469,7 +470,12 @@ Things the codebase silently relies on. Breaking these causes silent wrong behav
 
 ### Adding a New Model Family
 
-1. Create `transformersurgeon/models/newmodel_c/indexing_newmodel_c.py` with an `INDEXING` dict. Use `models/qwen2_c/indexing_qwen2_c.py` as a template. Required keys: `num_blocks_attr`, `path_list`, `path_template`. Optional but recommended: `calibration_groups`, `skip_connections`, export metadata (`structure`, `attn_type`, `mlp_type`).
+1. Create `transformersurgeon/models/newmodel_c/indexing_newmodel_c.py` with an `INDEXING` dict. Use `models/qwen2_c/indexing_qwen2_c.py` as a template. Required keys: `num_blocks_attr`, `path_list`, `path_template`. Optional but recommended: `calibration_groups`, `skip_connections`, export metadata (`structure`, `attn_type`, `mlp_type`, `rope_type`).
+   `rope_type` picks the converted decoder's RoPE variant from `blocks/rope.py::ROPE_INV_FREQ` (`"default"`, `"llama3"`). Use a fixed name, or `"auto"` to take
+   the HF config's `rope_type` (Llama: Llama 3.x → `llama3`, Llama 2/TinyLlama → `default`). A fixed type contradicted by the config, or a type with no
+   implementation, raises at conversion (it used to warn and fall back to plain RoPE, which drifts from HF: KL 2e-3 on Llama-3.2-1B at ~300 tokens).
+   The resolved type is `config.rope_type` of the converted decoder and `rope_type` in the export manifest. New variant = one function in `ROPE_INV_FREQ`
+   (attention scaling must stay 1).
 
 2. Create `transformersurgeon/models/newmodel_c/define_newmodel_c.py` with three classes (exact pattern — do not deviate):
    ```python

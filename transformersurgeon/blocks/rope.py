@@ -1,22 +1,113 @@
+import math
 import warnings
 
 import torch
 
 
+def rope_parameters_from_config(config) -> dict:
+    """RoPE parameters of an HF-style config as one flat dict.
+
+    transformers 5 keeps them in ``config.rope_parameters`` (``rope_type``,
+    ``rope_theta`` and the scaling fields); 4.x has ``config.rope_scaling``
+    (``rope_type`` or legacy ``type``) plus a top-level ``config.rope_theta``.
+    Missing ``rope_type`` means plain RoPE (``"default"``).
+    """
+    params = dict(getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {})
+    if "rope_type" not in params and "type" in params:
+        params["rope_type"] = params.pop("type")
+    params.setdefault("rope_type", "default")
+    if params["rope_type"] == "mrope":  # legacy Qwen2-VL marker: default frequencies, sectioned (HF does the same)
+        params["rope_type"] = "default"
+    if params.get("rope_theta") is None and getattr(config, "rope_theta", None) is not None:
+        params["rope_theta"] = config.rope_theta
+    return params
+
+
 def rope_theta_from_config(config, default: float = 1e6) -> float:
     """RoPE base of an HF-style config.
 
-    transformers 5 keeps it in ``config.rope_parameters["rope_theta"]``; older
-    configs have ``config.rope_theta``. ``default`` (the historical tsurgeon
-    value) only applies when neither is present. Only plain RoPE is
-    implemented, so scaled variants (e.g. Llama 3's "llama3") are reported.
+    ``default`` (the historical tsurgeon value) only applies when the config
+    has no ``rope_theta``. The encoder path only implements plain RoPE, so a
+    scaled variant is reported there; decoders resolve the variant with
+    :func:`resolve_rope_type`.
     """
-    params = getattr(config, "rope_parameters", None) or {}
-    rope_type = params.get("rope_type", "default")
-    if rope_type not in ("default", None):
-        warnings.warn(f"RoPE scaling '{rope_type}' is not implemented; using plain RoPE.", stacklevel=2)
-    theta = params.get("rope_theta", getattr(config, "rope_theta", None))
+    params = rope_parameters_from_config(config)
+    if params["rope_type"] != "default":
+        warnings.warn(f"RoPE scaling '{params['rope_type']}' is not implemented here; using plain RoPE.",
+                      stacklevel=2)
+    theta = params.get("rope_theta")
     return float(default if theta is None else theta)
+
+
+def _inv_freq_default(head_dim: int, params: dict, device="cpu") -> torch.Tensor:
+    return precompute_rope_inv_freqs(head_dim=head_dim, base=float(params.get("rope_theta", 1e6)), device=device)
+
+
+def _inv_freq_llama3(head_dim: int, params: dict, device="cpu") -> torch.Tensor:
+    """Llama 3.x frequency scaling (HF ``_compute_llama3_parameters``): low
+    frequencies (wavelength above ``original_max_position_embeddings /
+    low_freq_factor``) are divided by ``factor``, high frequencies are kept, and
+    the band in between is interpolated smoothly. The attention factor is 1."""
+    for key in ("factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings"):
+        if key not in params:
+            raise ValueError(f"RoPE type 'llama3' needs '{key}' in the config's RoPE parameters.")
+    inv_freq = _inv_freq_default(head_dim, params, device)
+    factor = float(params["factor"])
+    low_freq_factor = float(params["low_freq_factor"])
+    high_freq_factor = float(params["high_freq_factor"])
+    old_context_len = float(params["original_max_position_embeddings"])
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    wavelen = 2 * math.pi / inv_freq
+    scaled = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smoothed = (1 - smooth) * scaled / factor + smooth * scaled
+    is_medium = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
+    return torch.where(is_medium, smoothed, scaled)
+
+
+# rope_type -> inverse-frequency function (head_dim, params, device). Every entry
+# must keep the attention scaling at 1 (cos/sin are not rescaled by the decoder).
+ROPE_INV_FREQ = {
+    "default": _inv_freq_default,
+    "llama3": _inv_freq_llama3,
+}
+
+
+def resolve_rope_type(config, indexing_rope_type: str = "default") -> str:
+    """RoPE variant a converted decoder must use.
+
+    ``indexing_rope_type`` comes from the model's indexing file: a fixed type
+    (e.g. ``"default"`` for Qwen2) or ``"auto"`` to take the config's
+    ``rope_type`` (Llama: ``"llama3"`` for Llama 3.x, ``"default"`` for Llama
+    2 / TinyLlama). A fixed type that disagrees with a scaled config, or a type
+    without an implementation, raises instead of silently using plain RoPE.
+    """
+    config_type = rope_parameters_from_config(config)["rope_type"]
+    if indexing_rope_type == "auto":
+        rope_type = config_type
+    else:
+        rope_type = indexing_rope_type
+        if config_type not in ("default", rope_type):
+            raise NotImplementedError(
+                f"The config asks for RoPE '{config_type}' but the model's indexing fixes "
+                f"'{rope_type}'; set the indexing 'rope_type' to 'auto' or '{config_type}'."
+            )
+    if rope_type not in ROPE_INV_FREQ:
+        raise NotImplementedError(
+            f"RoPE type '{rope_type}' is not implemented (available: {sorted(ROPE_INV_FREQ)})."
+        )
+    return rope_type
+
+
+def precompute_rope_inv_freqs_for(rope_type: str, head_dim: int, params: dict, device="cpu") -> torch.Tensor:
+    """Inverse frequencies ``(head_dim//2,)`` of one registered RoPE variant."""
+    if rope_type not in ROPE_INV_FREQ:
+        raise NotImplementedError(
+            f"RoPE type '{rope_type}' is not implemented (available: {sorted(ROPE_INV_FREQ)})."
+        )
+    return ROPE_INV_FREQ[rope_type](head_dim, params, device)
 
 
 def precompute_mrope_inv_freqs(
@@ -319,7 +410,11 @@ def build_rope_prune_projection(
 
 
 __all__ = [
+    "ROPE_INV_FREQ",
+    "rope_parameters_from_config",
     "rope_theta_from_config",
+    "resolve_rope_type",
+    "precompute_rope_inv_freqs_for",
     "precompute_mrope_inv_freqs",
     "precompute_mrope_cos_sin_half",
     "precompute_rope_inv_freqs",

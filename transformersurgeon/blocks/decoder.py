@@ -4,8 +4,8 @@ from .mlp import MLP
 from .mlp import MLPGated
 from .norm import RMSNorm
 from .rope import (
-    rope_theta_from_config,
-    precompute_rope_inv_freqs,
+    rope_parameters_from_config,
+    precompute_rope_inv_freqs_for,
     precompute_rope_cos_sin_half,
 )
 from .atomic import AtomicSum
@@ -192,9 +192,12 @@ class TransformerDecoder(torch.nn.Module):
         self.register_buffer("k_pos", k_pos, persistent=True)
 
         # Precompute RoPE once for all position in kv_cache (up to max_cache_len)
-        inv_freq = precompute_rope_inv_freqs(
-            head_dim=head_dim,
-            base=rope_theta_from_config(config),
+        # The variant (plain, llama3, ...) is resolved at conversion from the
+        # model's indexing 'rope_type' (blocks/rope.py resolve_rope_type).
+        inv_freq = precompute_rope_inv_freqs_for(
+            getattr(config, "rope_type", "default"),
+            head_dim,
+            rope_parameters_from_config(config),
         )
         rope = precompute_rope_cos_sin_half(
             inv_freq,

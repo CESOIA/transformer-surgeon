@@ -102,6 +102,9 @@ QWEN2_C_INDEXING = {
         'attn_type': 'mha_causal',
         'mlp_type': 'mlp_gated',
         'norm_type': 'rmsnorm',
+        # RoPE variant for the converted decoder (blocks/rope.py ROPE_INV_FREQ).
+        # Qwen2/2.5 use plain RoPE; a scaled config (e.g. YaRN) raises at conversion.
+        'rope_type': 'default',
         'layer_matching': {
             'input_layernorm': 'norm_in',
             'self_attn': ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.out_proj'],

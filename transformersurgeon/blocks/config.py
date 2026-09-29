@@ -3,6 +3,7 @@
 from transformers import PretrainedConfig
 
 from ..utils.configuration import init_compressed_config
+from .rope import resolve_rope_type
 
 class CustomDecoderConfigCompress(PretrainedConfig):
     """Minimal decoder config used by converted TransformerDecoder graphs."""
@@ -29,6 +30,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         add_batch_dim=False,
         rmsnorm_prescale=True,
         rmsnorm_upcast=False,
+        rope_type="default",
         indexing=None,
         **kwargs,
     ):
@@ -51,6 +53,9 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         self.add_batch_dim = add_batch_dim
         self.rmsnorm_prescale = rmsnorm_prescale
         self.rmsnorm_upcast = rmsnorm_upcast
+        # RoPE variant (blocks/rope.py ROPE_INV_FREQ); its parameters stay in the
+        # passthrough HF fields (rope_parameters / rope_scaling / rope_theta).
+        self.rope_type = rope_type
         self.bias_required = bias_required or {"attn": {}, "mlp": {}}
 
         if indexing is None:
@@ -125,6 +130,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
                 "add_batch_dim",
                 "rmsnorm_prescale",
                 "rmsnorm_upcast",
+                "rope_type",
             }
         }
 
@@ -151,6 +157,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
             add_batch_dim=add_batch_dim,
             rmsnorm_prescale=rmsnorm_prescale,
             rmsnorm_upcast=rmsnorm_upcast,
+            rope_type=resolve_rope_type(source_config_obj, source_indexing.get("rope_type", "default")),
             indexing=converted_indexing,
             **passthrough_kwargs,
         )
