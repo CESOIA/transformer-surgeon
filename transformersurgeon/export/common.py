@@ -838,23 +838,37 @@ def calibrate_pt2e_observers(
         return tuple([t.clone() for t in group] for group in cache_template)
 
     token_batches: list[list[int]] = []
-    if model_name:
+    user_ids = getattr(config, "calibration_token_ids", None)
+    if user_ids is not None:
+        token_batches = [[int(t) for t in seq][:max_pos] for seq in user_ids]
+    elif model_name:
         try:
             from transformers import AutoTokenizer
             tok = AutoTokenizer.from_pretrained(model_name)
             for sent in _CAL_SENTENCES:
                 ids = tok.encode(sent, add_special_tokens=True)
-                token_batches.append(ids)
+                token_batches.append(ids[:max_pos])
         except Exception:
             pass
 
+    def _reset_mutable_caches():
+        for name, buf in prepared.named_buffers():
+            if "cache" in name.rsplit(".", 1)[-1]:
+                buf.zero_()
+
     with torch.no_grad():
         if token_batches:
+            # Real teacher-forced decode: positions 0..n-1 with the KV cache filling up,
+            # so the attention/cache observers see the ranges they see at run time.
+            # (Every token at pos 1 with an empty cache left them uncalibrated:
+            # Qwen2.5-1.5B 16a8w all-op, KL 0.96 -> 0.57 vs the unquantized-activation model.)
             for ids in token_batches:
-                for token_id in ids:
+                _reset_mutable_caches()
+                for pos_i, token_id in enumerate(ids):
                     inp = torch.tensor([[token_id]] if add_batch_dim else [token_id], dtype=torch.long)
-                    pos = torch.tensor([1], dtype=torch.long)
+                    pos = torch.tensor([pos_i], dtype=torch.long)
                     prepared(inp, pos, *_fresh_caches())
+            _reset_mutable_caches()
         else:
             for _ in range(32):
                 rand_shape = (1, 1) if add_batch_dim else (1,)

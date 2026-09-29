@@ -313,6 +313,7 @@ def convert_for_export(model, options=None, verbose=False):
             add_batch_dim = options.get('add_batch_dim', False)
             rmsnorm_prescale = options.get('rmsnorm_prescale', True)
             rmsnorm_upcast = options.get('rmsnorm_upcast', False)
+            masked_softmax = options.get('masked_softmax', False)
 
             converted_indexing = _build_converted_decoder_indexing(indexing)
             converted_compression_config = _build_converted_compression_config(
@@ -338,6 +339,7 @@ def convert_for_export(model, options=None, verbose=False):
                 add_batch_dim=add_batch_dim,
                 rmsnorm_prescale=rmsnorm_prescale,
                 rmsnorm_upcast=rmsnorm_upcast,
+                masked_softmax=masked_softmax,
             )
 
             new_model = TransformerDecoder(config=converted_config)

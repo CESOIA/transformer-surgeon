@@ -32,6 +32,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.norm_type = config.norm_type
         self.use_sdpa = config.use_sdpa
         self.attn_impl = getattr(config, "attn_impl", None)
+        self.masked_softmax = getattr(config, "masked_softmax", False)
         self.max_cache_len = config.max_cache_len
         self.cache_impl = getattr(config, "cache_impl", "mutable")
         self.add_batch_dim = getattr(config, "add_batch_dim", False)
@@ -77,6 +78,7 @@ class TransformerDecoderBlock(torch.nn.Module):
                 compression_config=self.compression_config["attn"],
                 use_sdpa=self.use_sdpa,
                 attn_impl=self.attn_impl,
+                masked_softmax=self.masked_softmax,
                 max_cache_len=self.max_cache_len,
                 cache_impl=self.cache_impl,
                 add_batch_dim=self.add_batch_dim,

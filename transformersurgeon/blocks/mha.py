@@ -7,7 +7,7 @@ from .rope import apply_rope_multihead, build_rope_prune_projection
 from .kv_cache_ops import kv_cache_update
 from . import LinearCompressed
 
-def attention(query, key, value, attn_mask=None, kv_layout="shd"):
+def attention(query, key, value, attn_mask=None, kv_layout="shd", masked_softmax=False, scale=None):
     """
     Explicit implementation of scaled dot-product attention.
     This is needed for cases where torch's built-in SDPA is not suited for model export (e.g., ONNX).
@@ -25,6 +25,12 @@ def attention(query, key, value, attn_mask=None, kv_layout="shd"):
             as built by TransformerDecoder, or (1, 1, q_seq_length, kv_seq_length).
         kv_layout: "shd" (sequence-major, the unbatched caches) or "hsd"
             (head-major, the io_inplace BHSD cache with its batch dim dropped).
+        masked_softmax: instead of adding the (large negative) mask to the scores,
+            replace masked scores with (row minimum - 20) -- the vendor
+            enable_masked_softmax form. Mathematically the same attention (masked
+            weights ~e^-20 of the smallest live one, vs e^-65504), but the scores
+            keep their own range: with an additive -65504 a 16-bit quantized score
+            tensor spans ~[-65504, 1e4], i.e. a ~1.15-logit quantization step.
             Both reduce to the same contraction below; the two transposes
             compose into one permute that exporters fold into the matmul.
 
@@ -40,11 +46,13 @@ def attention(query, key, value, attn_mask=None, kv_layout="shd"):
     group_size = q_head_num // kv_head_num
 
     dtype = query.dtype
-    # Score scale uses the query/key head dim. Under position-linked structured
-    # pruning q/k shrink together (k_head_dim == q_head_dim) while value stays at
-    # its own (possibly larger) v_head_dim, so key and value are handled with
-    # their own last dims rather than one shared head_dim.
-    scale = 1.0 / math.sqrt(q_head_dim)
+    # Score scale: callers pass the *original* head dim's 1/sqrt(d) (MHABase.score_scale),
+    # so pruning q/k channels removes their terms from q.k without changing the softmax
+    # temperature (hard pruning == soft pruning == the pruned HF model). The q_head_dim
+    # fallback only serves callers that pass nothing. Key and value keep their own last
+    # dims (value may differ under v pruning).
+    if scale is None:
+        scale = 1.0 / math.sqrt(q_head_dim)
 
     # GQA by broadcast, not by materialization: group the query heads under their
     # kv head and let matmul broadcast the single key/value head across the group,
@@ -74,7 +82,11 @@ def attention(query, key, value, attn_mask=None, kv_layout="shd"):
     scores = torch.matmul(query * scale, key)   # (kv_head_num, group, q_seq_len, kv_len)
 
     if attn_mask is not None:
-        scores = scores + attn_mask
+        if masked_softmax:
+            floor = torch.amin(scores, dim=-1, keepdim=True) - 20
+            scores = torch.where(attn_mask == 0, scores, floor)
+        else:
+            scores = scores + attn_mask
 
     scores = torch.nn.functional.softmax(scores, dim=-1)
 
@@ -182,6 +194,12 @@ class MHABase(torch.nn.Module):
         # finalize_rope_pruning/_project_rope below.
         self.rope_pruned = False
         self.register_buffer("rope_freq_proj", None, persistent=False)
+
+    @property
+    def score_scale(self):
+        """1/sqrt(original head_dim): pruning q/k channels must not change the softmax
+        temperature (it is a property of the model, and the soft-pruned HF model keeps it)."""
+        return 1.0 / math.sqrt(self.head_dim)
 
     @property
     def key_head_dim(self):
@@ -372,10 +390,10 @@ class MHAEncoder(MHABase): # No cache, no causal masking, for encoder-only use
         if self.use_sdpa:
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
-                is_causal=False, enable_gqa=True,
+                is_causal=False, enable_gqa=True, scale=self.score_scale,
             )
         else:
-            attn_output = attention(q, k, v)
+            attn_output = attention(q, k, v, scale=self.score_scale)
 
         # Concatenate heads and project output. The concatenated width is
         # num_heads * value_head_dim (== embed_dim unless v_proj was hard-pruned,
@@ -550,6 +568,10 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # from use_sdpa when not given explicitly, so existing callers that
         # only pass use_sdpa are unaffected.
         self.attn_impl = kwargs.get("attn_impl", None) or ("sdpa" if self.use_sdpa else "manual")
+        # Masked softmax (see attention()): only the "manual" kernel implements it.
+        self.masked_softmax = bool(kwargs.get("masked_softmax", False))
+        if self.masked_softmax and self.attn_impl != "manual":
+            raise ValueError("masked_softmax=True needs attn_impl='manual'.")
         if self.attn_impl not in ATTN_IMPLS:
             raise ValueError(f"Unsupported attn_impl {self.attn_impl!r}; expected one of {ATTN_IMPLS}")
 
@@ -668,8 +690,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         _ = torch.ops.llama.update_cache(k_b, self.custom_sdpa_key_cache, start_pos)
         _ = torch.ops.llama.update_cache(v_b, self.custom_sdpa_value_cache, start_pos)
 
-        q_head_dim = self.q_proj.out_features // self.num_heads
-        scale = 1.0 / math.sqrt(q_head_dim)  # matches attention()'s own convention
+        scale = self.score_scale  # original head_dim, as in attention()
 
         # Let the kernel derive the causal mask itself from start_pos
         # (is_causal=True, attn_mask=None) instead of handing it an explicit
@@ -796,9 +817,11 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                 q_t = q.transpose(0, 1) # (num_heads, in_seq_len, head_dim)
                 k_t = key_read if kv_layout == "hsd" else key_read.transpose(0, 1) # (kv_num_heads, L, head_dim)
                 v_t = value_read if kv_layout == "hsd" else value_read.transpose(0, 1) # (kv_num_heads, L, head_dim)
-                attn_output = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask, is_causal=False, enable_gqa=True)
+                attn_output = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask, is_causal=False,
+                                                             enable_gqa=True, scale=self.score_scale)
             else:
-                attn_output = attention(q, key_read, value_read, attn_mask, kv_layout=kv_layout)
+                attn_output = attention(q, key_read, value_read, attn_mask, kv_layout=kv_layout,
+                                        masked_softmax=self.masked_softmax, scale=self.score_scale)
 
         # Concatenate heads and project output. Width is num_heads * value_head_dim
         # (== embed_dim unless v_proj was hard-pruned, in which case out_proj's

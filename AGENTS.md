@@ -203,6 +203,21 @@ float linears 16a16w → one partition. `keep_reference_module=True` returns the
 PT2E fake-quant model the .pte was lowered from (`result.reference_module`) —
 the host parity reference, because the x86 HTP simulator costs ~8 min/token at 1.5B.
 
+### QNN: activation calibration and masked softmax
+
+- PT2E calibration (`export/common.py::calibrate_pt2e_observers`) decodes each sequence from position 0
+  with the KV cache filling up (reset between sequences). It used to feed every token at position 1 with
+  an empty cache, which left the attention/cache observers uncalibrated. Pass real text of the target
+  distribution with `QNNExportConfig.calibration_token_ids`; the built-in sentences are only a fallback.
+- `convert_options={"masked_softmax": True}` (manual attention only): masked scores become `row min - 20`
+  (the vendor's `enable_masked_softmax`) instead of `score + mask_penalty`. It is the same function in float,
+  but a 16-bit quantized score tensor no longer spans [-65504, +1e4] (a ~1.15-logit step). Measured on Qwen2.5-1.5B 16a8w
+  all-op vs the same weights without activation quantization: KL 0.96 (old) -> 0.57 (decode calibration)
+  -> 0.36 (+ masked softmax), top-1 61 % -> 90 %.
+- Attention scores always use the original `1/sqrt(head_dim)` (`MHABase.score_scale`), including after
+  q/k head_dim pruning. Pruning channels must not change the softmax temperature, and the converted
+  hard-pruned graph must equal the soft-pruned HF model. Before this, it used `1/sqrt(pruned dim)`.
+
 ### QNN: block-wise W4 (LPBQ)
 
 HTP holds block-quantized weights only as LPBQ: 4-bit weights, one float scale per output channel and

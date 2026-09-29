@@ -275,6 +275,10 @@ class QNNExportConfig(ExecutorchExporterConfig):
     # quant_scope="all" only: keep the attention core (RoPE, KV cache, scores,
     # mask, softmax, A.V) in fp16 instead of 16-bit fixed point.
     float_attention_core: bool = False
+    # Token-id sequences for PT2E activation calibration (each decoded from position 0
+    # with the KV cache filling up). None = a few built-in sentences. Use real text
+    # from the target distribution: static 16-bit ranges come only from these.
+    calibration_token_ids: Any = None
 
 
 def _resolve_qcom_chipset(soc_model: Any):
