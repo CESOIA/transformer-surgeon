@@ -203,6 +203,20 @@ float linears 16a16w → one partition. `keep_reference_module=True` returns the
 PT2E fake-quant model the .pte was lowered from (`result.reference_module`) —
 the host parity reference, because the x86 HTP simulator costs ~8 min/token at 1.5B.
 
+### QNN: block-wise W4 (LPBQ)
+
+HTP holds block-quantized weights only as LPBQ: 4-bit weights, one float scale per output channel and
+a 4-bit integer multiplier per block. Free per-group scales (XNNPACK/TensorRT style) cannot reach the
+device exactly, so the QNN exporter raises for them. Quantize with `precision=4, granularity="per_group",
+group_size=G, group_scale_bits=4`: those layers are annotated `use_16a4w_block` with block `(1, G)`, their
+exact scales are injected into the per-block observers, and QNN's encoder
+(`builders/node_visitor.py::make_qnn_per_block_config`) re-derives the same channel scale and integers, so the
+torch model and the HTP weights are identical (2-layer Qwen2.5-1.5B, G=128, x86 simulator step 0 vs fake-quant
+reference: cos 0.999999, KL 7e-6; 1 partition, 0 CPU ops). HTP runs LPBQ only on convolutions (Qualcomm's LLM
+recipes lower every linear as a 1×1 conv2d), so an LPBQ export forces ExecuTorch's `ConvertLinearToConv2d`
+and unties the embedding/lm_head weight first (that pass mishandles tied weights). The lm_head then gets its own
+copy of the matrix: a bigger file, and the same decode reads.
+
 ### Numerics caveats found on Qwen2.5-1.5B (large attention logits)
 
 - Causal-mask penalty was `-10000`; Qwen2.5 logits exceed ±1e4 (k biases ≈300),
@@ -383,6 +397,7 @@ Pruning masks survive `restore()` for STE fine-tuning. Call `manager.remove_mask
 | `precision` | `"full"` | `"full"`, `"binary"`, or `int` in `[2, 16]` (e.g. `8`, `4`, `2` — NOT the strings `"int8"`/`"int4"`/`"int2"`); hard apply: `int` in `[2, 8]` |
 | `granularity` | `"per_tensor"` | `"per_tensor"`, `"per_channel"`, `"per_group"` |
 | `group_size` | `128` | positive `int` dividing `in_features` (used by `"per_group"`) |
+| `group_scale_bits` | `None` | `None`, or `int` in `[1, 8]`: `per_group` + `vanilla` only; group scales become `channel_scale × m`, `m` an integer in `[1, 2**bits]`, `channel_scale = max group scale / 2**bits` (`m` rounded up: no clipping). `4` = Qualcomm HTP LPBQ, the only group format QNN exports |
 | `sparsity` | `0.0` | `float` in `[0, 1)` |
 | `sparse_method` | `"magnitude"` | `"magnitude"`, `"random"` |
 | `precision_activation` | `"full"` | same as `precision` |

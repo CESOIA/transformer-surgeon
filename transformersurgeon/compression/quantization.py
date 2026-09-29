@@ -30,6 +30,9 @@ class Quantizer(Compressor):
         self.eps = self.config["eps"]
         self.granularity = self.config["granularity"]
         self.group_size = self.config.get("group_size", 128)
+        # group_scale_bits: per_group scales restricted to channel_scale * m with an
+        # integer m in [1, 2**bits] (4 = Qualcomm HTP LPBQ); None = free group scales.
+        self.group_scale_bits = self.config.get("group_scale_bits", None)
         self.precision_activation = self.config["precision_activation"]
         self.method_activation = self.config["method_activation"]
         self.scheme_activation = self.config["scheme_activation"]
@@ -72,6 +75,11 @@ class Quantizer(Compressor):
             validate_sparse_method(sparse_method)
             validate_quantization_eps(eps)
             validate_quantization_granularity(granularity)
+            validate_quantization_group_scale_bits(self.group_scale_bits)
+            if self.group_scale_bits is not None and (granularity != "per_group" or method != "vanilla"):
+                raise NotImplementedError("group_scale_bits (LPBQ-style group scales) needs "
+                                          "granularity='per_group' and method='vanilla'.")
+            self.config["group_scale_bits"] = self.group_scale_bits
 
             self.config["method"] = method
             self.config["precision"] = precision
@@ -85,6 +93,7 @@ class Quantizer(Compressor):
                 _apply_hard_quantization(
                     module, method, precision, granularity, self.group_size, eps,
                     self._calibration_kwargs(method),
+                    group_scale_bits=self.group_scale_bits,
                     dynamic_activation=(precision_activation != "full"
                                         and method_activation == "dynamic_per_token"),
                 )
@@ -117,6 +126,8 @@ class Quantizer(Compressor):
                         if method != "vanilla":
                             raise NotImplementedError("per_group granularity is only implemented for method='vanilla'.")
                         calibration_kwargs["group_size"] = self.group_size
+                        if self.group_scale_bits is not None:
+                            calibration_kwargs["group_scale_bits"] = self.group_scale_bits
                     qdata, scale, dequantize_fn = METHOD_FUNCTIONS[method](
                         param.data, precision, eps, granularity, **calibration_kwargs
                     )
@@ -218,6 +229,7 @@ class Quantizer(Compressor):
         self.config["sparse_method"] = "magnitude"
         self.config["granularity"] = "per_tensor"
         self.config["group_size"] = 128
+        self.config["group_scale_bits"] = None
         self.config["precision_activation"] = "full"
         self.config["method_activation"] = "maxmin"
         self.config["scheme_activation"] = "asymmetric"
@@ -252,6 +264,7 @@ class Quantizer(Compressor):
             "_torchao_precision",
             "_torchao_per_channel",
             "_torchao_group_size",
+            "_torchao_group_scale_bits",
             "_torchao_act_dynamic",
             "_torchao_scale",
         ):
@@ -336,7 +349,7 @@ def _extract_aqt_scale(w: torch.Tensor) -> torch.Tensor | None:
 
 
 def _apply_hard_quantization(module, method, precision, granularity, group_size, eps,
-                             calibration_kwargs, dynamic_activation=False) -> None:
+                             calibration_kwargs, dynamic_activation=False, group_scale_bits=None) -> None:
     """Hard quantization computed by tsurgeon's own method functions.
 
     The integer weights and scales come from METHOD_FUNCTIONS[method] (vanilla
@@ -374,6 +387,8 @@ def _apply_hard_quantization(module, method, precision, granularity, group_size,
         extra = dict(kw)
         if granularity == "per_group":
             extra["group_size"] = group_size
+            if group_scale_bits is not None:
+                extra["group_scale_bits"] = group_scale_bits
         qdata, scale, _ = METHOD_FUNCTIONS[method](w, precision, eps, granularity, **extra)
         n, k = w.shape
         if granularity == "per_group":
@@ -398,6 +413,8 @@ def _apply_hard_quantization(module, method, precision, granularity, group_size,
         mod._torchao_per_channel = granularity == "per_channel"
         if granularity == "per_group":
             mod._torchao_group_size = int(group_size)
+            if group_scale_bits is not None:
+                mod._torchao_group_scale_bits = int(group_scale_bits)
         mod._torchao_act_dynamic = bool(dynamic_activation)
 
 
@@ -542,6 +559,12 @@ def validate_quantization_group_size(group_size: int) -> None:
     if not isinstance(group_size, int) or isinstance(group_size, bool) or group_size <= 0:
         raise ValueError(f"Quantization group_size must be a positive int, but got {group_size!r}.")
 
+def validate_quantization_group_scale_bits(bits) -> None:
+    if bits is None:
+        return
+    if not isinstance(bits, int) or isinstance(bits, bool) or not (1 <= bits <= 8):
+        raise ValueError(f"group_scale_bits must be None or an int in [1, 8], but got {bits!r}.")
+
 def validate_activation_scheme(scheme: str) -> None:
     if scheme not in VALID_ACTIVATION_SCHEMES:
         raise ValueError(
@@ -556,5 +579,6 @@ __all__ = [
     "validate_sparse_method",
     "validate_quantization_granularity",
     "validate_quantization_group_size",
+    "validate_quantization_group_scale_bits",
     "validate_activation_scheme",
 ]

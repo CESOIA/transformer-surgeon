@@ -370,6 +370,42 @@ def _resolve_linear_to_conv2d(wrapper: nn.Module, config: QNNExportConfig) -> bo
     return True
 
 
+def _untie_shared_weights(wrapper: nn.Module) -> int:
+    """Give every nn.Linear its own weight Parameter when it shares one with another
+    Linear/Embedding (ExecuTorch's ConvertLinearToConv2d mishandles shared weights)."""
+    seen, untied = set(), 0
+    for m in wrapper.modules():
+        if isinstance(m, nn.Embedding):
+            seen.add(id(m.weight))
+    for m in wrapper.modules():
+        if isinstance(m, nn.Linear):
+            if id(m.weight) in seen:
+                m.weight = nn.Parameter(m.weight.detach().clone(), requires_grad=False)
+                untied += 1
+            seen.add(id(m.weight))
+    return untied
+
+
+def _linear_block_sizes(graph_module: torch.nn.Module, block_layers: dict[str, int]) -> dict[str, tuple]:
+    """QnnQuantizer block_size_map (node name -> weight block) for the linear ops of
+    LPBQ layers: a (1, group_size) block over the (out, in) weight."""
+    sizes, found = {}, set()
+    for node in graph_module.graph.nodes:
+        if node.op != "call_function" or node.target not in (torch.ops.aten.linear.default,):
+            continue
+        stack = node.meta.get("nn_module_stack", {})
+        if not stack:
+            continue
+        qname = list(stack.values())[-1][0]
+        if qname in block_layers:
+            sizes[node.name] = (1, block_layers[qname])
+            found.add(qname)
+    missing = set(block_layers) - found
+    if missing:
+        raise RuntimeError(f"QNN export: no linear op found for LPBQ layers {sorted(missing)}.")
+    return sizes
+
+
 def _float_attention_nodes(graph_module) -> list[str]:
     """Nodes kept fp16 inside a quant_scope="all" graph: the attention core of every
     MHACausal (RoPE, KV-cache read/write, scores, mask, softmax, A.V -- everything
@@ -414,6 +450,16 @@ def export_with_qnn(
     # Detect per-layer compression metadata (hard / soft quantized layers).
     # Quantization is driven entirely by model metadata.
     layer_info = extract_layer_quant_info(wrapper)
+
+    # HTP runs LPBQ (block-quantized) weights only on convolutions -- Qualcomm's LLM
+    # recipes lower every linear as a 1x1 conv2d and block-quantize the convs. So an
+    # export with per-group (LPBQ) layers must use ConvertLinearToConv2d, which in
+    # ExecuTorch 1.3.1 cannot handle tied weights: untie them (the lm_head gets its
+    # own copy of the embedding matrix; only the file grows, the decode step reads
+    # one embedding row).
+    lpbq = any(i.get("group_size") is not None for i in layer_info.values())
+    if lpbq:
+        _untie_shared_weights(wrapper)
 
     with torch.inference_mode():
         exported = torch_export(
@@ -469,10 +515,22 @@ def export_with_qnn(
         # Group layers by QuantDtype and build submodule_qconfig_list.
         from collections import defaultdict as _defaultdict
         _qdtype_to_layers: dict[QuantDtype, set] = _defaultdict(set)
+        _block_layers: dict[str, int] = {}
         for _name, _info in layer_info.items():
             if _info.get("group_size") is not None:
-                raise NotImplementedError(
-                    f"QNN export: '{_name}' is per-group quantized; not supported by this exporter yet.")
+                # HTP block quantization is LPBQ: 4-bit weights, one float scale per
+                # channel x a 4-bit integer per block. Only group scales computed in
+                # that form (quantization group_scale_bits=4) reach the device exactly.
+                if _info["precision"] != 4 or _info.get("group_scale_bits") != 4:
+                    raise NotImplementedError(
+                        f"QNN export: '{_name}' is per-group quantized with free group scales "
+                        f"(precision={_info['precision']}, group_scale_bits={_info.get('group_scale_bits')}). "
+                        "HTP block quantization (LPBQ) holds 4-bit weights with group scales = channel "
+                        "scale x a 4-bit integer: quantize with precision=4, granularity='per_group', "
+                        "group_scale_bits=4.")
+                _block_layers[_name] = int(_info["group_size"])
+                _qdtype_to_layers[QuantDtype.use_16a4w_block].add(_name)
+                continue
             _qdtype = _PREC_TO_QDTYPE.get(_info["precision"])
             if _qdtype is not None:
                 _qdtype_to_layers[_qdtype].add(_name)
@@ -504,6 +562,8 @@ def export_with_qnn(
             quantizer.default_quant_config = _float_config
 
         quantizer.set_submodule_qconfig_list(_qconfig_list)
+        if _block_layers:
+            quantizer.set_block_size_map(_linear_block_sizes(sanitized_module, _block_layers))
 
         if config.quant_scope == "all" and config.float_attention_core:
             _discard = _float_attention_nodes(sanitized_module)
@@ -670,7 +730,7 @@ def export_with_qnn(
         model_for_edge,
         example_inputs,
         compiler_spec,
-        convert_linear_to_conv2d=_resolve_linear_to_conv2d(wrapper, config),
+        convert_linear_to_conv2d=lpbq or _resolve_linear_to_conv2d(wrapper, config),
         **edge_kwargs,
     )
 

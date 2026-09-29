@@ -402,6 +402,8 @@ def _extract_weight_quant_info(
             "per_channel": per_channel and group_size is None,
             # per-group: scale is (out_features, in_features // group_size)
             "group_size":  group_size,
+            # LPBQ-style group scales (channel scale x integer in [1, 2**bits]), or None
+            "group_scale_bits": getattr(module, '_torchao_group_scale_bits', None),
             # int8 asymmetric per-token dynamic activations (XNNPACK 8daXw)
             "act_dynamic": bool(getattr(module, '_torchao_act_dynamic', False)),
         }
@@ -671,6 +673,12 @@ def _inject_weight_observer(observer: nn.Module, info: dict) -> None:
     if info["precision"] not in _PRECISION_TO_EFFECTIVE_DENOM:
         return
     qrange = _PRECISION_TO_QRANGE[info["precision"]]
+    if info.get("group_size") is not None:
+        # Per-block observer (e.g. QNN LPBQ): keep the (out, in // group_size) layout.
+        scale = info["scale"].float().reshape(info["scale"].shape[0], -1)
+        zero_point = torch.zeros(scale.shape, dtype=torch.int32)
+        observer.calculate_qparams = lambda: (scale, zero_point)
+        return
     scale = info["scale"].reshape(-1).float()
     zero_point = torch.zeros(scale.shape, dtype=torch.int32)
     if not info["per_channel"]:
