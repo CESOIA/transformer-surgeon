@@ -37,7 +37,7 @@ class RMSNorm(torch.nn.Module):
         if self.upcast:
             input_dtype = x.dtype
             x = x.to(torch.float32)
-            x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+            x = x * torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + self.eps)
             return self.weight * x.to(input_dtype)
 
         if self.prescale:
@@ -46,8 +46,12 @@ class RMSNorm(torch.nn.Module):
             max_x = torch.clamp(max_x, min=1.0)  # Scaling is useless if max_x < 1
             x = x / max_x
 
-        # Evaluate variance
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        # Evaluate variance. x * x, not x.pow(2): ExecuTorch's QNN RecomposeRmsNorm
+        # fuses [mul(w, mul(x, rsqrt(mean(x*x) + eps)))] into one HTP RmsNorm op, and
+        # the QNN exporter rewrites pow(x, 2) to pow.Tensor_Tensor, which it does not
+        # match. Decomposed and quantized, x*x of Qwen2.5's ~5e3 activations spans ~2.5e7
+        # in one 16-bit scale (all-op 16a8w: KL 0.25 vs 0.066 with the norm float).
+        variance = (x * x).mean(dim=-1, keepdim=True)
 
         # Normalize with variance
         x = x * torch.rsqrt(variance + self.eps)

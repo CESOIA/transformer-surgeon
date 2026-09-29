@@ -214,6 +214,11 @@ the host parity reference, because the x86 HTP simulator costs ~8 min/token at 1
   but a 16-bit quantized score tensor no longer spans [-65504, +1e4] (a ~1.15-logit step). Measured on Qwen2.5-1.5B 16a8w
   all-op vs the same weights without activation quantization: KL 0.96 (old) -> 0.57 (decode calibration)
   -> 0.36 (+ masked softmax), top-1 61 % -> 90 %.
+- RMSNorm must reach HTP as one fused `RmsNorm` op. ExecuTorch's `RecomposeRmsNorm` matches
+  `w * (x * rsqrt(mean(x*x) + eps))` (or with `pow.Tensor_Scalar`), but this exporter rewrites `pow(x, 2)`
+  to `pow.Tensor_Tensor`, so `blocks/norm.py` computes `x * x` (bit-identical). Decomposed and quantized,
+  `x*x` of Qwen2.5's ~5e3 residual activations spans ~2.5e7 in one 16-bit scale. With the fusion:
+  16a8w all-op KL 0.25 -> 0.062, top-1 91 % (prescale on; 0.070 with `rmsnorm_prescale=False`, the vendor form).
 - Attention scores always use the original `1/sqrt(head_dim)` (`MHABase.score_scale`), including after
   q/k head_dim pruning. Pruning channels must not change the softmax temperature, and the converted
   hard-pruned graph must equal the soft-pruned HF model. Before this, it used `1/sqrt(pruned dim)`.
