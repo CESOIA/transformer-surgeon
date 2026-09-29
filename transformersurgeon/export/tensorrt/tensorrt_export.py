@@ -61,6 +61,10 @@ class TensorRTExportConfig(ONNXExportConfig):
     # into an fp16-accumulating kernel that overflows on models with large
     # attention logits (Qwen2.5: NaN logits). See attention_passes.py.
     fp32_attention_scores: bool = True
+    # Accumulate the GEMMs of LRD-factorized linears in fp32 (weights/activations stay
+    # fp16): TensorRT's M=1 fp16 GEMV kernels accumulate in fp16, which LRD models do not
+    # tolerate. See precision_passes.py.
+    fp32_accumulate_lrd: bool = True
 
 
 def engine_profiles(manifest: dict) -> list[OptimizationProfile]:
@@ -107,6 +111,9 @@ def export_with_tensorrt(model_or_graph, *, config: TensorRTExportConfig) -> Ten
         raise ValueError(f"Unsupported int4_backend {config.int4_backend!r}")
     if config.int4_backend == "edgellm_plugin":
         config = dataclasses.replace(config, graph_passes=[*config.graph_passes, edgellm_int4_pass])
+    if config.fp32_accumulate_lrd:
+        from .precision_passes import fp32_accumulate_lrd
+        config = dataclasses.replace(config, graph_passes=[*config.graph_passes, fp32_accumulate_lrd])
     if config.fp32_attention_scores:
         from .attention_passes import fp32_attention_scores
         config = dataclasses.replace(config, graph_passes=[fp32_attention_scores, *config.graph_passes])

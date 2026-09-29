@@ -219,6 +219,13 @@ copy of the matrix: a bigger file, and the same decode reads.
 
 ### Numerics caveats found on Qwen2.5-1.5B (large attention logits)
 
+- **TensorRT fp16 GEMV accumulates in fp16.** At M=1 TensorRT 10.16 picks `gemvx_f16f16_f16_f16` kernels (fp16 compute) for every
+  fp16 GEMM, including under `STRONGLY_TYPED` with tactic sources restricted (they come from Myelin). Dense layers tolerate it; plain-SVD LRD
+  layers do not (Qwen2.5-1.5B lrd0.5-mlp: KL 0.10 vs torch fp16, whose own fp32 floor is 3e-3). `TensorRTExportConfig.fp32_accumulate_lrd`
+  (default True, `export/tensorrt/precision_passes.py`) casts the operands of LRD-factor GEMMs to fp32 and the result back. TensorRT fuses
+  the casts, so the weights stay fp16 (same engine size) and the result is KL 3.5e-4 at +4.7 % decode time (8.94 vs 8.54 ms, L4). Casting
+  only the gate/up V factors recovers most of it (KL 5e-3, +2 %).
+
 - Causal-mask penalty was `-10000`; Qwen2.5 logits exceed ±1e4 (k biases ≈300),
   so masked slots got weight (KL 2.6e-3 vs HF in fp32). Now `-65504`
   (`blocks/decoder.py`). Any mask constant must exceed the model's logit range.
