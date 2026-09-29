@@ -396,6 +396,8 @@ def convert_for_export(model, options=None, verbose=False):
             # TransformerDecoderBlock/TransformerEncoderBlock, not driven by
             # layer_matching.
             attn_module = get_submodule(new_model, path_template.format(i=i, path="attn"))
+            if hasattr(attn_module, "finalize_head_pruning"):  # whole heads removed by block pruning
+                attn_module.finalize_head_pruning()
             if hasattr(attn_module, "finalize_rope_pruning"):
                 attn_module.finalize_rope_pruning()
 

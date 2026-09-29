@@ -8,6 +8,12 @@ from .structured_pruning import (
     validate_structured_pruning_repeated_pattern,
     validate_structured_pruning_coupled_repeated_pattern,
 )
+from .block_pruning import (
+    BlockPruner,
+    validate_block_pruning_ratio,
+    validate_block_pruning_method,
+    validate_block_pruning_blocks,
+)
 from .unstructured_pruning import (
     UnstructuredPruner,
     validate_unstructured_pruning_ratio,
@@ -34,15 +40,18 @@ from .quantization import (
 
 COMPRESSOR_DICT = {
     "structured_pruning": StructuredPruner,
+    "block_pruning": BlockPruner,
     "unstructured_pruning": UnstructuredPruner,
     "lrd": LRDer,
     "quantization": Quantizer
 }
 
 # Canonical order in which compressors are applied to a module.
-# lrd first (changes weight shape), then pruning (masks the result),
-# then quantization (must see the final float weights).
-APPLICATION_ORDER = ["lrd", "structured_pruning", "unstructured_pruning", "quantization"]
+# block pruning first (removes whole heads, and the matching input columns of
+# dependent layers, before anything factorizes or quantizes them), then lrd
+# (changes weight shape), then pruning (masks the result), then quantization
+# (must see the final float weights).
+APPLICATION_ORDER = ["block_pruning", "lrd", "structured_pruning", "unstructured_pruning", "quantization"]
 
 # Compression properties that are group-scoped: they may be set ONLY through a
 # group name (manager.set(..., group=...)), never via plain criteria. Enabling
@@ -83,6 +92,18 @@ COMPRESSION_REGISTRY = {
         "reduce_op": dict(default=None, validator=validate_structured_pruning_reduce_op),
         # Group-only option (see GROUP_OPTIONS): settable only via a group name.
         "share_mask": dict(default=False, validator=validate_structured_pruning_share_mask),
+    },
+    # Whole-block removal (e.g. attention heads), separate from structured
+    # pruning; where blocks are and what they cascade to comes from the
+    # indexing's pruning.block_pruning (compression/block_pruning.py).
+    "block_pruning": {
+        # fraction of blocks removed in every unit (e.g. query heads per KV group):
+        # int(ratio * blocks_per_unit) blocks per unit.
+        "ratio": dict(default=0.0, validator=validate_block_pruning_ratio),
+        "method": dict(default="magnitude", validator=validate_block_pruning_method),
+        # explicit global block indices to remove (overrides ratio/method); must hit
+        # every unit equally.
+        "blocks": dict(default=None, validator=validate_block_pruning_blocks),
     },
     "unstructured_pruning": {
         "ratio": dict(default=0.0, validator=validate_unstructured_pruning_ratio),

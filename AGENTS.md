@@ -77,6 +77,7 @@ Where to look when you need to change something:
 | Change scheme grouping (shared masks) | `utils/grouping.py` (`SchemeGroup`) + `utils/manager.py` (`create_group`/`delete_group`/`auto_groups`) |
 | Add a new model family | `models/newmodel_c/indexing_newmodel_c.py` + `models/newmodel_c/define_newmodel_c.py` |
 | Add / change a RoPE variant (e.g. Llama 3 frequency scaling) | `blocks/rope.py` (`ROPE_INV_FREQ`, `resolve_rope_type`) + the model's indexing `rope_type` |
+| Remove whole attention heads (block pruning) | `compression/block_pruning.py` + indexing `pruning.block_pruning`; converted side `blocks/mha.py::finalize_head_pruning` |
 | Change what layers get compressed / pruning coupling in a model | `models/qwen2_c/indexing_qwen2_c.py` (or the relevant model's `indexing_*.py`) — `path_list` and the `pruning` block |
 | Change layer filtering / criteria logic | `utils/manager.py` → `iter_filtered()` |
 | Change calibration data collection hooks | `calibration/raw_data/activation.py` or `weight_grad.py` |
@@ -338,6 +339,31 @@ Scope: both MLP and attention (q/k/v) structured pruning are wired end-to-end
 at conversion time (`blocks/mha.py::MHABase.finalize_rope_pruning()`), and a
 hard-pruned `v_proj` cascades into `o_proj` via `coupled_repeated_pattern`. See
 `test/e2e/test_gqa_attention_pruning.py`.
+
+### `"block_pruning"` — Whole-Block (Attention-Head) Removal
+
+Separate from `structured_pruning`: removes complete row blocks, e.g. whole query heads, instead of
+channels (structured pruning on attention shrinks `head_dim`). Code: `compression/block_pruning.py`;
+model truth: the indexing's `pruning.block_pruning` (per prunable layer: `owner`, `block_size_attr`,
+`blocks_per_unit_attr`, `input_dependence`). Wired for `self_attn.q_proj` in `qwen2_c` and `llama_c`.
+
+| param | default | valid values |
+|---|---|---|
+| `ratio` | `0.0` | `float` in `[0, 1)` — `int(ratio × blocks_per_unit)` heads removed in **every** KV group |
+| `method` | `"magnitude"` | `"magnitude"` (‖q block‖·‖o columns‖), `"random"` (torch RNG) |
+| `blocks` | `None` | explicit global head indices to remove (overrides ratio/method); must hit every KV group equally |
+
+```python
+manager.set("block_pruning", "blocks", [1, 6], criteria=[["self_attn.q_proj", 0]])  # 1 head per KV group
+manager.apply(hard=True)
+```
+
+- Uniform per KV group so GQA stays regular; removing a whole group (all its query heads) raises.
+- Soft apply zeroes the heads' `o_proj` input columns (zeroed query rows would not silence a head); restore undoes it.
+- Hard apply removes q rows (+bias) and `o_proj` columns, sets `self_attn.num_key_value_groups` to the kept
+  heads per KV head (HF keeps running), and records `q_proj.block_prune_mask`. `convert_for_export` adopts the head
+  count via `blocks/mha.py::MHABase.finalize_head_pruning()`; the manifest/cache geometry is unchanged (KV heads stay).
+- Not combinable with structured (head_dim) pruning of the same q_proj (raises).
 
 ### `"unstructured_pruning"` — Weight-Level Sparsity
 

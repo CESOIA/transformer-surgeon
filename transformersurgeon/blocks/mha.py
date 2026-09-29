@@ -197,6 +197,30 @@ class MHABase(torch.nn.Module):
         """
         return self.v_proj.out_features // self.kv_num_heads
 
+    def finalize_head_pruning(self):
+        """Adopt the query-head count left by block pruning (whole heads removed,
+        ``compression/block_pruning.py``). Conversion-time hook like
+        ``finalize_rope_pruning``: call once after q_proj's weights and its
+        ``block_prune_mask`` buffer (kept heads) are loaded, before the RoPE
+        hook and any forward(). head_dim is unchanged; the heads kept per KV
+        group are equal, so grouped attention stays regular."""
+        kept = getattr(self.q_proj, "block_prune_mask", None)
+        if kept is None:
+            return
+        num_heads = int(kept.sum().item())
+        if self.q_proj.out_features != num_heads * self.head_dim:
+            raise ValueError(
+                f"q_proj has {self.q_proj.out_features} rows but block_prune_mask keeps {num_heads} heads "
+                f"of head_dim {self.head_dim}."
+            )
+        if num_heads % self.kv_num_heads:
+            raise ValueError(f"{num_heads} query heads left by block pruning do not split evenly over "
+                             f"{self.kv_num_heads} KV heads.")
+        if getattr(self.q_proj, "rope_prune_mask", None) is not None:
+            raise NotImplementedError("Block pruning combined with RoPE-linked structured pruning of q_proj "
+                                      "is not supported.")
+        self.num_heads = num_heads
+
     def finalize_rope_pruning(self):
         """Freeze this module's RoPE-pruning geometry from q_proj/k_proj's
         *current* shapes and ``rope_prune_mask`` buffers. Instantiation-time

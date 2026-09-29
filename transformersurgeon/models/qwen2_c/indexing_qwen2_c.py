@@ -87,6 +87,19 @@ QWEN2_C_INDEXING = {
             # never user-compressible, and only ever pruned by forwarding a
             # mask through them (see CoupledPruner.apply_chain).
             'norm_layers': ['input_layernorm', 'post_attention_layernorm'],
+            # block_pruning: whole-block removal (compression/block_pruning.py),
+            # separate from structured pruning. One q_proj block = one query head
+            # (head_dim rows); removing it removes the same o_proj input columns,
+            # uniformly per KV group, and sets self_attn.num_key_value_groups to
+            # the kept query heads per KV head.
+            'block_pruning': {
+                'self_attn.q_proj': {
+                    'owner': 'self_attn',
+                    'block_size_attr': 'head_dim',
+                    'blocks_per_unit_attr': 'num_key_value_groups',
+                    'input_dependence': ['self_attn.o_proj'],
+                },
+            },
         },
         'path_template': "model.layers.{block_index}.{path}",
         'extra_layers': ["model.norm"],
