@@ -25,6 +25,15 @@ LLAMA_C_INDEXING = {
             ['input_layernorm', 'self_attn'],
             ['post_attention_layernorm', 'mlp'],
         ],
+        # SmoothQuant groups (compression/smoothquant.py): producer -> consumers that read its
+        # output, joined only by per-channel-commuting ops (norm directly; up_proj through
+        # act(gate) * up). o_proj is not listed: its producer (v_proj) reaches it through
+        # attention and GQA head sharing.
+        'smoothing': {
+            'input_layernorm': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
+            'post_attention_layernorm': ['mlp.gate_proj', 'mlp.up_proj'],
+            'mlp.up_proj': ['mlp.down_proj'],
+        },
         'calibration_groups': {
             'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
             'mlp': [['gate_proj', 'up_proj'], ['down_proj']],

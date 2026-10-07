@@ -152,9 +152,11 @@ def test_activation_quantization_pass_rejects_non_tensorrt_schemes(bad):
 
 
 @caps.requires_tensorrt
-def test_tensorrt_w8a8_static_activations_match_eager(tmp_path):
-    """W8 weights + calibrated static INT8 input activations (TensorRT W8A8) == the
-    hook-simulated tsurgeon model; the ONNX carries one activation Q/DQ per linear."""
+@pytest.mark.parametrize("smooth", [False, True])
+def test_tensorrt_w8a8_static_activations_match_eager(tmp_path, smooth):
+    """W8 weights + calibrated static INT8 input activations (TensorRT W8A8), optionally
+    SmoothQuant-ed first, == the hook-simulated tsurgeon model; the ONNX carries one
+    activation Q/DQ per linear."""
     import onnx
     from torch.utils.data import DataLoader
 
@@ -173,6 +175,8 @@ def test_tensorrt_w8a8_static_activations_match_eager(tmp_path):
     gen = torch.Generator().manual_seed(1)
     manager.set_calibration_data(DataLoader(
         [{"input_ids": torch.randint(0, 256, (16,), generator=gen)} for _ in range(4)], batch_size=1))
+    if smooth:
+        assert manager.smooth_activations(alpha=0.5, criteria=crit)["groups"] == 6
     manager.apply(hard=True, criteria=crit, show_progress=False)
     linears = [m for m in model.modules() if hasattr(m, "_act_quant_scale")]
     assert len(linears) == 14 and not any(hasattr(m, "_act_out_quant_scale") for m in linears)
