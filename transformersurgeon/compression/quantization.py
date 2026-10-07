@@ -36,6 +36,7 @@ class Quantizer(Compressor):
         self.precision_activation = self.config["precision_activation"]
         self.method_activation = self.config["method_activation"]
         self.scheme_activation = self.config["scheme_activation"]
+        self.quantize_output_activation = self.config.get("quantize_output_activation", True)
         self.calibration_store = None
 
     def set_calibration_store(self, calibration_data):
@@ -46,7 +47,7 @@ class Quantizer(Compressor):
         if self.precision_activation != "full" and self.method_activation != "dynamic_per_token":
             if "activation_range" not in summaries:
                 summaries.append("activation_range")
-            if "output_activation_range" not in summaries:
+            if self.quantize_output_activation and "output_activation_range" not in summaries:
                 summaries.append("output_activation_range")
         return tuple(summaries)
 
@@ -186,7 +187,9 @@ class Quantizer(Compressor):
             )
 
         # Output activation fake-quant emulation via forward post-hook.
-        if precision_activation != "full":
+        validate_quantize_output_activation(self.quantize_output_activation)
+        self.config["quantize_output_activation"] = self.quantize_output_activation
+        if precision_activation != "full" and self.quantize_output_activation:
             if self.calibration_store is None or "output_activation_range" not in self.calibration_store:
                 raise RuntimeError(
                     "Output activation quantization requires calibration data. "
@@ -233,6 +236,7 @@ class Quantizer(Compressor):
         self.config["precision_activation"] = "full"
         self.config["method_activation"] = "maxmin"
         self.config["scheme_activation"] = "asymmetric"
+        self.config["quantize_output_activation"] = True
         self.strip_runtime_state(module)
 
     def strip_runtime_state(self, module):
@@ -297,11 +301,12 @@ def _make_activation_fake_quant_hook(
         qmax = 2 ** precision - 1
         qmin = 0
 
-    zp = zero_point.float()
-    s = scale.float()
-
-    def hook(_, inputs):
+    # Read the module's buffers at call time (not the tensors given here), so the
+    # hook follows the module across .to(device) and state_dict loads.
+    def hook(module, inputs):
         x = inputs[0]
+        s = module._act_quant_scale.float()
+        zp = module._act_quant_zero_point.float()
         xq = torch.clamp(torch.round(x / s) + zp, qmin, qmax)
         x_fq = (xq - zp) * s
         return (x_fq.to(x.dtype),) + inputs[1:]
@@ -323,10 +328,9 @@ def _make_output_activation_fake_quant_hook(
         qmax = 2 ** precision - 1
         qmin = 0
 
-    zp = zero_point.float()
-    s = scale.float()
-
-    def hook(_, inputs, output):
+    def hook(module, inputs, output):
+        s = module._act_out_quant_scale.float()
+        zp = module._act_out_quant_zero_point.float()
         xq = torch.clamp(torch.round(output / s) + zp, qmin, qmax)
         x_fq = (xq - zp) * s
         return x_fq.to(output.dtype)
@@ -565,6 +569,10 @@ def validate_quantization_group_scale_bits(bits) -> None:
     if not isinstance(bits, int) or isinstance(bits, bool) or not (1 <= bits <= 8):
         raise ValueError(f"group_scale_bits must be None or an int in [1, 8], but got {bits!r}.")
 
+def validate_quantize_output_activation(value) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"quantize_output_activation must be a bool, but got {value!r}.")
+
 def validate_activation_scheme(scheme: str) -> None:
     if scheme not in VALID_ACTIVATION_SCHEMES:
         raise ValueError(
@@ -581,4 +589,5 @@ __all__ = [
     "validate_quantization_group_size",
     "validate_quantization_group_scale_bits",
     "validate_activation_scheme",
+    "validate_quantize_output_activation",
 ]

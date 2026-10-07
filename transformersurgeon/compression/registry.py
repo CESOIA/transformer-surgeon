@@ -35,6 +35,7 @@ from .quantization import (
     validate_quantization_eps,
     validate_quantization_granularity,
     validate_quantization_group_size,
+    validate_quantize_output_activation,
     validate_quantization_group_scale_bits,
     validate_activation_scheme,
 )
@@ -131,6 +132,10 @@ COMPRESSION_REGISTRY = {
         "precision_activation": dict(default="full", validator=validate_precision),
         "method_activation": dict(default="maxmin", validator=validate_activation_method),
         "scheme_activation": dict(default="asymmetric", validator=validate_activation_scheme),
+        # Static activation quantization of the linear's output as well as its input.
+        # False = input only: the INT8 GEMMs of TensorRT (W8A8) take int8 inputs and
+        # write float outputs.
+        "quantize_output_activation": dict(default=True, validator=validate_quantize_output_activation),
     }
 }
 

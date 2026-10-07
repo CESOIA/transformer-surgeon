@@ -36,7 +36,7 @@ from ..common import (
     finalize_export_result,
     resolve_components_and_wrapper,
 )
-from .quantization import apply_weight_quantization
+from .quantization import apply_activation_quantization, apply_weight_quantization
 
 
 def _tensor_scatter(cache, update, write_index):
@@ -155,6 +155,7 @@ def export_with_onnx(model_or_graph: Any, *, config: ONNXExportConfig) -> ONNXEx
 
     quantized = (apply_weight_quantization(model, layer_info, int4_block_size=config.int4_block_size)
                  if layer_info else {})
+    act_quantized = apply_activation_quantization(model, layer_info) if layer_info else {}
     manifest = build_llm_manifest(
         wrapper, model_config, backend=config.backend, artifact=config.output_path,
         precision="mixed" if quantized else "full",
@@ -163,7 +164,8 @@ def export_with_onnx(model_or_graph: Any, *, config: ONNXExportConfig) -> ONNXEx
         max_input_len=int(config.max_input_len),
         logits_dtype=str(logits_dtype).replace("torch.", ""),
         inputs={"input_ids": {"shape": ["seq"], "dtype": "int64"}, "pos_id": {"shape": [1], "dtype": "int64"}},
-        quantized_layers={name: {"precision": q["precision"], "granularity": q["granularity"]}
+        quantized_layers={name: {"precision": q["precision"], "granularity": q["granularity"],
+                                 **act_quantized.get(name, {})}
                           for name, q in quantized.items()},
     )
     for graph_pass in config.graph_passes:

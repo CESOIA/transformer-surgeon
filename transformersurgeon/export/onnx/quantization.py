@@ -12,8 +12,13 @@ DequantizeLinear, which TensorRT fuses into a weight-only GEMM:
                      blocks (exact, and a kernel-supported block size)
 
 Hard-quantized layers reuse tsurgeon's exact scales; soft-quantized ones
-(scale None) get symmetric per-channel max-abs scales. Activations stay float
-(activation calibration, if any, is reported and ignored).
+(scale None) get symmetric per-channel max-abs scales.
+
+Static activation quantization (apply_activation_quantization): a layer whose
+input activation was calibrated by tsurgeon (``act_scale``; INT8 symmetric,
+per-tensor) gets QuantizeLinear -> DequantizeLinear on the activation input of
+its GEMM. TensorRT fuses Q/DQ(x) + DQ(W) into a native INT8 GEMM (W8A8) with a
+float output. For an LRD layer the calibrated input is the one of its V factor.
 """
 
 import warnings
@@ -62,10 +67,6 @@ def apply_weight_quantization(model, layer_info: dict[str, dict[str, Any]], *, i
         if precision not in _QRANGE:
             warnings.warn(f"ONNX export: unsupported precision {precision} for {layer_name}; kept float.", stacklevel=2)
             continue
-        if info.get("act_scale") is not None:
-            warnings.warn(f"ONNX export: activation quantization of {layer_name} is not exported "
-                          "(weight-only); activations stay float.", stacklevel=2)
-
         weight_name = f"{layer_name}.weight"
         init = _find_initializer(model, weight_name)
         if init is None:
@@ -150,4 +151,70 @@ def apply_weight_quantization(model, layer_info: dict[str, dict[str, Any]], *, i
     return done
 
 
-__all__ = ["apply_weight_quantization"]
+def _gemm_consumers(model, weight_name: str) -> list:
+    """GEMM nodes reading ``weight_name`` (or its weight DequantizeLinear output) as their B input."""
+    names = {weight_name, weight_name + "_dq"}
+    return [n for n in model.graph.node
+            if n.op_type in ("Gemm", "MatMul") and len(n.input) > 1 and n.input[1] in names]
+
+
+def apply_activation_quantization(model, layer_info: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Insert static INT8 Q/DQ on the activation input of calibrated linears (in place).
+
+    Returns {layer_name: {"act_precision", "act_granularity"}} for the layers rewritten.
+    Only symmetric INT8 per-tensor scales are expressible for TensorRT (zero point 0).
+    """
+    from onnx import helper, numpy_helper
+
+    done: dict[str, dict[str, Any]] = {}
+    for layer_name, info in layer_info.items():
+        if info.get("act_scale") is None:
+            continue
+        if info.get("act_out_scale") is not None:
+            raise NotImplementedError(
+                f"ONNX/TensorRT export: {layer_name} has output-activation quantization; TensorRT INT8 "
+                "GEMMs write float outputs (quantize the input only: quantize_output_activation=False).")
+        precision, scheme = int(info["act_precision"]), info["act_scheme"]
+        zp = info["act_zero_point"].detach().reshape(-1)
+        if precision != 8 or scheme != "symmetric" or bool((zp != 0).any()):
+            raise NotImplementedError(
+                f"ONNX/TensorRT export: {layer_name} activation is {precision}-bit {scheme}; only INT8 "
+                "symmetric (zero point 0) is supported.")
+        scale = info["act_scale"].detach().float().reshape(-1)
+        if scale.numel() != 1:
+            raise NotImplementedError(f"ONNX/TensorRT export: {layer_name} activation scale is not per-tensor.")
+        # The module input feeds the V factor of an LRD layer.
+        target = f"{layer_name}.linear_V.weight"
+        if _find_initializer(model, target) is None and _find_initializer(model, target + "_q") is None:
+            target = f"{layer_name}.weight"
+        consumers = _gemm_consumers(model, target)
+        if not consumers:
+            raise RuntimeError(f"ONNX export: no GEMM reads '{target}'; cannot place {layer_name}'s activation Q/DQ.")
+        w = _find_initializer(model, target + "_scale")
+        if w is None:
+            w = _find_initializer(model, target)
+        float_dtype = numpy_helper.to_array(w).dtype
+        if float_dtype not in (np.float16, np.float32):
+            raise RuntimeError(f"ONNX export: unexpected float dtype {float_dtype} for {target}.")
+        prefix = f"{layer_name}.act"
+        s_init = numpy_helper.from_array(np.array(scale.item(), dtype=float_dtype), prefix + "_scale")
+        z_init = numpy_helper.from_array(np.array(0, dtype=np.int8), prefix + "_zero_point")
+        model.graph.initializer.extend([s_init, z_init])
+        new_nodes = []
+        for k, node in enumerate(consumers):
+            x = node.input[0]
+            q_out, dq_out = f"{prefix}{k}_q", f"{prefix}{k}_dq"
+            new_nodes.append(helper.make_node("QuantizeLinear", [x, s_init.name, z_init.name], [q_out],
+                                              name=f"{prefix}{k}_QuantizeLinear"))
+            new_nodes.append(helper.make_node("DequantizeLinear", [q_out, s_init.name, z_init.name], [dq_out],
+                                              name=f"{prefix}{k}_DequantizeLinear"))
+            node.input[0] = dq_out
+        # Keep the graph topologically sorted: Q/DQ go right before their first consumer.
+        first = min(list(model.graph.node).index(n) for n in consumers)
+        for j, n in enumerate(new_nodes):
+            model.graph.node.insert(first + j, n)
+        done[layer_name] = {"act_precision": 8, "act_granularity": "per_tensor"}
+    return done
+
+
+__all__ = ["apply_activation_quantization", "apply_weight_quantization"]

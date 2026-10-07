@@ -108,6 +108,92 @@ def test_weight_quantization_pass_is_exact(precision):
     np.testing.assert_allclose(q_out * s_out, w.astype(np.float32), rtol=1e-3)
 
 
+def _act_info(scale=0.05, scheme="symmetric", zero_point=0, out_scale=None):
+    return {"act_scale": torch.tensor([scale]), "act_zero_point": torch.tensor([zero_point], dtype=torch.int32),
+            "act_precision": 8, "act_scheme": scheme, "act_out_scale": out_scale}
+
+
+def _gemm_model(weight_names=("lin.weight",)):
+    from onnx import TensorProto, helper, numpy_helper
+
+    nodes = [helper.make_node("Gemm", ["x", w], [f"y{i}"], transB=1) for i, w in enumerate(weight_names)]
+    inits = [numpy_helper.from_array(np.ones((4, 8), np.float16), w) for w in weight_names]
+    graph = helper.make_graph(nodes, "g", [helper.make_tensor_value_info("x", TensorProto.FLOAT16, [1, 8])],
+                              [helper.make_tensor_value_info(f"y{i}", TensorProto.FLOAT16, [1, 4])
+                               for i in range(len(weight_names))], inits)
+    return helper.make_model(graph)
+
+
+@caps.requires_onnx
+def test_activation_quantization_pass_places_qdq_on_gemm_input():
+    from onnx import numpy_helper
+
+    from transformersurgeon.export.onnx import apply_activation_quantization
+
+    model = _gemm_model()
+    done = apply_activation_quantization(model, {"lin": _act_info(0.05)})
+    assert done == {"lin": {"act_precision": 8, "act_granularity": "per_tensor"}}
+    ops = [n.op_type for n in model.graph.node]
+    assert ops == ["QuantizeLinear", "DequantizeLinear", "Gemm"]
+    gemm = model.graph.node[2]
+    assert gemm.input[0] == model.graph.node[1].output[0] and model.graph.node[0].input[0] == "x"
+    inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+    assert inits["lin.act_scale"].dtype == np.float16 and float(inits["lin.act_scale"]) == pytest.approx(0.05, rel=1e-3)
+    assert inits["lin.act_zero_point"].dtype == np.int8 and int(inits["lin.act_zero_point"]) == 0
+
+
+@caps.requires_onnx
+@pytest.mark.parametrize("bad", [dict(scheme="asymmetric", zero_point=3), dict(out_scale=torch.tensor([0.1]))])
+def test_activation_quantization_pass_rejects_non_tensorrt_schemes(bad):
+    from transformersurgeon.export.onnx import apply_activation_quantization
+
+    with pytest.raises(NotImplementedError):
+        apply_activation_quantization(_gemm_model(), {"lin": _act_info(**bad)})
+
+
+@caps.requires_tensorrt
+def test_tensorrt_w8a8_static_activations_match_eager(tmp_path):
+    """W8 weights + calibrated static INT8 input activations (TensorRT W8A8) == the
+    hook-simulated tsurgeon model; the ONNX carries one activation Q/DQ per linear."""
+    import onnx
+    from torch.utils.data import DataLoader
+
+    from transformersurgeon.export import export_to_backend
+    from transformersurgeon.export.tensorrt import TensorRTExportConfig
+    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+    from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
+
+    model = _tiny(torch.float16)
+    manager = Qwen2CompressionSchemesManager(model)
+    crit = ["self_attn", "mlp"]
+    for key, value in (("precision", 8), ("granularity", "per_channel"), ("precision_activation", 8),
+                       ("method_activation", "maxmin"), ("scheme_activation", "symmetric"),
+                       ("quantize_output_activation", False)):
+        manager.set("quantization", key, value, criteria=crit)
+    gen = torch.Generator().manual_seed(1)
+    manager.set_calibration_data(DataLoader(
+        [{"input_ids": torch.randint(0, 256, (16,), generator=gen)} for _ in range(4)], batch_size=1))
+    manager.apply(hard=True, criteria=crit, show_progress=False)
+    linears = [m for m in model.modules() if hasattr(m, "_act_quant_scale")]
+    assert len(linears) == 14 and not any(hasattr(m, "_act_out_quant_scale") for m in linears)
+
+    prompt = torch.tensor([3, 17, 42, 5, 99])
+    with torch.no_grad():
+        ref = model.cuda()(input_ids=prompt[None].cuda()).logits[0, -1].float()
+    model.cpu()
+    cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), backend="tensorrt",
+                               max_input_len=8, convert_options=CONVERT)
+    result = export_to_backend(model, config=cfg)
+    graph = onnx.load(result.onnx_path, load_external_data=False).graph
+    assert sum(n.op_type == "QuantizeLinear" for n in graph.node) == 14
+    manifest = json.load(open(result.manifest_path))
+    assert all(q.get("act_precision") == 8 for q in manifest["quantized_layers"].values())
+
+    session = TensorRTLLMSession(result.manifest_path)
+    session.prefill(prompt)
+    torch.testing.assert_close(session.logits.float(), ref, atol=3e-2, rtol=3e-2)
+
+
 @caps.requires_tensorrt
 def test_tensorrt_session_matches_eager(tmp_path):
     from transformersurgeon.export import export_to_backend
