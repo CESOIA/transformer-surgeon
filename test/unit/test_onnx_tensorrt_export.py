@@ -6,6 +6,7 @@ See docs/investigations/TENSORRT_ONNX_EXPORT.md for why this path exists.
 from __future__ import annotations
 
 import json
+import os
 
 import numpy as np
 import pytest
@@ -223,6 +224,40 @@ def test_tensorrt_session_matches_eager(tmp_path):
         ref = _eager_logits(model, torch.tensor(tokens), "cuda")
         torch.testing.assert_close(session.logits.float(), ref, atol=2e-2, rtol=2e-2)
         tokens.append(int(session.input_ids.item()))
+
+
+@caps.requires_tensorrt
+def test_engine_file_is_streamed_in_chunks(tmp_path, monkeypatch):
+    """An engine file is deserialized through the chunked stream reader (never
+    read whole), and gives the same logits as the in-memory plan."""
+    from transformersurgeon.export import export_to_backend
+    from transformersurgeon.export.tensorrt import TensorRTExportConfig, engine as engine_mod
+    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+
+    model = _tiny(torch.float16)
+    cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), backend="tensorrt",
+                               max_input_len=8, convert_options=CONVERT)
+    result = export_to_backend(model, config=cfg)
+    reads = []
+    make_reader = engine_mod._file_stream_reader
+
+    def small_chunks(path, chunk_bytes=0):
+        r = make_reader(path, chunk_bytes=4096)
+        read = r.read
+        r.read = lambda n, s: reads.append(n) or read(n, s)
+        return r
+
+    monkeypatch.setattr(engine_mod, "_file_stream_reader", small_chunks)
+    session = TensorRTLLMSession(result.manifest_path)
+    assert len(reads) > 1
+    prompt = torch.tensor([3, 17, 42, 5, 99])
+    session.prefill(prompt)
+    streamed = session.logits.float().clone()
+
+    with open(os.path.join(os.path.dirname(result.manifest_path), "model.engine"), "rb") as f:
+        runner = engine_mod.TensorRTEngineRunner(f.read())  # in-memory plan path
+    assert runner.engine.num_io_tensors == session.decoder.engine.num_io_tensors
+    torch.testing.assert_close(streamed, _eager_logits(model, prompt, "cuda"), atol=2e-2, rtol=2e-2)
 
 
 @caps.requires_edgellm_plugin

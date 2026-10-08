@@ -48,6 +48,29 @@ def _logger(verbose: bool):
     return trt.Logger(trt.Logger.VERBOSE if verbose else trt.Logger.WARNING)
 
 
+def _file_stream_reader(path: str, chunk_bytes: int = 64 << 20):
+    """IStreamReaderV2 over an engine file, handing TensorRT ``chunk_bytes`` at a
+    time: deserializing never holds the whole plan in host memory (a 3 GB
+    engine otherwise needs 3 GB of host RAM next to its device weights, i.e.
+    2x the weights at load on unified-memory devices such as Jetson)."""
+    trt = _trt()
+    whence = {trt.SeekPosition.SET: os.SEEK_SET, trt.SeekPosition.CUR: os.SEEK_CUR, trt.SeekPosition.END: os.SEEK_END}
+
+    class _Reader(trt.IStreamReaderV2):
+        def __init__(self):
+            trt.IStreamReaderV2.__init__(self)
+            self.file = open(path, "rb")
+
+        def read(self, num_bytes, stream):
+            return self.file.read(min(num_bytes, chunk_bytes))
+
+        def seek(self, offset, where):
+            self.file.seek(offset, whence[where])
+            return True
+
+    return _Reader()
+
+
 def load_plugin_libraries(paths: Iterable[str]) -> None:
     """dlopen TensorRT plugin libraries so their creators self-register."""
     for path in paths:
@@ -170,7 +193,8 @@ class TensorRTEngineRunner:
     ):
         """``engine`` is serialized bytes, an engine file path, or another
         runner whose deserialized engine (and weights) this one shares --
-        e.g. one runner per optimization profile of the same engine."""
+        e.g. one runner per optimization profile of the same engine. A file is
+        streamed in chunks (``_file_stream_reader``), never read whole."""
         trt = _trt()
         self.device = torch.device(device)
         if isinstance(engine, TensorRTEngineRunner):
@@ -178,13 +202,17 @@ class TensorRTEngineRunner:
             self.engine = engine.engine
         else:
             load_plugin_libraries(plugin_libraries)
-            if isinstance(engine, str):
-                with open(engine, "rb") as f:
-                    engine = f.read()
             logger = _logger(False)
             trt.init_libnvinfer_plugins(logger, "")
             self._runtime = trt.Runtime(logger)
-            self.engine = self._runtime.deserialize_cuda_engine(engine)
+            if isinstance(engine, str):
+                reader = _file_stream_reader(engine)
+                try:
+                    self.engine = self._runtime.deserialize_cuda_engine(reader)
+                finally:
+                    reader.file.close()
+            else:
+                self.engine = self._runtime.deserialize_cuda_engine(engine)
             if self.engine is None:
                 raise RuntimeError("Failed to deserialize TensorRT engine.")
         self.context = self.engine.create_execution_context()
