@@ -11,6 +11,11 @@ to ship; build the engine where it will run, e.g. on the Jetson:
 Optimization profiles follow the manifest: profile 0 is decode (seq = 1, so
 TensorRT tunes for single-token GEMV), profile 1 -- present when the graph was
 exported with max_input_len > 1 -- is prompt prefill (seq = 1..max_input_len).
+
+Attention: models converted with cache_impl="io_paged" export their fused
+paged attention as TensorRT Edge-LLM's AttentionPlugin (XQA decode kernels, cost
+grows with the context, not max_cache_len; see edgellm_attention.py). Other
+cache implementations keep TensorRT's own MatMul/Softmax attention.
 """
 
 import argparse
@@ -20,6 +25,7 @@ import os
 from dataclasses import dataclass
 
 from ..onnx import ONNXExportConfig, ONNXExportResult, export_with_onnx
+from .edgellm_attention import attention_translations, edgellm_attention_pass
 from .edgellm_int4 import edgellm_int4_pass, resolve_plugin_libraries
 from .engine import EngineBuildConfig, OptimizationProfile, build_engine
 
@@ -111,6 +117,8 @@ def export_with_tensorrt(model_or_graph, *, config: TensorRTExportConfig) -> Ten
         raise ValueError(f"Unsupported int4_backend {config.int4_backend!r}")
     if config.int4_backend == "edgellm_plugin":
         config = dataclasses.replace(config, graph_passes=[*config.graph_passes, edgellm_int4_pass])
+    config = dataclasses.replace(config, custom_translations={**attention_translations(), **config.custom_translations},
+                                 graph_passes=[*config.graph_passes, edgellm_attention_pass])
     if config.fp32_accumulate_lrd:
         from .precision_passes import fp32_accumulate_lrd
         config = dataclasses.replace(config, graph_passes=[*config.graph_passes, fp32_accumulate_lrd])

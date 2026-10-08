@@ -121,13 +121,15 @@ def edgellm_int4_pass(model, manifest: dict) -> None:
 
 
 def resolve_plugin_libraries(manifest: dict, explicit: tuple[str, ...] = ()) -> tuple[str, ...]:
-    """Plugin libraries an engine for ``manifest`` needs (explicit paths win)."""
-    if explicit or PLUGIN_NAME not in manifest.get("plugins", {}):
+    """Plugin libraries an engine for ``manifest`` needs (explicit paths win).
+    Every Edge-LLM plugin (INT4 GEMM, AttentionPlugin) lives in one library."""
+    used = [k for k, v in manifest.get("plugins", {}).items() if v.get("library_env") == PLUGIN_ENV]
+    if explicit or not used:
         return tuple(explicit)
     path = os.environ.get(PLUGIN_ENV)
     if not path:
         raise RuntimeError(
-            f"This export uses TensorRT Edge-LLM's INT4 plugin: pass its library "
+            f"This export uses TensorRT Edge-LLM plugins ({', '.join(used)}): pass their library "
             f"(libNvInfer_edgellm_plugin.so) explicitly or set {PLUGIN_ENV}."
         )
     return (path,)

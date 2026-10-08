@@ -126,10 +126,13 @@ def build_zero_caches(decoder: nn.Module) -> tuple[list[torch.Tensor], list[torc
 
     Introspects each block's attention module for its (possibly per-layer)
     cache geometry, so heterogeneous shapes work without re-plumbing.
-    Returns ``([], [])`` for the mutable path (no cache I/O).
+    Returns ``([], [])`` for the mutable path (no cache I/O). ``io_paged``
+    returns one KV pool per block in the first list and an empty second list.
     """
     if getattr(decoder, "cache_impl", "mutable") == "mutable":
         return [], []
+    if decoder.cache_impl == "io_paged":
+        return [torch.zeros(b.attn.cache_shape("kv"), dtype=b.attn.dtype) for b in decoder.blocks], []
     key_caches, value_caches = [], []
     for block in decoder.blocks:
         attn = block.attn
@@ -148,6 +151,8 @@ class LLMWrapper(nn.Module):
         internal module state; unchanged legacy contract).
       - ``io_*``: ``forward(input_ids, pos_id, key_caches, value_caches)`` ->
         ``(logits, new_key_caches, new_value_caches)`` (KV cache is graph I/O).
+      - ``io_paged``: ``forward(input_ids, pos_id, kv_pools)`` ->
+        ``(logits, new_kv_pools)`` (one paged K+V pool per layer).
     """
 
     def __init__(self, embedding: nn.Module, decoder: nn.Module, final_layer: nn.Module):
@@ -174,6 +179,10 @@ class LLMWrapper(nn.Module):
         if self.cache_impl == "mutable":
             hidden = self.decoder(self.embedding(input_ids), pos_id=pos_id_tensor)
             return self._head(hidden)
+
+        if self.cache_impl == "io_paged":
+            hidden, new_pools, _ = self.decoder(self.embedding(input_ids), pos_id=pos_id_tensor, key_caches=key_caches)
+            return self._head(hidden), new_pools
 
         hidden, new_key_caches, new_value_caches = self.decoder(
             self.embedding(input_ids),
@@ -291,7 +300,10 @@ def resolve_components_and_wrapper(
     # zero caches to the example inputs so torch.export traces the full contract.
     if getattr(wrapper, "cache_impl", "mutable") != "mutable":
         key_caches, value_caches = build_zero_caches(wrapper.decoder)
-        example_inputs = (*example_inputs, key_caches, value_caches)
+        if wrapper.cache_impl == "io_paged":
+            example_inputs = (*example_inputs, key_caches)
+        else:
+            example_inputs = (*example_inputs, key_caches, value_caches)
 
     if getattr(config, "dynamic_shapes", None) is not None:
         warnings.warn(
@@ -1029,6 +1041,10 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
     decoder = wrapper.decoder
     cache_impl = getattr(decoder, "cache_impl", "mutable")
     caches = [
+        {"layer": i, "kv": {"input": f"past_kv_{i}", "output": f"present_kv_{i}",
+                            "shape": list(block.attn.cache_shape("kv"))}}
+        for i, block in enumerate(decoder.blocks)
+    ] if cache_impl == "io_paged" else [
         {
             "layer": i,
             "key": {"input": f"past_key_{i}", "output": f"present_key_{i}",
@@ -1045,8 +1061,8 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         "artifact": os.path.basename(artifact),
         "cache_impl": cache_impl,
         "cache_io": cache_impl != "mutable",
-        "cache_inplace": cache_impl == "io_inplace",
-        "cache_layout": "BHSD" if cache_impl == "io_inplace" else "SHD",
+        "cache_inplace": cache_impl in ("io_inplace", "io_paged"),
+        "cache_layout": {"io_inplace": "BHSD", "io_paged": "PAGED"}.get(cache_impl, "SHD"),
         # The allocated cache buffer, not config.dtype (None for configs without one).
         "cache_dtype": str(decoder.blocks[0].attn.key_cache.dtype).replace("torch.", ""),
         "max_cache_len": int(decoder.max_cache_len),
@@ -1077,8 +1093,11 @@ def load_llm_manifest(artifact_path: str) -> dict[str, Any]:
 def zero_caches_from_manifest(
     manifest: dict[str, Any], device: torch.device | str = "cpu"
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Per-layer zero (key, value) caches with the exported shapes and dtype."""
+    """Per-layer zero (key, value) caches with the exported shapes and dtype
+    (io_paged: (kv pools, []) )."""
     dtype = getattr(torch, manifest["cache_dtype"])
+    if manifest.get("cache_layout") == "PAGED":
+        return [torch.zeros(layer["kv"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]], []
     keys = [torch.zeros(layer["key"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]]
     values = [torch.zeros(layer["value"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]]
     return keys, values

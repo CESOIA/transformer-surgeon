@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from .rope import apply_rope_multihead, build_rope_prune_projection
 from .kv_cache_ops import kv_cache_update
+from .paged_attention_ops import KV_PAGE_SIZE, num_kv_pages, paged_attention
 from . import LinearCompressed
 
 def attention(query, key, value, attn_mask=None, kv_layout="shd", masked_softmax=False, scale=None):
@@ -477,8 +478,8 @@ class MHAEncoderFusedProj(torch.nn.Module): # Qwen-style fused projection MHA (N
         
         return output
     
-CACHE_IMPLS = ("mutable", "io_scatter", "io_concat", "io_inplace")
-ATTN_IMPLS = ("manual", "sdpa", "custom_sdpa")
+CACHE_IMPLS = ("mutable", "io_scatter", "io_concat", "io_inplace", "io_paged")
+ATTN_IMPLS = ("manual", "sdpa", "custom_sdpa", "paged")
 
 
 def _ensure_custom_sdpa_ops():
@@ -520,9 +521,18 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                         which TensorRT executes in place on the aliased
                         input buffer). The only mode that accepts
                         ``in_seq_len > 1``, i.e. a whole prompt in one call.
+    - ``"io_paged"``  : one paged KV pool per layer as graph I/O,
+                        ``(2, num_pages, 128, kv_num_heads, head_dim)`` (K pages
+                        then V pages), and ``attn_impl="paged"``: RoPE, the
+                        cache write and attention over the *filled* slots are
+                        one fused op (``blocks/paged_attention_ops.py``;
+                        TensorRT Edge-LLM's XQA AttentionPlugin on TensorRT).
+                        Decode cost grows with the context instead of with
+                        max_cache_len. Needs equal q/k/v head dims and
+                        unpruned RoPE.
 
-    All of them produce an updated **fixed-size** cache and then run the
-    identical mask + attention code, so the paths are numerically equivalent.
+    The first four produce an updated **fixed-size** cache and then run the
+    identical mask + attention code, so those paths are numerically equivalent.
     Except for ``io_inplace``, the framework feeds one token at a time
     (``in_seq_len == 1``) and the writers assume that.
     """
@@ -557,17 +567,25 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # value_head_dim. At construction these equal head_dim (weights are loaded
         # -- and possibly resized -- afterwards), so the mutable path re-checks
         # geometry lazily in forward via _ensure_cache_geometry.
-        self.register_buffer("key_cache", torch.zeros(self.cache_shape("key"), dtype=self.dtype), persistent=False)
-        self.register_buffer("value_cache", torch.zeros(self.cache_shape("value"), dtype=self.dtype), persistent=False)
+        # io_paged keeps no internal cache: an empty buffer only carries the dtype.
+        empty = (0,) if self.cache_impl == "io_paged" else None
+        self.register_buffer("key_cache", torch.zeros(empty or self.cache_shape("key"), dtype=self.dtype),
+                             persistent=False)
+        self.register_buffer("value_cache", torch.zeros(empty or self.cache_shape("value"), dtype=self.dtype),
+                             persistent=False)
 
         # attn_impl selects the attention kernel: "manual" (explicit GQA-aware
         # softmax/matmul, the default), "sdpa" (torch.nn.functional.scaled_dot_
-        # product_attention, equivalent to the old use_sdpa=True), or
+        # product_attention, equivalent to the old use_sdpa=True),
         # "custom_sdpa" (ExecuTorch's fused CPU custom ops -- optimized for
-        # XNNPACK/portable-CPU export, untested with QNN/TensorRT). Derives
-        # from use_sdpa when not given explicitly, so existing callers that
-        # only pass use_sdpa are unaffected.
-        self.attn_impl = kwargs.get("attn_impl", None) or ("sdpa" if self.use_sdpa else "manual")
+        # XNNPACK/portable-CPU export, untested with QNN/TensorRT), or "paged"
+        # (the fused paged-KV op; the only kernel of cache_impl="io_paged").
+        # Derives from use_sdpa when not given explicitly, so existing callers
+        # that only pass use_sdpa are unaffected.
+        default_impl = "paged" if self.cache_impl == "io_paged" else ("sdpa" if self.use_sdpa else "manual")
+        self.attn_impl = kwargs.get("attn_impl", None) or default_impl
+        if (self.attn_impl == "paged") != (self.cache_impl == "io_paged"):
+            raise ValueError("attn_impl='paged' and cache_impl='io_paged' go together.")
         # Masked softmax (see attention()): only the "manual" kernel implements it.
         self.masked_softmax = bool(kwargs.get("masked_softmax", False))
         if self.masked_softmax and self.attn_impl != "manual":
@@ -605,6 +623,8 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         single source for the internal buffers and for exporters that build
         the io_* caches fed as graph inputs.
         """
+        if self.cache_impl == "io_paged":  # one pool for K and V; ``which`` is "kv"
+            return (2, num_kv_pages(self.max_cache_length), KV_PAGE_SIZE, self.kv_num_heads, self.value_head_dim)
         head_dim = self.key_head_dim if which == "key" else self.value_head_dim
         if self.cache_impl == "io_inplace":
             return (1, self.kv_num_heads, self.max_cache_length, head_dim)
@@ -613,6 +633,8 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
     def _ensure_cache_geometry(self):
         """Reallocate the internal (mutable-path) KV buffers if q/k pruning has
         changed the key head_dim since construction. No-op once sized correctly."""
+        if self.cache_impl == "io_paged":
+            return
         if tuple(self.key_cache.shape) != self.cache_shape("key"):
             self.key_cache = torch.zeros(
                 self.cache_shape("key"), dtype=self.key_cache.dtype, device=self.key_cache.device,
@@ -725,8 +747,27 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         return attn_output.squeeze(0).to(orig_dtype).transpose(0, 1)  # (num_heads, in_seq_len, value_head_dim)
 
+    def _forward_paged(self, x, in_seq_len, kv_pool, paged):
+        """cache_impl == 'io_paged': packed q|k|v -> fused RoPE + paged cache
+        write + attention over the filled slots (``paged_attention``).
+        ``paged`` = (context_lengths, rope_cos_sin, kvcache_start_index,
+        kv_page_table), built once per step by TransformerDecoder."""
+        head_dim = self.value_head_dim
+        if self.rope_pruned or self.key_head_dim != head_dim or self.q_proj.out_features != self.num_heads * head_dim:
+            raise NotImplementedError(
+                "cache_impl='io_paged' needs equal q/k/v head dims and unpruned RoPE (one cos/sin table "
+                "for every head); use 'io_inplace' for within-head pruned attention.")
+        qkv = torch.cat([self.q_proj(x), self.k_proj(x), self.v_proj(x)], dim=-1)
+        qkv = qkv.reshape(1, in_seq_len, qkv.shape[-1])
+        context_lengths, rope_cos_sin, start_index, page_table = paged
+        attn_output, kv_pool = paged_attention(
+            qkv, kv_pool, context_lengths, rope_cos_sin, start_index, page_table,
+            self.num_heads, self.kv_num_heads, head_dim, float(self.score_scale))
+        out_shape = (1, in_seq_len, -1) if self.add_batch_dim else (in_seq_len, -1)
+        return self.out_proj(attn_output.reshape(out_shape)), kv_pool, None
+
     def forward(self, x, pos_id, attn_mask,
-                key_cache=None, value_cache=None, rope=None):
+                key_cache=None, value_cache=None, rope=None, paged=None):
         """
         Forward pass of the causal Multi-Head Attention with caching.
 
@@ -743,14 +784,21 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
                 caches for the ``io_*`` modes. If omitted, the internal buffers
                 are used as the initial cache.
             rope (tuple, optional): Tuple of (cos, sin) tensors for RoPE application.
+            paged (tuple, optional): io_paged only -- (context_lengths,
+                rope_cos_sin, kvcache_start_index, kv_page_table); ``key_cache``
+                is then the layer's KV pool.
 
         Returns:
-            output (mutable mode) or (output, key_cache, value_cache) (io modes).
+            output (mutable mode) or (output, key_cache, value_cache) (io modes;
+            io_paged returns (output, kv_pool, None)).
         """
         if self.add_batch_dim:
             _, in_seq_len, embed_dim = x.size()
         else:
             in_seq_len, embed_dim = x.size()
+
+        if self.cache_impl == "io_paged":
+            return self._forward_paged(x, in_seq_len, key_cache, paged)
 
         # Match the internal buffers to the current (possibly pruned) key head_dim.
         self._ensure_cache_geometry()

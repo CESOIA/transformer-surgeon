@@ -55,6 +55,8 @@ def fp32_attention_scores(model: onnx.ModelProto, manifest: dict | None = None) 
         new_nodes.setdefault(list(g.node).index(sm) + 1, []).append(back)
         count += 1
     if not count:
+        if any(n.op_type == "AttentionPlugin" for n in g.node):
+            return  # fused plugin attention (io_paged): accumulates in fp32 itself
         raise RuntimeError("fp32_attention_scores: no MatMul->Add->Softmax pattern found")
     nodes = list(g.node)
     out = []

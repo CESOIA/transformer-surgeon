@@ -19,6 +19,12 @@ Graph contract (names are fixed; shapes/dtypes are recorded in the manifest):
 With ``cache_impl="io_inplace"`` the cache write is an opset-24 TensorScatter:
 consumers should bind each present_* to the same buffer as its past_* (TensorRT
 requires it -- it aliases them and updates in place).
+
+With ``cache_impl="io_paged"`` each layer has one paged K+V pool instead
+(past_kv_i / present_kv_i, also updated in place) and attention is the fused
+``tsurgeon::paged_attention`` op, which has no standard ONNX form: the target
+must map it (``custom_translations``; the TensorRT backend emits Edge-LLM's
+AttentionPlugin).
 """
 
 import os
@@ -92,8 +98,11 @@ class ONNXExportConfig(ExporterConfig):
     graph_passes: list[Callable] = field(default_factory=list)
 
 
-def io_names(num_layers: int) -> tuple[list[str], list[str]]:
+def io_names(num_layers: int, paged: bool = False) -> tuple[list[str], list[str]]:
     """(input_names, output_names) in torch.onnx's flattened arg/output order."""
+    if paged:
+        return (["input_ids", "pos_id"] + [f"past_kv_{i}" for i in range(num_layers)],
+                ["logits"] + [f"present_kv_{i}" for i in range(num_layers)])
     inputs = ["input_ids", "pos_id"]
     inputs += [f"past_key_{i}" for i in range(num_layers)]
     inputs += [f"past_value_{i}" for i in range(num_layers)]
@@ -126,7 +135,7 @@ def export_with_onnx(model_or_graph: Any, *, config: ONNXExportConfig) -> ONNXEx
     layer_info = extract_layer_quant_info(wrapper)
 
     num_layers = len(wrapper.decoder.blocks)
-    input_names, output_names = io_names(num_layers)
+    input_names, output_names = io_names(num_layers, paged=cache_impl == "io_paged")
     dynamic_shapes = None
     if config.max_input_len > 1:
         # torch.export specializes size-1 dims, so trace with a 2-token prompt.
@@ -139,6 +148,9 @@ def export_with_onnx(model_or_graph: Any, *, config: ONNXExportConfig) -> ONNXEx
         logits_dtype = wrapper(*example_inputs)[0].dtype
 
     translations = {**default_translations(), **config.custom_translations}
+    if cache_impl == "io_paged" and torch.ops.tsurgeon.paged_attention.default not in translations:
+        raise ValueError("cache_impl='io_paged' has no portable ONNX form: export with a backend that maps "
+                         "tsurgeon::paged_attention (backend='tensorrt').")
     program = torch.onnx.export(
         wrapper,
         example_inputs,

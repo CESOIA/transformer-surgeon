@@ -3,8 +3,9 @@ Greedy generation with a TensorRT engine built from a tsurgeon ONNX export.
 
 TensorRTLLMSession drives the graph contract recorded in the export manifest:
 
-  * KV caches are allocated once; with ``cache_inplace`` each present_* output
-    is bound to its past_* input buffer (TensorRT updates it in place).
+  * KV caches are allocated once (key/value per layer, or one paged K+V pool
+    per layer for cache_impl="io_paged"); with ``cache_inplace`` each present_*
+    output is bound to its past_* input buffer (TensorRT updates it in place).
   * prefill() feeds the prompt through the prefill profile in chunks of up to
     max_input_len tokens (or token by token for a decode-only export).
   * decode steps replay one CUDA graph that runs the engine, takes the greedy
@@ -46,15 +47,16 @@ class TensorRTLLMSession:
 
         cache_dtype = _DTYPES[self.manifest["cache_dtype"]]
         self.caches: dict[str, torch.Tensor] = {}
+        kinds = [k for k in ("key", "value", "kv") if k in self.manifest["caches"][0]]
         for layer in self.manifest["caches"]:
-            for kind in ("key", "value"):
+            for kind in kinds:
                 spec = layer[kind]
                 buf = torch.zeros(spec["shape"], dtype=cache_dtype, device=self.device)
                 self.caches[spec["input"]] = buf
                 # In place: the output *is* the input buffer. Otherwise the
                 # engine writes a fresh tensor that is copied back after a step.
                 self.caches[spec["output"]] = buf if self.manifest["cache_inplace"] else torch.empty_like(buf)
-        self._cache_pairs = [(l[k]["input"], l[k]["output"]) for l in self.manifest["caches"] for k in ("key", "value")]
+        self._cache_pairs = [(l[k]["input"], l[k]["output"]) for l in self.manifest["caches"] for k in kinds]
 
         self.input_ids = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.pos_id = torch.zeros(1, dtype=torch.int64, device=self.device)

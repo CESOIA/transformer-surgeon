@@ -9,6 +9,7 @@ from .rope import (
     precompute_rope_cos_sin_half,
 )
 from .atomic import AtomicSum
+from .paged_attention_ops import identity_page_table, num_kv_pages
 
 class TransformerDecoderBlock(torch.nn.Module):
 
@@ -117,6 +118,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             key_cache=None,
             value_cache=None,
             rope=None,
+            paged=None,
     ):
         """
         Forward pass of the Transformer Decoder Block.
@@ -131,6 +133,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             key_cache/value_cache (torch.Tensor, optional): Incoming fixed-size KV
                 caches for the ``io_*`` cache implementations (ignored by ``mutable``).
             rope (tuple(torch.Tensor, torch.Tensor), optional): Precomputed RoPE cos/sin tensors.
+            paged (tuple, optional): io_paged per-step attention inputs (see MHACausal.forward).
 
         Returns:
             mutable mode: output embeddings (seq_len, embed_dim).
@@ -145,6 +148,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             key_cache=key_cache,
             value_cache=value_cache,
             rope=rope,
+            paged=paged,
             )
         if self.cache_impl == "mutable":
             x = attn_out
@@ -208,6 +212,14 @@ class TransformerDecoder(torch.nn.Module):
         )
         self.register_buffer("rope_cos", rope[0].to(config.dtype), persistent=True)
         self.register_buffer("rope_sin", rope[1].to(config.dtype), persistent=True)
+        if self.cache_impl == "io_paged":
+            # Fused paged attention applies RoPE itself from a float32 (1, max_pos,
+            # head_dim) cos|sin table, and reads the pool through a page table
+            # (sequence 0 owns every page).
+            self.register_buffer("rope_cos_sin", torch.cat([rope[0], rope[1]], dim=-1).squeeze(1)
+                                 .unsqueeze(0).float(), persistent=False)
+            self.register_buffer("kv_page_table", identity_page_table(num_kv_pages(self.max_cache_len)),
+                                 persistent=False)
 
         # Additive causal-mask penalty, a 1-element buffer. It must exceed any real
         # attention logit: a finite -1e4 is NOT enough -- Qwen2.5 (k biases ~300)
@@ -246,6 +258,18 @@ class TransformerDecoder(torch.nn.Module):
         # max_cache_len) compare/where/index calls per token, most of which fall
         # outside the XNNPACK delegate and pay full ExecuTorch op-dispatch
         # overhead per call).
+        if self.cache_impl == "io_paged":
+            # No mask and no per-layer RoPE lookup: the fused op takes the cache
+            # length after this step and derives positions and causality from it.
+            in_seq_len = x.shape[1] if self.add_batch_dim else x.shape[0]
+            start = pos_id.to(torch.int32)
+            paged = (start + in_seq_len, self.rope_cos_sin, start, self.kv_page_table)
+            new_pools = []
+            for i, block in enumerate(self.blocks):
+                x, pool, _ = block(x, pos_id=pos_id, attn_mask=None, key_cache=key_caches[i], paged=paged)
+                new_pools.append(pool)
+            return self.norm(x), new_pools, None
+
         if self.cache_impl == "io_inplace":
             # Multi-token capable: the in_seq_len new tokens sit at positions
             # pos_id .. pos_id + in_seq_len - 1. Build the (in_seq_len,
