@@ -206,6 +206,16 @@ float linears 16a16w → one partition. `keep_reference_module=True` returns the
 PT2E fake-quant model the .pte was lowered from (`result.reference_module`) —
 the host parity reference, because the x86 HTP simulator costs ~8 min/token at 1.5B.
 
+**16a16w and biases (`split_float_linear_bias`, default True).** A 16a16w linear computes its bias
+in int32 with scale `act_scale × weight_scale`; with 16-bit weights that scale is tiny (largest bias
+≈ input range × max|w| of the channel, ~1–2 on Qwen2.5-1.5B), and Qwen2.5's q/k biases (up to ~316)
+overflow it by up to ~65× and are clipped in every layer: MLP-only quantized exports (attention left
+float → 16a16w) were garbage on device *and* in the fake-quant reference. With the option on, every
+biased linear that is not compression-quantized becomes `add(linear(x, W), b)` before PT2E: the
+weights stay 16-bit and the bias gets its own 16-bit activation scale, so only the targeted linears
+change precision. Compression-quantized (W8/W4) linears keep the fused derived int32 bias (8-bit
+weights have ~250× more headroom). Still 1 delegate / 0 CPU ops. Test: `test/unit/test_qnn_bias_split.py`.
+
 ### QNN: activation calibration and masked softmax
 
 - PT2E calibration (`export/common.py::calibrate_pt2e_observers`) decodes each sequence from position 0
@@ -380,9 +390,15 @@ writers), `per_head_uniform` (recorded only).
 Scope: both MLP and attention (q/k/v) structured pruning are wired end-to-end
 (prune → cascade → convert → export). Attention hard pruning changes `head_dim`
 (GQA); RoPE projection geometry and the pruned KV-cache are resolved per-kv-group
-at conversion time (`blocks/mha.py::MHABase.finalize_rope_pruning()`), and a
-hard-pruned `v_proj` cascades into `o_proj` via `coupled_repeated_pattern`. See
-`test/e2e/test_gqa_attention_pruning.py`.
+at conversion time (`blocks/mha.py::MHABase.finalize_rope_pruning()`, then
+`MHACausal.finalize_cache_geometry()` resizes the internal KV buffers to the pruned
+key/value head dims), and a hard-pruned `v_proj` cascades into `o_proj` via
+`coupled_repeated_pattern`. See `test/e2e/test_gqa_attention_pruning.py`.
+**Never resize module buffers inside `forward()`:** `torch.export` traces the reassignment
+as a fresh tensor per call (`aten.full`), not a mutable buffer. That is how head_dim-pruned
+mutable-cache exports (QNN, XNNPACK) silently lost their KV cache until 2026-10-13;
+`forward()` now only checks the geometry and raises. `io_*` caches (TensorRT) are graph
+inputs sized by `cache_shape()` and were never affected.
 
 ### `"block_pruning"` — Whole-Block (Attention-Head) Removal
 
