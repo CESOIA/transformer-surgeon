@@ -216,6 +216,11 @@ weights stay 16-bit and the bias gets its own 16-bit activation scale, so only t
 change precision. Compression-quantized (W8/W4) linears keep the fused derived int32 bias (8-bit
 weights have ~250× more headroom). Still 1 delegate / 0 CPU ops. Test: `test/unit/test_qnn_bias_split.py`.
 
+**Activation-only reference (`quantize_float_model`, default False, needs `quant_scope="all"`).** Lowers a
+model with *no* compression-quantized linear as the same fixed-point graph (16a16w everywhere, bias split
+as above) instead of fp16. Its distance from fp16 is the cost of HTP's 16-bit activations alone, so a
+compressed config measured against it isolates the weight compression. Test: `test/unit/test_qnn_activation_only.py`.
+
 ### QNN: activation calibration and masked softmax
 
 - PT2E calibration (`export/common.py::calibrate_pt2e_observers`) decodes each sequence from position 0

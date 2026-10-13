@@ -277,6 +277,10 @@ class QNNExportConfig(ExecutorchExporterConfig):
     # separate add (the bias then gets its own 16-bit scale), keeping the 16-bit
     # weights so only the targeted linears change precision.
     split_float_linear_bias: bool = True
+    # quant_scope="all" only: quantize the graph (16a16w everywhere) even when no
+    # linear is compression-quantized. Gives the activation-only reference point:
+    # the cost of HTP's fixed-point graph without any weight compression.
+    quantize_float_model: bool = False
     # Keep a deep copy of the quantized torch model the .pte is lowered from
     # (PT2E fake-quant graph for quantized exports) as result.reference_module.
     keep_reference_module: bool = False
@@ -519,7 +523,10 @@ def export_with_qnn(
     model_for_edge = sanitized_module
     exported_for_mismatch = None
 
-    if layer_info:
+    if config.quantize_float_model and config.quant_scope != "all":
+        raise ValueError("QNNExportConfig.quantize_float_model requires quant_scope='all'.")
+    quantize = bool(layer_info) or config.quantize_float_model
+    if quantize:
         from executorch.backends.qualcomm.quantizer.quantizer import (
             QnnQuantizer,
             QuantDtype,
@@ -750,7 +757,7 @@ def export_with_qnn(
     # which makes their FC op invalid for QNN. Inject an edge-dialect cast pass (after
     # LayoutTransform, before TagQuantIO) to insert _to_copy(x, float16) in front of each
     # affected float16 linear, giving QNN a clean float16 input.
-    if layer_info:
+    if quantize:
         from executorch.backends.qualcomm._passes import LayoutTransform, TagQuantIO
         from executorch.backends.qualcomm._passes.qnn_pass_manager import get_capture_program_passes
         from executorch.backends.qualcomm._passes.utils import get_passes_dependency_for_capture_program
@@ -794,7 +801,7 @@ def export_with_qnn(
     with open(config.output_path, "wb") as f:
         f.write(et_program.buffer)
 
-    result_precision = "mixed" if layer_info else "full"
+    result_precision = "mixed" if quantize else "full"
 
     result = finalize_executorch_result(
         pte_path=config.output_path,
