@@ -79,6 +79,7 @@ def test_add_batch_dim_matches_unbatched_under_pruned_rope():
         mod.q_proj.register_buffer("rope_prune_mask", q_keep)
         mod.k_proj.register_buffer("rope_prune_mask", k_keep)
         mod.finalize_rope_pruning()
+        mod.finalize_cache_geometry()  # as convert_for_export does
 
     _hard_prune(m_unbatched)
     _hard_prune(m_batched)

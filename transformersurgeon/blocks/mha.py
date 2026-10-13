@@ -565,8 +565,8 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # Sized from key_head_dim/value_head_dim so a hard-pruned k_proj (shrunk
         # rotary head_dim) gets a matching key cache; v is uncoupled and keeps
         # value_head_dim. At construction these equal head_dim (weights are loaded
-        # -- and possibly resized -- afterwards), so the mutable path re-checks
-        # geometry lazily in forward via _ensure_cache_geometry.
+        # -- and possibly resized -- afterwards), so convert_for_export resizes
+        # them once via finalize_cache_geometry; forward() only checks.
         # io_paged keeps no internal cache: an empty buffer only carries the dtype.
         empty = (0,) if self.cache_impl == "io_paged" else None
         self.register_buffer("key_cache", torch.zeros(empty or self.cache_shape("key"), dtype=self.dtype),
@@ -630,9 +630,51 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             return (1, self.kv_num_heads, self.max_cache_length, head_dim)
         return (self.max_cache_length, self.kv_num_heads, head_dim)
 
-    def _ensure_cache_geometry(self):
-        """Reallocate the internal (mutable-path) KV buffers if q/k pruning has
-        changed the key head_dim since construction. No-op once sized correctly."""
+    def _cache_geometry_ok(self):
+        if self.cache_impl == "io_paged":
+            return True
+        ok = (tuple(self.key_cache.shape) == self.cache_shape("key")
+              and tuple(self.value_cache.shape) == self.cache_shape("value"))
+        if self.attn_impl == "custom_sdpa":
+            ok = ok and (self.custom_sdpa_key_cache.shape[-1] == self.key_head_dim
+                         and self.custom_sdpa_value_cache.shape[-1] == self.value_head_dim)
+        return ok
+
+    def _check_custom_sdpa_dims(self):
+        if self.attn_impl != "custom_sdpa":
+            return
+        q_head_dim = self.q_proj.out_features // self.num_heads
+        if q_head_dim != self.value_head_dim:
+            raise RuntimeError(
+                "attn_impl='custom_sdpa' requires q_head_dim == value_head_dim "
+                "(torch.ops.llama.custom_sdpa sizes its output like `query`, "
+                f"not `value`); got q_head_dim={q_head_dim}, value_head_dim="
+                f"{self.value_head_dim}. This happens when RoPE-linked "
+                "structured pruning shrank q/k's head_dim while v_proj stayed "
+                "unpruned -- use attn_impl='manual' or 'sdpa' for such models."
+            )
+
+    def _check_cache_geometry(self):
+        """forward()-time guard: the internal KV buffers must already match the
+        (possibly pruned) head dims. Resizing them here would be traced by
+        torch.export as a fresh zero tensor per step (aten.full) instead of a
+        mutable buffer, i.e. a model that silently drops its KV cache."""
+        self._check_custom_sdpa_dims()
+        if not self._cache_geometry_ok():
+            raise RuntimeError(
+                "KV cache buffers do not match the pruned key/value head dims "
+                f"(key_cache {tuple(self.key_cache.shape)} vs {self.cache_shape('key')}, "
+                f"value_cache {tuple(self.value_cache.shape)} vs {self.cache_shape('value')}). "
+                "Call finalize_cache_geometry() once after loading pruned weights "
+                "(convert_for_export does this)."
+            )
+
+    def finalize_cache_geometry(self):
+        """Resize the internal KV buffers to the current (possibly pruned)
+        key/value head dims. Conversion-time hook like ``finalize_rope_pruning``:
+        call once after q/k/v weights are loaded and before any forward() or
+        export -- ``utils.convert.convert_for_export`` does this. No-op once
+        sized correctly."""
         if self.cache_impl == "io_paged":
             return
         if tuple(self.key_cache.shape) != self.cache_shape("key"):
@@ -645,16 +687,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             )
 
         if self.attn_impl == "custom_sdpa":
-            q_head_dim = self.q_proj.out_features // self.num_heads
-            if q_head_dim != self.value_head_dim:
-                raise RuntimeError(
-                    "attn_impl='custom_sdpa' requires q_head_dim == value_head_dim "
-                    "(torch.ops.llama.custom_sdpa sizes its output like `query`, "
-                    f"not `value`); got q_head_dim={q_head_dim}, value_head_dim="
-                    f"{self.value_head_dim}. This happens when RoPE-linked "
-                    "structured pruning shrank q/k's head_dim while v_proj stayed "
-                    "unpruned -- use attn_impl='manual' or 'sdpa' for such models."
-                )
+            self._check_custom_sdpa_dims()
             if self.custom_sdpa_key_cache.shape[-1] != self.key_head_dim:
                 self.custom_sdpa_key_cache = torch.zeros(
                     1, self.max_cache_length, self.kv_num_heads, self.key_head_dim,
@@ -698,7 +731,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
     def _forward_custom_sdpa(self, q, k, v, pos_id, attn_mask):
         """attn_impl == 'custom_sdpa': ExecuTorch's fused CPU custom ops.
-        float32-only, batched (bsz=1) layout -- see _ensure_cache_geometry for
+        float32-only, batched (bsz=1) layout -- see finalize_cache_geometry for
         the q_head_dim==value_head_dim precondition and __init__ for the
         cache_impl=='mutable' constraint this path requires.
         """
@@ -800,8 +833,8 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         if self.cache_impl == "io_paged":
             return self._forward_paged(x, in_seq_len, key_cache, paged)
 
-        # Match the internal buffers to the current (possibly pruned) key head_dim.
-        self._ensure_cache_geometry()
+        # The internal buffers were sized at conversion (finalize_cache_geometry).
+        self._check_cache_geometry()
 
         # Fall back to internal buffers when caches are not threaded in.
         if key_cache is None:
@@ -813,7 +846,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         # than self.head_dim if position-linked structured pruning hard-pruned
         # them (see _project_rope) -- v_proj is uncoupled from that pruning and
         # keeps value_head_dim. The key cache follows the pruned key_head_dim (set
-        # by _ensure_cache_geometry / build_zero_caches), so a hard-pruned k_proj
+        # by finalize_cache_geometry / build_zero_caches), so a hard-pruned k_proj
         # writes into a matching cache.
         #
         # When add_batch_dim, q_proj/k_proj/v_proj (LinearCompressed) see a
@@ -840,7 +873,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
 
         if self.attn_impl == "custom_sdpa":
             # custom_sdpa owns its own dedicated fp32 cache (see __init__/
-            # _ensure_cache_geometry) and writes it via torch.ops.llama.update_cache
+            # finalize_cache_geometry) and writes it via torch.ops.llama.update_cache
             # inside _forward_custom_sdpa -- the unbatched key_cache/value_cache
             # buffers above are left untouched/unused on this path.
             attn_output = self._forward_custom_sdpa(q, k, v, pos_id, attn_mask)

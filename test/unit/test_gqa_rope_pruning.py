@@ -98,6 +98,8 @@ def _hard_prune_qk(mod, q_keep, k_keep, num_heads, kv_num_heads):
     # Mimics utils.convert.convert_for_export: freeze RoPE-pruning geometry
     # once, right after (hard-pruned) weights/masks are in place.
     mod.finalize_rope_pruning()
+    if hasattr(mod, "finalize_cache_geometry"):
+        mod.finalize_cache_geometry()
 
 
 @pytest.mark.parametrize("use_sdpa", [False, True])

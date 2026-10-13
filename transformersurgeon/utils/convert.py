@@ -403,6 +403,10 @@ def convert_for_export(model, options=None, verbose=False):
                 attn_module.finalize_head_pruning()
             if hasattr(attn_module, "finalize_rope_pruning"):
                 attn_module.finalize_rope_pruning()
+            # KV buffers follow the (possibly pruned) key/value head dims; sizing
+            # them in forward() would export as a per-step zero cache.
+            if hasattr(attn_module, "finalize_cache_geometry"):
+                attn_module.finalize_cache_geometry()
 
         # Handle extra layers if any
         if 'extra_layers' in indexing:

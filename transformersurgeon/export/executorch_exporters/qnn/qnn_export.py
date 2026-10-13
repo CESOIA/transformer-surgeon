@@ -269,6 +269,14 @@ class QNNExportConfig(ExecutorchExporterConfig):
     #              and linears the model left float are carried as 16a16w, so the
     #              decoder lowers to a single HTP partition.
     quant_scope: str = "linear"
+    # quant_scope="all" only: a float linear carried as 16a16w computes its bias in
+    # int32 with scale act_scale x weight_scale, which 16-bit weights make tiny
+    # (largest bias ~ input range x max|w| of the channel): Qwen2.5's q/k biases
+    # (up to ~316) overflow it by up to ~65x and are clipped in every layer. True
+    # moves the bias of every linear that is not compression-quantized into a
+    # separate add (the bias then gets its own 16-bit scale), keeping the 16-bit
+    # weights so only the targeted linears change precision.
+    split_float_linear_bias: bool = True
     # Keep a deep copy of the quantized torch model the .pte is lowered from
     # (PT2E fake-quant graph for quantized exports) as result.reference_module.
     keep_reference_module: bool = False
@@ -388,6 +396,39 @@ def _untie_shared_weights(wrapper: nn.Module) -> int:
                 untied += 1
             seen.add(id(m.weight))
     return untied
+
+
+def _in_layers(node: torch.fx.Node, layer_names) -> bool:
+    """Same match as the quantizer's per-layer predicate: any enclosing module."""
+    stack = node.meta.get("nn_module_stack", {})
+    return any(qname in layer_names for qname, _ in stack.values())
+
+
+def _split_float_linear_bias(graph_module: torch.fx.GraphModule, quantized_layers) -> list[str]:
+    """linear(x, W, b) -> add(linear(x, W), b) for every biased linear outside
+    ``quantized_layers`` (those get the 16a16w default config). See
+    QNNExportConfig.split_float_linear_bias. Returns the split nodes' module names."""
+    graph = graph_module.graph
+    split = []
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target != torch.ops.aten.linear.default:
+            continue
+        if len(node.args) < 3 or node.args[2] is None or _in_layers(node, quantized_layers):
+            continue
+        x, weight, bias = node.args[:3]
+        with graph.inserting_before(node):
+            linear = graph.call_function(torch.ops.aten.linear.default, (x, weight))
+            linear.meta = dict(node.meta)
+            add = graph.call_function(torch.ops.aten.add.Tensor, (linear, bias))
+            add.meta = dict(node.meta)
+        node.replace_all_uses_with(add)
+        graph.erase_node(node)
+        stack = node.meta.get("nn_module_stack", {})
+        split.append(list(stack.values())[-1][0] if stack else node.name)
+    if split:
+        graph.lint()
+        graph_module.recompile()
+    return split
 
 
 def _linear_block_sizes(graph_module: torch.nn.Module, block_layers: dict[str, int]) -> dict[str, tuple]:
@@ -572,6 +613,11 @@ def export_with_qnn(
         if config.quant_scope == "all" and config.float_attention_core:
             _discard = _float_attention_nodes(sanitized_module)
             quantizer.add_discard_nodes(_discard)
+
+        if config.quant_scope == "all" and config.split_float_linear_bias:
+            _split = _split_float_linear_bias(sanitized_module, frozenset(layer_info))
+            if _split:
+                print(f"  QNN: bias split from {len(_split)} float (16a16w) linears, e.g. {_split[:3]}")
 
         prepared = prepare_pt2e(sanitized_module, quantizer)
 

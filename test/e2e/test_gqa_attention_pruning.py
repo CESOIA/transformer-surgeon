@@ -134,3 +134,58 @@ def test_auto_qk_hard_prune_io_cache_sizes():
     assert key_caches and value_caches
     assert key_caches[0].shape[-1] == HEAD_DIM - 4  # pruned key cache
     assert value_caches[0].shape[-1] == HEAD_DIM    # full value cache
+
+
+@pytest.mark.parametrize("cache_impl", ["mutable", "io_scatter"])
+def test_auto_qk_hard_prune_export_keeps_kv_cache(cache_impl):
+    """Regression: with a pruned key head_dim, the mutable KV buffers used to be
+    resized inside forward(), which torch.export traced as a fresh zero cache
+    per step (aten.full) -- the exported model silently had no KV cache.
+    The buffers must be sized at conversion and exported as mutated buffers."""
+    model = FAMILIES["qwen2"].build().eval()
+    mgr = Qwen2CompressionSchemesManager(model)
+    _configure_qk_auto(mgr)
+    mgr.apply(hard=True)
+    mgr.prepare_for_save()
+
+    converted = convert_for_export(
+        model, options={"use_sdpa": False, "cache_impl": cache_impl, "max_cache_len": 32}
+    )
+    wrapper = LLMWrapper(model.get_input_embeddings(), converted["text"], model.lm_head).eval()
+    blocks = wrapper.decoder.blocks
+    for b in blocks:  # sized at conversion, before any forward()
+        assert b.attn.key_cache.shape[-1] == HEAD_DIM - 4
+        assert b.attn.value_cache.shape[-1] == HEAD_DIM
+
+    inputs = (torch.tensor([1]), torch.tensor([0]))
+    if cache_impl != "mutable":
+        inputs = (*inputs, *build_zero_caches(wrapper.decoder))
+    # run_decompositions functionalizes the no_grad cache write, as the backend lowerings do.
+    ep = torch.export.export(wrapper, inputs, strict=False).run_decompositions({})
+    full_ops = [n for n in ep.graph.nodes if n.op == "call_function" and "full" in str(n.target)
+                and len(n.args) and tuple(n.args[0]) in {tuple(b.attn.key_cache.shape) for b in blocks}
+                | {tuple(b.attn.value_cache.shape) for b in blocks}]
+    assert not full_ops, f"KV cache rebuilt inside the graph: {full_ops}"
+    if cache_impl == "mutable":
+        mutated = set(ep.graph_signature.buffers_to_mutate.values())
+        for i in range(len(blocks)):
+            assert f"decoder.blocks.{i}.attn.key_cache" in mutated
+            assert f"decoder.blocks.{i}.attn.value_cache" in mutated
+
+
+def test_unfinalized_pruned_cache_raises():
+    """forward() must not resize the KV buffers (export would drop the cache)."""
+    model = FAMILIES["qwen2"].build().eval()
+    mgr = Qwen2CompressionSchemesManager(model)
+    _configure_qk_auto(mgr)
+    mgr.apply(hard=True)
+    mgr.prepare_for_save()
+    converted = convert_for_export(
+        model, options={"use_sdpa": False, "cache_impl": "mutable", "max_cache_len": 32}
+    )
+    wrapper = LLMWrapper(model.get_input_embeddings(), converted["text"], model.lm_head).eval()
+    attn = wrapper.decoder.blocks[0].attn
+    attn.key_cache = torch.zeros(32, attn.kv_num_heads, HEAD_DIM)  # stale, unpruned geometry
+    with pytest.raises(RuntimeError, match="finalize_cache_geometry"):
+        with torch.no_grad():
+            wrapper(torch.tensor([1]), torch.tensor([0]))
