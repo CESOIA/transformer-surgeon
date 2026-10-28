@@ -516,9 +516,9 @@ class CompressionScheme:
             
             if self.soft_applied:
                 if hard:
-                    print(f"  ! Compression already hard applied, making the changes permanent (HARD mode)")
+                    print("  ! Compression already hard applied, making the changes permanent (HARD mode)")
                 else:
-                    print(f"  ! Compression already soft applied, skipping re-application.")
+                    print("  ! Compression already soft applied, skipping re-application.")
 
         if self.hard_applied or (self.soft_applied and not hard):
             return # Nothing to do

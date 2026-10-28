@@ -25,10 +25,11 @@ test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
       Messaggi ora uniformi: `"<nome> must be <regola>, but got <valore>."`.
 - [x] Nomi I/O del grafo: una sola definizione `export/manifest.py::cache_io_name` / `graph_io_names`
       (`onnx/exporter.py::io_names` ora è un alias).
-- [ ] `utils/__init__` va bene; verificare con `pyflakes` che non restino import inutili
-      (restano solo import fatti apposta per registrare operatori).
-- [ ] Valutare se `hf/hf_export.py` debba ancora chiamare `manager.apply(hard=True)` (compressione
-      lanciata dall'export HF): documentarlo o spostarlo.
+- [x] `pyflakes transformersurgeon` pulito: restano solo le ri-esportazioni degli `__init__` e 5 import
+      voluti (registrazione di operatori/esportatori: `custom_sdpa`, `exporter.py` → `backends`,
+      `qnn/passes.py`, `onnx/exporter.py`, `tensorrt/edgellm_attention.py`).
+- [x] `hf/hf_export.py` chiama ancora `manager.apply(hard=True)` se riceve un manager: **tenuto** per
+      compatibilità e documentato nella docstring come unica eccezione; da citare nel report.
 
 ## B2. Violazioni residue delle regole di architettura (verificate il 2026-10-28)
 
@@ -47,7 +48,7 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 - [ ] Export QNN riconosce l'attenzione cercando i nomi di classe `MHACausal`/`TransformerDecoder`
       in `nn_module_stack` (`export/backends/qnn/passes.py::_float_attention_nodes`): usare un
       marcatore sull'atomo.
-- [ ] `hf/hf_export.py::export_to_hf` chiama `manager.apply(hard=True)` (vedi punto B).
+- [x] `hf/hf_export.py::export_to_hf` chiama `manager.apply(hard=True)`: tenuto e documentato (punto B).
 - [ ] `blocks/` contiene atomi legati a una backend (`custom_sdpa` ExecuTorch, `paged` Edge-LLM):
       ammesso perché sono atomi selezionabili, ma va detto nel report.
 - [ ] `BACKEND_OPERATIONS` copre attenzione, cache, RMSNorm, batch, softmax mascherata e lineari;
