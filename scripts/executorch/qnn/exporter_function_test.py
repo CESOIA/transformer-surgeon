@@ -1,13 +1,10 @@
 import argparse
 import os
-import random
 import re
 import traceback
 from datetime import datetime
 
 import torch
-from datasets import load_dataset
-from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2ForCausalLMCompress
@@ -15,6 +12,7 @@ from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 from transformersurgeon.export import export_to_backend
 from transformersurgeon.export.backends.qnn import QNNExportConfig
 from transformersurgeon.export.convert import convert_for_export
+from transformersurgeon.calibration import wikitext2_loader
 
 
 ATEN_PATTERN = re.compile(r"aten\.[A-Za-z0-9_\.]+")
@@ -224,38 +222,6 @@ def _build_pte_stem(args: argparse.Namespace) -> str:
     return "_".join(parts)
 
 
-def _build_wikitext_calibration_loader(
-    tokenizer,
-    num_samples: int = 128,
-    seq_len: int = 512,
-    seed: int = 42,
-) -> DataLoader:
-    raw = load_dataset(
-        "EleutherAI/wikitext_document_level",
-        "wikitext-2-raw-v1",
-        split="train",
-    )
-    texts = [t for t in raw["page"] if isinstance(t, str) and len(t) > 0]
-    corpus = "\n\n".join(texts)
-
-    token_ids = tokenizer(corpus, truncation=False, padding=False,
-                          return_attention_mask=False)["input_ids"]
-
-    max_samples = len(token_ids) // seq_len
-    actual = min(num_samples, max_samples)
-
-    rng = random.Random(seed)
-    examples = []
-    for _ in range(actual):
-        start = rng.randint(0, len(token_ids) - seq_len - 1)
-        examples.append({
-            "input_ids": torch.tensor(token_ids[start:start + seq_len], dtype=torch.long),
-            "attention_mask": torch.ones(seq_len, dtype=torch.long),
-        })
-
-    return DataLoader(examples, batch_size=1, shuffle=False)
-
-
 def quantize_mlp_with_manager(model, args, calibration_loader=None):
     act_info = f", activation=a{args.act_precision}" if calibration_loader is not None else ""
     print(
@@ -349,7 +315,7 @@ def main():
         if args.calibrate:
             print(f"Building WikiText-2 calibration loader ({args.num_calibration_samples} samples, seq_len={args.calibration_seq_len})")
             tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-            calibration_loader = _build_wikitext_calibration_loader(
+            calibration_loader = wikitext2_loader(
                 tokenizer,
                 num_samples=args.num_calibration_samples,
                 seq_len=args.calibration_seq_len,

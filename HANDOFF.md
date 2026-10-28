@@ -74,7 +74,8 @@ blocks/       catalog.py  ← BLOCK_CATALOG: famiglia → atomo → {object, sum
 compression/  manager.py, scheme.py, grouping.py, cascade.py, config.py, compressible_layers.py,
               registry.py, compressori (lrd, structured/unstructured/block pruning, quantization, smoothquant)
               structured_pruning_methods/pruning_dims.py (spostato da blocks)
-calibration/  backbone.py, raw_data/, summaries/, input_absmax.py (collect_input_absmax, usato da SmoothQuant)
+calibration/  backbone.py, raw_data/, summaries/, input_absmax.py (collect_input_absmax, usato da SmoothQuant),
+              datasets.py (finestre di token per la calibrazione; WikiText-2 con import differito di `datasets`)
 models/       factory.py (build_family); per famiglia: indexing_<m>.py (dizionario modello) + family_<m>.py (dizionario famiglia)
 export/       operations.py ← BACKEND_OPERATIONS (blocco → operazione per backend, default + opzioni)
               exporter.py (Exporter, register_exporter, get_exporter, export_to_backend), config.py, convert.py,
@@ -188,5 +189,6 @@ Idee chiave:
 | dizionari `__ts_args__` costruiti a mano in 5 punti della cascata | `utils/batches.py::pack_batch` / `normalize_batch` |
 | `config if config_attr == "" else getattr(...)` in 6 punti | `utils/indexing.py::get_block_config` / `num_blocks` |
 | raccolta absmax di SmoothQuant fuori da `calibration/` | `calibration/input_absmax.py::collect_input_absmax` |
+| caricatore WikiText-2 copiato in 6 script/esempi + 2 benchmark | `calibration/datasets.py::token_windows_loader` / `wikitext2_loader` |
 | `isinstance(compressor, Quantizer)` nel manager | hook generico `Compressor.prepare_for_save` |
 | nome del componente "text" fisso nell'export | componente con `structure == "transformer_decoder"` |

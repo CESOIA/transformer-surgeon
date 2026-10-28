@@ -12,9 +12,8 @@ test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
 
 ## B. Pulizie rimaste
 
-- [ ] Script: il caricatore WikiText-2 di calibrazione è copiato in ~6 file
-      (`scripts/executorch/*`, `benchmarks/nonhom_*`, `examples/02`): ridurlo a una funzione
-      (es. `scripts/common_data.py` o, se generale, `calibration/datasets.py`).
+- [x] Script: caricatore WikiText-2 copiato in 8 file → `calibration/datasets.py`
+      (`token_windows_loader`, `wikitext2_loader`; verificato: stessi campioni del vecchio caricatore).
 - [ ] `scripts/executorch/qnn/full_quant_export.py` è ~90% copia di `exporter_function_test.py`:
       unificare o archiviare.
 - [ ] Validatori duplicati in `compression/` (ratio, eps, method): un modulo `validators.py` con fabbriche.

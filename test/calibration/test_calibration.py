@@ -84,3 +84,16 @@ def test_collect_input_absmax_is_per_channel_max_abs():
     layer = model.get_submodule(LAYER)
     stats = collect_input_absmax(model, [layer], loader)
     torch.testing.assert_close(stats[layer], x.abs().amax(0))
+
+
+def test_token_windows_loader_random_and_sequential():
+    from transformersurgeon.calibration import token_windows_loader
+
+    ids = list(range(100))
+    random_windows = [b["input_ids"][0] for b in token_windows_loader(ids, 5, 10, seed=3)]
+    assert len(random_windows) == 5 and all(w.tolist() == list(range(w[0], w[0] + 10)) for w in random_windows)
+    assert [b["input_ids"][0].tolist() for b in token_windows_loader(ids, 5, 10, seed=3)] == \
+           [w.tolist() for w in random_windows]  # seeded
+    sequential = list(token_windows_loader(ids, 50, 30, sequential=True, labels=True))
+    assert [b["input_ids"][0, 0].item() for b in sequential] == [0, 30, 60]  # at most len // seq_len
+    assert all(torch.equal(b["labels"], b["input_ids"]) and b["attention_mask"].sum() == 30 for b in sequential)

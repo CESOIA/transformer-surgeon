@@ -27,16 +27,15 @@ Usage:
 """
 
 import argparse
-import random
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
+from transformersurgeon.calibration import wikitext2_loader
 
 
 MODEL_NAME = "Qwen/Qwen2-0.5B-Instruct"
@@ -66,30 +65,6 @@ def parse_args():
 # --------------------------------------------------------------------------
 # Calibration data
 # --------------------------------------------------------------------------
-
-def build_wikitext_loader(tokenizer, num_samples: int, seq_len: int, seed: int) -> DataLoader:
-    """Random fixed-length token chunks from WikiText-2, wrapped as a DataLoader."""
-    raw = load_dataset(
-        "EleutherAI/wikitext_document_level",
-        "wikitext-2-raw-v1",
-        split="train",
-    )
-    texts = [t for t in raw["page"] if isinstance(t, str) and len(t) > 0]
-    corpus = "\n\n".join(texts)
-    token_ids = tokenizer(corpus, truncation=False, padding=False,
-                          return_attention_mask=False)["input_ids"]
-    actual = min(num_samples, len(token_ids) // seq_len)
-    rng = random.Random(seed)
-    examples = []
-    for _ in range(actual):
-        start = rng.randint(0, len(token_ids) - seq_len - 1)
-        chunk = torch.tensor(token_ids[start:start + seq_len], dtype=torch.long)
-        examples.append({
-            "input_ids": chunk,
-            "attention_mask": torch.ones(seq_len, dtype=torch.long),
-        })
-    return DataLoader(examples, batch_size=1, shuffle=False)
-
 
 # --------------------------------------------------------------------------
 # Model inspection
@@ -227,7 +202,7 @@ def main():
 
     print(f"\nBuilding WikiText-2 calibration set "
           f"({args.num_cal_samples} chunks x {args.cal_seq_len} tokens) ...")
-    loader = build_wikitext_loader(tokenizer, args.num_cal_samples, args.cal_seq_len, args.seed)
+    loader = wikitext2_loader(tokenizer, args.num_cal_samples, args.cal_seq_len, seed=args.seed)
 
     manager = Qwen2CompressionSchemesManager(model)
     manager.set_calibration_data(loader)
