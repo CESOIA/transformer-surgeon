@@ -105,6 +105,7 @@ Idee chiave:
 - `archive/code/` — funzioni morte o rotte, ognuna con docstring che spiega il motivo:
   M-RoPE helpers, `MHAEncoderFusedProj`, rami posizioni/patchify dell'encoder,
   `_apply_torchao_hard_quantization`, pezzi inutilizzati di `export/common.py`.
+- `archive/scripts/` — script sostituiti (`qnn_full_quant_export.py` → `exporter_function_test.py --quant-layers all`).
 - `archive/tests/` — vecchia suite completa, aggiornata ai nuovi import ed eseguibile:
   `pytest archive/tests` (riferimento di regressione finché non si decide di eliminarla).
 - Rimossi senza archivio (non erano codice): `__init__.py` alla radice (commento),
@@ -131,7 +132,8 @@ Idee chiave:
 - Usare **solo gli ambienti conda** (il `python` di base importa un'altra copia del repo):
   `py312_tensorrt` (veloce, ha onnx/tensorrt/GPU, ha `pyflakes`), `py310-executorch-qnn`,
   `py312_executorch_xnnpack` (pytest installato durante questa sessione).
-- Gli script fuori dal repo vanno lanciati con `PYTHONPATH=$PWD`.
+- Gli script fuori dal repo vanno lanciati con `PYTHONPATH=$PWD`. Attenzione: `conda run` **sovrascrive**
+  `PYTHONPATH`; usare `conda run -n <env> env PYTHONPATH=<repo> python ...`.
 - Test (`pytest.ini` raccoglie solo `test/`):
   ```bash
   conda run -n py312_tensorrt python -m pytest test -q -p no:cacheprovider          # nuova suite
@@ -190,5 +192,6 @@ Idee chiave:
 | `config if config_attr == "" else getattr(...)` in 6 punti | `utils/indexing.py::get_block_config` / `num_blocks` |
 | raccolta absmax di SmoothQuant fuori da `calibration/` | `calibration/input_absmax.py::collect_input_absmax` |
 | caricatore WikiText-2 copiato in 6 script/esempi + 2 benchmark | `calibration/datasets.py::token_windows_loader` / `wikitext2_loader` |
+| `scripts/executorch/qnn/full_quant_export.py` (~90% copia) | `exporter_function_test.py --quant-layers all` |
 | `isinstance(compressor, Quantizer)` nel manager | hook generico `Compressor.prepare_for_save` |
 | nome del componente "text" fisso nell'export | componente con `structure == "transformer_decoder"` |

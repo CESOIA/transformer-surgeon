@@ -14,8 +14,11 @@ test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
 
 - [x] Script: caricatore WikiText-2 copiato in 8 file → `calibration/datasets.py`
       (`token_windows_loader`, `wikitext2_loader`; verificato: stessi campioni del vecchio caricatore).
-- [ ] `scripts/executorch/qnn/full_quant_export.py` è ~90% copia di `exporter_function_test.py`:
-      unificare o archiviare.
+- [x] `scripts/executorch/qnn/full_quant_export.py` unito in `exporter_function_test.py`
+      (`--quant-layers {none,mlp,all}`, `--quant-method`, `--act-method`, `--act-scheme`; alias
+      `--quant-mlp`, `--precision`, `--quantize-activations`); originale in `archive/scripts/`;
+      `run_full_quant.sh` = `exporter_function_test.py --quant-layers all`. Le citazioni di
+      `full_quant_export.py` in `AGENTS.md` e `notes/refactor/recaps/` vanno sistemate al punto C.
 - [ ] Validatori duplicati in `compression/` (ratio, eps, method): un modulo `validators.py` con fabbriche.
 - [ ] `export/backends/onnx/exporter.py::io_names` duplica i nomi I/O di `manifest.py`: unificare.
 - [ ] `utils/__init__` va bene; verificare con `pyflakes` che non restino import inutili

@@ -1,3 +1,7 @@
+"""ARCHIVED 2026-10-28 (refactor): merged into scripts/executorch/qnn/exporter_function_test.py
+(``--quant-layers all``, ``--quant-method``, ``--act-method``, ``--act-scheme``; the flags
+``--precision`` and ``--quantize-activations`` are kept as aliases). This copy is no longer run.
+"""
 """Export a full-size (no LRD) Qwen2 model to QNN with every attention/MLP
 linear layer quantized to int8 or int4, and an independent toggle for
 static activation quantization.

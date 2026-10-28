@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Launcher for full_quant_export.py.
+# Launcher for exporter_function_test.py with every attention+MLP linear quantized
+# (the former full_quant_export.py, archived in archive/scripts/; its flags
+# --precision / --quantize-activations are accepted as aliases).
 # Sets LD_LIBRARY_PATH before Python starts (glibc caches it at process init,
 # so os.environ changes inside Python are too late for dlopen to see them).
 # After running `conda activate py310-executorch-qnn` these vars are set
@@ -14,4 +16,4 @@ NDK_LIB="/workspace/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/lib"
 
 export LD_LIBRARY_PATH="${QNN_LIB}:${NDK_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-exec python3 "${SCRIPT_DIR}/full_quant_export.py" "$@"
+exec python3 "${SCRIPT_DIR}/exporter_function_test.py" --quant-layers all "$@"
