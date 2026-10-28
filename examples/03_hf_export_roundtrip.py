@@ -108,7 +108,6 @@ def main():
     manager.init_vcon()            # wrap target layers in VCONBlock
     manager.set_vcon_beta(beta=1.0)  # start at original output (beta=1 → no compression visible)
     manager.apply(hard=True)       # hard=True: irreversible, suitable for export
-    manager.update_config()        # write compression_config back into model.config
 
     params_after = param_count(model)
     print(f"Parameters after  compression: {params_after / 1e6:.2f} M "
