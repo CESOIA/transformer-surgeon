@@ -15,6 +15,7 @@ class KVCache:
       sequence, dim) as seen by the attention kernel.
     - ``manifest_layout``: layout name recorded in export manifests.
     - ``multi_token``: whether one call may write several tokens (prefill).
+    - ``requires_kernel``: the only attention kernel that works with this cache, or ``None``.
     """
 
     name = None
@@ -22,6 +23,7 @@ class KVCache:
     read_layout = "shd"
     manifest_layout = "SHD"
     multi_token = False
+    requires_kernel = None
 
     def shape(self, attn, which):
         """Shape of the ``which`` (``"key"``/``"value"``) cache of ``attn``."""

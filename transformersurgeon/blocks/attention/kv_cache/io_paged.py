@@ -11,6 +11,7 @@ class PagedCache(KVCache):
     name = "io_paged"
     manifest_layout = "PAGED"
     multi_token = True
+    requires_kernel = "paged"
 
     def shape(self, attn, which="kv"):
         return (2, num_kv_pages(attn.max_cache_length), KV_PAGE_SIZE, attn.kv_num_heads, attn.value_head_dim)

@@ -170,7 +170,7 @@ FAMILIES: Dict[str, FamilySpec] = {
     ),
     "vit": FamilySpec(
         "vit", _vit, _mgr("ViTCompressionSchemesManager"), _pixels,
-        lrd_criteria="attention.attention.query", mlp_prune_criteria="intermediate.dense",
+        lrd_criteria="attention.q_proj", mlp_prune_criteria="mlp.fc1",
     ),
     "qwen2_vl": FamilySpec(
         "qwen2_vl",

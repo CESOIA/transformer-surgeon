@@ -25,6 +25,7 @@ class EmbeddingCompressed(LowRankMixin, nn.Module):
         super().__init__()
         if embedding_dim <= 0:
             self.skip = True
+            self.num_embeddings, self.embedding_dim, self.rank = num_embeddings, 0, "full"
             return
         self.skip = False
         self.num_embeddings = num_embeddings

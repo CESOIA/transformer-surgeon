@@ -36,8 +36,8 @@ class MHACausal(MHABase):
         self.max_cache_length = max_cache_len
         self.masked_softmax = bool(masked_softmax)
 
-        paged_kernel = self.kernel.requires_cache == "io_paged"
-        if paged_kernel != (cache_impl == "io_paged"):
+        if self.kv_cache.requires_kernel not in (None, self.attn_impl) or (
+                self.kernel.requires_cache == "io_paged" and cache_impl != "io_paged"):
             raise ValueError("attn_impl='paged' and cache_impl='io_paged' go together.")
         if self.masked_softmax and not self.kernel.supports_masked_softmax:
             raise ValueError("masked_softmax=True needs attn_impl='manual'.")

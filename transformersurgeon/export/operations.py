@@ -20,7 +20,7 @@ fields take the backend default from here, and a choice that is not listed for
 the backend is rejected before any tracing starts.
 """
 
-from ..blocks import ATTENTION_KERNELS
+from ..blocks import ATTENTION_KERNELS, KV_CACHES
 
 BACKENDS = ("xnnpack", "qnn", "onnx", "tensorrt")
 
@@ -229,8 +229,9 @@ def resolve_convert_options(backend, options=None):
     cache = resolved["cache_impl"]
     if resolved.get("attn_impl") is None:
         candidates = [default_for(backend, "attention_kernel")] + list(options_for(backend, "attention_kernel"))
+        required = KV_CACHES[cache].requires_kernel
         for name in candidates:
-            if ATTENTION_KERNELS[name].requires_cache in (None, cache):
+            if ATTENTION_KERNELS[name].requires_cache in (None, cache) and required in (None, name):
                 resolved["attn_impl"] = name
                 break
 

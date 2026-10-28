@@ -26,7 +26,11 @@ class LinearCompressed(LowRankMixin, nn.Linear):
     def __init__(self, in_features: int, out_features: int, bias: bool = True,
                  rank=None, device=None, dtype=None):
         if out_features <= 0:
+            # Fully pruned layer: a plain module that returns its input unchanged.
+            nn.Module.__init__(self)
             self.skip = True
+            self.in_features, self.out_features, self.rank = in_features, 0, "full"
+            self.weight = self.bias = self.linear_V = None
             return
         self.skip = False
         super().__init__(in_features=in_features, out_features=out_features, bias=bias,
