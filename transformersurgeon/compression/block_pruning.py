@@ -89,7 +89,7 @@ class BlockPruner(Compressor):
         return spec
 
     def _resolve(self, name):
-        from ..utils.utils import get_submodule  # lazy: avoid import cycle
+        from ..utils import get_submodule
         scheme = self.scheme
         return get_submodule(scheme.model, scheme.path_template.format(block_index=scheme.block_id, path=name))
 

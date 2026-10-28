@@ -14,10 +14,10 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch.utils.data import DataLoader
 
-from .raw_data import instantiate_raw_collector, normalize_calibration_batch
+from .raw_data import instantiate_raw_collector
 from .summaries import SummaryRuntime, get_summary
-from ..utils.interface import build_progress_bar
-from ..utils.utils import get_submodule, infer_model_device, move_to_device
+from ..utils import build_progress_bar, normalize_batch
+from ..utils import get_submodule, infer_model_device, move_to_device
 
 
 def _compute_calibration_loss(loss_fn, model_output, label):
@@ -215,7 +215,7 @@ def run_compression_calibration(
             if max_batches is not None:
                 total_batches = max_batches
 
-        progress_bar = build_progress_bar(enabled=show_progress, total=total_batches, verbose=verbose)
+        progress_bar = build_progress_bar(enabled=show_progress, total=total_batches, verbose=verbose, desc="Calibration")
 
         try:
             model.eval()
@@ -244,7 +244,7 @@ def run_compression_calibration(
                         runtime.reset_batch()
 
                 # Normalize heterogeneous loader outputs to a canonical model invocation form.
-                model_args, model_kwargs, label = normalize_calibration_batch(batch, batch_id=batch_id)
+                model_args, model_kwargs, label = normalize_batch(batch, batch_id=batch_id)
                 model_args = move_to_device(model_args, device)
                 model_kwargs = move_to_device(model_kwargs, device)
                 label = move_to_device(label, device)
@@ -255,7 +255,7 @@ def run_compression_calibration(
                 shifted_model_kwargs = model_kwargs
                 if requires_shifted_model and shifted_device is not None:
                     if shifted_calibration_data is not None:
-                        shifted_args, shifted_kwargs, _ = normalize_calibration_batch(
+                        shifted_args, shifted_kwargs, _ = normalize_batch(
                             shifted_batch,
                             batch_id=batch_id,
                         )

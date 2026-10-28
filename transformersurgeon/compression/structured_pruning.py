@@ -540,7 +540,7 @@ class StructuredPruner(Compressor):
         reached the last block, tracked via the ``block_id`` threaded through
         every hop by ``_hop_block_id``.
         """
-        from ..utils.utils import get_submodule  # lazy: avoid import cycle
+        from ..utils import get_submodule
 
         if name in ("final_layer", "final_norm"):
             is_last_block = (
@@ -666,7 +666,7 @@ class StructuredPruner(Compressor):
         if not extra_paths:
             return
 
-        from ..utils.utils import get_submodule  # lazy: avoid import cycle
+        from ..utils import get_submodule
 
         keep = mask.to(torch.bool)
         for path in extra_paths:

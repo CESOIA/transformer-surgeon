@@ -26,7 +26,7 @@ def test_rope_theta_from_config():
 
 def test_converted_decoder_uses_config_eps_and_rope_theta():
     from transformersurgeon.blocks.rope import precompute_rope_cos_sin_half, precompute_rope_inv_freqs
-    from transformersurgeon.utils import convert_for_export
+    from transformersurgeon.export.convert import convert_for_export
 
     model = _qwen2().eval()
     model.config.rms_norm_eps = 1e-6
@@ -60,7 +60,7 @@ def test_manifest_describes_per_layer_caches(tmp_path, cache_impl):
         build_wrapper,
         zero_caches_from_manifest,
     )
-    from transformersurgeon.utils import convert_for_export
+    from transformersurgeon.export.convert import convert_for_export
 
     model = _qwen2().eval()
     decoder = convert_for_export(model, options={"cache_impl": cache_impl, "max_cache_len": 16})["text"]

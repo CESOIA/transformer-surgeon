@@ -1,7 +1,7 @@
 from transformers.models.distilbert.modeling_distilbert import DistilBertForSequenceClassification
 from transformers.models.distilbert.configuration_distilbert import DistilBertConfig
 from . import DISTILBERT_C_INDEXING as INDEXING
-from ...utils import (
+from ...compression import (
     init_compressed_config,
     replace_layers_upon_init,
     CompressionSchemesManager,

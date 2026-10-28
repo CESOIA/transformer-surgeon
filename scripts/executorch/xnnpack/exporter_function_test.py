@@ -11,7 +11,7 @@ from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 from transformersurgeon.export import export_to_backend
 from transformersurgeon.export.executorch_exporters.xnnpack import XNNPACKExportConfig
-from transformersurgeon.utils import convert_for_export
+from transformersurgeon.export.convert import convert_for_export
 
 
 _DTYPE_MAP = {

@@ -14,10 +14,10 @@ from copy import deepcopy
 
 logger = logging.getLogger(__name__)
 from ..calibration import run_compression_calibration, SUPPORTED_SUMMARIES
-from ..compression import GROUP_OPTIONS, COMPRESSION_REGISTRY
+from .registry import GROUP_OPTIONS, COMPRESSION_REGISTRY
 from .scheme import CompressionScheme
 from .grouping import SchemeGroup
-from .utils import flatten_index_paths, get_submodule
+from ..utils import flatten_index_paths, get_submodule
 from .cascade import apply_cascade
 from ..blocks import LinearCompressed, EmbeddingCompressed, Conv2dCompressed, Conv3dCompressed
 
@@ -306,7 +306,7 @@ class CompressionSchemesManager:
         *all* its consumers match ``criteria``. Uses the calibration data
         (set_calibration_data). Call before quantization (manager.apply). Returns a summary.
         """
-        from ..compression.smoothquant import apply_smoothquant
+        from .smoothquant import apply_smoothquant
 
         if self.calibration_data is None:
             raise ValueError("smooth_activations needs calibration data: call set_calibration_data(...) first.")
@@ -945,7 +945,7 @@ class CompressionSchemesManager:
         default so they round-trip through save/load. Call
         ``manager.remove_masks()`` before saving if they are not needed.
         """
-        from ..compression.quantization import Quantizer
+        from .quantization import Quantizer
         import torch.nn as nn
 
         soft_only = [

@@ -1,7 +1,7 @@
 from transformers.models.bert.modeling_bert import BertForSequenceClassification
 from transformers.models.bert.configuration_bert import BertConfig
 from . import BERT_C_INDEXING as INDEXING
-from ...utils import (
+from ...compression import (
     init_compressed_config,
     replace_layers_upon_init,
     CompressionSchemesManager,

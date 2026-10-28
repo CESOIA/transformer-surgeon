@@ -1,8 +1,8 @@
 """Utility functions for compression configuration across different transformer models."""
 
 from typing import Dict, Any, Optional
-from ..compression import COMPRESSION_REGISTRY
-from .utils import flatten_index_paths
+from .registry import COMPRESSION_REGISTRY
+from ..utils import flatten_index_paths
 
 def init_compressed_config(
     config_instance,

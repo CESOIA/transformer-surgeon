@@ -6,7 +6,7 @@ from transformers.models.qwen2_vl.configuration_qwen2_vl import (
     Qwen2VLConfig,
 )
 from . import QWEN2_VL_C_INDEXING as INDEXING
-from ...utils import (
+from ...compression import (
     init_compressed_config,
     replace_layers_upon_init, 
     CompressionSchemesManager,

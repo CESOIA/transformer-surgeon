@@ -30,7 +30,7 @@ def _tiny(dtype=torch.float32):
 def _eager_logits(model, token_ids, device):
     """Reference: the converted io_inplace graph in eager PyTorch, prompt in one call."""
     from transformersurgeon.export.common import build_wrapper, build_zero_caches
-    from transformersurgeon.utils import convert_for_export
+    from transformersurgeon.export.convert import convert_for_export
 
     decoder = convert_for_export(model, options=CONVERT)["text"]
     wrapper = build_wrapper({"embedding": model.get_input_embeddings(), "decoder": decoder,

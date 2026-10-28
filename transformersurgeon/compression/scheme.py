@@ -11,12 +11,12 @@ from ..blocks import LinearCompressed
 from ..blocks import EmbeddingCompressed
 from ..blocks import Conv2dCompressed, Conv3dCompressed
 from ..blocks import VCONBlock
-from ..compression import (
+from .registry import (
     COMPRESSOR_DICT,
     COMPRESSION_REGISTRY,
     APPLICATION_ORDER,
 )
-from .utils import get_submodule
+from ..utils import get_submodule
 
 # PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
 # but this is not easy for skip connections, e.g., residual connections in transformers

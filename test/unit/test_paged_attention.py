@@ -15,7 +15,7 @@ import torch
 import transformersurgeon as T
 from transformersurgeon.blocks.paged_attention_ops import KV_PAGE_SIZE
 from transformersurgeon.export.common import LLMWrapper, build_zero_caches
-from transformersurgeon.utils import convert_for_export
+from transformersurgeon.export.convert import convert_for_export
 
 from _helpers import capabilities as caps
 

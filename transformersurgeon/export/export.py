@@ -6,8 +6,8 @@ from .registry import EXPORT_ROUTINES
 from .config import BackendExportConfig
 from .common import _normalize_component_devices
 from ..blocks import TransformerDecoder
-from ..utils import convert_for_export
-from ..utils.utils import get_submodule
+from .convert import convert_for_export
+from ..utils import get_submodule
 
 def _resolve_model_components_for_export(
     model_or_graph: Any,

@@ -5,7 +5,7 @@ from transformers import PretrainedConfig
 from ..blocks import LinearCompressed, EmbeddingCompressed, Conv2dCompressed, Conv3dCompressed
 from typing import Dict, Any
 import math
-from .utils import flatten_index_paths
+from ..utils import flatten_index_paths
 
 def replace_layers_upon_init(
         model: torch.nn.Module, # model to modify (e.g., vision encoder, language decoder)

@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from ..calibration import run_compression_calibration
-from ..calibration.raw_data import normalize_calibration_batch
-from .utils import get_submodule, infer_model_device, move_to_device
+from ..utils import normalize_batch, pack_batch
+from ..utils import get_submodule, infer_model_device, move_to_device
 
 
 def apply_cascade(
@@ -597,7 +597,7 @@ def _collect_preprocessing_outputs(
             if max_batches is not None and batch_id >= max_batches:
                 break
 
-            model_args, model_kwargs, label = normalize_calibration_batch(batch, batch_id=batch_id)
+            model_args, model_kwargs, label = normalize_batch(batch, batch_id=batch_id)
             model_args = tuple(move_to_device(model_args, device))
             model_kwargs = dict(move_to_device(model_kwargs, device))
 
@@ -636,7 +636,7 @@ def _collect_loader_inputs(
         if max_batches is not None and batch_id >= max_batches:
             break
 
-        model_args, model_kwargs, label = normalize_calibration_batch(batch, batch_id=batch_id)
+        model_args, model_kwargs, label = normalize_batch(batch, batch_id=batch_id)
         model_args = tuple(move_to_device(model_args, device))
         model_kwargs = dict(move_to_device(model_kwargs, device))
 

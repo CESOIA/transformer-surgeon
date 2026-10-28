@@ -1,7 +1,7 @@
 from transformers.models.modernbert.modeling_modernbert import ModernBertForSequenceClassification
 from transformers.models.modernbert.configuration_modernbert import ModernBertConfig
 from . import MODERNBERT_C_INDEXING as INDEXING
-from ...utils import (
+from ...compression import (
     init_compressed_config,
     replace_layers_upon_init,
     CompressionSchemesManager,

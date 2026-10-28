@@ -18,7 +18,7 @@ def _float_qwen2():
 
 
 def _components(model, opts):
-    from transformersurgeon.utils import convert_for_export
+    from transformersurgeon.export.convert import convert_for_export
 
     conv = convert_for_export(model, options=opts)
     return {"embedding": model.get_input_embeddings(), "decoder": conv["text"],

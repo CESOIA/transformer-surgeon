@@ -1,7 +1,7 @@
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.llama.configuration_llama import LlamaConfig
 from . import LLAMA_C_INDEXING as INDEXING
-from ...utils import (
+from ...compression import (
     init_compressed_config,
     replace_layers_upon_init,
     CompressionSchemesManager,

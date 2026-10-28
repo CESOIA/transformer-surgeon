@@ -44,7 +44,7 @@ from transformers import ViTImageProcessor
 
 from transformersurgeon import ViTForImageClassificationCompress
 from transformersurgeon.models.vit_c import ViTCompressionSchemesManager
-from transformersurgeon.utils import convert_for_export
+from transformersurgeon.export.convert import convert_for_export
 
 
 MODEL_NAME = "Ahmed9275/Vit-Cifar100"

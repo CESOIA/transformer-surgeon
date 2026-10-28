@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _helpers.model_factory import FAMILIES  # noqa: E402
 
 from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager  # noqa: E402
-from transformersurgeon.utils import convert_for_export  # noqa: E402
+from transformersurgeon.export.convert import convert_for_export  # noqa: E402
 from transformersurgeon.export.common import LLMWrapper, build_zero_caches  # noqa: E402
 
 pytestmark = pytest.mark.e2e

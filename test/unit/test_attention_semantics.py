@@ -9,7 +9,7 @@ import torch
 
 import transformersurgeon as T
 from transformersurgeon.export.common import LLMWrapper
-from transformersurgeon.utils import convert_for_export
+from transformersurgeon.export.convert import convert_for_export
 
 N = 24
 IDS = torch.arange(1, N + 1) * 11 % 256

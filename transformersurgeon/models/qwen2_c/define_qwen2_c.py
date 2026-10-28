@@ -2,7 +2,7 @@ import inspect
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from . import QWEN2_C_INDEXING as INDEXING
-from ...utils import (
+from ...compression import (
     init_compressed_config,
     replace_layers_upon_init, 
     CompressionSchemesManager,

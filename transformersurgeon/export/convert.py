@@ -7,7 +7,7 @@ import torch.nn as nn
 from ..blocks import TransformerDecoder
 from ..blocks.encoder import TransformerEncoder
 from ..blocks.config import CustomDecoderConfigCompress, CustomEncoderConfigCompress
-from .utils import get_submodule, flatten_index_paths
+from ..utils import get_submodule, flatten_index_paths
 
 
 _QUANT_BUFFER_SUFFIXES = (

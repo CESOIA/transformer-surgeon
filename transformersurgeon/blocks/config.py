@@ -2,7 +2,6 @@
 
 from transformers import PretrainedConfig
 
-from ..utils.configuration import init_compressed_config
 from .rope import resolve_rope_type
 
 class CustomDecoderConfigCompress(PretrainedConfig):
@@ -64,6 +63,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         if indexing is None:
             self.compression_config = compression_config or {}
         else:
+            from ..compression.config import init_compressed_config
             init_compressed_config(
                 config_instance=self,
                 indexing=indexing,
@@ -213,6 +213,7 @@ class CustomEncoderConfigCompress(PretrainedConfig):
         if indexing is None:
             self.compression_config = compression_config or {}
         else:
+            from ..compression.config import init_compressed_config
             init_compressed_config(
                 config_instance=self,
                 indexing=indexing,

@@ -29,8 +29,8 @@ from typing import Iterable, Optional, Union
 import torch
 import torch.nn as nn
 
-from ..calibration.raw_data import normalize_calibration_batch
-from ..utils.utils import get_submodule, infer_model_device, move_to_device
+from ..utils import normalize_batch
+from ..utils import get_submodule, infer_model_device, move_to_device
 
 
 def _input_weight(linear: nn.Module) -> torch.Tensor:
@@ -94,7 +94,7 @@ def collect_input_absmax(model: nn.Module, modules: Iterable[nn.Module], calibra
         for batch_id, batch in enumerate(calibration_data):
             if max_batches is not None and batch_id >= max_batches:
                 break
-            args, kwargs, _ = normalize_calibration_batch(batch, batch_id=batch_id)
+            args, kwargs, _ = normalize_batch(batch, batch_id=batch_id)
             model(*move_to_device(args, device), **move_to_device(kwargs, device))
     finally:
         for h in handles:

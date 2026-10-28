@@ -35,7 +35,7 @@ def _mlp_w8_qwen2(big_bias: bool):
 
 def _wrapper(model):
     from transformersurgeon.export.common import LLMWrapper
-    from transformersurgeon.utils import convert_for_export
+    from transformersurgeon.export.convert import convert_for_export
 
     conv = convert_for_export(model, options={"use_sdpa": False, "max_cache_len": 32, "masked_softmax": True})
     return LLMWrapper(model.get_input_embeddings(), conv["text"], model.lm_head).eval()
@@ -102,7 +102,7 @@ def test_qnn_mlp_only_fake_quant_tracks_float(tmp_path, split):
     ref = run(_wrapper(_mlp_w8_qwen2(big_bias=True)))
     model = _mlp_w8_qwen2(big_bias=True)
     opts = {"use_sdpa": False, "max_cache_len": 32, "masked_softmax": True}
-    from transformersurgeon.utils import convert_for_export
+    from transformersurgeon.export.convert import convert_for_export
     conv = convert_for_export(model, options=opts)
     comps = {"embedding": model.get_input_embeddings(), "decoder": conv["text"],
              "final_layer": model.lm_head, "config": model.config}

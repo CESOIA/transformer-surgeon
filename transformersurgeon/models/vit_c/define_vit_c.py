@@ -2,7 +2,7 @@ from transformers.models.vit.modeling_vit import ViTForImageClassification
 from transformers.models.vit.configuration_vit import ViTConfig
 from . import VIT_C_INDEXING as INDEXING
 from .legacy_conversion import build_legacy_vit_key_mapping, peek_checkpoint_keys
-from ...utils import (
+from ...compression import (
     init_compressed_config,
     replace_layers_upon_init,
     CompressionSchemesManager,
