@@ -38,7 +38,7 @@ QWEN2_VL_C_INDEXING = {
             'output_dependence': {
                 # 'preprocessing_conv' is a sentinel: the conv's output feeds
                 # block 0's residual stream via norm1. Resolved directly (no
-                # block_index) by the manager/structured pruner, not via
+                # block_index) by CompressionScheme (compression/scheme.py), not via
                 # path_template.
                 'preprocessing_conv': ['norm1'],
                 'norm1': ['attn.qkv'],
@@ -85,7 +85,7 @@ QWEN2_VL_C_INDEXING = {
             'output_dependence': {
                 # 'preprocessing' is a sentinel: the embedding's output feeds
                 # block 0's residual stream via input_layernorm. Resolved
-                # directly (no block_index) by the manager/structured pruner,
+                # directly (no block_index) by CompressionScheme (compression/scheme.py),
                 # not via path_template.
                 'preprocessing': ['input_layernorm'],
                 'input_layernorm': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
@@ -93,7 +93,7 @@ QWEN2_VL_C_INDEXING = {
                 'mlp.up_proj': ['mlp.down_proj'],
                 # Wraps to the next block's input_layernorm (or, on the last
                 # block, to 'final_norm' -- see the 'final_norm'/'final_layer'
-                # gating in structured_pruning.py).
+                # gating in CompressionScheme.coupled_target_chains).
                 'mlp.down_proj': ['input_layernorm', 'final_norm'],
                 'self_attn.v_proj': ['self_attn.o_proj'],
                 'self_attn.o_proj': ['post_attention_layernorm', 'final_norm'],

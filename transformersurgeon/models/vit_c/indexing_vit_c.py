@@ -48,7 +48,7 @@ VIT_C_INDEXING = {
                 # in extra_layers) -> 'final_layer' (classifier).
                 # 'preprocessing_conv' is a sentinel: the conv's output feeds
                 # block 0's residual stream via layernorm_before. Resolved
-                # directly (no block_index) by the manager/structured pruner,
+                # directly (no block_index) by CompressionScheme (compression/scheme.py),
                 # not via path_template.
                 'preprocessing_conv': ['layernorm_before'],
                 'mlp.fc1': ['mlp.fc2'],
