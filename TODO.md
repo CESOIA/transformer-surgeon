@@ -54,7 +54,7 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
       "attention", `TransformerDecoder` = "decoder_stack"), letto da `qnn/passes.py::_export_role`;
       verificato: stessi nodi del vecchio confronto per nome (mutable, io_inplace, sdpa).
 - [x] `hf/hf_export.py::export_to_hf` chiama `manager.apply(hard=True)`: tenuto e documentato (punto B).
-- [ ] `blocks/` contiene atomi legati a una backend (`custom_sdpa` ExecuTorch, `paged` Edge-LLM):
+- [x] (→ report, sezione E) `blocks/` contiene atomi legati a una backend (`custom_sdpa` ExecuTorch, `paged` Edge-LLM):
       ammesso perché sono atomi selezionabili, ma va detto nel report.
 - [x] `BACKEND_OPERATIONS` ora copre anche `mlp`, `rope_frequencies`, `embedding`, `output_head` con un
       terzo tipo di voce `model_key` (scelta del dizionario del modello, `default: None`, o implementazione
@@ -75,8 +75,9 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 
 ## C. Documentazione di progetto
 
-- [ ] Riscrivere `AGENTS.md` e `CLAUDE.md` (mappa file, invarianti, ricette "aggiungi modello /
-      metodo / calibrazione / atomo / backend") sulla nuova struttura.
+- [x] `AGENTS.md` e `CLAUDE.md` riscritti sulla nuova struttura (regole delle cartelle, mappa file, invarianti,
+      ricette); in `AGENTS.md` le sezioni tecniche dei backend e dei parametri sono state tenute, con i percorsi
+      aggiornati. Rimossa la tabella "Open TODOs" (i tag `TODO(...)` non esistono più nel codice).
 - [ ] Aggiornare `README.md`, `FRAMEWORK_STRUCTURE.md`, `llms.txt`, `docs/concepts.md`
       (es. `weight_2` → `linear_V`, percorsi `utils.manager` → `compression.manager`,
       `utils.convert` → `export.convert`, `export_with_*` → `export_to_backend`/classi `*Exporter`).

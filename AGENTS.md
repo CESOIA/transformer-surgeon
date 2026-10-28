@@ -1,160 +1,162 @@
 # AGENTS.md — transformer-surgeon
 
-Agent-oriented guide for working on this codebase. For user-facing docs read [README.md](README.md). For architecture depth read [docs/concepts.md](docs/concepts.md).
+Agent-oriented guide for working on this codebase. For user-facing docs read [README.md](README.md); for the
+architecture in depth read [docs/concepts.md](docs/concepts.md). Work in progress on the refactoring branch is
+tracked in [HANDOFF.md](HANDOFF.md) and [TODO.md](TODO.md).
 
 ---
 
 ## Project Summary
 
-transformer-surgeon adds compression (LRD, pruning, quantization) to HuggingFace transformer models without breaking the standard `from_pretrained` / `generate` / `save_pretrained` workflow. The entry points are model-specific subclasses (e.g. `Qwen2ForCausalLMCompress`) and a manager (`Qwen2CompressionSchemesManager`). The core loop is always:
+transformer-surgeon adds compression (low-rank decomposition, pruning, quantization) to Hugging Face transformer
+models without breaking `from_pretrained` / `generate` / `save_pretrained`, and exports the compressed model to
+device backends (ExecuTorch XNNPACK and Qualcomm QNN, ONNX, TensorRT). The entry points are the generated
+per-family classes (e.g. `Qwen2ForCausalLMCompress`) and their manager (`Qwen2CompressionSchemesManager`):
 
 ```python
-manager.set("lrd", "rank", 128, criteria="mlp")   # configure
-manager.apply(hard=False)                           # compress (reversible)
-model.generate(...)                                 # use normally
-manager.restore()                                   # undo
+manager.set("lrd", "rank", 128, criteria="mlp")   # configure (declarative)
+manager.apply(hard=False)                          # compress (reversible)
+model.generate(...)                                # use normally
+manager.restore()                                  # undo
+manager.apply(hard=True)                           # permanent, before export
+export_to_backend(model, QNNExportConfig(output_path="model.pte"))
 ```
-
-`hard=True` is irreversible and used only for final export.
 
 ---
 
 ## Dev Setup and Test Commands
 
 ```bash
-git clone https://github.com/CESOIA/transformer-surgeon.git
-cd transformer-surgeon
 pip install -e ".[dev]"
+pytest                     # the suite in test/ (one folder per package folder), tiny random models, no downloads
+pytest archive/tests --continue-on-collection-errors   # legacy suite, kept as a regression reference
 ```
 
-Run tests:
-
-```bash
-# Default: test/unit + test/e2e/test_model_families.py — no downloads, no GPU.
-# All 7 families (qwen2, llama, bert, modernbert, distilbert, vit, qwen2_vl,
-# qwen2_5_vl) via tiny random-weight models from test/_helpers/model_factory.py.
-pytest
-
-# Bug regressions (pinned assertions for previously-broken framework behavior)
-pytest test/unit/test_known_bugs.py -v
-
-# Real-checkpoint export pipelines — HF roundtrip, convert, XNNPACK, TensorRT, QNN.
-# Each backend is gated by test/_helpers/capabilities.py (skips if unavailable).
-pytest test/e2e/test_export_pipelines.py -v
-
-# Single file / test
-pytest test/e2e/test_model_families.py::test_lrd_soft_apply_and_restore -v
-```
+Backends are capability-gated (`test/_helpers/capabilities.py`): tests skip when ExecuTorch, the QNN SDK, ONNX,
+TensorRT or a GPU are missing. On the development machine use the conda environments `py312_tensorrt`,
+`py310-executorch-qnn`, `py312_executorch_xnnpack` (see HANDOFF.md §6 for the expected environment failures).
 
 ---
 
-## Architecture in 30 Seconds
+## Architecture
 
-Three layers, one direction:
+One pipeline, compression → export, driven by dictionaries. Each package folder has one job:
 
-| Layer | Class | Role |
+| Folder | Job | Must not contain |
 |---|---|---|
-| **What** | `Compressor` subclass | Algorithm: how to compress one `LinearCompressed` layer |
-| **Where** | `CompressionScheme` | Binds a model path to a compressor config (built by manager, never instantiated directly) |
-| **How many** | `CompressionSchemesManager` | Iterates all schemes, filters by criteria, runs calibration, calls apply/restore |
+| `utils/` | Generic helpers on modules, dotted paths, batches, devices | anything about a model, a compression type or the export |
+| `models/` | One folder per family: the **model dictionary** (`indexing_<m>.py`) and the **family dictionary** (`family_<m>.py`); `factory.py::build_family` generates config/model/manager classes | algorithms |
+| `compression/` | Manager, schemes, groups, compressors (LRD, pruning, quantization, SmoothQuant), option registry and validators | model names, export details |
+| `calibration/` | Collection of calibration statistics (raw-data collectors, summaries, input absmax, calibration datasets) | compression decisions |
+| `blocks/` | Simplified export-ready transformer split into selectable **atoms** (one class per file), listed in `blocks/catalog.py::BLOCK_CATALOG` | model-specific information, compression decisions |
+| `export/` | Conversion to `blocks/` stacks, generic exporter, per-backend exporters, and `export/operations.py::BACKEND_OPERATIONS` (block type → device operation per backend) | compression decisions |
+| `hf/` | Save to a Hugging Face directory / Hub with remote code | — |
 
-See [docs/concepts.md](docs/concepts.md) for the full lifecycle walkthrough.
+Inside `compression/` there are three layers: **what** (`Compressor` subclasses: how to compress one layer),
+**where** (`CompressionScheme`: one model layer, its compressors and its topology, built by the manager),
+**how many** (`CompressionSchemesManager`: filtering by criteria, calibration, apply/restore).
+
+Two dictionaries join the folders:
+
+- the model dictionary says which operations the model needs (`structure`, `attn_type`, `mlp_type`,
+  `norm_type`, `rope_type`), i.e. which atoms of `BLOCK_CATALOG` build its export graph;
+- `BACKEND_OPERATIONS` says, per backend, which implementation of each operation is used by default and which
+  alternatives are supported (`cache_impl`, `attn_impl`, `rmsnorm_impl`, `masked_softmax`, `add_batch_dim`,
+  and the configuration fields `quant_path`, `quant_scope`, `int4_backend`, `convert_linear_to_conv2d`).
+  `resolve_convert_options(backend, options)` fills the defaults and rejects unsupported choices.
 
 ---
 
 ## File Map
 
-Where to look when you need to change something:
-
-| Task | File |
+| Task | Where |
 |---|---|
-| Change a compression algorithm | `transformersurgeon/compression/lrd.py`, `structured_pruning.py`, `unstructured_pruning.py`, `quantization.py` |
-| Add a new compression method | Subclass `compression/abstract.py` → new file in `compression/` → register in `compression/registry.py` |
-| Add an LRD variant (e.g. new SVD method) | New file in `compression/lrd_methods/`, import in `compression/lrd.py` |
-| Add a pruning variant | New file in `compression/structured_pruning_methods/` or `unstructured_pruning_methods/` |
-| Change structured-pruning masks / scoring / effective dims | `compression/structured_pruning.py`, `compression/structured_pruning_methods/`, `blocks/pruning_dims.py` |
-| Change cross-layer input pruning (coupling) | `compression/coupled_pruning.py` (invoked in cascade by the structured pruner) |
-| Change scheme grouping (shared masks) | `utils/grouping.py` (`SchemeGroup`) + `utils/manager.py` (`create_group`/`delete_group`/`auto_groups`) |
-| Add a new model family | `models/newmodel_c/indexing_newmodel_c.py` + `models/newmodel_c/define_newmodel_c.py` |
-| Add / change a RoPE variant (e.g. Llama 3 frequency scaling) | `blocks/rope.py` (`ROPE_INV_FREQ`, `resolve_rope_type`) + the model's indexing `rope_type` |
-| Remove whole attention heads (block pruning) | `compression/block_pruning.py` + indexing `pruning.block_pruning`; converted side `blocks/mha.py::finalize_head_pruning` |
-| Change what layers get compressed / pruning coupling in a model | `models/qwen2_c/indexing_qwen2_c.py` (or the relevant model's `indexing_*.py`) — `path_list` and the `pruning` block |
-| Change layer filtering / criteria logic | `utils/manager.py` → `iter_filtered()` |
-| Change calibration data collection hooks | `calibration/raw_data/activation.py` or `weight_grad.py` |
-| Add a new calibration summary (statistic) | Subclass `calibration/summaries/base.py` → new file → register in `calibration/summaries/registry.py` |
-| Change how covariance is computed | `calibration/summaries/covariance.py` |
-| Change the `LinearCompressed` forward pass | `blocks/linear_compressed.py` |
-| Change VCON blending | `blocks/vcon_block.py` |
-| Change HuggingFace export | `hf/hf_export.py` |
-| Change export graph conversion | `utils/convert.py` |
-| Change what parameters are valid for a compression type | `compression/registry.py` → `COMPRESSION_REGISTRY` |
-| Change backend-export machinery shared by all backends (quant-metadata extraction, PT2E calibration, weight-mismatch checks, error stats, the export manifest) | `export/common.py` |
-| Change which layers get PT2E Q/DQ (linear-only annotation, shared by XNNPACK and TensorRT) | `export/linear_quantizer.py` |
-| Add/change a backend exporter | `export/registry.py` → `EXPORT_ROUTINES`, plus the backend's own subpackage (`export/executorch_exporters/xnnpack/`, `export/executorch_exporters/qnn/`, `export/tensorrt/`) |
-| Change which attention kernel `MHACausal` uses at export (`manual`/`sdpa`/`custom_sdpa`) | `blocks/mha.py::MHACausal`, threaded via `attn_impl` in `convert_options` (`utils/convert.py`, `blocks/config.py`, `blocks/decoder.py`) |
-| Change the KV-cache mechanism (`cache_impl`, incl. the in-place `io_inplace` + its custom op) | `blocks/mha.py::MHACausal` (`cache_shape`, `_write_*`), `blocks/kv_cache_ops.py`, `blocks/decoder.py` (multi-token mask/RoPE) |
-| Change the paged cache + fused attention (`io_paged`, Edge-LLM AttentionPlugin) | `blocks/paged_attention_ops.py` (eager op = plugin contract), `MHACausal._forward_paged`, `blocks/decoder.py`, `export/tensorrt/edgellm_attention.py` |
-| Change the ONNX export (I/O contract, manifest, weight Q/DQ) | `export/onnx/onnx_export.py`, `export/onnx/quantization.py` |
-| Change the plain-TensorRT build / runtime / Edge-LLM INT4 plugin pass | `export/tensorrt/tensorrt_export.py`, `engine.py`, `session.py`, `edgellm_int4.py` |
+| Change a compression algorithm | `compression/lrd.py`, `structured_pruning.py`, `block_pruning.py`, `unstructured_pruning.py`, `quantization.py`, `smoothquant.py` |
+| Add a method variant (LRD, quantization, unstructured pruning) | new file in `compression/<type>_methods/` + one entry in its `METHOD_FUNCTIONS` |
+| Change option defaults / validation | `compression/registry.py` (`COMPRESSION_REGISTRY`), `compression/validators.py` |
+| Change cross-layer pruning (coupling) | `compression/coupled_pruning.py`; chain resolution in `compression/scheme.py::coupled_target_chains` |
+| Change grouping (shared masks) | `compression/grouping.py` (`SchemeGroup`) + `compression/manager.py` (`create_group`, `auto_groups`) |
+| Change criteria filtering | `compression/manager.py::iter_filtered` |
+| Change cascade (block-wise) calibration | `compression/cascade.py` |
+| Change which layers become compressible at model init | `compression/compressible_layers.py::replace_layers_upon_init` |
+| Add / change a model family | `models/<m>_c/` (two dictionaries) + one line in `models/__init__.py::FAMILIES` |
+| Change calibration hooks / statistics | `calibration/raw_data/`, `calibration/summaries/` (+ their `registry.py`) |
+| Calibration data (token windows, WikiText-2) | `calibration/datasets.py` |
+| Change the compressible layers | `blocks/layers/` (`LinearCompressed`, `EmbeddingCompressed`, `Conv2d/3dCompressed`, `LowRankMixin`, `VCONBlock`) |
+| Change an export atom | `blocks/attention/{kernels,kv_cache}/`, `blocks/norm/`, `blocks/mlp/`, `blocks/positions/`, `blocks/stacks/` |
+| Add an atom | new file in the right `blocks/` subfolder + entry in `blocks/catalog.py` (+ `BACKEND_OPERATIONS` if the export chooses it) |
+| Change HF model → `blocks/` conversion | `export/convert.py::convert_for_export` |
+| Change the traced wrapper / example inputs | `export/wrapper.py` |
+| Change quantisation metadata read at export | `compression/quantization.py::export_quant_info` (the only reader of the private layer state), `export/quant_info.py` |
+| Change PT2E calibration / scale injection | `export/pt2e.py`, `export/pt2e_linear_quantizer.py` |
+| Change the runtime manifest | `export/manifest.py` (graph I/O names: `graph_io_names`) |
+| Change the generic export steps | `export/exporter.py` (`Exporter.export`, `resolve_components`) |
+| Change / add a backend | `export/backends/` (`xnnpack.py`, `qnn/`, `onnx/`, `tensorrt/`, shared ExecuTorch steps in `executorch_base.py`) |
+| Change the HF export | `hf/hf_export.py` |
 
 ---
 
 ## Export Backends
 
-`transformersurgeon/export/` lowers a (possibly compressed) model to a deployment backend via `export_to_backend(model_or_graph, config)` (`export/export.py`). It dispatches through `EXPORT_ROUTINES` (`export/registry.py`) to one of:
+`export_to_backend(model_or_components, config)` picks the exporter registered for `config.backend`
+(`export/exporter.py::EXPORTERS`) and runs `Exporter.export`: complete `convert_options` from
+`BACKEND_OPERATIONS`, convert the model with `convert_for_export` if needed, move the components to CPU and the
+requested dtype, then call the backend's `lower()`.
 
 | Backend | Config class | Module | Output |
 |---|---|---|---|
-| `xnnpack` | `XNNPACKExportConfig` | `export/executorch_exporters/xnnpack/` | ExecuTorch `.pte` |
-| `qnn` | `QNNExportConfig` | `export/executorch_exporters/qnn/` | ExecuTorch `.pte` (Qualcomm NPU) |
-| `onnx` | `ONNXExportConfig` | `export/onnx/` | Portable `model.onnx` + `model.manifest.json` (I/O contract) |
-| `tensorrt` | `TensorRTExportConfig` | `export/tensorrt/tensorrt_export.py` | `onnx` output + plain TensorRT engine built from it (Jetson path) |
+| `xnnpack` | `XNNPACKExportConfig` | `export/backends/xnnpack.py` | ExecuTorch `.pte` |
+| `qnn` | `QNNExportConfig` | `export/backends/qnn/` | ExecuTorch `.pte` (Qualcomm NPU) |
+| `onnx` | `ONNXExportConfig` | `export/backends/onnx/` | Portable `model.onnx` + manifest |
+| `tensorrt` | `TensorRTExportConfig` | `export/backends/tensorrt/` | the ONNX output + a TensorRT engine built from it |
 
-All of them share the backend-agnostic machinery in `export/common.py`: `resolve_components_and_wrapper()` builds the model wrapper and example inputs, `extract_layer_quant_info()` reads per-layer compression metadata straight off the model (no separate quant config needed), and `inject_scales_into_pt2e_observers()` overrides PT2E-calibrated observers with the exact surgeon scales before `convert_pt2e()`. This is what makes **mixed-precision export** work: a model with some `LinearCompressed` layers hard-quantized to INT8/INT4 and others left float exports to a single engine/program with only the quantized layers getting Q/DQ ops.
+Every backend reads the per-layer quantisation decided by the compression step (`extract_layer_quant_info`), so
+**mixed precision** works: only the quantised layers get quantise/dequantise operations.
 
 ```python
 from transformersurgeon.export import export_to_backend
-from transformersurgeon.export.tensorrt import TensorRTExportConfig
+from transformersurgeon.export.backends import TensorRTExportConfig
 
-config = TensorRTExportConfig(output_path="out/model.onnx", backend="tensorrt", max_input_len=512,
-                                  convert_options={"cache_impl": "io_inplace", "max_cache_len": 1024,
-                                                   "rmsnorm_prescale": False, "rmsnorm_upcast": True})
-result = export_to_backend(model, config=config)   # model can be a full HF model or {embedding, decoder, final_layer}
+config = TensorRTExportConfig(output_path="out/model.onnx", max_input_len=512,
+                              convert_options={"max_cache_len": 1024, "rmsnorm_impl": "rmsnorm_upcast"})
+result = export_to_backend(model, config)   # full HF model, or {embedding, decoder, final_layer[, config]}
 print(result.onnx_path, result.manifest_path, result.engine_path)
 ```
 
-Device placement is normalized internally (`resolve_components_and_wrapper` traces on CPU regardless of the input model's device), so callers don't need to manage component devices themselves.
+Every backend writes `<artifact stem>.manifest.json` next to its artifact (`export/manifest.py::build_llm_manifest`):
+cache implementation, layout and dtype, per-layer key/value cache shapes (they differ per layer after pruning) and
+graph I/O names. Runners use `load_llm_manifest` and `zero_caches_from_manifest` instead of re-deriving geometry.
 
-Every backend writes `<artifact stem>.manifest.json` next to its artifact (`result.manifest_path`, built by `common.build_llm_manifest`): cache implementation, layout and dtype, and per-layer key/value cache shapes (they differ per layer after pruning). Runners load it with `common.load_llm_manifest` and allocate caches with `common.zero_caches_from_manifest` instead of passing geometry by hand — see `scripts/executorch/xnnpack/inference_exported_test.py` and `export/tensorrt/session.py`.
+## Backend Details
 
 ### ONNX → plain TensorRT (`onnx`, `tensorrt`) — the Jetson path
 
-A TensorRT engine only runs on the GPU architecture + TensorRT version it was built with, so for edge targets (Jetson Orin) the artifact is the ONNX file; the engine is built on the device (`python -m transformersurgeon.export.tensorrt.tensorrt_export model.manifest.json`). Needs `pip install -e ".[onnx]"` plus the `tensorrt` Python package matching the CUDA version (e.g. `tensorrt-cu13`). CLI: `scripts/tensorrt/export_and_generate.py`. Measured at parity with NVIDIA's TensorRT Edge-LLM for decode — see `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
+A TensorRT engine only runs on the GPU architecture + TensorRT version it was built with, so for edge targets (Jetson Orin) the artifact is the ONNX file; the engine is built on the device (`python -m transformersurgeon.export.backends.tensorrt.exporter model.manifest.json`). Needs `pip install -e ".[onnx]"` plus the `tensorrt` Python package matching the CUDA version (e.g. `tensorrt-cu13`). CLI: `scripts/tensorrt/export_and_generate.py`. Measured at parity with NVIDIA's TensorRT Edge-LLM for decode — see `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
 
-- **Cache:** convert with `cache_impl="io_inplace"`: BHSD `(1, kv_heads, max_cache_len, head_dim)` caches as graph I/O, written by `tsurgeon::kv_cache_update` (`blocks/kv_cache_ops.py`) which exports as opset-24 `TensorScatter`. TensorRT aliases each `present_*` output to its `past_*` input and updates it in place — bind both to the same buffer. `mutable` is rejected (ONNX has no state).
-- **Fused decode attention (`cache_impl="io_paged"`, opt-in):** one paged K+V pool per layer `(2, ceil(max_cache_len/128), 128, kv_heads, head_dim)` (`past_kv_i`/`present_kv_i`, bind both to one buffer: the plugin writes in place without declaring the alias) and one `tsurgeon::paged_attention` op per layer (RoPE + cache write + attention over the filled slots; eager implementation in `blocks/paged_attention_ops.py`). The TensorRT backend maps it to TensorRT Edge-LLM's `AttentionPlugin` (XQA decode kernels, NVRTC-compiled at engine build): decode cost follows the context, not `max_cache_len`, unlike the static-cache MatMul/Softmax path which reads every slot. Needs `EDGELLM_PLUGIN_PATH`, equal q/k/v head dims (head_dim 32/64/128, q:kv 1–8) and unpruned RoPE (within-head pruning keeps per-kv-group frequencies: use `io_inplace`); whole-head pruning works. Decode only (`max_input_len=1`; prompts run token by token). The plain `onnx` backend rejects it (no standard ONNX form).
+- **Cache:** convert with `cache_impl="io_inplace"`: BHSD `(1, kv_heads, max_cache_len, head_dim)` caches as graph I/O, written by `tsurgeon::kv_cache_update` (`blocks/attention/kv_cache/io_inplace.py`) which exports as opset-24 `TensorScatter`. TensorRT aliases each `present_*` output to its `past_*` input and updates it in place — bind both to the same buffer. `mutable` is rejected (ONNX has no state).
+- **Fused decode attention (`cache_impl="io_paged"`, opt-in):** one paged K+V pool per layer `(2, ceil(max_cache_len/128), 128, kv_heads, head_dim)` (`past_kv_i`/`present_kv_i`, bind both to one buffer: the plugin writes in place without declaring the alias) and one `tsurgeon::paged_attention` op per layer (RoPE + cache write + attention over the filled slots; eager implementation in `blocks/attention/kernels/paged.py`). The TensorRT backend maps it to TensorRT Edge-LLM's `AttentionPlugin` (XQA decode kernels, NVRTC-compiled at engine build): decode cost follows the context, not `max_cache_len`, unlike the static-cache MatMul/Softmax path which reads every slot. Needs `EDGELLM_PLUGIN_PATH`, equal q/k/v head dims (head_dim 32/64/128, q:kv 1–8) and unpruned RoPE (within-head pruning keeps per-kv-group frequencies: use `io_inplace`); whole-head pruning works. Decode only (`max_input_len=1`; prompts run token by token). The plain `onnx` backend rejects it (no standard ONNX form).
 - **Prefill:** `max_input_len > 1` makes `input_ids` `(seq,)` dynamic; only `io_inplace` accepts `in_seq_len > 1`. The engine gets two optimization profiles: 0 = decode (seq 1), 1 = prefill.
 - **Numerics:** use `rmsnorm_upcast=True` (float32 RMSNorm, HF semantics) for fp16 GPU exports; `rmsnorm_prescale=False` alone overflows in fp16.
 - **Quantization:** weight-only. INT4 → blocked `DequantizeLinear` (per-channel scales tiled over 128/64/32 blocks, exact). Plain TensorRT 10.16 has no fast single-token INT4 GEMV, so INT4 decode runs at fp16 speed unless `int4_backend="edgellm_plugin"` (opt-in): eligible layers become TensorRT Edge-LLM's `Int4GroupwiseGemmPluginV2`, and the engine then needs `libNvInfer_edgellm_plugin.so` (`EDGELLM_PLUGIN_PATH`; recorded in the manifest under `plugins`). INT8 weight-only gives no speedup on TensorRT (it folds to fp16). **W8A8 (native INT8 GEMMs):** quantize the layer with `precision_activation=8, method_activation="maxmin", scheme_activation="symmetric", quantize_output_activation=False` and calibration data; the exporter (`apply_activation_quantization`) puts a per-tensor INT8 QuantizeLinear/DequantizeLinear on the GEMM's activation input (an LRD layer: on its V factor's input), recorded as `act_precision` in the manifest's `quantized_layers`. Only symmetric INT8 per-tensor input scales are exportable; output-activation quantization raises.
   Models with massive activations (Qwen2.5 down_proj input amax ~5e3) need **SmoothQuant** first: `manager.set_calibration_data(...)`, then `manager.smooth_activations(alpha=0.5, criteria=...)` *before* `manager.apply` of the quantization (groups from `indexing['smoothing']`: norm→q/k/v, norm→gate/up, up→down; float result unchanged; refuses already-quantized weights). Qwen2.5-1.5B W8A8 all linears: KL vs fp16 1.71 → 0.18 (alpha 0.5).
-- **Runtime:** `export/tensorrt/session.py::TensorRTLLMSession` (prefill + CUDA-graph greedy decode, manifest-driven); `export/tensorrt/engine.py` (engine build/run helpers).
+- **Runtime:** `export/backends/tensorrt/session.py::TensorRTLLMSession` (prefill + CUDA-graph greedy decode, manifest-driven); `export/backends/tensorrt/engine.py` (engine build/run helpers).
 - **Extending to a new target:** `ONNXExportConfig.custom_translations` (torch op → onnxscript) and `graph_passes` (post-export `(model, manifest)` rewrites) — `edgellm_int4.py` is the worked example.
 
-Tests: `test/unit/test_io_inplace_cache.py`, `test/unit/test_onnx_tensorrt_export.py`, `test/unit/test_paged_attention.py`, `test/e2e/test_export_pipelines.py::test_export_tensorrt` (gated by `requires_onnx` / `requires_tensorrt` / `requires_edgellm_plugin`). Benchmark workspace with the Edge-LLM vendor baseline: `../trt-models/`.
+Tests: `test/export/test_exporter.py` (ONNX, TensorRT, graph passes), `test/blocks/test_attention.py` (cache and kernel atoms); the more detailed legacy tests are kept in `archive/tests/unit/test_io_inplace_cache.py`, `test_onnx_tensorrt_export.py`, `test_paged_attention.py` (gated by `requires_onnx` / `requires_tensorrt` / `requires_edgellm_plugin`). Benchmark workspace with the Edge-LLM vendor baseline: `../trt-models/`.
 
 ### XNNPACK: `attn_impl` — optimized causal attention
 
-`MHACausal` (`blocks/mha.py`) supports three attention kernels via `attn_impl` in `convert_options`, orthogonal to `cache_impl`:
+`MHACausal` (`blocks/attention/causal.py`) supports three attention-kernel atoms (`blocks/attention/kernels/`) via `attn_impl` in `convert_options`, orthogonal to `cache_impl`:
 
 | `attn_impl` | Kernel | Notes |
 |---|---|---|
-| `"manual"` (default) | Explicit GQA-aware softmax/matmul (`attention()` in `mha.py`) | Always available, any backend |
+| `"manual"` (default) | Explicit GQA-aware softmax/matmul (`kernels/manual.py::attention`) | Always available, any backend |
 | `"sdpa"` | `torch.nn.functional.scaled_dot_product_attention` | Equivalent to the legacy `use_sdpa=True` |
 | `"custom_sdpa"` | ExecuTorch's fused CPU custom ops (`torch.ops.llama.custom_sdpa` / `update_cache`) | XNNPACK-only. Requires `cache_impl="mutable"` and `q_head_dim == value_head_dim` — both validated at construction/forward time rather than silently producing wrong output |
 
-`custom_sdpa` needs ExecuTorch's `executorch.extension.llm.custom_ops` extension importable both at **export** time (`MHACausal.__init__` imports it lazily, guarded with a clear `RuntimeError` if unavailable) and at **inference** time in whatever process later loads the `.pte` — the AOT registration from the export process does not carry over to a separate process. `scripts/executorch/xnnpack/inference_exported_test.py` handles this by conditionally re-importing the extension, keyed off an `attn_impl` field in the `.cache_meta.json` sidecar written by `exporter_function_test.py`.
+`custom_sdpa` needs ExecuTorch's `executorch.extension.llm.custom_ops` extension importable both at **export** time (`kernels/custom_sdpa.py` imports it lazily, guarded with a clear `RuntimeError` if unavailable) and at **inference** time in whatever process later loads the `.pte` — the AOT registration from the export process does not carry over to a separate process. `scripts/executorch/xnnpack/inference_exported_test.py` handles this by conditionally re-importing the extension, keyed off an `attn_impl` field in the `.cache_meta.json` sidecar written by `exporter_function_test.py`.
 
-CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,sdpa,custom_sdpa}`. Tests: `test/unit/test_mha_causal_custom_sdpa.py` (numeric parity vs `"manual"`, plus the validation guards), `test/e2e/test_export_pipelines.py::test_export_xnnpack_custom_sdpa` — both gated by `test/_helpers/capabilities.py::requires_custom_sdpa` (narrower than `requires_executorch`: a minimal ExecuTorch install may lack the LLM custom-ops extension).
+CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,sdpa,custom_sdpa}`. Tests: `test/blocks/test_attention.py`; legacy `archive/tests/unit/test_mha_causal_custom_sdpa.py` (numeric parity vs `"manual"`, plus the validation guards) — both gated by `test/_helpers/capabilities.py::requires_custom_sdpa` (narrower than `requires_executorch`: a minimal ExecuTorch install may lack the LLM custom-ops extension).
 
 ### XNNPACK: `add_batch_dim` — experimental leading batch dimension
 
@@ -164,8 +166,8 @@ and every component's hidden states carry an explicit leading batch dim
 ...)` contract — matching ExecuTorch's own llama exporter's convention, on the
 hypothesis that XNNPACK may select faster GEMM/FC microkernels or weight
 packing for batched shapes (see `docs/investigations/XNNPACK_DECODE_SPEED_FIX.md` for the
-investigation this came out of). Threaded through `blocks/config.py`,
-`utils/convert.py`, `blocks/decoder.py` exactly like `attn_impl`/`cache_impl`.
+investigation this came out of). Threaded through `blocks/stacks/config.py`,
+`export/convert.py`, `blocks/stacks/decoder.py` exactly like `attn_impl`/`cache_impl`.
 
 Scoped narrowly to minimize risk: `MHACausal` absorbs the batch dim
 immediately after q/k/v projection (`.view(in_seq_len, ...)` on a
@@ -214,16 +216,16 @@ float → 16a16w) were garbage on device *and* in the fake-quant reference. With
 biased linear that is not compression-quantized becomes `add(linear(x, W), b)` before PT2E: the
 weights stay 16-bit and the bias gets its own 16-bit activation scale, so only the targeted linears
 change precision. Compression-quantized (W8/W4) linears keep the fused derived int32 bias (8-bit
-weights have ~250× more headroom). Still 1 delegate / 0 CPU ops. Test: `test/unit/test_qnn_bias_split.py`.
+weights have ~250× more headroom). Still 1 delegate / 0 CPU ops. Test: `test/export/test_exporter.py::test_qnn_split_float_linear_bias_moves_only_float_biases_and_keeps_outputs` (legacy: `archive/tests/unit/test_qnn_bias_split.py`).
 
 **Activation-only reference (`quantize_float_model`, default False, needs `quant_scope="all"`).** Lowers a
 model with *no* compression-quantized linear as the same fixed-point graph (16a16w everywhere, bias split
 as above) instead of fp16. Its distance from fp16 is the cost of HTP's 16-bit activations alone, so a
-compressed config measured against it isolates the weight compression. Test: `test/unit/test_qnn_activation_only.py`.
+compressed config measured against it isolates the weight compression. Test: `archive/tests/unit/test_qnn_activation_only.py`.
 
 ### QNN: activation calibration and masked softmax
 
-- PT2E calibration (`export/common.py::calibrate_pt2e_observers`) decodes each sequence from position 0
+- PT2E calibration (`export/pt2e.py::calibrate_pt2e_observers`) decodes each sequence from position 0
   with the KV cache filling up (reset between sequences). It used to feed every token at position 1 with
   an empty cache, which left the attention/cache observers uncalibrated. Pass real text of the target
   distribution with `QNNExportConfig.calibration_token_ids`; the built-in sentences are only a fallback.
@@ -234,9 +236,9 @@ compressed config measured against it isolates the weight compression. Test: `te
   -> 0.36 (+ masked softmax), top-1 61 % -> 90 %.
 - RMSNorm must reach HTP as one fused `RmsNorm` op. ExecuTorch's `RecomposeRmsNorm` matches
   `w * (x * rsqrt(mean(x*x) + eps))` (or with `pow.Tensor_Scalar`), but this exporter rewrites `pow(x, 2)`
-  to `pow.Tensor_Tensor`, so `blocks/norm.py` computes `x * x` (bit-identical). Decomposed and quantized,
+  to `pow.Tensor_Tensor`, so the RMS normalisation atoms (`blocks/norm/`) compute `x * x` (bit-identical). Decomposed and quantized,
   `x*x` of Qwen2.5's ~5e3 residual activations spans ~2.5e7 in one 16-bit scale. With the fusion:
-  16a8w all-op KL 0.25 -> 0.062, top-1 91 % (prescale on; 0.070 with `rmsnorm_prescale=False`, the vendor form).
+  16a8w all-op KL 0.25 -> 0.062, top-1 91 % (`rmsnorm_impl="rmsnorm_prescaled"`; 0.070 with `"rmsnorm"`, the vendor form).
 - Attention scores always use the original `1/sqrt(head_dim)` (`MHABase.score_scale`), including after
   q/k head_dim pruning. Pruning channels must not change the softmax temperature, and the converted
   hard-pruned graph must equal the soft-pruned HF model. Before this, it used `1/sqrt(pruned dim)`.
@@ -260,13 +262,13 @@ copy of the matrix: a bigger file, and the same decode reads.
 - **TensorRT fp16 GEMV accumulates in fp16.** At M=1 TensorRT 10.16 picks `gemvx_f16f16_f16_f16` kernels (fp16 compute) for every
   fp16 GEMM, including under `STRONGLY_TYPED` with tactic sources restricted (they come from Myelin). Dense layers tolerate it; plain-SVD LRD
   layers do not (Qwen2.5-1.5B lrd0.5-mlp: KL 0.10 vs torch fp16, whose own fp32 floor is 3e-3). `TensorRTExportConfig.fp32_accumulate_lrd`
-  (default True, `export/tensorrt/precision_passes.py`) casts the operands of LRD-factor GEMMs to fp32 and the result back. TensorRT fuses
+  (default True, `export/backends/tensorrt/precision_passes.py`) casts the operands of LRD-factor GEMMs to fp32 and the result back. TensorRT fuses
   the casts, so the weights stay fp16 (same engine size) and the result is KL 3.5e-4 at +4.7 % decode time (8.94 vs 8.54 ms, L4). Casting
   only the gate/up V factors recovers most of it (KL 5e-3, +2 %).
 
 - Causal-mask penalty was `-10000`; Qwen2.5 logits exceed ±1e4 (k biases ≈300),
   so masked slots got weight (KL 2.6e-3 vs HF in fp32). Now `-65504`
-  (`blocks/decoder.py`). Any mask constant must exceed the model's logit range.
+  (`blocks/stacks/decoder.py`). Any mask constant must exceed the model's logit range.
 - q·kᵀ partial sums overflow fp16 (≈1.9e5) → any backend kernel that
   accumulates attention scores in fp16 produces inf/NaN (TensorRT 10.16's fused
   attention did: token 659 @ pos 0). TensorRT export needs the scores in fp32
@@ -282,10 +284,10 @@ version.
 
 | Option | Where | Default | Notes |
 |---|---|---|---|
-| `rmsnorm_prescale` | `convert_options` → `blocks/config.py` → `decoder.py` → `blocks/norm.py::RMSNorm` | `True` | `False` drops the max-abs rescale in front of each RMSNorm so ExecuTorch folds it into one `aten.rms_norm` (as Qualcomm's reference does), saving ~245 HTP dispatches/token. Not bit-identical — rescaling changes how `eps` enters the variance — so keep it on where fp16 overflow is a real risk. CLI: `--no-rmsnorm-prescale` |
+| `rmsnorm_impl` (alias `rmsnorm_prescale`) | `convert_options` → `blocks/stacks/config.py` → `blocks/norm/` atom | `"rmsnorm_prescaled"` | `"rmsnorm"` (or `rmsnorm_prescale=False`) drops the max-abs rescale in front of each RMSNorm so ExecuTorch folds it into one `aten.rms_norm` (as Qualcomm's reference does), saving ~245 HTP dispatches/token. Not bit-identical — rescaling changes how `eps` enters the variance — so keep it on where fp16 overflow is a real risk. CLI: `--no-rmsnorm-prescale` |
 | `convert_linear_to_conv2d` | `QNNExportConfig` | `False` | Vendor-recommended 1×1-conv lowering. Off because it showed no measurable DDR change here and ExecuTorch 1.3.1's pass breaks on fp16 weights and on tied weights — `_resolve_linear_to_conv2d` detects both and warns instead of failing deep in lowering. CLI: `--linear-to-conv2d` |
 
-`MHACausal`'s `attn_impl="manual"` kernel (`attention()` in `blocks/mha.py`) computes
+`MHACausal`'s `attn_impl="manual"` kernel (`blocks/attention/kernels/manual.py::attention`) computes
 GQA by **broadcast**, not by materialising a `repeat_interleave`'d KV cache, and
 permutes the cache *before* the group expansion rather than after. Do not reorder
 those two steps: expanding first makes the permute run over a `group_size`-times
@@ -297,15 +299,6 @@ Qwen2-0.5B. The math is unchanged either way.
 was always 2048 slots regardless of `--max-sequence-length`.
 
 ---
-
-## Open TODOs
-
-Known gaps, flagged in the code with a greppable `TODO(<tag>)` (comment + docstring) — `git grep -n 'TODO('`:
-
-| Tag | Where | Gap |
-|---|---|---|
-| `TODO(P3a)` | `blocks/embedding_compressed.py::EmbeddingCompressed` | No weight-quantization path: embeddings (and tied `lm_head`) stay fp32 in quantized exports, dominating `.pte` size on large-vocab models. See `docs/investigations/FRAMEWORK_PROBLEMS.md` P3a/P3b. |
-| `TODO(custom_sdpa-encoder)` | `blocks/mha.py::MHAEncoder` | `attn_impl="custom_sdpa"` only exists on `MHACausal`; encoder-only models can't use the fused ExecuTorch kernel yet. |
 
 ## Compression Parameter Reference
 
@@ -360,9 +353,10 @@ callback: `manager.set_calibration_loss(...)`).
   `[0,1,1,0,0,1,0,1]` with `granularity=4`, `coupled_repeated_pattern=2` cascades
   as `[0,1,1,0, 0,1,1,0, 0,1,0,1, 0,1,0,1]`. This layer's own output rows are
   still pruned by the unexpanded mask; only the downstream cascade changes.
-- Effective kept dim is single-sourced in `blocks/pruning_dims.py`
-  (`effective_out_features`), reused by the pruner, coupled pruning, and the
-  converted MLP blocks so a hard-pruned model converts/exports with matching shapes.
+- Effective kept dim is single-sourced in
+  `compression/structured_pruning_methods/pruning_dims.py` (`effective_out_features`);
+  `convert_for_export` reads the pruned shapes from the source layers, so a
+  hard-pruned model converts/exports with matching shapes.
 
 #### Grouped structured pruning (shared masks)
 
@@ -383,22 +377,23 @@ manager.apply(hard=True)
 
 Rules: `share_mask` (and any `GROUP_OPTIONS`) can only be set through `group=`
 (not `criteria`), and enabling one resets that scheme's non-group config. Grouping
-and the coupled cascade live entirely in `compression/structured_pruning.py` (the
-first compressor in a group computes the shared mask; siblings reuse it) — the
-manager only builds groups and iterates `scheme.apply`.
+and the coupled cascade live in `compression/structured_pruning.py` (the first
+compressor in a group computes the shared mask; siblings reuse it); the module
+chains to cascade into are resolved by `CompressionScheme.coupled_target_chains`
+(`compression/scheme.py`). The manager only builds groups and iterates `scheme.apply`.
 
 Indexing annotations (`models/*/indexing_*.py`, under a `pruning` key):
 `output_dependence` (coupling targets), `coupled_masks` (share a mask within a
 block), `coupled_masks_all` (share a mask across all blocks — the residual/hidden
-writers), `per_head_uniform` (recorded only).
+writers), `norm_layers` (transparent hops), `position_linked` (RoPE-indexed rows).
 
 Scope: both MLP and attention (q/k/v) structured pruning are wired end-to-end
 (prune → cascade → convert → export). Attention hard pruning changes `head_dim`
 (GQA); RoPE projection geometry and the pruned KV-cache are resolved per-kv-group
-at conversion time (`blocks/mha.py::MHABase.finalize_rope_pruning()`, then
+at conversion time (`blocks/attention/base.py::MHABase.finalize_rope_pruning()`, then
 `MHACausal.finalize_cache_geometry()` resizes the internal KV buffers to the pruned
 key/value head dims), and a hard-pruned `v_proj` cascades into `o_proj` via
-`coupled_repeated_pattern`. See `test/e2e/test_gqa_attention_pruning.py`.
+`coupled_repeated_pattern`. See `archive/tests/e2e/test_gqa_attention_pruning.py`.
 **Never resize module buffers inside `forward()`:** `torch.export` traces the reassignment
 as a fresh tensor per call (`aten.full`), not a mutable buffer. That is how head_dim-pruned
 mutable-cache exports (QNN, XNNPACK) silently lost their KV cache until 2026-10-13;
@@ -427,7 +422,7 @@ manager.apply(hard=True)
 - Soft apply zeroes the heads' `o_proj` input columns (zeroed query rows would not silence a head); restore undoes it.
 - Hard apply removes q rows (+bias) and `o_proj` columns, sets `self_attn.num_key_value_groups` to the kept
   heads per KV head (HF keeps running), and records `q_proj.block_prune_mask`. `convert_for_export` adopts the head
-  count via `blocks/mha.py::MHABase.finalize_head_pruning()`; the manifest/cache geometry is unchanged (KV heads stay).
+  count via `blocks/attention/base.py::MHABase.finalize_head_pruning()`; the manifest/cache geometry is unchanged (KV heads stay).
 - Not combinable with structured (head_dim) pruning of the same q_proj (raises).
 
 ### `"unstructured_pruning"` — Weight-Level Sparsity
@@ -461,7 +456,8 @@ Pruning masks survive `restore()` for STE fine-tuning. Call `manager.remove_mask
 `METHOD_FUNCTIONS[method]` produces the integers and scales; torchao's
 `IntxUnpackedToInt8Tensor` is only the container (scale stored in the weight
 dtype, zero point 0). Every exporter reads those exact numbers back
-(`export/common.py::extract_layer_quant_info` → `scale`, `precision`,
+(`compression/quantization.py::export_quant_info`, collected by
+`export/quant_info.py::extract_layer_quant_info` → `scale`, `precision`,
 `per_channel`, `group_size`, `act_dynamic`), so eager == exported up to kernel
 arithmetic. Before 2026-09 the hard path called torchao's own RTN regardless
 of `method` (hard GPTQ was silently RTN) — do not reintroduce `quantize_()` there.
@@ -495,123 +491,83 @@ Passed to `manager.set()`, `manager.apply()`, `manager.restore()`, etc.:
 
 ## Coding Invariants
 
-Things the codebase silently relies on. Breaking these causes silent wrong behavior or hard-to-trace errors:
-
-1. **`Compressor.apply()` always receives a `LinearCompressed`**, never a plain `nn.Linear`. Target layers are replaced at model init time by `replace_layers_upon_init()` in `utils/modeling.py`.
-
-2. **`manager.set()` is purely declarative** — it writes config but never touches the model. The model is only modified during `manager.apply()`.
-
-3. **Soft apply (`hard=False`) is always reversible**; hard apply is permanent. Once `hard=True` is used, `manager.restore()` cannot undo the compression.
-
-4. **`init_vcon()` must be called before `apply()`** when using VCON. Reversing the order raises an error because the scheme wrapping needs to happen before compression is applied to the secondary block.
-
-5. **`manager.prepare_for_save()` must be called before `export_to_hf()` when applying manually** — it strips runtime quantization artifacts. Passing `manager=manager` to `export_to_hf()` triggers this automatically.
-
-6. **`calibration_store` is a plain `dict`** owned by each `CompressionScheme`. `CalibrationSummary` implementations write to it; `Compressor` implementations read from it. Don't write to it from anywhere else.
-
-7. **`INDEXING["path_template"]` must be a Python format string** with `{block_index}` and `{path}` — the manager calls `.format(block_index=..., path=...)` to resolve full module paths. Missing either placeholder breaks all scheme lookups.
-
-8. **`attn_impl="custom_sdpa"` (`MHACausal`) requires `cache_impl="mutable"` and `q_head_dim == value_head_dim`.** Both are validated (`ValueError` at construction, `RuntimeError` at forward) rather than silently producing wrong output — `torch.ops.llama.custom_sdpa`'s kernel sizes its output like `query`, not `value`, so RoPE-linked structured pruning that shrinks q/k's head_dim while `v_proj` stays unpruned is incompatible with this kernel (use `"manual"` or `"sdpa"` instead).
+1. **Folder rules** (table above). Adding a model touches only `models/`; a compression method only
+   `compression/`; a calibration statistic only `calibration/`; a backend only `export/` (plus new atoms in
+   `blocks/` when an operation does not exist yet). Code outside `models/` never branches on a model name.
+2. **`Compressor.apply()` always receives a compressible layer** (`LinearCompressed`, ...), never a plain
+   `nn.Linear`: listed layers are replaced at model init by `compression/compressible_layers.py::replace_layers_upon_init`.
+3. **Compressors never read paths or sentinels.** Topology (block index, `path_template`, `'preprocessing'`/
+   `'final_layer'`/`'final_norm'`) is resolved by `CompressionScheme` (`coupled_target_chains`, `resolve_in_block`).
+4. **Only `compression/quantization.py` reads the private quantisation state** (`_torchao_*`, `_act_quant_*`, ...);
+   everyone else goes through `export_quant_info` / `copy_quant_state`.
+5. **`manager.set()` is purely declarative**; the model changes only in `manager.apply()`. Soft apply is reversible,
+   hard apply is not.
+6. **`blocks/` is a frozen, already-compressed graph.** It never decides what to compress; `convert_for_export`
+   reads shapes, ranks and biases from the source layers. Weight-dependent geometry (RoPE pruning projection,
+   pruned cache sizes) is resolved once at conversion (`finalize_*` methods), never inside `forward()`;
+   never resize buffers in `forward()` (`torch.export` would trace a fresh tensor, not a mutable buffer).
+7. **Exporters find special atoms by their `EXPORT_ROLE` class attribute** (`"attention"` on `MHACausal`,
+   `"decoder_stack"` on `TransformerDecoder`), never by class name.
+8. **`init_vcon()` must be called before `apply()`** when using VCON.
+9. **`manager.prepare_for_save()` before `export_to_hf()`** when applying manually (passing `manager=` to
+   `export_to_hf` applies and prepares for you). Never call it before a backend export: it upcasts and dequantises.
+10. **`path_template` is a format string** with `{block_index}` and `{path}`.
+11. **`attn_impl="custom_sdpa"` requires `cache_impl="mutable"` and `q_head_dim == value_head_dim`** (validated).
 
 ---
 
 ## Anti-Patterns
 
-- **Don't instantiate `CompressionScheme` directly.** The manager builds schemes from indexing metadata. Direct instantiation bypasses path resolution and calibration group assignment.
-
-- **Don't assume `module.weight.shape` is `[out_features, in_features]` after LRD.** After `init_lrd(rank)`, `weight` becomes `[out_features, rank]` and `module.linear_V.weight` is `[rank, in_features]`. Check `module.rank != "full"` or `module.linear_V is not None` before accessing weight shape.
-
-- **Don't call `hard=True` then `restore()`.** Hard apply is irreversible. `restore()` will appear to succeed but produce wrong shapes or no-op silently.
-
-- **Don't put model-specific logic in `CompressionSchemesManager`.** The manager is generic. All model-specific information belongs in the model's `indexing_*.py` file.
-
-- **Don't use `"standard"` calibration mode with `"aa-svd"`.** AA-SVD requires cross-layer shifted activations, which need staged (cascade) passes. Set `manager.set_calibration_mode("cascade")` before calling `apply()`.
-
-- **Don't use `"cascade"` calibration mode with a family indexed `'no_cascade_calibration': True`** (currently `bert_c`, `modernbert_c`). `apply()` raises `ValueError` immediately — these families' layer layout (grouped/bidirectional QKV, or ModernBERT's per-layer-type rotary embeddings) isn't modeled by the single-flow block-wise cascade in `utils/cascade.py`. Use `"standard"` mode (`"svd"`/`"svd-llm-v2"` LRD, or non-AA-SVD compressors) instead.
-
-- **Don't call `reapply_masks()` before `manager.apply()`.** Masks are created during `apply()`. `reapply_masks()` is for re-applying existing masks after an optimizer step during STE fine-tuning.
+- **Don't instantiate `CompressionScheme` directly**; the manager builds schemes from the model dictionary.
+- **Don't assume `weight.shape == [out, in]` after LRD**: `weight` is `[out, rank]`, `linear_V.weight` is `[rank, in]`.
+- **Don't call `restore()` after `hard=True`.**
+- **Don't put model-specific logic outside `models/`** (not even in comments: describe the feature, e.g. "a
+  composite embedding module", not the model).
+- **Don't hard-code an implementation choice in an exporter**: add it to `BACKEND_OPERATIONS`.
+- **Don't use `"standard"` calibration mode with `"aa-svd"`** (needs `manager.set_calibration_mode("cascade")`), and
+  don't use `"cascade"` with a family whose dictionary sets `'no_cascade_calibration': True` (`bert_c`, `modernbert_c`).
+- **Don't call `reapply_masks()` before `manager.apply()`.**
 
 ---
 
 ## Extension Recipes
 
-### Adding a New Compression Method
+### Adding a model family
 
-1. Subclass `Compressor` from `transformersurgeon/compression/abstract.py`. Implement all six abstract methods:
-   - `set_calibration_store(calibration_data: dict)` — store the per-scheme result dict reference
-   - `needs_calibration() -> tuple[str, ...]` — return required summary names (empty tuple if none)
-   - `apply(module: LinearCompressed, hard: bool, soft_applied: bool)` — compress the module
-   - `restore(module: LinearCompressed)` — undo compression
-   - `_to_compress() -> bool` — guard against no-op (e.g., rank == "full")
-   - `__repr__() -> str` — human-readable config string for printing
+1. Create `models/<m>_c/indexing_<m>_c.py` (model dictionary; copy the closest family). Required keys per
+   component: `num_blocks_attr`, `path_list`, `path_template`; for export also `structure`, `attn_type`,
+   `mlp_type`, `norm_type`, `rope_type` (`"auto"` takes the HF configuration's RoPE type).
+2. Create `models/<m>_c/family_<m>_c.py` (family dictionary: `indexing`, `hf_config`, `hf_model`,
+   `class_names`, `auto_class`, optional `sub_configs`, `checkpoint_key_mapping`) and call `build_family`.
+3. Add `__init__.py` re-exporting both modules, and one line to `models/__init__.py::FAMILIES`.
+   Verified on 2026-10-28 with Mistral (copy of `llama_c` with the HF classes changed): nothing else is needed.
+4. For tests, add a tiny builder to `test/_helpers/model_factory.py::FAMILIES`.
 
-2. Place the class in a new file, e.g. `transformersurgeon/compression/mymethod.py`.
+### Adding a compression method variant
 
-3. Register it in `transformersurgeon/compression/registry.py`:
-   ```python
-   # In COMPRESSOR_DICT:
-   "mymethod": MyMethodCompressor,
+One file in `compression/<type>_methods/` and one entry in its `METHOD_FUNCTIONS` (`VALID_METHODS` derives
+from it); if it needs statistics, list the summary names in the compressor's `CALIBRATED_METHOD_DICT`.
 
-   # In COMPRESSION_REGISTRY:
-   "mymethod": {
-       "param_name": {"default": default_val, "validator": lambda v: isinstance(v, int)},
-       ...
-   }
-   ```
+### Adding a compression type
 
-4. (Optional) If the method needs a new calibration summary, follow the **Adding a Calibration Summary** steps below and reference its name in `needs_calibration()`.
+1. Subclass `compression/abstract.py::Compressor` (`set_calibration_store`, `needs_calibration`, `apply`,
+   `restore`, `_to_compress`, `__repr__`; optionally `prepare_for_save`, `check_coupling`).
+2. Register it in `compression/registry.py` (`COMPRESSOR_DICT`, `COMPRESSION_REGISTRY` with defaults and
+   validators built from `compression/validators.py`, and `APPLICATION_ORDER`).
 
-### Adding a New Model Family
+### Adding a calibration summary / raw-data collector
 
-1. Create `transformersurgeon/models/newmodel_c/indexing_newmodel_c.py` with an `INDEXING` dict. Use `models/qwen2_c/indexing_qwen2_c.py` as a template. Required keys: `num_blocks_attr`, `path_list`, `path_template`. Optional but recommended: `calibration_groups`, `skip_connections`, export metadata (`structure`, `attn_type`, `mlp_type`, `rope_type`).
-   `rope_type` picks the converted decoder's RoPE variant from `blocks/rope.py::ROPE_INV_FREQ` (`"default"`, `"llama3"`). Use a fixed name, or `"auto"` to take
-   the HF config's `rope_type` (Llama: Llama 3.x → `llama3`, Llama 2/TinyLlama → `default`). A fixed type contradicted by the config, or a type with no
-   implementation, raises at conversion (it used to warn and fall back to plain RoPE, which drifts from HF: KL 2e-3 on Llama-3.2-1B at ~300 tokens).
-   The resolved type is `config.rope_type` of the converted decoder and `rope_type` in the export manifest. New variant = one function in `ROPE_INV_FREQ`
-   (attention scaling must stay 1).
+Subclass `calibration/summaries/base.py::CalibrationSummary` (or `calibration/raw_data/base.py::RawDataCollector`)
+and register an instance in the folder's `registry.py`; reference the summary name from the compressor.
 
-2. Create `transformersurgeon/models/newmodel_c/define_newmodel_c.py` with three classes (exact pattern — do not deviate):
-   ```python
-   from transformersurgeon.utils.configuration import init_compressed_config
-   from transformersurgeon.utils.modeling import replace_layers_upon_init
-   from transformersurgeon.utils.manager import CompressionSchemesManager
-   from .indexing_newmodel_c import INDEXING
+### Adding an atom
 
-   class NewModelConfigCompress(NewModelConfig):
-       def __init__(self, **kwargs):
-           super().__init__(**kwargs)
-           init_compressed_config(self)
+One class per file in the right `blocks/` subfolder, one entry in `blocks/catalog.py::BLOCK_CATALOG`
+(`selected_by: "model"` or `"export"`). If the export chooses it, add it to the backend options in
+`export/operations.py::BACKEND_OPERATIONS`.
 
-   class NewModelForTaskCompress(NewModelForTask):
-       config_class = NewModelConfigCompress
-       indexing = INDEXING
-       def __init__(self, config):
-           super().__init__(config)
-           replace_layers_upon_init(self, INDEXING)
+### Adding a backend
 
-   class NewModelCompressionSchemesManager(CompressionSchemesManager):
-       def __init__(self, model):
-           super().__init__(model, INDEXING)
-   ```
-
-3. Create `transformersurgeon/models/newmodel_c/__init__.py` exporting the three classes and add them to `transformersurgeon/models/__init__.py`.
-
-### Adding a Calibration Summary
-
-1. Subclass `CalibrationSummary` from `transformersurgeon/calibration/summaries/base.py`. Set the `name` class attribute and `required_raw_data` (list of raw data stream names the summary consumes). Implement `update_from_raw()` (single-batch update) and optionally `update_runtime()` for running-statistic accumulation across batches.
-
-2. Register a singleton instance in `transformersurgeon/calibration/summaries/registry.py`:
-   ```python
-   SUMMARY_REGISTRY["my_summary_name"] = MySummary()
-   ```
-
-3. Reference `"my_summary_name"` in your `Compressor.needs_calibration()` return value.
-
-### Adding a Raw Data Collector
-
-1. Subclass `RawDataCollector` from `transformersurgeon/calibration/raw_data/base.py`. Set the `name` class attribute and implement `build_forward_hook(emit_raw)`. Set `requires_backward = True` and implement `collect_after_backward` if gradient data is needed.
-
-2. Register in `transformersurgeon/calibration/raw_data/registry.py`:
-   ```python
-   RAW_DATA_REGISTRY["my_collector"] = MyCollector
-   ```
+Subclass `export/exporter.py::Exporter` (`backend`, `config_class`, `lower`, optional `check_available`) in
+`export/backends/`, decorate it with `@register_exporter`, import it in `export/backends/__init__.py`, and add
+the backend's column to every entry of `BACKEND_OPERATIONS`.
