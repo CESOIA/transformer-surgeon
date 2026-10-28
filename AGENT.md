@@ -157,3 +157,26 @@ Idee chiave:
   (gli esportatori dei backend).
 - Il file `AGENTS.md` (con la S) e `CLAUDE.md` descrivono ancora la **vecchia** struttura:
   vanno aggiornati (vedi TODO).
+
+## 8. Duplicazioni già eliminate (per il report)
+
+| prima (copie) | ora (una sola definizione) |
+|---|---|
+| `init_lrd`/`cancel_lrd` in `LinearCompressed` e `EmbeddingCompressed` | `blocks/layers/low_rank.py::LowRankMixin` |
+| costruzione dei lineari ripetuta in MHA, MLP, MLPGated (rank/bias da `compression_config`) | `blocks/layers/linear_compressed.py::linear_from_spec` |
+| tre varianti RMSNorm in una classe con flag | un atomo per file + `rms_normalize` condivisa |
+| scrittura cache + kernel con `if/elif` in `MHACausal.forward`, maschere nel decoder | atomi `kv_cache/*` e `kernels/*` con interfaccia comune |
+| `from_source_config` decoder vs encoder; split per prefisso `blocks.{i}.` decoder vs encoder | `stacks/config.py::_ConvertedStackConfig` (+ `block_layer_specs`) |
+| 8 file `define_*.py` quasi identici (config/modello/manager) | `models/factory.py::build_family` + dizionari di famiglia |
+| `export/common.py` (1180 righe) | `wrapper.py`, `quant_info.py`, `pt2e.py`, `checks.py`, `manifest.py`, `result.py` |
+| tre parser dell'input di export; normalizzazione dei device fatta due volte | `export/exporter.py::resolve_components` + `Exporter.export` |
+| scrittura `.pte` + finalize ripetuti in XNNPACK (2×) e QNN | `ExecuTorchExporter.write_program` / `finalize` |
+| lista dei 19 attributi di quantizzazione in `quantization.py` e `convert.py` | `QUANT_RUNTIME_BUFFERS` / `QUANT_RUNTIME_ATTRS` |
+| `_extract_aqt_scale` copiata in due file | `compression/quantization.py::extract_torchao_scale` |
+| hook di quantizzazione simulata ingresso/uscita; regola qmin/qmax ripetuta 3× | `_make_fake_quant_hook` + `activation_qrange` |
+| `WeightCollector`/`BiasCollector`, `WeightSummary`/`BiasSummary`, due riepiloghi di intervallo | `ParamCollector`, `_ParamSummary`, `_RangeSummary` |
+| dizionari `__ts_args__` costruiti a mano in 5 punti della cascata | `utils/batches.py::pack_batch` / `normalize_batch` |
+| `config if config_attr == "" else getattr(...)` in 6 punti | `utils/indexing.py::get_block_config` / `num_blocks` |
+| raccolta absmax di SmoothQuant fuori da `calibration/` | `calibration/input_absmax.py::collect_input_absmax` |
+| `isinstance(compressor, Quantizer)` nel manager | hook generico `Compressor.prepare_for_save` |
+| nome del componente "text" fisso nell'export | componente con `structure == "transformer_decoder"` |
