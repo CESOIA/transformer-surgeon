@@ -45,9 +45,9 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 - [ ] Contratto compressione→export tramite attributi privati (`_torchao_*`, `_act_quant_*`,
       `_soft_quant_precision`) letti da `export/quant_info.py`: introdurre un descrittore pubblico
       (es. `Quantizer.export_info(module)`).
-- [ ] Export QNN riconosce l'attenzione cercando i nomi di classe `MHACausal`/`TransformerDecoder`
-      in `nn_module_stack` (`export/backends/qnn/passes.py::_float_attention_nodes`): usare un
-      marcatore sull'atomo.
+- [x] Export QNN: l'attenzione si riconosce dal marcatore `EXPORT_ROLE` sugli atomi (`MHACausal` =
+      "attention", `TransformerDecoder` = "decoder_stack"), letto da `qnn/passes.py::_export_role`;
+      verificato: stessi nodi del vecchio confronto per nome (mutable, io_inplace, sdpa).
 - [x] `hf/hf_export.py::export_to_hf` chiama `manager.apply(hard=True)`: tenuto e documentato (punto B).
 - [ ] `blocks/` contiene atomi legati a una backend (`custom_sdpa` ExecuTorch, `paged` Edge-LLM):
       ammesso perché sono atomi selezionabili, ma va detto nel report.

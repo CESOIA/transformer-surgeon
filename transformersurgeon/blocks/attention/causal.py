@@ -23,6 +23,10 @@ class MHACausal(MHABase):
     ``(output, key_cache, value_cache)`` (``(output, kv_pool, None)`` for pages).
     """
 
+    # Role read by exporters that treat whole atoms specially (e.g. the QNN
+    # exporter keeps the attention core in fp16 under quant_scope="all").
+    EXPORT_ROLE = "attention"
+
     def __init__(self, embed_dim, num_heads, kv_num_heads=None, attn_impl=None, use_sdpa=False,
                  linear_specs=None, dtype=None, cache_impl="mutable", max_cache_len=2048,
                  add_batch_dim=False, masked_softmax=False):

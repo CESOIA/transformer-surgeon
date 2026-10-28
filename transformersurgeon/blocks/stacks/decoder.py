@@ -82,6 +82,9 @@ class TransformerDecoder(torch.nn.Module):
     ``(hidden, new_key_caches, new_value_caches)`` (one entry per block).
     """
 
+    # Role read by exporters (see MHACausal.EXPORT_ROLE).
+    EXPORT_ROLE = "decoder_stack"
+
     config_class = CustomDecoderConfigCompress
 
     def __init__(self, config):

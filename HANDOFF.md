@@ -98,7 +98,8 @@ Idee chiave:
 - I blocchi non leggono più `compression_config`: `convert_for_export` legge dimensioni,
   rango e bias dai layer sorgente (`layer_specs`). La chiave `bias_required` è stata tolta
   dai dizionari dei modelli.
-- I nomi di classe usati dall'export QNN (`MHACausal`, `TransformerDecoder`) sono rimasti.
+- L'export QNN non cerca più nomi di classe: legge l'attributo di classe `EXPORT_ROLE` degli atomi
+  (`"attention"` su `MHACausal`, `"decoder_stack"` su `TransformerDecoder`).
 
 ## 4. Codice archiviato (`archive/`)
 

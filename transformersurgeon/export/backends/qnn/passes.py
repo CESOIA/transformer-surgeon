@@ -7,6 +7,8 @@ the compression step.
 """
 
 import _operator
+import functools
+import importlib
 import re
 from typing import Any
 
@@ -14,7 +16,6 @@ import torch
 import torch.fx
 import torch.nn as nn
 
-from ....blocks import MHACausal, TransformerDecoder
 
 # Block index in the module path of a converted stack ("blocks.<i>.attn...").
 _BLOCK_INDEX = re.compile(r"blocks\.(\d+)")
@@ -292,15 +293,30 @@ def _float_attention_nodes(graph_module) -> list[str]:
         stack = list(node.meta.get("nn_module_stack", {}).values())
         if not stack:
             continue
-        types = [str(t[1]) if isinstance(t, tuple) else str(t) for t in stack]
-        inner = types[-1]
-        in_attn = any(MHACausal.__qualname__ in t for t in types)
-        is_linear = "Linear" in inner  # q/k/v/out projections (LinearCompressed / nn.Linear)
-        at_decoder_root = inner.endswith(f"{TransformerDecoder.__qualname__}'>") or inner.endswith(
-            TransformerDecoder.__qualname__)
-        if (in_attn and not is_linear) or at_decoder_root:
+        roles = [_export_role(t[1] if isinstance(t, tuple) else t) for t in stack]
+        inner = stack[-1][1] if isinstance(stack[-1], tuple) else stack[-1]
+        is_linear = issubclass(_module_class(inner) or object, nn.Linear)  # q/k/v/out projections
+        if ("attention" in roles and not is_linear) or roles[-1] == "decoder_stack":
             names.append(node.name)
     return names
+
+
+@functools.lru_cache(maxsize=None)
+def _module_class(type_name) -> type | None:
+    """Class of an ``nn_module_stack`` entry (a class, or its ``"module.Class"`` name)."""
+    if isinstance(type_name, type):
+        return type_name
+    name = str(type_name).removeprefix("<class '").removesuffix("'>")
+    module, _, qualname = name.rpartition(".")
+    try:
+        return getattr(importlib.import_module(module), qualname)
+    except (ImportError, AttributeError, ValueError):
+        return None
+
+
+def _export_role(type_name) -> str | None:
+    """``EXPORT_ROLE`` declared by a ``blocks/`` atom (None for any other module)."""
+    return getattr(_module_class(type_name), "EXPORT_ROLE", None)
 
 
 def make_split_graph_blocks_pass(shard_layers):
