@@ -9,64 +9,32 @@ import torch
 from .base import CalibrationSummary
 
 
-class ActivationRangeSummary(CalibrationSummary):
-    """Tracks running min/max of input activations over a calibration dataset.
+class _RangeSummary(CalibrationSummary):
+    """Running min/max of the single raw stream in ``required_raw_data``.
 
-    Stored value: calibration_store["activation_range"] = {"min": tensor, "max": tensor}
-    These are consumed by Quantizer.apply() to compute scale/zero_point for
-    static activation fake-quantization emulation.
+    Stored value: ``calibration_store[name] = {"min": tensor, "max": tensor}``.
     """
+
+    def update_from_raw(self, calibration_store: dict, raw_data: Mapping[str, torch.Tensor]) -> None:
+        x = raw_data[self.required_raw_data[0]].float()
+        batch_min, batch_max = x.min(), x.max()
+        prev = calibration_store.get(self.name)
+        if prev is None:
+            calibration_store[self.name] = {"min": batch_min, "max": batch_max}
+        else:
+            calibration_store[self.name] = {"min": torch.min(prev["min"], batch_min),
+                                            "max": torch.max(prev["max"], batch_max)}
+
+
+class ActivationRangeSummary(_RangeSummary):
+    """Range of the layer *input* activations (static input-activation quantisation)."""
 
     name = "activation_range"
     required_raw_data = ("activation",)
 
-    def initialize_store(self, calibration_store: dict) -> None:
-        calibration_store.pop(self.name, None)
 
-    def update_from_raw(self, calibration_store: dict, raw_data: Mapping[str, torch.Tensor]) -> None:
-        x = raw_data["activation"].float()
-        batch_min = x.min()
-        batch_max = x.max()
-        if self.name not in calibration_store:
-            calibration_store[self.name] = {"min": batch_min, "max": batch_max}
-        else:
-            prev = calibration_store[self.name]
-            calibration_store[self.name] = {
-                "min": torch.min(prev["min"], batch_min),
-                "max": torch.max(prev["max"], batch_max),
-            }
-
-    # update_runtime falls back to update_from_raw (base class default),
-    # which is correct — running min/max is stateless across batches.
-
-
-class OutputActivationRangeSummary(CalibrationSummary):
-    """Tracks running min/max of OUTPUT activations over a calibration dataset.
-
-    Mirrors ActivationRangeSummary but uses the OutputActivationCollector stream
-    (module output rather than input).
-
-    Stored value: calibration_store["output_activation_range"] = {"min": tensor, "max": tensor}
-    These are consumed by Quantizer.apply() to compute scale/zero_point for
-    the output-side static activation fake-quantization and PT2E output observer
-    injection (required by XNNPACK's fused INT8 linear kernel).
-    """
+class OutputActivationRangeSummary(_RangeSummary):
+    """Range of the layer *output* activations (static output-activation quantisation)."""
 
     name = "output_activation_range"
     required_raw_data = ("output_activation",)
-
-    def initialize_store(self, calibration_store: dict) -> None:
-        calibration_store.pop(self.name, None)
-
-    def update_from_raw(self, calibration_store: dict, raw_data: Mapping[str, torch.Tensor]) -> None:
-        x = raw_data["output_activation"].float()
-        batch_min = x.min()
-        batch_max = x.max()
-        if self.name not in calibration_store:
-            calibration_store[self.name] = {"min": batch_min, "max": batch_max}
-        else:
-            prev = calibration_store[self.name]
-            calibration_store[self.name] = {
-                "min": torch.min(prev["min"], batch_min),
-                "max": torch.max(prev["max"], batch_max),
-            }

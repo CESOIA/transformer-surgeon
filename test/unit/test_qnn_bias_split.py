@@ -34,7 +34,7 @@ def _mlp_w8_qwen2(big_bias: bool):
 
 
 def _wrapper(model):
-    from transformersurgeon.export.common import LLMWrapper
+    from transformersurgeon.export import LLMWrapper
     from transformersurgeon.export.convert import convert_for_export
 
     conv = convert_for_export(model, options={"use_sdpa": False, "max_cache_len": 32, "masked_softmax": True})
@@ -46,8 +46,8 @@ def test_split_only_float_biased_linears_and_keeps_outputs():
     pytest.importorskip("executorch")
     from torch.export import export as torch_export
 
-    from transformersurgeon.export.common import extract_layer_quant_info
-    from transformersurgeon.export.executorch_exporters.qnn.qnn_export import (
+    from transformersurgeon.export import extract_layer_quant_info
+    from transformersurgeon.export.backends.qnn.passes import (
         _decompose_wrap_with_set_grad_enabled,
         _split_float_linear_bias,
     )
@@ -87,7 +87,7 @@ def test_split_only_float_biased_linears_and_keeps_outputs():
 def test_qnn_mlp_only_fake_quant_tracks_float(tmp_path, split):
     """End to end through the QNN exporter (PT2E fake-quant reference + HTP lowering)."""
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.executorch_exporters.qnn import QNNExportConfig
+    from transformersurgeon.export.backends.qnn import QNNExportConfig
 
     toks = [5, 17, 99, 3, 42, 200, 7, 64]
 

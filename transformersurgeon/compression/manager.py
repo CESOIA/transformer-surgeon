@@ -10,14 +10,14 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import PretrainedConfig
 from typing import Any, Callable, Dict, List, Optional, Union
-from copy import deepcopy
 
 logger = logging.getLogger(__name__)
 from ..calibration import run_compression_calibration, SUPPORTED_SUMMARIES
 from .registry import GROUP_OPTIONS, COMPRESSION_REGISTRY
 from .scheme import CompressionScheme
 from .grouping import SchemeGroup
-from ..utils import flatten_index_paths, get_submodule
+from ..utils import flatten_index_paths, get_block_config, get_submodule
+from ..utils import num_blocks as indexing_num_blocks
 from .cascade import apply_cascade
 from ..blocks import LinearCompressed, EmbeddingCompressed, Conv2dCompressed, Conv3dCompressed
 
@@ -313,7 +313,6 @@ class CompressionSchemesManager:
         selected = {scheme.path for scheme in self.iter_filtered(criteria=criteria)}
         summary = apply_smoothquant(self.model, self.indexing, self.calibration_data, alpha=alpha,
                                     consumers_filter=lambda path: path in selected, max_batches=max_batches)
-        self.smoothing = summary
         return summary
 
     def auto_groups(self):
@@ -342,9 +341,7 @@ class CompressionSchemesManager:
                 continue
 
             path_template = block_indexing["path_template"]
-            config_attr = block_indexing.get("config_attr", "")
-            block_config = self.config if config_attr == "" else getattr(self.config, config_attr)
-            num_blocks = getattr(block_config, block_indexing["num_blocks_attr"])
+            num_blocks = indexing_num_blocks(self.config, block_indexing)
 
             # Per-block coupling: one group per block per set.
             for block_id in range(num_blocks):
@@ -419,9 +416,7 @@ class CompressionSchemesManager:
                 continue
 
             path_template = block_indexing["path_template"]
-            config_attr = block_indexing.get("config_attr", "")
-            block_config = self.config if config_attr == "" else getattr(self.config, config_attr)
-            num_blocks = getattr(block_config, block_indexing["num_blocks_attr"])
+            num_blocks = indexing_num_blocks(self.config, block_indexing)
 
             for block_id in range(num_blocks):
                 for layer_group in coupled_masks:
@@ -945,9 +940,6 @@ class CompressionSchemesManager:
         default so they round-trip through save/load. Call
         ``manager.remove_masks()`` before saving if they are not needed.
         """
-        from .quantization import Quantizer
-        import torch.nn as nn
-
         soft_only = [
             scheme.path for scheme in self.iter_filtered(criteria=criteria)
             if scheme.soft_applied and not scheme.hard_applied
@@ -966,14 +958,13 @@ class CompressionSchemesManager:
 
             # Dequantize torchao AffineQuantizedTensor weights to plain float.
             # save_pretrained cannot serialize subclassed tensors.
-            if isinstance(module, nn.Linear):
+            if isinstance(module, torch.nn.Linear):
                 w = module.weight
                 if type(w) is not torch.Tensor and hasattr(w, 'dequantize'):
-                    module.weight = nn.Parameter(w.dequantize(), requires_grad=False)
+                    module.weight = torch.nn.Parameter(w.dequantize(), requires_grad=False)
 
             for compressor in scheme.compressors.values():
-                if isinstance(compressor, Quantizer):
-                    compressor.strip_runtime_state(module)
+                compressor.prepare_for_save(module)
 
     def restore(self, topology=False, criteria=None, verbose=False):
         """
@@ -1032,17 +1023,13 @@ class CompressionSchemesManager:
         all_schemes = {}
         
         for block_name, block_indexing in self.indexing.items():
-            config_attr = block_indexing.get('config_attr', None)
+            config_attr = block_indexing['config_attr']
             num_blocks_attr = block_indexing['num_blocks_attr']
             path_list = flatten_index_paths(block_indexing['path_list'])
             path_template = block_indexing['path_template']
-            config_attr = block_indexing['config_attr'] # added by babisant88: it's done twice.
 
             # Get the specific config for this block type
-            if config_attr == '':
-                block_specific_config = self.config
-            else:
-                block_specific_config = getattr(self.config, config_attr, None)
+            block_specific_config = get_block_config(self.config, block_indexing)
             assert block_specific_config is not None, f"Config attribute '{config_attr}' not found in the model configuration for block '{block_name}'. Please check the indexing configuration."
 
             # Get blocks number
@@ -1226,16 +1213,6 @@ class CompressionSchemesManager:
             if select:
                 yield scheme
 
-    def update_config(self, verbose=False):
-        """
-        Updates the model's configuration object with the current pruning ratios and LRD ranks from all CompressionScheme objects.
-        Modifications are made in-place.
-        
-        Returns:
-            The updated configuration object.
-        """
-        
-
     def __iter__(self):
         """
         Yields all CompressionScheme objects from the nested dictionaries.
@@ -1266,15 +1243,6 @@ class CompressionSchemesManager:
         # add intendation for better readability
         string = string.replace("\n", "\n  ")
         return string
-                    
-    def _set_model(self, model):
-        """
-        Sets the model for each CompressionScheme in the manager.
-        Args:
-            model (torch.nn.Module): The model to set for each compression scheme.
-        """       
-        # Set the model for each compression scheme
-        for scheme in self:
-            scheme.model = model
+
 
 __all__ = ["CompressionSchemesManager"]

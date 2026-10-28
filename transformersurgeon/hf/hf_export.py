@@ -3,19 +3,17 @@ from huggingface_hub import HfApi, create_repo
 from transformers import PreTrainedModel
 
 def _infer_auto_map(model: PreTrainedModel):
-    # always map config and generic AutoModel
+    """Auto classes recorded in config.json for remote-code loading: configuration,
+    base model, and the family's own auto class (``auto_class`` of its family dictionary)."""
     auto_map = {
-        "AutoConfig": "autoload."+model.config.__class__.__name__,
-        "AutoModel": "autoload."+model.__class__.__name__,
+        "AutoConfig": "autoload." + model.config.__class__.__name__,
+        "AutoModel": "autoload." + model.__class__.__name__,
     }
-    # Heuristics for common specialized autos
-    name = model.__class__.__name__
-    if "ForConditionalGeneration" in name:
-        auto_map["AutoModelForConditionalGeneration"] = "autoload."+model.__class__.__name__
-    ### add more heuristics here if needed
-    ### ...
-
+    auto_class = getattr(model, "auto_class", None)
+    if auto_class:
+        auto_map[auto_class] = "autoload." + model.__class__.__name__
     return auto_map
+
 
 def export_to_hf(
         model: PreTrainedModel,

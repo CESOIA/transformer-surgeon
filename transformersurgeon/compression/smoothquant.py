@@ -24,13 +24,13 @@ V factor; for an LRD producer the output rows are those of its U factor.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Union
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
-from ..utils import normalize_batch
-from ..utils import get_submodule, infer_model_device, move_to_device
+from ..calibration import collect_input_absmax
+from ..utils import get_block_config, get_submodule
 
 
 def _input_weight(linear: nn.Module) -> torch.Tensor:
@@ -55,10 +55,7 @@ def resolve_smoothing_groups(model: nn.Module, indexing: dict, consumers_filter=
         spec = block_indexing.get("smoothing")
         if not spec:
             continue
-        cfg = model.config
-        if block_indexing.get("config_attr"):
-            cfg = getattr(cfg, block_indexing["config_attr"])
-        num_blocks = getattr(cfg, block_indexing["num_blocks_attr"])
+        num_blocks = getattr(get_block_config(model.config, block_indexing), block_indexing["num_blocks_attr"])
         template = block_indexing["path_template"]
         for i in range(num_blocks):
             for producer, consumers in spec.items():
@@ -72,34 +69,6 @@ def resolve_smoothing_groups(model: nn.Module, indexing: dict, consumers_filter=
                     "consumers": [(c, get_submodule(model, template.format(block_index=i, path=c))) for c in consumers],
                 })
     return groups
-
-
-@torch.no_grad()
-def collect_input_absmax(model: nn.Module, modules: Iterable[nn.Module], calibration_data,
-                         max_batches: Optional[int] = None) -> dict[nn.Module, torch.Tensor]:
-    """Per-input-channel max |x| of each module's input over the calibration data (fp32)."""
-    stats: dict[nn.Module, torch.Tensor] = {}
-    handles = []
-
-    def make_hook(mod):
-        def hook(_, inputs):
-            x = inputs[0].detach().float().abs().reshape(-1, inputs[0].shape[-1]).amax(0)
-            stats[mod] = x if mod not in stats else torch.maximum(stats[mod], x)
-        return hook
-
-    for m in set(modules):
-        handles.append(m.register_forward_pre_hook(make_hook(m)))
-    device = infer_model_device(model)
-    try:
-        for batch_id, batch in enumerate(calibration_data):
-            if max_batches is not None and batch_id >= max_batches:
-                break
-            args, kwargs, _ = normalize_batch(batch, batch_id=batch_id)
-            model(*move_to_device(args, device), **move_to_device(kwargs, device))
-    finally:
-        for h in handles:
-            h.remove()
-    return {m: v.cpu() for m, v in stats.items()}
 
 
 @torch.no_grad()
@@ -163,4 +132,4 @@ def apply_smoothquant(model: nn.Module, indexing: dict, calibration_data, alpha:
     return summary
 
 
-__all__ = ["apply_smoothquant", "collect_input_absmax", "resolve_smoothing_groups"]
+__all__ = ["apply_smoothquant", "resolve_smoothing_groups"]

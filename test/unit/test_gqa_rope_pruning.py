@@ -8,10 +8,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from transformersurgeon.blocks.mha import MHACausal, MHAEncoder
-from transformersurgeon.blocks.rope import (
+from transformersurgeon.blocks.attention import MHACausal, MHAEncoder
+from transformersurgeon.blocks.positions.rope_pruning import _derive_rope_prune_pattern
+from transformersurgeon.blocks.positions.rope import (
     build_rope_prune_projection,
-    _derive_rope_prune_pattern,
     precompute_rope_cos_sin_half,
     precompute_rope_inv_freqs,
 )

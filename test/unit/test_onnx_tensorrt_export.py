@@ -29,12 +29,12 @@ def _tiny(dtype=torch.float32):
 
 def _eager_logits(model, token_ids, device):
     """Reference: the converted io_inplace graph in eager PyTorch, prompt in one call."""
-    from transformersurgeon.export.common import build_wrapper, build_zero_caches
+    from transformersurgeon.export import build_wrapper, build_zero_caches
     from transformersurgeon.export.convert import convert_for_export
 
     decoder = convert_for_export(model, options=CONVERT)["text"]
     wrapper = build_wrapper({"embedding": model.get_input_embeddings(), "decoder": decoder,
-                             "final_layer": model.lm_head}, model_config=model.config).eval().to(device)
+                             "final_layer": model.lm_head}).eval().to(device)
     keys, values = build_zero_caches(wrapper.decoder)
     with torch.no_grad():
         return wrapper(token_ids.to(device), torch.tensor([0], device=device),
@@ -46,7 +46,7 @@ def test_onnx_export_io_contract_and_manifest(tmp_path):
     import onnx
 
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.onnx import ONNXExportConfig
+    from transformersurgeon.export.backends.onnx import ONNXExportConfig
 
     path = str(tmp_path / "model.onnx")
     cfg = ONNXExportConfig(output_path=path, backend="onnx", max_input_len=8, convert_options=CONVERT)
@@ -66,7 +66,7 @@ def test_onnx_export_io_contract_and_manifest(tmp_path):
 @caps.requires_onnx
 def test_onnx_export_rejects_mutable_cache(tmp_path):
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.onnx import ONNXExportConfig
+    from transformersurgeon.export.backends.onnx import ONNXExportConfig
 
     cfg = ONNXExportConfig(output_path=str(tmp_path / "m.onnx"), backend="onnx",
                            convert_options={**CONVERT, "cache_impl": "mutable"})
@@ -80,7 +80,7 @@ def test_weight_quantization_pass_is_exact(precision):
     """Per-channel scales survive the Q/DQ rewrite exactly (INT4 tiles them over blocks)."""
     from onnx import TensorProto, helper, numpy_helper
 
-    from transformersurgeon.export.onnx import apply_weight_quantization
+    from transformersurgeon.export.backends.onnx import apply_weight_quantization
 
     rng = np.random.default_rng(0)
     qmax = 7 if precision == 4 else 127
@@ -129,7 +129,7 @@ def _gemm_model(weight_names=("lin.weight",)):
 def test_activation_quantization_pass_places_qdq_on_gemm_input():
     from onnx import numpy_helper
 
-    from transformersurgeon.export.onnx import apply_activation_quantization
+    from transformersurgeon.export.backends.onnx import apply_activation_quantization
 
     model = _gemm_model()
     done = apply_activation_quantization(model, {"lin": _act_info(0.05)})
@@ -146,7 +146,7 @@ def test_activation_quantization_pass_places_qdq_on_gemm_input():
 @caps.requires_onnx
 @pytest.mark.parametrize("bad", [dict(scheme="asymmetric", zero_point=3), dict(out_scale=torch.tensor([0.1]))])
 def test_activation_quantization_pass_rejects_non_tensorrt_schemes(bad):
-    from transformersurgeon.export.onnx import apply_activation_quantization
+    from transformersurgeon.export.backends.onnx import apply_activation_quantization
 
     with pytest.raises(NotImplementedError):
         apply_activation_quantization(_gemm_model(), {"lin": _act_info(**bad)})
@@ -162,8 +162,8 @@ def test_tensorrt_w8a8_static_activations_match_eager(tmp_path, smooth):
     from torch.utils.data import DataLoader
 
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTExportConfig
-    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+    from transformersurgeon.export.backends.tensorrt import TensorRTExportConfig
+    from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
     from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 
     model = _tiny(torch.float16)
@@ -202,8 +202,8 @@ def test_tensorrt_w8a8_static_activations_match_eager(tmp_path, smooth):
 @caps.requires_tensorrt
 def test_tensorrt_session_matches_eager(tmp_path):
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTExportConfig
-    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+    from transformersurgeon.export.backends.tensorrt import TensorRTExportConfig
+    from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
 
     model = _tiny(torch.float16)
     cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), backend="tensorrt",
@@ -231,8 +231,8 @@ def test_engine_file_is_streamed_in_chunks(tmp_path, monkeypatch):
     """An engine file is deserialized through the chunked stream reader (never
     read whole), and gives the same logits as the in-memory plan."""
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTExportConfig, engine as engine_mod
-    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+    from transformersurgeon.export.backends.tensorrt import TensorRTExportConfig, engine as engine_mod
+    from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
 
     model = _tiny(torch.float16)
     cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), backend="tensorrt",
@@ -263,8 +263,8 @@ def test_engine_file_is_streamed_in_chunks(tmp_path, monkeypatch):
 @caps.requires_edgellm_plugin
 def test_edgellm_int4_plugin_matches_dequantize_backend(tmp_path):
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTExportConfig
-    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+    from transformersurgeon.export.backends.tensorrt import TensorRTExportConfig
+    from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
     from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 
     prompt = torch.tensor([3, 17, 42, 5, 99])

@@ -4,7 +4,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from transformersurgeon.export.tensorrt.precision_passes import fp32_accumulate_lrd
+from transformersurgeon.export.backends.tensorrt.precision_passes import fp32_accumulate_lrd
 
 
 def _model():

@@ -106,7 +106,7 @@ def test_convert_for_export_graph(qwen_classes):
 def test_export_xnnpack(qwen_classes, out_dir):
     ModelCls, ManagerCls, convert_for_export = qwen_classes
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.executorch_exporters.xnnpack import XNNPACKExportConfig
+    from transformersurgeon.export.backends.xnnpack import XNNPACKExportConfig
 
     model = _quantize_two_mlp_layers(_load_float_model(ModelCls), ManagerCls)
     comps = _components(model, convert_for_export)
@@ -127,7 +127,7 @@ def test_export_xnnpack_custom_sdpa(qwen_classes, out_dir):
     default manual attention kernel."""
     ModelCls, ManagerCls, convert_for_export = qwen_classes
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.executorch_exporters.xnnpack import XNNPACKExportConfig
+    from transformersurgeon.export.backends.xnnpack import XNNPACKExportConfig
 
     model = _quantize_two_mlp_layers(_load_float_model(ModelCls), ManagerCls)
     converted = convert_for_export(
@@ -157,9 +157,9 @@ def test_export_tensorrt(qwen_classes, out_dir, int4_backend):
         pytest.skip("requires tensorrt_edgellm and EDGELLM_PLUGIN_PATH")
     ModelCls, ManagerCls, convert_for_export = qwen_classes
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.common import build_wrapper, build_zero_caches
-    from transformersurgeon.export.tensorrt import TensorRTExportConfig
-    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+    from transformersurgeon.export import build_wrapper, build_zero_caches
+    from transformersurgeon.export.backends.tensorrt import TensorRTExportConfig
+    from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
 
     model = _load_float_model(ModelCls)
     if int4_backend is not None:
@@ -190,8 +190,8 @@ def test_export_tensorrt(qwen_classes, out_dir, int4_backend):
         mgr.apply(hard=True, criteria=crit)
     wrapper = build_wrapper({"embedding": ref_model.get_input_embeddings(),
                              "decoder": convert_for_export(ref_model, options=options)["text"],
-                             "final_layer": ref_model.lm_head}, model_config=ref_model.config).cuda().eval()
-    from transformersurgeon.export.common import extract_layer_quant_info
+                             "final_layer": ref_model.lm_head}).cuda().eval()
+    from transformersurgeon.export import extract_layer_quant_info
     extract_layer_quant_info(wrapper)  # same dequantized weights the exporter sees
     keys, values = build_zero_caches(wrapper.decoder)
     with torch.no_grad():
@@ -203,7 +203,7 @@ def test_export_tensorrt(qwen_classes, out_dir, int4_backend):
 def test_export_qnn(qwen_classes, out_dir):
     ModelCls, ManagerCls, convert_for_export = qwen_classes
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.executorch_exporters.qnn import QNNExportConfig
+    from transformersurgeon.export.backends.qnn import QNNExportConfig
 
     model = _quantize_two_mlp_layers(_load_float_model(ModelCls), ManagerCls)
     comps = _components(model, convert_for_export)

@@ -8,7 +8,7 @@
 import torch
 
 import transformersurgeon as T
-from transformersurgeon.export.common import LLMWrapper
+from transformersurgeon.export import LLMWrapper
 from transformersurgeon.export.convert import convert_for_export
 
 N = 24

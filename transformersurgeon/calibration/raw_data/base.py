@@ -43,16 +43,6 @@ class RawDataCollector(ABC):
     each target module after ``loss.backward()`` for every calibration batch.
     Set this for gradient-based collectors (e.g., ``WeightGradCollector``)."""
 
-    requires_loss: bool = False
-    """Reserved flag for collectors that need direct access to the scalar loss
-    value. The current backbone does not auto-inject the loss; this flag is
-    provided for future use."""
-
-    requires_labels: bool = False
-    """Reserved flag for collectors that depend on explicit target labels. The
-    current backbone does not auto-inject targets into model ``kwargs``; this
-    flag is provided for future use."""
-
     uses_shifted_model: bool = False
     """If ``True``, the backbone registers this collector's hook on a *shifted*
     copy of the model rather than the base model. Required for collectors that

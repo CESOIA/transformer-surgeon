@@ -9,9 +9,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from transformersurgeon.blocks.config import CustomDecoderConfigCompress
-from transformersurgeon.blocks.decoder import TransformerDecoder
-from transformersurgeon.blocks.kv_cache_ops import kv_cache_update
+from transformersurgeon.blocks.stacks.config import CustomDecoderConfigCompress
+from transformersurgeon.blocks.stacks.decoder import TransformerDecoder
+from transformersurgeon.blocks.attention.kv_cache import kv_cache_update
 
 MAX_LEN = 16
 
@@ -41,7 +41,6 @@ def _decoder(cache_impl, attn_impl="manual"):
         max_cache_len=MAX_LEN,
         cache_impl=cache_impl,
         attn_impl=attn_impl,
-        indexing=_CONVERTED_INDEXING,
     )
     return TransformerDecoder(config=cfg).eval()
 

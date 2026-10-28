@@ -115,4 +115,11 @@ def peek_checkpoint_keys(pretrained_model_name_or_path, **hub_kwargs) -> Optiona
     return None
 
 
-__all__ = ["build_legacy_vit_key_mapping", "peek_checkpoint_keys"]
+def legacy_checkpoint_key_mapping(pretrained_model_name_or_path, **hub_kwargs) -> Optional[Dict[str, str]]:
+    """Old -> new key mapping for a legacy ViT checkpoint, or ``None`` if none is needed
+    (used as the family's ``checkpoint_key_mapping``)."""
+    raw_keys = peek_checkpoint_keys(pretrained_model_name_or_path, **hub_kwargs)
+    return build_legacy_vit_key_mapping(raw_keys) if raw_keys is not None else None
+
+
+__all__ = ["build_legacy_vit_key_mapping", "peek_checkpoint_keys", "legacy_checkpoint_key_mapping"]

@@ -1,41 +1,55 @@
+"""Convert a compressed Hugging Face model into export-ready ``blocks/`` stacks.
+
+``convert_for_export`` reads, for every component of the model dictionary that
+declares a ``structure``:
+
+1. the geometry and the atoms the model needs (``structure``, ``attn_type``,
+   ``mlp_type``, ``norm_type``, ``rope_type`` and the ``*_attr`` names);
+2. the geometry of every already-compressed linear layer (size, rank, bias),
+   straight from the source modules;
+3. the export implementation options (``attn_impl``, ``cache_impl``, ...).
+
+It then builds the stack named by ``structure`` from the block catalog, copies
+the weights layer by layer (``layer_matching`` pairs source and target names)
+and calls the attention modules' ``finalize_*`` hooks once. It never decides
+anything about compression: it reproduces what the compression step produced.
+"""
+
 import warnings
-import copy
 
 import torch
 import torch.nn as nn
 
-from ..blocks import TransformerDecoder
-from ..blocks.encoder import TransformerEncoder
-from ..blocks.config import CustomDecoderConfigCompress, CustomEncoderConfigCompress
-from ..utils import get_submodule, flatten_index_paths
+from ..blocks import build_block, resolve_atom
+from ..blocks.stacks.config import rmsnorm_impl_from_flags
+from ..compression.quantization import QUANT_RUNTIME_ATTRS, QUANT_RUNTIME_BUFFERS, extract_torchao_scale
+from ..utils import flatten_index_paths, get_block_config, get_parent_module, get_submodule, replace_parameter
+
+# Export implementation options understood by the converted stacks, with defaults.
+DEFAULT_CONVERT_OPTIONS = {
+    "attn_impl": None,           # None: "manual" ("sdpa" if use_sdpa), "paged" with cache_impl="io_paged"
+    "use_sdpa": False,
+    "cache_impl": "mutable",
+    "max_cache_len": 2048,
+    "add_batch_dim": False,
+    "rmsnorm_impl": None,        # None: from rmsnorm_prescale / rmsnorm_upcast
+    "rmsnorm_prescale": True,
+    "rmsnorm_upcast": False,
+    "masked_softmax": False,
+}
 
 
-_QUANT_BUFFER_SUFFIXES = (
-    "_act_quant_scale", "_act_quant_zero_point",
-    "_act_out_quant_scale", "_act_out_quant_zero_point",
-    "_torchao_scale",
-)
-_QUANT_PLAIN_ATTRS = (
-    "_torchao_precision", "_torchao_per_channel", "_torchao_group_size", "_torchao_group_scale_bits",
-    "_torchao_act_dynamic",
-    "_soft_quant_precision",
-    "_act_quant_precision", "_act_quant_method", "_act_quant_scheme",
-    "_act_out_quant_precision", "_act_out_quant_method", "_act_out_quant_scheme",
-)
-
-
-def _extract_aqt_scale(w: torch.Tensor) -> torch.Tensor | None:
-    """Extract the quantization scale from any torchao quantized weight tensor.
-
-    Tries multiple attribute paths to handle both the old AffineQuantizedTensor
-    layout (tensor_impl.scale) and new-style subclasses (direct .scale attribute).
-    """
-    if hasattr(w, 'tensor_impl') and hasattr(w.tensor_impl, 'scale'):
-        return w.tensor_impl.scale.detach().clone()
-    scale = getattr(w, 'scale', None)
-    if isinstance(scale, torch.Tensor):
-        return scale.detach().clone()
-    return None
+def resolve_convert_options(options=None):
+    """Fill defaults and translate the boolean RMS-normalisation flags into ``rmsnorm_impl``."""
+    unknown = set(options or {}) - set(DEFAULT_CONVERT_OPTIONS)
+    if unknown:
+        raise ValueError(f"Unknown convert options {sorted(unknown)}; known: {sorted(DEFAULT_CONVERT_OPTIONS)}.")
+    resolved = {**DEFAULT_CONVERT_OPTIONS, **(options or {})}
+    prescale = resolved.pop("rmsnorm_prescale")
+    upcast = resolved.pop("rmsnorm_upcast")
+    if resolved["rmsnorm_impl"] is None:
+        resolved["rmsnorm_impl"] = rmsnorm_impl_from_flags(prescale, upcast)
+    return resolved
 
 
 def _replace_param(root: nn.Module, dotted_key: str, ref: torch.Tensor) -> None:
@@ -44,11 +58,8 @@ def _replace_param(root: nn.Module, dotted_key: str, ref: torch.Tensor) -> None:
     Used to let a freshly-built block layer adopt the source layer's hard-pruned
     weight/bias shape before a strict ``load_state_dict`` copies the values in.
     """
-    parent_path, _, attr = dotted_key.rpartition(".")
-    parent = get_submodule(root, parent_path) if parent_path else root
-    old = getattr(parent, attr)
-    setattr(parent, attr, nn.Parameter(
-        torch.empty_like(ref), requires_grad=getattr(old, "requires_grad", True)))
+    parent, attr = get_parent_module(root, dotted_key)
+    replace_parameter(parent, attr, torch.empty_like(ref))
 
 
 def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> None:
@@ -78,7 +89,7 @@ def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> 
     # so that load_state_dict below can fill them in.
     new_modules = dict(new_layer.named_modules())
     for key, tensor in plain_state.items():
-        if any(key.endswith(s) for s in _QUANT_BUFFER_SUFFIXES):
+        if any(key.endswith(s) for s in QUANT_RUNTIME_BUFFERS):
             parent_path, buf_name = key.rsplit(".", 1) if "." in key else ("", key)
             parent_mod = new_modules.get(parent_path)
             if parent_mod is not None and buf_name not in parent_mod._buffers:
@@ -124,7 +135,7 @@ def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> 
             if hasattr(old_submod, dim_attr):
                 setattr(new_submod, dim_attr, getattr(old_submod, dim_attr))
 
-        for attr in _QUANT_PLAIN_ATTRS:
+        for attr in QUANT_RUNTIME_ATTRS:
             if hasattr(old_submod, attr):
                 setattr(new_submod, attr, getattr(old_submod, attr))
 
@@ -136,7 +147,7 @@ def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> 
             and isinstance(w_old, torch.Tensor)
             and type(w_old) is not torch.Tensor
         ):
-            scale = _extract_aqt_scale(w_old)
+            scale = extract_torchao_scale(w_old)
             if scale is not None:
                 new_submod.register_buffer("_torchao_scale", scale)
 
@@ -179,247 +190,86 @@ def _flatten_layer_matching(indexing, source_paths):
     return layer_matching
 
 
-def _build_bias_required_config(layer_matching, source_bias):
-    """Build converted bias map for attention/MLP layers."""
-    bias_required_config = {
-        "attn": {},
-        "mlp": {},
+def _layer_spec(module):
+    """Geometry of an already-compressed linear-like source layer, or ``None`` for other layers."""
+    if getattr(module, "skip", False):
+        return {"out_features": 0}
+    if not hasattr(module, "out_features"):
+        return None
+    return {
+        "in_features": module.in_features,
+        "out_features": module.out_features,
+        "rank": getattr(module, "rank", "full"),
+        "bias": getattr(module, "bias", None) is not None,
     }
 
-    if isinstance(source_bias, dict):
-        bias_by_path = source_bias
-    elif isinstance(source_bias, (list, tuple)):
-        bias_by_path = {
-            mapped_path: source_bias[j]
-            for j, mapped_path in enumerate(layer_matching)
-            if j < len(source_bias)
-        }
-    else:
-        raise TypeError(
-            "Indexing 'bias_required' must be a list/tuple or dict, "
-            f"got {type(source_bias).__name__}."
-        )
 
-    for mapped_path, is_required in bias_by_path.items():
-        if mapped_path.startswith("attn."):
-            bias_required_config["attn"][mapped_path.split(".", 1)[1]] = bool(is_required)
-        elif mapped_path.startswith("mlp."):
-            bias_required_config["mlp"][mapped_path.split(".", 1)[1]] = bool(is_required)
-
-    return bias_required_config
-
-
-def _build_converted_compression_config(indexing, source_config_obj, num_blocks):
-    """
-    Remap source compression_config keys from original HF paths to converted custom graph paths.
-    """
-    source_paths = flatten_index_paths(indexing['path_list'])
-    layer_matching = _flatten_layer_matching(indexing, source_paths)
-    source_cfg = getattr(source_config_obj, 'compression_config', {}) or {}
-
-    converted_cfg = {}
+def _block_pairs(model, indexing, num_blocks):
+    """``(source module path, target module path)`` for every listed layer of every block."""
+    source_paths = flatten_index_paths(indexing["path_list"])
+    target_paths = _flatten_layer_matching(indexing, source_paths)
     for i in range(num_blocks):
-        for old_path, new_path in zip(source_paths, layer_matching):
-            old_full = indexing['path_template'].format(block_index=i, path=old_path)
-            new_full = f"blocks.{i}.{new_path}"
-            converted_cfg[new_full] = copy.deepcopy(source_cfg.get(old_full, {}))
+        for source, target in zip(source_paths, target_paths):
+            yield i, indexing["path_template"].format(block_index=i, path=source), f"blocks.{i}.{target}"
 
-    return converted_cfg
-
-
-# Static shape of the converted (blocks/) graph: every block lives at
-# "blocks.{block_index}.{path}" and blocks are counted the same way
-# regardless of model family. This is purely descriptive metadata consumed
-# by init_compressed_config() to default-fill each layer's compression_config
-# -- it is never attached to the converted model itself (blocks/ is a frozen,
-# already-compressed model; nothing may re-drive compression against it once
-# built, see CLAUDE.md).
-_CONVERTED_BLOCK_INDEXING_TEMPLATE = {
-    "config_attr": "",
-    "num_blocks_attr": "num_hidden_layers",
-    "path_template": "blocks.{block_index}.{path}",
-}
-
-
-def _build_converted_decoder_indexing(indexing):
-    """Build converted indexing compatible with converted decoder config/model."""
-    source_paths = flatten_index_paths(indexing["path_list"])
-    layer_matching = _flatten_layer_matching(indexing, source_paths)
-    decoder_indexing = dict(_CONVERTED_BLOCK_INDEXING_TEMPLATE)
-    decoder_indexing["path_list"] = [
-        path
-        for path in layer_matching
-        if path.startswith("attn.") or path.startswith("mlp.")
-    ]
-    return {"decoder": decoder_indexing}
-
-
-def _build_converted_encoder_indexing(indexing):
-    """Build converted indexing compatible with converted encoder config/model."""
-    source_paths = flatten_index_paths(indexing["path_list"])
-    layer_matching = _flatten_layer_matching(indexing, source_paths)
-    encoder_indexing = dict(_CONVERTED_BLOCK_INDEXING_TEMPLATE)
-    encoder_indexing["path_list"] = [
-        path
-        for path in layer_matching
-        if path.startswith("attn.") or path.startswith("mlp.")
-    ]
-    return {"encoder": encoder_indexing}
 
 def convert_for_export(model, options=None, verbose=False):
-    """
-    Convert model components to be compatible with export formats like ONNX.
+    """Build one export-ready stack per model component.
 
     Args:
-        model: The transformer model to be converted.
-        indexing: Model-specific indexing dictionary.
+        model: A compressed Hugging Face model whose class carries its model
+            dictionary as ``indexing``.
+        options: Export implementation options (see ``DEFAULT_CONVERT_OPTIONS``).
+        verbose: Print every weight transfer.
 
     Returns:
-        The converted model.
+        ``{component name: stack or None}``; ``None`` for components whose
+        dictionary declares no ``structure``.
     """
-
-    options = options or {}
-
-    # Get indexing and config for the whole model (e.g., vision + text)
-    whole_indexing = model.indexing
-    whole_config_obj = model.config
-
-    # Convert each model component separately
-    new_models = {}
-    for name, indexing in whole_indexing.items():
+    options = resolve_convert_options(options)
+    converted = {}
+    for name, indexing in model.indexing.items():
+        if "structure" not in indexing:
+            warnings.warn(f"Structure not specified for model with name '{name}'. Skipping conversion.")
+            converted[name] = None
+            continue
         if verbose:
             print(f"Converting {name} component for export...")
 
-        # Check if conversion is supported
-        if 'structure' not in indexing:
-            warnings.warn(f"Structure not specified for model with name '{name}'. Skipping conversion.")
-            new_models[name] = None
-            continue
+        source_config = get_block_config(model.config, indexing)
+        num_blocks = getattr(source_config, indexing["num_blocks_attr"])
+        pairs = list(_block_pairs(model, indexing, num_blocks))
 
-        # Get configuration of the specific model component
-        if indexing['config_attr'] == "":
-            source_config_obj = whole_config_obj
-        else:
-            source_config_obj = getattr(whole_config_obj, indexing['config_attr'])
+        layer_specs = {}
+        for _, source, target in pairs:
+            spec = _layer_spec(get_submodule(model, source))
+            if spec is not None:
+                layer_specs[target] = spec
 
-        # Instantiate new model structure based on indexing
-        num_blocks = getattr(source_config_obj, indexing['num_blocks_attr'])
+        stack_cls = resolve_atom("stack", indexing["structure"])
+        config = stack_cls.config_class.from_source_config(source_config, indexing, layer_specs, **options)
+        new_model = build_block("stack", indexing["structure"], config)
 
-        if indexing['structure'] == 'transformer_decoder':
-            use_sdpa = options.get('use_sdpa', False)
-            attn_impl = options.get('attn_impl', None)
-            max_cache_len = options.get('max_cache_len', 2048)
-            cache_impl = options.get('cache_impl', 'mutable')
-            add_batch_dim = options.get('add_batch_dim', False)
-            rmsnorm_prescale = options.get('rmsnorm_prescale', True)
-            rmsnorm_upcast = options.get('rmsnorm_upcast', False)
-            masked_softmax = options.get('masked_softmax', False)
-
-            converted_indexing = _build_converted_decoder_indexing(indexing)
-            converted_compression_config = _build_converted_compression_config(
-                indexing,
-                source_config_obj,
-                num_blocks,
-            )
-            source_paths = flatten_index_paths(indexing["path_list"])
-            layer_matching = _flatten_layer_matching(indexing, source_paths)
-            source_bias = indexing.get("bias_required", [])
-            bias_required_config = _build_bias_required_config(layer_matching, source_bias)
-
-            converted_config = CustomDecoderConfigCompress.from_source_config(
-                source_config_obj=source_config_obj,
-                source_indexing=indexing,
-                converted_indexing=converted_indexing["decoder"],
-                compression_config=converted_compression_config,
-                bias_required=bias_required_config,
-                use_sdpa=use_sdpa,
-                attn_impl=attn_impl,
-                max_cache_len=max_cache_len,
-                cache_impl=cache_impl,
-                add_batch_dim=add_batch_dim,
-                rmsnorm_prescale=rmsnorm_prescale,
-                rmsnorm_upcast=rmsnorm_upcast,
-                masked_softmax=masked_softmax,
-            )
-
-            new_model = TransformerDecoder(config=converted_config)
-            path_template = "blocks.{i}.{path}"
-        elif indexing['structure'] == 'transformer_encoder':
-            use_sdpa = options.get('use_sdpa', False)
-
-            converted_indexing = _build_converted_encoder_indexing(indexing)
-            converted_compression_config = _build_converted_compression_config(
-                indexing,
-                source_config_obj,
-                num_blocks,
-            )
-            source_paths = flatten_index_paths(indexing["path_list"])
-            layer_matching = _flatten_layer_matching(indexing, source_paths)
-            source_bias = indexing.get("bias_required", [])
-            bias_required_config = _build_bias_required_config(layer_matching, source_bias)
-
-            converted_config = CustomEncoderConfigCompress.from_source_config(
-                source_config_obj=source_config_obj,
-                source_indexing=indexing,
-                converted_indexing=converted_indexing["encoder"],
-                compression_config=converted_compression_config,
-                bias_required=bias_required_config,
-                use_sdpa=use_sdpa,
-                use_final_norm=indexing.get("use_final_norm", True),
-                position_embedding_type=indexing.get("position_embedding_type", "none"),
-            )
-
-            new_model = TransformerEncoder(config=converted_config)
-            path_template = "blocks.{i}.{path}"
-        else:
-            raise NotImplementedError(f"Conversion for structure '{indexing['structure']}' is not implemented.")
-        
-        # Import parameters from the original model to the new model
-        source_paths = flatten_index_paths(indexing['path_list'])
-        layer_matching = _flatten_layer_matching(indexing, source_paths)
+        for _, source, target in pairs:
+            _load_state_dict_dequantized(get_submodule(model, source), get_submodule(new_model, target))
+            if verbose:
+                print("Transferring parameters:", source, "->", target)
         for i in range(num_blocks):
-            for old_path, new_path in zip(source_paths, layer_matching):
-                old_path = indexing['path_template'].format(block_index=i, path=old_path)
-                new_path = path_template.format(i=i, path=new_path)
-                old_layer = get_submodule(model, old_path)
-                new_layer = get_submodule(new_model, new_path)
-                _load_state_dict_dequantized(old_layer, new_layer)
-                if verbose:
-                    print("Transfering parameters:", old_path, "->", new_path)
-                    for pname, param in old_layer.named_parameters():
-                        print(f"  {pname}: {param.shape}, dtype={param.dtype}, device={param.device}")
-                    print("   -->")
-                    for pname, param in new_layer.named_parameters():
-                        print(f"  {pname}: {param.shape}, dtype={param.dtype}, device={param.device}")
+            # Freeze the attention geometry that depends on the loaded weights, once.
+            attn = get_submodule(new_model, f"blocks.{i}.attn")
+            for hook in ("finalize_head_pruning", "finalize_rope_pruning", "finalize_cache_geometry"):
+                if hasattr(attn, hook):
+                    getattr(attn, hook)()
 
-            # q_proj/k_proj (and their rope_prune_mask buffers, if hard-pruned)
-            # are now loaded -- freeze this block's RoPE-pruning geometry once,
-            # here at conversion time, so blocks/mha.py's forward() never has
-            # to re-derive it. attn's submodule name is a fixed convention of
-            # TransformerDecoderBlock/TransformerEncoderBlock, not driven by
-            # layer_matching.
-            attn_module = get_submodule(new_model, path_template.format(i=i, path="attn"))
-            if hasattr(attn_module, "finalize_head_pruning"):  # whole heads removed by block pruning
-                attn_module.finalize_head_pruning()
-            if hasattr(attn_module, "finalize_rope_pruning"):
-                attn_module.finalize_rope_pruning()
-            # KV buffers follow the (possibly pruned) key/value head dims; sizing
-            # them in forward() would export as a per-step zero cache.
-            if hasattr(attn_module, "finalize_cache_geometry"):
-                attn_module.finalize_cache_geometry()
+        extra = indexing.get("extra_layers", [])
+        extra_targets = indexing.get("extra_layers_matching") or [path.split(".")[-1] for path in extra]
+        for source, target in zip(extra, extra_targets):
+            if verbose:
+                print("Transferring extra layer parameters:", source, "->", target)
+            _load_state_dict_dequantized(get_submodule(model, source), get_submodule(new_model, target))
 
-        # Handle extra layers if any
-        if 'extra_layers' in indexing:
-            extra_layers_matching = indexing.get('extra_layers_matching', [])
-            if not extra_layers_matching:
-                extra_layers_matching = [path.split(".")[-1] for path in indexing['extra_layers']]
-            for old_path, new_path in zip(indexing['extra_layers'], extra_layers_matching):
-                if verbose:
-                    print("Transfering extra layer parameters:", old_path, "->", new_path)
-                old_layer = get_submodule(model, old_path)
-                new_layer = get_submodule(new_model, new_path)
-                _load_state_dict_dequantized(old_layer, new_layer)
+        converted[name] = new_model
+    return converted
 
-        new_models[name] = new_model
 
-    return new_models
+__all__ = ["convert_for_export", "resolve_convert_options", "DEFAULT_CONVERT_OPTIONS"]

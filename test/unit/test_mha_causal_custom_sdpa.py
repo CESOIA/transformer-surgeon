@@ -11,8 +11,8 @@ import torch
 
 from _helpers import capabilities as caps
 
-from transformersurgeon.blocks.mha import MHACausal
-from transformersurgeon.blocks.rope import (
+from transformersurgeon.blocks.attention import MHACausal
+from transformersurgeon.blocks.positions.rope import (
     precompute_rope_cos_sin_half,
     precompute_rope_inv_freqs,
 )

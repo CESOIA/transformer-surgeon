@@ -8,7 +8,7 @@
 
 The artifact is out-dir/model.onnx + model.manifest.json (+ model.engine when
 built here). On a Jetson, copy the ONNX + manifest and build there with
-    python -m transformersurgeon.export.tensorrt.tensorrt_export model.manifest.json
+    python -m transformersurgeon.export.backends.tensorrt.exporter model.manifest.json
 Needs onnx, onnxscript, the `tensorrt` package and a CUDA device; the Edge-LLM
 INT4 plugin additionally needs EDGELLM_PLUGIN_PATH (see edgellm_int4.py).
 """
@@ -22,8 +22,8 @@ from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.export import export_to_backend
-from transformersurgeon.export.tensorrt import TensorRTExportConfig
-from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+from transformersurgeon.export.backends.tensorrt import TensorRTExportConfig
+from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
 from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 
 

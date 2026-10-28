@@ -8,10 +8,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from transformersurgeon.blocks.config import CustomDecoderConfigCompress
-from transformersurgeon.blocks.decoder import TransformerDecoder
-from transformersurgeon.blocks.mha import MHACausal
-from transformersurgeon.blocks.rope import (
+from transformersurgeon.blocks.stacks.config import CustomDecoderConfigCompress
+from transformersurgeon.blocks.stacks.decoder import TransformerDecoder
+from transformersurgeon.blocks.attention import MHACausal
+from transformersurgeon.blocks.positions.rope import (
     precompute_rope_cos_sin_half,
     precompute_rope_inv_freqs,
 )
@@ -130,7 +130,6 @@ def _tiny_decoder_config(add_batch_dim):
         max_cache_len=8,
         cache_impl="mutable",
         add_batch_dim=add_batch_dim,
-        indexing=_CONVERTED_INDEXING,
     )
 
 

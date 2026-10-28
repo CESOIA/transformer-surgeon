@@ -86,14 +86,14 @@ def test_both_coupled_gate_up_pruned_independently_is_guarded():
 # --------------------------------------------------------------------------- #
 # #5  QNN export: no capability guard, undeclared py-cpuinfo dep crashes on import
 #     Fixed: is_qnn_available() probes cheap preconditions without importing the
-#     Qualcomm backend package, and export_with_qnn() checks it up front (with a
+#     Qualcomm backend package, and the QNN exporter checks it up front (with a
 #     try/except fallback around the real Qualcomm import) instead of letting a
 #     bare "install py-cpuinfo" ImportError surface mid-export.
 # --------------------------------------------------------------------------- #
 def test_qnn_unavailable_raises_clear_error_instead_of_cpuinfo_importerror():
-    from transformersurgeon.export.executorch_exporters.qnn import (
+    from transformersurgeon.export.backends.qnn import (
         QNNExportConfig,
-        export_with_qnn,
+        QNNExporter,
         is_qnn_available,
     )
 
@@ -103,7 +103,7 @@ def test_qnn_unavailable_raises_clear_error_instead_of_cpuinfo_importerror():
 
     config = QNNExportConfig(output_path="/tmp/unused.pte", backend="qnn")
     with pytest.raises(RuntimeError, match="QNN backend unavailable"):
-        export_with_qnn(None, config=config)
+        QNNExporter().export(None, config)
 
 
 # --------------------------------------------------------------------------- #

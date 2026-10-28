@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import inspect
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
@@ -610,11 +610,7 @@ def _collect_preprocessing_outputs(
             label = _detach_and_optionally_offload(label, offload_to_cpu)
 
             cached_inputs.append(
-                {
-                    "__ts_args__": (out,),
-                    "__ts_kwargs__": {},
-                    "__ts_label__": label,
-                }
+                pack_batch((out,), {}, label)
             )
 
     if len(cached_inputs) == 0:
@@ -646,11 +642,7 @@ def _collect_loader_inputs(
             label = move_to_device(label, cpu)
 
         cached_inputs.append(
-            {
-                "__ts_args__": model_args,
-                "__ts_kwargs__": model_kwargs,
-                "__ts_label__": label,
-            }
+            pack_batch(model_args, model_kwargs, label)
         )
 
     if len(cached_inputs) == 0:
@@ -680,9 +672,8 @@ def _run_block_on_cached_inputs(
 
     with torch.no_grad():
         for batch in batch_iter:
-            model_args = tuple(move_to_device(batch.get("__ts_args__", tuple()), device))
-            model_kwargs = dict(move_to_device(batch.get("__ts_kwargs__", {}), device))
-            label = batch.get("__ts_label__", None)
+            model_args, model_kwargs, label = normalize_batch(batch, batch_id=0)
+            model_args, model_kwargs = move_to_device(model_args, device), move_to_device(model_kwargs, device)
 
             out = block_module(*model_args, **model_kwargs)
 
@@ -690,11 +681,7 @@ def _run_block_on_cached_inputs(
             label = _detach_and_optionally_offload(label, offload_to_cpu)
 
             next_cached_inputs.append(
-                {
-                    "__ts_args__": (out,),
-                    "__ts_kwargs__": {},
-                    "__ts_label__": label,
-                }
+                pack_batch((out,), {}, label)
             )
 
     return next_cached_inputs
@@ -770,7 +757,7 @@ def _apply_skip_residuals(
 def _extract_cached_hidden_states(cached_inputs) -> List[torch.Tensor]:
     hidden_states = []
     for batch_idx, batch in enumerate(cached_inputs):
-        model_args = tuple(batch.get("__ts_args__", tuple()))
+        model_args = normalize_batch(batch, batch_id=batch_idx)[0]
         if len(model_args) == 0 or not isinstance(model_args[0], torch.Tensor):
             raise ValueError(
                 "Skip connection residual capture expects tensor hidden states as first positional arg. "
@@ -789,8 +776,7 @@ def _add_residual_to_cached_outputs(cached_outputs, residual_hidden_states: List
 
     updated_outputs = []
     for batch_idx, (batch, residual) in enumerate(zip(cached_outputs, residual_hidden_states)):
-        model_args = tuple(batch.get("__ts_args__", tuple()))
-        label = batch.get("__ts_label__", None)
+        model_args, _, label = normalize_batch(batch, batch_id=batch_idx)
 
         if len(model_args) == 0 or not isinstance(model_args[0], torch.Tensor):
             raise ValueError(
@@ -806,11 +792,7 @@ def _add_residual_to_cached_outputs(cached_outputs, residual_hidden_states: List
             )
 
         updated_outputs.append(
-            {
-                "__ts_args__": (out + residual,),
-                "__ts_kwargs__": {},
-                "__ts_label__": label,
-            }
+            pack_batch((out + residual,), {}, label)
         )
 
     return updated_outputs
@@ -851,9 +833,8 @@ def _attach_position_embeddings_if_configured(
 
     with torch.no_grad():
         for batch in cached_inputs:
-            model_args = tuple(move_to_device(batch.get("__ts_args__", tuple()), device))
-            model_kwargs = dict(move_to_device(batch.get("__ts_kwargs__", {}), device))
-            label = batch.get("__ts_label__", None)
+            model_args, model_kwargs, label = normalize_batch(batch, batch_id=0)
+            model_args, model_kwargs = move_to_device(model_args, device), move_to_device(model_kwargs, device)
 
             if len(model_args) == 0 or not isinstance(model_args[0], torch.Tensor):
                 enriched.append(batch)
@@ -887,11 +868,7 @@ def _attach_position_embeddings_if_configured(
             model_kwargs["position_ids"] = position_ids
 
             enriched.append(
-                {
-                    "__ts_args__": model_args,
-                    "__ts_kwargs__": model_kwargs,
-                    "__ts_label__": label,
-                }
+                pack_batch(model_args, model_kwargs, label)
             )
 
     return enriched

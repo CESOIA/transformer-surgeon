@@ -15,38 +15,31 @@ import torch
 from .base import RawDataCollector
 
 
-class WeightCollector(RawDataCollector):
+class ParamCollector(RawDataCollector):
+    """Emits a float32 copy of the module parameter named ``name`` on every forward."""
+
+    def __init__(self, *, offload_to_cpu: bool = False):
+        self.offload_to_cpu = offload_to_cpu
+
+    def build_forward_hook(self, *, emit_raw: Callable[[str, torch.Tensor], None]):
+        def _hook(module, inputs, output):
+            param = getattr(module, self.name, None)
+            if param is None:
+                raise ValueError(
+                    f"Cannot collect '{self.name}' calibration summary: module {type(module).__name__} "
+                    f"has no {self.name}."
+                )
+            param = param.detach().clone()
+            if self.offload_to_cpu:
+                param = param.cpu()
+            emit_raw(self.name, param.float())
+
+        return _hook
+
+
+class WeightCollector(ParamCollector):
     name = "weight"
 
-    def __init__(self, *, offload_to_cpu: bool = False):
-        self.offload_to_cpu = offload_to_cpu
 
-    def build_forward_hook(self, *, emit_raw: Callable[[str, torch.Tensor], None]):
-        def _hook(module, inputs, output):
-            weight = module.weight.detach().clone()
-            if self.offload_to_cpu:
-                weight = weight.cpu()
-            emit_raw(self.name, weight.float())
-
-        return _hook
-
-
-class BiasCollector(RawDataCollector):
+class BiasCollector(ParamCollector):
     name = "bias"
-
-    def __init__(self, *, offload_to_cpu: bool = False):
-        self.offload_to_cpu = offload_to_cpu
-
-    def build_forward_hook(self, *, emit_raw: Callable[[str, torch.Tensor], None]):
-        def _hook(module, inputs, output):
-            bias = getattr(module, "bias", None)
-            if bias is None:
-                raise ValueError(
-                    f"Cannot collect 'bias' calibration summary: module {type(module).__name__} has no bias."
-                )
-            bias = bias.detach().clone()
-            if self.offload_to_cpu:
-                bias = bias.cpu()
-            emit_raw(self.name, bias.float())
-
-        return _hook

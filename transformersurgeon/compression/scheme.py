@@ -6,7 +6,7 @@ Provides the CompressionScheme class for managing structured pruning and low-ran
 import copy
 import inspect
 import torch
-from typing import Union
+
 from ..blocks import LinearCompressed
 from ..blocks import EmbeddingCompressed
 from ..blocks import Conv2dCompressed, Conv3dCompressed

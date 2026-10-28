@@ -5,7 +5,7 @@ from typing import List, Optional, Union
 # ``blocks`` (the lowest layer) so both the compression algorithms and the
 # converted-graph blocks agree on pruned shapes. Re-exported here for callers
 # that import it from the pruning methods package.
-from ...blocks.pruning_dims import effective_num_pruned, effective_out_features
+from .pruning_dims import effective_num_pruned, effective_out_features
 
 
 def build_structured_mask(

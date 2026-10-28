@@ -44,9 +44,7 @@ MODERNBERT_C_INDEXING = {
             'output_dependence': {},
             'coupled_masks': [],
             'coupled_masks_all': [],
-            'per_head_uniform': [],
         },
-        'pruning_supported': [],
         # Alternating global/local attention layers each need their own rotary
         # embedding call keyed by layer type
         # (`rotary_emb(hidden_states, position_ids, layer_type)`), which the
@@ -57,7 +55,6 @@ MODERNBERT_C_INDEXING = {
         # (see docs/investigations/FRAMEWORK_PROBLEMS.md #1 and `no_cascade_calibration` there).
         'no_cascade_calibration': True,
         'path_template': "model.layers.{block_index}.{path}",
-        'qkv_paths': ['attn.Wqkv'],
         'preprocessing': "model.embeddings",
         'final_layer': "classifier",
 

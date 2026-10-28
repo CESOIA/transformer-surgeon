@@ -6,7 +6,7 @@ import torch
 from executorch.runtime import Runtime
 from transformers import Qwen2TokenizerFast
 
-from transformersurgeon.export.common import load_llm_manifest, zero_caches_from_manifest
+from transformersurgeon.export import load_llm_manifest, zero_caches_from_manifest
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 

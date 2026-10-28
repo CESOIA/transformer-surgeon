@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Union
 
 from .abstract import Compressor
-from .quantization_methods import METHOD_FUNCTIONS, ACT_METHOD_FUNCTIONS
+from .quantization_methods import METHOD_FUNCTIONS, ACT_METHOD_FUNCTIONS, activation_qrange
 from .unstructured_pruning_methods import METHOD_FUNCTIONS as SPARSITY_FUNCTIONS
 from .unstructured_pruning import validate_unstructured_pruning_ratio
 
@@ -18,6 +18,24 @@ VALID_GRANULARITIES = ["per_tensor", "per_channel", "per_group"]
 CALIBRATED_METHOD_DICT = {
     "gptq": ("covariance",),
 }
+
+
+
+# Runtime state that Quantizer.apply() leaves on a quantized layer. Exporters and
+# the converter read it (export/convert.py, export/common.py); strip_runtime_state
+# removes it before saving.
+QUANT_RUNTIME_BUFFERS = (
+    "_act_quant_scale", "_act_quant_zero_point",
+    "_act_out_quant_scale", "_act_out_quant_zero_point",
+    "_torchao_scale",
+)
+QUANT_RUNTIME_ATTRS = (
+    "_torchao_precision", "_torchao_per_channel", "_torchao_group_size", "_torchao_group_scale_bits",
+    "_torchao_act_dynamic",
+    "_soft_quant_precision",
+    "_act_quant_precision", "_act_quant_method", "_act_quant_scheme",
+    "_act_out_quant_precision", "_act_out_quant_method", "_act_out_quant_scheme",
+)
 
 
 class Quantizer(Compressor):
@@ -183,7 +201,7 @@ class Quantizer(Compressor):
                 module._act_quant_hook_handle.remove()
 
             module._act_quant_hook_handle = module.register_forward_pre_hook(
-                _make_activation_fake_quant_hook(scale, zero_point, precision_activation, scheme_activation)
+                _make_fake_quant_hook("_act_quant", precision_activation, scheme_activation)
             )
 
         # Output activation fake-quant emulation via forward post-hook.
@@ -214,7 +232,7 @@ class Quantizer(Compressor):
                 module._act_out_quant_hook_handle.remove()
 
             module._act_out_quant_hook_handle = module.register_forward_hook(
-                _make_output_activation_fake_quant_hook(out_scale, out_zero_point, precision_activation, scheme_activation)
+                _make_fake_quant_hook("_act_out_quant", precision_activation, scheme_activation, output=True)
             )
 
     def _calibration_kwargs(self, method):
@@ -253,27 +271,12 @@ class Quantizer(Compressor):
         if hasattr(module, "_act_out_quant_hook_handle"):
             module._act_out_quant_hook_handle.remove()
             del module._act_out_quant_hook_handle
-        for attr in (
-            "_act_quant_scale",
-            "_act_quant_zero_point",
-            "_act_quant_precision",
-            "_act_quant_method",
-            "_act_quant_scheme",
-            "_act_out_quant_scale",
-            "_act_out_quant_zero_point",
-            "_act_out_quant_precision",
-            "_act_out_quant_method",
-            "_act_out_quant_scheme",
-            "_soft_quant_precision",
-            "_torchao_precision",
-            "_torchao_per_channel",
-            "_torchao_group_size",
-            "_torchao_group_scale_bits",
-            "_torchao_act_dynamic",
-            "_torchao_scale",
-        ):
+        for attr in QUANT_RUNTIME_BUFFERS + QUANT_RUNTIME_ATTRS:
             if hasattr(module, attr):
                 delattr(module, attr)
+
+    def prepare_for_save(self, module):
+        self.strip_runtime_state(module)
 
     def _to_compress(self):
         return self.precision != "full"
@@ -287,58 +290,26 @@ class Quantizer(Compressor):
         )
 
 
-def _make_activation_fake_quant_hook(
-    scale: torch.Tensor,
-    zero_point: torch.Tensor,
-    precision: int,
-    scheme: str,
-):
-    """Return a forward pre-hook that fake-quantizes the input activation."""
-    if scheme == "symmetric":
-        qmax = 2 ** (precision - 1) - 1
-        qmin = -qmax
-    else:
-        qmax = 2 ** precision - 1
-        qmin = 0
+def _make_fake_quant_hook(prefix: str, precision: int, scheme: str, output: bool = False):
+    """Hook that fake-quantises a module's input (forward pre-hook) or output (forward hook).
 
-    # Read the module's buffers at call time (not the tensors given here), so the
-    # hook follows the module across .to(device) and state_dict loads.
-    def hook(module, inputs):
-        x = inputs[0]
-        s = module._act_quant_scale.float()
-        zp = module._act_quant_zero_point.float()
-        xq = torch.clamp(torch.round(x / s) + zp, qmin, qmax)
-        x_fq = (xq - zp) * s
-        return (x_fq.to(x.dtype),) + inputs[1:]
+    Scale and zero point are read from the module buffers ``<prefix>_scale`` and
+    ``<prefix>_zero_point`` at call time, so the hook follows the module across
+    ``.to(device)`` and state-dict loads.
+    """
+    qmin, qmax = activation_qrange(precision, scheme)
 
-    return hook
+    def fake_quant(module, x):
+        s = getattr(module, f"{prefix}_scale").float()
+        zp = getattr(module, f"{prefix}_zero_point").float()
+        return ((torch.clamp(torch.round(x / s) + zp, qmin, qmax) - zp) * s).to(x.dtype)
+
+    if output:
+        return lambda module, inputs, out: fake_quant(module, out)
+    return lambda module, inputs: (fake_quant(module, inputs[0]),) + inputs[1:]
 
 
-def _make_output_activation_fake_quant_hook(
-    scale: torch.Tensor,
-    zero_point: torch.Tensor,
-    precision: int,
-    scheme: str,
-):
-    """Return a forward post-hook that fake-quantizes the output activation."""
-    if scheme == "symmetric":
-        qmax = 2 ** (precision - 1) - 1
-        qmin = -qmax
-    else:
-        qmax = 2 ** precision - 1
-        qmin = 0
-
-    def hook(module, inputs, output):
-        s = module._act_out_quant_scale.float()
-        zp = module._act_out_quant_zero_point.float()
-        xq = torch.clamp(torch.round(output / s) + zp, qmin, qmax)
-        x_fq = (xq - zp) * s
-        return x_fq.to(output.dtype)
-
-    return hook
-
-
-def _extract_aqt_scale(w: torch.Tensor) -> torch.Tensor | None:
+def extract_torchao_scale(w: torch.Tensor) -> torch.Tensor | None:
     """Extract the quantization scale from any torchao quantized weight tensor.
 
     Tries multiple attribute paths to handle old AffineQuantizedTensor (tensor_impl.scale)
@@ -421,101 +392,6 @@ def _apply_hard_quantization(module, method, precision, granularity, group_size,
                 mod._torchao_group_scale_bits = int(group_scale_bits)
         mod._torchao_act_dynamic = bool(dynamic_activation)
 
-
-def _apply_torchao_hard_quantization(module, precision, granularity: str, group_size: int = 128) -> None:
-    """Apply torchao native weight-only quantization to *module* in-place."""
-    try:
-        from torchao.quantization import (
-            quantize_,
-            Int8WeightOnlyConfig,
-            IntxWeightOnlyConfig,
-        )
-        from torchao.quantization.granularity import PerRow, PerTensor, PerAxis, PerGroup
-    except ImportError as exc:
-        raise ImportError(
-            "torchao is required for hard quantization. "
-            "Install it with: pip install torchao"
-        ) from exc
-
-    ao_granularity_row = PerRow()        # per-channel (output dim)
-    ao_granularity_tensor = PerTensor()
-    ao_granularity_axis = PerAxis(axis=0)  # used by IntxWeightOnlyConfig
-
-    per_channel = granularity == "per_channel"
-
-    if precision == "binary":
-        raise ValueError(
-            "Hard quantization does not support 'binary' precision. "
-            "Use soft quantization (hard=False) for binary."
-        )
-
-    if isinstance(precision, int) and precision > 8:
-        raise ValueError(
-            f"Hard quantization requires precision ≤ 8; got {precision}."
-        )
-
-    if granularity == "per_group":
-        # Symmetric max-abs scale per (output row, group of `group_size` inputs).
-        if not (isinstance(precision, int) and 2 <= precision <= 8):
-            raise ValueError(f"per_group hard quantization needs an int precision in [2, 8]; got {precision!r}.")
-        in_features = module.weight.shape[-1]
-        if in_features % group_size:
-            raise ValueError(f"per_group: in_features {in_features} is not divisible by group_size {group_size}.")
-        config = IntxWeightOnlyConfig(
-            weight_dtype=getattr(torch, f"int{precision}"),
-            granularity=PerGroup(group_size),
-        )
-    elif precision == 8:
-        config = Int8WeightOnlyConfig(
-            granularity=ao_granularity_row if per_channel else ao_granularity_tensor
-        )
-    elif isinstance(precision, int) and 2 <= precision <= 7:
-        # IntxWeightOnlyConfig handles any sub-byte width (1–7 bits) including int4,
-        # using a generic AffineQuantizedTensor path that does not require mslk.
-        torch_dtype = getattr(torch, f"int{precision}")
-        config = IntxWeightOnlyConfig(
-            weight_dtype=torch_dtype,
-            granularity=ao_granularity_axis,
-        )
-    else:
-        raise ValueError(f"Unsupported precision for hard quantization: {precision!r}.")
-
-    quantize_(module, config)
-
-    quantized_any = False
-    for m in module.modules():
-        if not isinstance(m, nn.Linear):
-            continue
-        w = m.weight
-        # Detect any torchao quantized weight: old AffineQuantizedTensor or new-style
-        # subclasses (e.g. IntxWeightOnly) which don't inherit from AffineQuantizedTensor.
-        if type(w) is torch.Tensor:
-            continue
-        if not isinstance(w, torch.Tensor):
-            continue
-        quantized_any = True
-        m._torchao_precision = precision
-        scale = _extract_aqt_scale(w)
-        if scale is not None:
-            m.register_buffer("_torchao_scale", scale)
-            m._torchao_per_channel = scale.numel() > 1
-            if granularity == "per_group":
-                # scale is (out_features, in_features // group_size)
-                m._torchao_group_size = int(group_size)
-
-    if not quantized_any and not isinstance(module, nn.Linear):
-        # torchao's quantize_() only dispatches to nn.Linear submodules in this
-        # version -- on anything else (Conv2dCompressed/Conv3dCompressed,
-        # EmbeddingCompressed, ...) it silently leaves the weight untouched.
-        # Fail loudly instead of returning a model that looks quantized but isn't.
-        raise NotImplementedError(
-            f"Hard (torchao) quantization is not supported for {type(module).__name__} "
-            "in this torchao version (quantize_() only targets nn.Linear and made no "
-            "change here). Use soft quantization (hard=False) instead."
-        )
-
-
-### CONFIGURATION VALIDATORS ###
 
 def validate_quantization_method(method: str) -> None:
     if method not in VALID_METHODS:

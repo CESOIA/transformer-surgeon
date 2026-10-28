@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 from transformersurgeon.export import export_to_backend
-from transformersurgeon.export.executorch_exporters.qnn import QNNExportConfig
+from transformersurgeon.export.backends.qnn import QNNExportConfig
 from transformersurgeon.export.convert import convert_for_export
 
 

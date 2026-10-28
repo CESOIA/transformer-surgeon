@@ -13,8 +13,8 @@ import pytest
 import torch
 
 import transformersurgeon as T
-from transformersurgeon.blocks.paged_attention_ops import KV_PAGE_SIZE
-from transformersurgeon.export.common import LLMWrapper, build_zero_caches
+from transformersurgeon.blocks.attention.kernels.paged import KV_PAGE_SIZE
+from transformersurgeon.export import LLMWrapper, build_zero_caches
 from transformersurgeon.export.convert import convert_for_export
 
 from _helpers import capabilities as caps
@@ -76,7 +76,7 @@ def test_paged_rejects_rope_pruned_attention():
 
 
 def test_paged_attention_requires_paged_cache():
-    from transformersurgeon.blocks.mha import MHACausal
+    from transformersurgeon.blocks.attention import MHACausal
 
     with pytest.raises(ValueError, match="io_paged"):
         MHACausal(64, 4, kv_num_heads=2, attn_impl="paged", cache_impl="io_inplace", max_cache_len=16)
@@ -85,7 +85,7 @@ def test_paged_attention_requires_paged_cache():
 @caps.requires_onnx
 def test_onnx_backend_rejects_paged_cache(tmp_path):
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.onnx import ONNXExportConfig
+    from transformersurgeon.export.backends.onnx import ONNXExportConfig
 
     cfg = ONNXExportConfig(output_path=str(tmp_path / "m.onnx"), backend="onnx",
                            convert_options={"cache_impl": "io_paged", "max_cache_len": CACHE})
@@ -100,8 +100,8 @@ def test_tensorrt_attention_plugin_matches_eager(tmp_path, remove_heads):
     import onnx
 
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.tensorrt import TensorRTExportConfig
-    from transformersurgeon.export.tensorrt.session import TensorRTLLMSession
+    from transformersurgeon.export.backends.tensorrt import TensorRTExportConfig
+    from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
 
     m = _tiny(torch.float16, head_dim=64, remove_heads=remove_heads)  # XQA: head_dim 32/64/128
     cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), backend="tensorrt", max_input_len=1,

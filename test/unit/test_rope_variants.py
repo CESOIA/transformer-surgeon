@@ -1,4 +1,4 @@
-"""RoPE variants of the converted decoder (blocks/rope.py ROPE_INV_FREQ).
+"""RoPE variants of the converted decoder (blocks/rope.py ROPE_FREQUENCIES).
 
 The indexing file names the variant (``'rope_type'``: fixed, or ``'auto'`` =
 the config's). Llama 3.x needs the ``llama3`` frequency scaling; plain RoPE
@@ -10,12 +10,12 @@ import pytest
 import torch
 
 import transformersurgeon as T
-from transformersurgeon.blocks.rope import (
+from transformersurgeon.blocks.positions.rope import (
     precompute_rope_inv_freqs_for,
     resolve_rope_type,
     rope_parameters_from_config,
 )
-from transformersurgeon.export.common import LLMWrapper
+from transformersurgeon.export import LLMWrapper
 from transformersurgeon.export.convert import convert_for_export
 
 LLAMA3_SCALING = {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,

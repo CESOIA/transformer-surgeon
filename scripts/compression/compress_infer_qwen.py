@@ -41,7 +41,7 @@ from transformers import AutoTokenizer
 from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 from transformersurgeon.export.convert import convert_for_export
-from transformersurgeon.export.common import LLMWrapper, build_zero_caches
+from transformersurgeon.export import LLMWrapper, build_zero_caches
 
 
 MODEL_NAME = "Qwen/Qwen2-0.5B-Instruct"

@@ -175,6 +175,13 @@ class Compressor(ABC):
         """
         pass
 
+    def prepare_for_save(self, module):
+        """Remove runtime state this compressor left on ``module`` that must not be serialised
+        (hooks, export-only buffers). Called by ``manager.prepare_for_save()``.
+
+        Default: no-op.
+        """
+
     @abstractmethod
     def _to_compress(self):
         """Return whether compression should actually be applied.

@@ -70,14 +70,12 @@ VIT_C_INDEXING = {
             'coupled_masks_all': [
                 ['attention.o_proj', 'mlp.fc2', 'preprocessing_conv'],
             ],
-            'per_head_uniform': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
             # Normalization layers: transparent to the embedding/hidden size,
             # never user-compressible, and only ever pruned by forwarding a
             # mask through them (see CoupledPruner.apply_chain).
             'norm_layers': ['layernorm_before', 'layernorm_after'],
         },
         'path_template': "vit.layers.{block_index}.{path}",
-        'qkv_paths': [],
         'preprocessing': "vit.embeddings",
         'preprocessing_conv': "vit.embeddings.patch_embeddings.projection",
         # cls_token/position_embeddings are concatenated/added directly to
@@ -103,16 +101,6 @@ VIT_C_INDEXING = {
             'attention': ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.out_proj'],
             'layernorm_after': 'norm_out',
             'mlp': ['mlp.up_proj', 'mlp.down_proj'],
-        },
-        'bias_required': {
-            'attn.q_proj': True,
-            'attn.k_proj': True,
-            'attn.v_proj': True,
-            'attn.out_proj': True,
-            'norm_in': False,
-            'mlp.up_proj': True,
-            'mlp.down_proj': True,
-            'norm_out': False,
         },
         'extra_layers': ["vit.layernorm"],
         'extra_layers_matching': ["norm"],

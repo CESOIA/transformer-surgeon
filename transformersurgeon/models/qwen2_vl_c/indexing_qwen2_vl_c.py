@@ -54,7 +54,6 @@ QWEN2_VL_C_INDEXING = {
             'coupled_masks_all': [
                 ['attn.proj', 'mlp.fc2', 'preprocessing_conv'],
             ],
-            'per_head_uniform': [],
             # Normalization layers: transparent to the embedding/hidden size,
             # never user-compressible, and only ever pruned by forwarding a
             # mask through them (see CoupledPruner.apply_chain).
@@ -62,8 +61,6 @@ QWEN2_VL_C_INDEXING = {
         },
         'path_template': "model.visual.blocks.{block_index}.{path}",
         'preprocessing_conv': "model.visual.patch_embed.proj",
-        'qkv_paths': ["attn.qkv"],  # Paths that represent QKV concatenated layers
-        'pruning_supported': [],
     },
     'text':
     {
@@ -115,7 +112,6 @@ QWEN2_VL_C_INDEXING = {
             'coupled_masks_all': [
                 ['self_attn.o_proj', 'mlp.down_proj', 'preprocessing'],
             ],
-            'per_head_uniform': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
             # position_linked: layers whose output rows are indexed by RoPE
             # position (q/k head slices are paired 1:1 with rotary sin/cos
             # bands). Hard structured pruning removes rows by importance score,
@@ -135,9 +131,6 @@ QWEN2_VL_C_INDEXING = {
         'position_embeddings_source': "model.language_model.rotary_emb",
         'position_embeddings_targets': ["self_attn"],
         'position_ids_ndim': 2,
-        'qkv_paths': [],  # No QKV concatenated layers in text blocks
-        'lrd_supported': ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"],
-        'pruning_supported': [],
     }
 }
 

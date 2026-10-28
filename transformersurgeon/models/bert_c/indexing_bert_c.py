@@ -57,7 +57,6 @@ BERT_C_INDEXING = {
             'coupled_masks_all': [
                 ['attention.output.dense', 'output.dense'],
             ],
-            'per_head_uniform': ['attention.self.query', 'attention.self.key', 'attention.self.value'],
             # Normalization layers: transparent to the embedding/hidden size,
             # never user-compressible, and only ever pruned by forwarding a
             # mask through them (see CoupledPruner.apply_chain).
@@ -65,7 +64,6 @@ BERT_C_INDEXING = {
         },
         'no_cascade_calibration': True,
         'path_template': "bert.encoder.layer.{block_index}.{path}",
-        'qkv_paths': [],
         'preprocessing': "bert.embeddings",
         'final_layer': "classifier",
 
@@ -82,16 +80,6 @@ BERT_C_INDEXING = {
             'intermediate': ['mlp.up_proj'],
             'output': ['mlp.down_proj'],
             'output.LayerNorm': 'norm_out',
-        },
-        'bias_required': {
-            'attn.q_proj': True,
-            'attn.k_proj': True,
-            'attn.v_proj': True,
-            'attn.out_proj': True,
-            'norm_in': False,
-            'mlp.up_proj': True,
-            'mlp.down_proj': True,
-            'norm_out': False,
         },
         'use_final_norm': False,
         'position_embedding_type': 'none',

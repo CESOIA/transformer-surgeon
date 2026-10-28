@@ -28,7 +28,7 @@ def _components(model, opts):
 def test_requires_scope_all(tmp_path):
     pytest.importorskip("executorch")
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.executorch_exporters.qnn import QNNExportConfig, is_qnn_available
+    from transformersurgeon.export.backends.qnn import QNNExportConfig, is_qnn_available
 
     if not is_qnn_available():
         pytest.skip("QNN toolchain not available")
@@ -44,8 +44,8 @@ def test_requires_scope_all(tmp_path):
 @pytest.mark.qnn
 def test_float_model_lowered_fixed_point(tmp_path):
     from transformersurgeon.export import export_to_backend
-    from transformersurgeon.export.common import LLMWrapper
-    from transformersurgeon.export.executorch_exporters.qnn import QNNExportConfig
+    from transformersurgeon.export import LLMWrapper
+    from transformersurgeon.export.backends.qnn import QNNExportConfig
 
     toks = [5, 17, 99, 3, 42, 200, 7, 64]
     opts = {"use_sdpa": False, "max_cache_len": 32, "masked_softmax": True}
