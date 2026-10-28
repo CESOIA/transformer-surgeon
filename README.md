@@ -143,22 +143,20 @@ Notes:
   (also used per-layer by `repeated_pattern`), settable via `criteria` or `group=`.
 - `granularity=<int>` prunes uniformly within each chunk (e.g. per attention head);
   `repeated_pattern=True` lets layers with different chunk counts (GQA `q_proj`/`k_proj`) share one mask.
-- MLP pruning and GQA-aware attention pruning (q/k head-dim via RoPE, v→o cascade) are both wired through convert/export; see `test/e2e/test_gqa_attention_pruning.py`.
-- See `scripts/compression/prune_qwen.py` (gradient pruning) and
-  `scripts/compression/prune_quant_export_tensorrt.py` (prune + quant → TensorRT).
+- MLP pruning and GQA-aware attention pruning (q/k head-dim via RoPE, v→o cascade) are both wired through convert/export; see `archive/tests/e2e/test_gqa_attention_pruning.py`.
+- See `scripts/compression/compress_infer_qwen.py` (compress, calibrate, convert and run a Qwen model).
 
-### Convert to export-friendly graph, then compress
+### Compress, then convert to the export-ready graph
+
+Compression is always decided on the Hugging Face model; `convert_for_export` then builds the
+simplified `blocks/` graph from the already-compressed layers (it never compresses anything itself):
 
 ```python
 from transformersurgeon import convert_for_export
-from transformersurgeon.utils import CompressionSchemesManager
 
-converted = convert_for_export(model, options={"use_sdpa": False})
-decoder = converted["text"].to(device).eval()
-
-manager = CompressionSchemesManager(decoder, decoder.indexing)
-manager.set("lrd", "rank", 256, criteria=[[0, "attn.q_proj"]])
-manager.apply(hard=False)
+manager.apply(hard=True)
+converted = convert_for_export(model, options={"cache_impl": "io_inplace", "max_cache_len": 1024})
+decoder = converted["text"].eval()   # one entry per component of the model dictionary with a `structure`
 ```
 
 ### Export to a deployment backend (ExecuTorch / TensorRT)
@@ -167,22 +165,21 @@ manager.apply(hard=False)
 
 ```python
 from transformersurgeon.export import export_to_backend
-from transformersurgeon.export.tensorrt import TensorRTExportConfig
+from transformersurgeon.export.backends import TensorRTExportConfig
 
 # Portable ONNX + manifest, and a TensorRT engine for the local GPU
 # (for a Jetson, set build_engine=False and build the engine on the device).
 config = TensorRTExportConfig(
-    output_path="out/model.onnx", backend="tensorrt", max_input_len=512,
-    convert_options={"cache_impl": "io_inplace", "max_cache_len": 1024,
-                     "rmsnorm_prescale": False, "rmsnorm_upcast": True},
+    output_path="out/model.onnx", max_input_len=512,
+    convert_options={"max_cache_len": 1024, "rmsnorm_impl": "rmsnorm_upcast"},
 )
-result = export_to_backend(model, config=config)
+result = export_to_backend(model, config)
 print(result.onnx_path, result.engine_path)
 ```
 
 Device placement is handled internally — `model` can live on CPU or CUDA; components are traced on CPU.
 
-> The ONNX path needs `pip install -e ".[onnx]"`; building/running engines also needs the `tensorrt` Python package matching your CUDA (e.g. `tensorrt-cu13`) and a CUDA device. `TensorRTLLMSession` (`export/tensorrt/session.py`) runs the engine (prefill + CUDA-graph decode). CLI: `scripts/tensorrt/export_and_generate.py`. End-to-end examples: `test/e2e/test_export_pipelines.py`; details: `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
+> The ONNX path needs `pip install -e ".[onnx]"`; building/running engines also needs the `tensorrt` Python package matching your CUDA (e.g. `tensorrt-cu13`) and a CUDA device. `TensorRTLLMSession` (`export/backends/tensorrt/session.py`) runs the engine (prefill + CUDA-graph decode). CLI: `scripts/tensorrt/export_and_generate.py`. End-to-end examples: `test/export/test_exporter.py`; details: `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
 
 ## 🎯 Filtering Layers with `criteria`
 
@@ -250,10 +247,10 @@ These groups are consumed by `CompressionSchemesManager` exactly like previous u
 
 ## 📂 References
 
-- [test/e2e/test_model_families.py](test/e2e/test_model_families.py) — manager basics, LRD/quant/pruning, convert-then-compress, all 7 families
-- [test/e2e/test_export_pipelines.py](test/e2e/test_export_pipelines.py) — HF roundtrip, XNNPACK, TensorRT, QNN export (capability-gated)
-- [test/unit/test_known_bugs.py](test/unit/test_known_bugs.py) — pinned regressions for open framework bugs
-- [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package internals and extension guide
+- [test/](test/) — one test folder per package folder (`models/`, `compression/`, `calibration/`, `blocks/`, `export/`, `hf/`), tiny random models, backend tests capability-gated
+- [archive/tests/](archive/tests/) — the pre-refactoring suite, kept as a regression reference
+- [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package layout and data flow
+- [AGENTS.md](AGENTS.md) — folder rules, file map, parameter reference, extension recipes
 
 ## License
 

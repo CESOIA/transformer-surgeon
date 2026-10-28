@@ -78,9 +78,9 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 - [x] `AGENTS.md` e `CLAUDE.md` riscritti sulla nuova struttura (regole delle cartelle, mappa file, invarianti,
       ricette); in `AGENTS.md` le sezioni tecniche dei backend e dei parametri sono state tenute, con i percorsi
       aggiornati. Rimossa la tabella "Open TODOs" (i tag `TODO(...)` non esistono più nel codice).
-- [ ] Aggiornare `README.md`, `FRAMEWORK_STRUCTURE.md`, `llms.txt`, `docs/concepts.md`
-      (es. `weight_2` → `linear_V`, percorsi `utils.manager` → `compression.manager`,
-      `utils.convert` → `export.convert`, `export_with_*` → `export_to_backend`/classi `*Exporter`).
+- [x] Aggiornati `README.md` (rimosso il flusso "converti poi comprimi" e script inesistenti), `FRAMEWORK_STRUCTURE.md`
+      (riscritto), `llms.txt`, `docs/concepts.md` (nuova sezione cartelle + dizionari, `weight_2` → `linear_V`,
+      export e ricette). `docs/index.md` e `mkdocs.yml` restano per la sezione D (sito).
 
 ## D. Sito web della documentazione (`docs/`)
 
