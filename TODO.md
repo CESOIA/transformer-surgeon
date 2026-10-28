@@ -4,8 +4,8 @@ Leggere prima [HANDOFF.md](HANDOFF.md). Ordine consigliato; spuntare man mano.
 
 ## A. Nuova suite di test — FATTA (commit "Refactor phase 6")
 
-Nuova suite `test/` verde nei tre ambienti (2026-10-28): `py312_tensorrt` 211 passati / 4 saltati,
-`py312_executorch_xnnpack` 209/6, `py310-executorch-qnn` 209/6. Vecchia suite `archive/tests`:
+Nuova suite `test/` verde nei tre ambienti (2026-10-28): `py312_tensorrt` 212 passati / 4 saltati,
+`py312_executorch_xnnpack` 210/6, `py310-executorch-qnn` 210/6. Vecchia suite `archive/tests`:
 solo i fallimenti d'ambiente attesi di HANDOFF.md §6 (nessuna regressione).
 File: `test/{utils,blocks,compression,calibration,models}/`, `test/export/{test_operations,test_convert,
 test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
@@ -98,11 +98,15 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 
 - [x] Prima stesura: `notes/refactor/REPORT.md` (termini, regole, metodo, cambiamenti per cartella, i due dizionari,
       duplicazioni, correzioni, archivio, test, verifica delle regole, limiti). Affermazioni verificate sul codice.
-- [ ] Rilettura finale per chiarezza (fare dopo il sito, aggiornando i numeri dei test se cambiano) e pagina nel sito.
+- [x] Rilettura finale: aggiunte definizioni (layer, teste di attenzione, precisione, batch/maschera/kernel,
+      gestore/schema/compressore, termini di sviluppo, legenda delle tabelle); numeri aggiornati; pagina `docs/report.md`.
 
 ## F. Chiusura
 
-- [ ] Suite completa nei tre ambienti, nessuna regressione rispetto ad HANDOFF.md §6.
-- [ ] Ripassare la richiesta originale (HANDOFF.md §1) punto per punto e confermare che ogni regola è
-      rispettata o che l'eccezione è motivata nel report.
-- [ ] `git push -u origin draft-prolucio-refactor` (chiedere conferma all'utente).
+- [x] Suite completa nei tre ambienti (2026-10-28): nuova 212/4, 210/6, 210/6; vecchia solo con i fallimenti
+      d'ambiente attesi. `mkdocs build --strict` pulito.
+- [x] Ripasso della richiesta (HANDOFF.md §1): 1 ramo ✓; 2 riepiloghi per cartella ✓ (`notes/refactor/recaps/`);
+      3 duplicazioni → una funzione ✓ (HANDOFF §8, report §6); 4 obsoleto archiviato in `archive/` ✓; 5 test per
+      oggetto in `test/` ✓, vecchi in `archive/tests/` ✓; 6 sito in `docs/` con esempi ✓; 7 report in italiano ✓.
+      Regole di architettura: rispettate, eccezioni motivate nel report §10.2.
+- [ ] `git push -u origin draft-prolucio-refactor` (**chiedere conferma all'utente**).

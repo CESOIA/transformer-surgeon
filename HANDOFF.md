@@ -157,7 +157,7 @@ Idee chiave:
   - `py312_tensorrt`: nessuno (145 passati, 18 saltati).
   Senza `--continue-on-collection-errors` la vecchia suite negli ambienti ExecuTorch si ferma
   all'errore di raccolta di `test_precision_passes` (manca `onnx`).
-  **Nuova suite**: nessun fallimento atteso in nessun ambiente (211/4, 209/6, 209/6 passati/saltati al 2026-10-28).
+  **Nuova suite**: nessun fallimento atteso in nessun ambiente (212/4, 210/6, 210/6 passati/saltati al 2026-10-28).
   Nota: nel test QNN della nuova suite si usa `soc_model="SM8850"`, `quant_scope="all"` perché con lo
   scope di default questa versione del toolchain QNN non convalida alcuni operatori float sull'HTP
   (`aten.rms_norm` non delegato); il vecchio `test_export_qnn` fallisce invece con IndexError.

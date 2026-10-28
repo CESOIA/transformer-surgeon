@@ -19,6 +19,20 @@ I termini seguenti ricorrono in tutta la relazione. Sono definiti qui una volta 
   rete *feed-forward* (due o tre trasformazioni lineari con una funzione di attivazione in mezzo, indicata nel
   codice come MLP, *multi-layer perceptron*). Esistono *decoder* (generano testo una parola alla volta e vedono
   solo il passato: Qwen2, Llama) ed *encoder* (leggono tutta la sequenza: BERT, ViT).
+- **Layer, pesi, embedding.** Un *layer* (strato) è una singola operazione della rete con i suoi parametri; i più
+  comuni sono i layer *lineari*, che moltiplicano l'ingresso per una matrice di *pesi* e aggiungono un vettore
+  detto *bias*. L'*embedding* è il primo layer: trasforma ogni parola (rappresentata da un numero intero, il
+  *token*) in un vettore. La *testa di uscita* è l'ultimo layer: trasforma il vettore finale in un punteggio per
+  ogni parola del vocabolario.
+- **Teste di attenzione.** L'attenzione calcola, per ogni posizione, tre vettori: *interrogazione* (in inglese
+  *query*), *chiave* e *valore*. Il calcolo è diviso in più *teste* indipendenti, ognuna su una porzione del
+  vettore. Nell'attenzione a gruppi di interrogazioni (*grouped-query attention*) più teste di interrogazione
+  condividono la stessa testa di chiave e valore.
+- **Precisione numerica.** I numeri reali sono rappresentati in *virgola mobile* a 32 bit (*precisione
+  singola*) o a 16 bit (*mezza precisione*, più veloce ma con un intervallo di valori molto più piccolo).
+- **Batch, maschera, kernel.** Un *batch* è un gruppo di esempi elaborati insieme. Una *maschera* è un vettore di
+  zeri e uni che indica quali elementi tenere (nella potatura) o quali posizioni ignorare (nell'attenzione). Un
+  *kernel* è l'implementazione di un'operazione per un certo hardware.
 - **Hugging Face.** Libreria di riferimento (`transformers`) da cui provengono i modelli. La libreria
   `transformer-surgeon` ne estende le classi senza cambiarne l'uso (`from_pretrained`, `generate`,
   `save_pretrained`).
@@ -49,6 +63,14 @@ I termini seguenti ricorrono in tutta la relazione. Sono definiti qui una volta 
   già elaborate, per non ricalcolarli. Questa memoria si chiama cache delle chiavi e dei valori (cache KV).
 - **Grafo di export.** Versione semplificata del modello, scritta con operazioni che i backend sanno tradurre,
   che viene *tracciata* (registrata operazione per operazione) da `torch.export`.
+- **Gestore, schema, compressore.** Il *gestore* (`CompressionSchemesManager`) è l'oggetto con cui l'utente
+  configura e applica la compressione a tutto il modello. Per ogni layer comprimibile esiste uno *schema*
+  (`CompressionScheme`) che conserva le opzioni di quel layer. Un *compressore* (ad esempio `LRDer`,
+  `Quantizer`) è l'algoritmo che comprime un singolo layer.
+- **Termini di sviluppo.** Una *docstring* è il testo di documentazione scritto all'inizio di una funzione o
+  classe Python. Un *commit* è un salvataggio registrato nella storia del codice (strumento `git`), un *ramo*
+  (*branch*) è una linea di sviluppo separata. Un *SDK* (*software development kit*) è il pacchetto di strumenti
+  di un produttore; un *plugin* è un componente aggiuntivo che estende un programma con nuove operazioni.
 - **Dizionario.** In questa relazione, una struttura dati Python (`dict`) leggibile che descrive qualcosa al
   posto di codice: un modello, un catalogo di componenti, una tabella di scelte. Il codice legge i dizionari
   invece di contenere rami del tipo "se il modello è X".
@@ -102,7 +124,7 @@ nuovi atomi in `blocks/`, quando un'operazione non esiste ancora).
    comportamento nuovo è stato confrontato con quello vecchio sugli stessi ingressi (ad esempio: stessi nodi
    selezionati, stessi campioni di calibrazione, stesse uscite numeriche).
 
-In cifre: il pacchetto passa da 124 file e 17 838 righe a 165 file e 17 056 righe. I file sono di più perché molte
+In cifre: il pacchetto passa da 124 file e 17 838 righe a 165 file e 17 073 righe. I file sono di più perché molte
 classi che convivevano in un unico file sono ora in un file ciascuna; le righe sono di meno perché le copie sono
 state eliminate.
 
@@ -276,6 +298,12 @@ dispositivo preferisce quell'implementazione.
 | norm | `layernorm` | normalizzazione di layer | modello | — |
 | rope_frequencies | `default`, `llama3` | frequenze RoPE | modello | semplici; scalate per bande (contesti lunghi) |
 
+Alcuni termini della tabella: un blocco è *pre-normalizzato* se la normalizzazione è applicata prima
+dell'attenzione e della rete feed-forward, *post-normalizzato* se dopo; un kernel *fuso* esegue in un'unica
+operazione più passaggi che altrimenti sarebbero separati; una cache *a pagine* è divisa in porzioni di
+dimensione fissa usate man mano che la sequenza cresce; la *porta moltiplicativa* è il terzo lineare della rete
+feed-forward, la cui uscita (dopo l'attivazione) moltiplica elemento per elemento quella del secondo.
+
 La normalizzazione RMS (*root mean square*) divide ogni vettore per la radice della media dei quadrati dei suoi
 elementi. In mezza precisione (numeri a 16 bit) il quadrato di valori grandi può superare il massimo
 rappresentabile: per questo esistono le varianti riscalata e in precisione singola.
@@ -298,7 +326,16 @@ al codice: un'opzione della conversione (`convert_option`), un campo della confi
 | esecuzione dei lineari | campo di configurazione | fully-connected | FullyConnected | Gemm | prodotto di matrici |
 | rete feed-forward | modello (`mlp_type`) | — | — | — | — |
 | frequenze RoPE | modello (`rope_type`) | — | — | — | — |
-| embedding, testa di uscita | implementazione unica | — | — | — | — |
+| embedding, testa di uscita | implementazione unica | unica | unica | unica | unica |
+
+Legenda dei valori: la *softmax* trasforma i punteggi dell'attenzione in pesi che sommano a uno; nella variante
+*mascherata* le posizioni escluse vengono sostituite da un valore basso invece di ricevere una penalità additiva.
+Per la quantizzazione dei lineari: `pt2e` usa il flusso PT2E (sezione 4.6); `linear` (QNN) quantizza solo i
+lineari compressi, `all` (alternativa) tutto il grafo; `qdq` inserisce nel file ONNX coppie di operazioni
+"quantizza/dequantizza"; `dequantize` (TensorRT) riconverte i pesi interi in virgola mobile prima del prodotto.
+*Fully-connected*, *FullyConnected* e *Gemm* sono i nomi che XNNPACK, QNN e ONNX danno al layer lineare. Il
+trattino indica una scelta che spetta al dizionario del modello; "unica" indica che esiste una sola
+implementazione.
 
 Esempio di voce (cache KV, solo due backend):
 
@@ -420,9 +457,9 @@ I test sono stati eseguiti in tre ambienti, ognuno con un insieme diverso di bac
 
 | Ambiente | Nuova suite | Vecchia suite (`archive/tests`) |
 |---|---|---|
-| `py312_tensorrt` (ONNX, TensorRT, scheda grafica) | 211 superati, 4 saltati | 145 superati, 18 saltati |
-| `py312_executorch_xnnpack` | 209 superati, 6 saltati | 2 fallimenti d'ambiente, 1 errore di raccolta |
-| `py310-executorch-qnn` (con l'SDK Qualcomm) | 209 superati, 6 saltati | 6 fallimenti d'ambiente, 1 errore di raccolta |
+| `py312_tensorrt` (ONNX, TensorRT, scheda grafica) | 212 superati, 4 saltati | 145 superati, 18 saltati |
+| `py312_executorch_xnnpack` | 210 superati, 6 saltati | 2 fallimenti d'ambiente, 1 errore di raccolta |
+| `py310-executorch-qnn` (con l'SDK Qualcomm) | 210 superati, 6 saltati | 6 fallimenti d'ambiente, 1 errore di raccolta |
 
 I fallimenti della vecchia suite sono **dovuti all'ambiente** ed erano presenti anche prima della
 rifattorizzazione: mancano il pacchetto `onnx` (errore di raccolta), alcuni operatori quantizzati e il kernel
@@ -449,7 +486,8 @@ compilatore Qualcomm rifiuta alcune operazioni in virgola mobile.
 ### 10.2 Eccezioni motivate
 
 - **Atomi legati a un backend in `blocks/`.** Il kernel `custom_sdpa` usa un operatore di ExecuTorch e il kernel
-  `paged` segue il contratto del plugin di TensorRT Edge-LLM. Sono ammessi perché sono atomi selezionabili: il
+  `paged` segue il contratto del plugin di attenzione di TensorRT Edge-LLM (la libreria di NVIDIA per eseguire
+  modelli linguistici su dispositivi embedded come le schede Jetson). Sono ammessi perché sono atomi selezionabili: il
   resto di `blocks/` non dipende da essi, e il dizionario di export li propone solo ai backend che li supportano.
 - **La potatura a blocchi modifica un attributo del modello Hugging Face** (il numero di teste per gruppo) per
   mantenerlo eseguibile dopo la potatura. Non viola la regola: il compressore è generico (blocchi di righe
