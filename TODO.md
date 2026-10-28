@@ -109,4 +109,4 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
       3 duplicazioni → una funzione ✓ (HANDOFF §8, report §6); 4 obsoleto archiviato in `archive/` ✓; 5 test per
       oggetto in `test/` ✓, vecchi in `archive/tests/` ✓; 6 sito in `docs/` con esempi ✓; 7 report in italiano ✓.
       Regole di architettura: rispettate, eccezioni motivate nel report §10.2.
-- [ ] `git push -u origin draft-prolucio-refactor` (**chiedere conferma all'utente**).
+- [x] `git push -u origin draft-prolucio-refactor` (approvato dall'utente, fatto il 2026-10-28). Nessuna PR aperta.

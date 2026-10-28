@@ -55,7 +55,8 @@ Commit del refactoring (dal più vecchio):
 | `0a79938`, `b527fbd`, `2746d95` | esempio 03 corretto; nuova suite parziale; HANDOFF/TODO |
 | fase 6 | nuova suite completa (`test/export/test_wrapper_manifest.py`, `test_exporter.py`, `test/hf/`), parità encoder, `pytest.ini` → `testpaths = test`, fixture `out_dir`/`torch_device` riesportate in `archive/tests/conftest.py` |
 
-Il branch **non è ancora stato pushato** dopo il refactoring (solo `draft-prolucio` è su origin).
+Il ramo è su origin (`origin/draft-prolucio-refactor`, push del 2026-10-28). Tutte le voci di TODO.md sono
+chiuse; eventuale passo successivo (da decidere con l'utente): aprire una PR verso `draft-prolucio`.
 
 ## 3. Nuova struttura del pacchetto (`transformersurgeon/`)
 
