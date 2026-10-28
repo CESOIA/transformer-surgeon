@@ -37,9 +37,11 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 - [x] Commenti che citavano modelli in `compression/`, `export/`, `blocks/` riformulati in modo generico
       (la caratteristica al posto del modello; le misure restano come "decoder da 1.5B parametri").
       Resta solo `llama::custom_sdpa` in `export/operations.py`, nome di un operatore ExecuTorch.
-- [ ] `compression/structured_pruning.py` conosce la topologia (sentinelle `preprocessing`,
-      `final_layer`, `final_norm`, `preprocessing_conv`, `_hop_block_id`): spostare la risoluzione dei
-      percorsi in un'API dello schema/manager, così il compressore riceve catene di moduli già risolte.
+- [x] Topologia fuori dai compressori: `_hop_block_id`, `_resolve_named_module`, `_resolve_target_chains`,
+      `_coupled_target_chains` spostati (senza cambi di logica) in `CompressionScheme` (`compression/scheme.py`),
+      API pubblica `scheme.coupled_target_chains()` e `scheme.resolve_in_block(name)` (usata anche da
+      `block_pruning.py`). `structured_pruning.py` e `block_pruning.py` non leggono più percorsi né sentinelle.
+
 - [x] `compression/block_pruning.py`: verificato che è già generico (blocchi di righe raggruppati in unità;
       i nomi degli attributi `owner`/`block_size_attr`/`blocks_per_unit_attr` vengono dal dizionario del
       modello). Rispetta la regola: da spiegare nel report. Corretti anche i riferimenti a file spostati

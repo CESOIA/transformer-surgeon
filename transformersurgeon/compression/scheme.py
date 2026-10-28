@@ -612,6 +612,143 @@ class CompressionScheme:
         for compressor in self.compressors.values():
             compressor.remove_mask(module)
 
+    # ------------------------------------------------------------------ topology
+    # Resolution of the model dictionary's layer names into modules. Compressors
+    # call these instead of reading paths, block indices or sentinel names.
+
+    def resolve_in_block(self, name):
+        """Module ``name`` (a per-block layer name of the dictionary) in this scheme's block."""
+        return get_submodule(self.model, self.path_template.format(block_index=self.block_id, path=name))
+
+    @staticmethod
+    def _hop_block_id(path_list, source_name, source_block_id, target_name):
+        """Resolve which block a coupled hop lives in, given its source hop.
+
+        ``output_dependence`` entries are declared per-block, at the granularity
+        of a single block's layer list (``path_list``). A dependency stays within
+        the same block if the target comes *later* in that per-block execution
+        order (e.g. self_attn.o_proj -> post_attention_layernorm, both consumed
+        within this block via the residual stream). If the target comes at the
+        same position or *earlier* (e.g. mlp.down_proj -> input_layernorm), the
+        dependency wraps around: this block's output feeds the *next* block's
+        input via the residual stream, so the coupled cascade must target
+        ``block_id + 1``.
+
+        Every output-writing layer touches every later block too (residual
+        skip connections), but ``coupled_masks_all`` already forces one shared
+        mask across all blocks' residual writers, so cascading strictly one
+        block ahead is sufficient -- that next block's own cascade continues
+        the chain from there. Generalized from a single scheme's own
+        name/block_id so it can also resolve hops *within* a chain (e.g. a
+        norm forwarding to its own output_dependence targets), not just the
+        scheme's immediate targets.
+        """
+        if not path_list or source_block_id is None:
+            return source_block_id
+        try:
+            source_pos = path_list.index(source_name)
+            target_pos = path_list.index(target_name)
+        except ValueError:
+            return source_block_id
+        return source_block_id + 1 if target_pos <= source_pos else source_block_id
+
+    def _resolve_named_module(self, name, block_id):
+        """Resolve a single ``output_dependence`` entry name to a module.
+
+        Handles the ``'final_layer'``/``'final_norm'`` singleton sentinels
+        (resolved off the scheme's pre-threaded paths, not block-indexed) and
+        ordinary ``path_list`` leaf names (block-indexed via
+        ``path_template``, dropped if out of range). Returns ``None`` if the
+        entry can't be resolved (missing sentinel path, block out of range,
+        or -- for the sentinels -- ``block_id`` isn't the last block).
+
+        The last-block gating for the sentinels applies regardless of how
+        deep in a chain they're reached: a source's own ``output_dependence``
+        entry may name ``'final_layer'``/``'final_norm'`` directly (e.g. the
+        last MLP projection of a pre-norm decoder), or a normalization hop's *own*
+        ``output_dependence`` entry may (e.g. the output norm of a post-norm
+        encoder block, resolved through the recursion in
+        ``_resolve_target_chains``) -- both must only fire once the walk has
+        reached the last block, tracked via the ``block_id`` threaded through
+        every hop by ``_hop_block_id``.
+        """
+        scheme, num_blocks = self, self.num_blocks
+        if name in ("final_layer", "final_norm"):
+            is_last_block = (
+                num_blocks is not None and block_id is not None and block_id == num_blocks - 1
+            )
+            if not is_last_block:
+                return None
+            sentinel_path = scheme.final_layer_path if name == "final_layer" else scheme.final_norm_path
+            if not sentinel_path:
+                return None
+            return get_submodule(scheme.model, sentinel_path)
+
+        if num_blocks is not None and (block_id is None or block_id >= num_blocks):
+            return None
+        full_path = scheme.path_template.format(block_index=block_id, path=name)
+        return get_submodule(scheme.model, full_path)
+
+    def _resolve_target_chains(self, name, block_id):
+        """Resolve one ``output_dependence`` entry to a list of hop chains.
+
+        A chain is ``[hop_1, ..., terminal]``: normalization-layer hops
+        (per indexing's ``pruning.norm_layers``, or the ``'final_norm'``
+        sentinel) are transparent, so resolution walks through them via
+        their *own* ``output_dependence`` entry -- which may fan out to
+        several onward targets, producing multiple chains rooted at the same
+        top-level name (e.g. ``input_layernorm`` -> q/k/v).
+        """
+        module = self._resolve_named_module(name, block_id)
+        if module is None:
+            return []
+
+        pruning_indexing = self.pruning_indexing
+        norm_layers = pruning_indexing.get("norm_layers", ())
+        if name not in norm_layers and name != "final_norm":
+            return [[module]]
+
+        onward_names = pruning_indexing.get("output_dependence", {}).get(name, [])
+        chains = []
+        for onward_name in onward_names:
+            onward_block_id = self._hop_block_id(self.path_list, name, block_id, onward_name)
+            for sub_chain in self._resolve_target_chains(onward_name, onward_block_id):
+                chains.append([module] + sub_chain)
+        return chains
+
+    def coupled_target_chains(self):
+        """Chains of modules whose input follows this layer's output (structured-pruning cascade).
+
+        Model specifics come only from the model dictionary's ``pruning``
+        section (``output_dependence``, ``norm_layers``); the compressors
+        receive the resolved chains and never see paths or sentinels.
+
+        One sentinel source gets special resolution: ``'preprocessing'`` --
+        the singleton embedding scheme itself (``scheme.block_id is None``)
+        always cascades into block 0. Every other name (including the
+        ``'final_layer'``/``'final_norm'`` sentinels, wherever they appear)
+        resolves generically through ``_resolve_target_chains``, which
+        applies the last-block gating itself (see
+        ``_resolve_named_module``).
+        """
+        scheme = self
+        dependence = self.pruning_indexing.get("output_dependence", {})
+        next_layers = dependence.get(scheme.name, [])
+        if not next_layers:
+            return []
+
+        num_blocks = self.num_blocks
+        chains = []
+        for next_layer in next_layers:
+            target_block_id = 0 if scheme.block_id is None else self._hop_block_id(
+                scheme.path_list, scheme.name, scheme.block_id, next_layer
+            )
+            if num_blocks is not None and target_block_id is not None and target_block_id >= num_blocks:
+                # No next block to cascade into (ordinary path_list target).
+                continue
+            chains.extend(self._resolve_target_chains(next_layer, target_block_id))
+        return chains
+
     def __repr__(self):
         string = f"CompressionScheme(name={self.name}, block_id={self.block_id}, path={self.path}, applied=(soft={self.soft_applied}, hard={self.hard_applied}))\n"
         for comp_name, compressor in self.compressors.items():

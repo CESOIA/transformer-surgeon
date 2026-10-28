@@ -200,5 +200,6 @@ Idee chiave:
 | ~25 funzioni `validate_*` con 5 schemi ripetuti (insieme, intervallo, positivo, intero, booleano) | fabbriche di `compression/validators.py` |
 | nomi I/O delle cache in `manifest.py` e `onnx/exporter.py::io_names` | `export/manifest.py::cache_io_name` / `graph_io_names` |
 | lettura degli attributi privati di quantizzazione in `export/quant_info.py` e `export/convert.py` | `compression/quantization.py::export_quant_info` / `copy_quant_state` |
+| risoluzione dei percorsi (sentinelle, blocco successivo) dentro `structured_pruning.py` e `block_pruning.py` | `CompressionScheme.coupled_target_chains` / `resolve_in_block` |
 | `isinstance(compressor, Quantizer)` nel manager | hook generico `Compressor.prepare_for_save` |
 | nome del componente "text" fisso nell'export | componente con `structure == "transformer_decoder"` |

@@ -90,9 +90,7 @@ class BlockPruner(Compressor):
         return spec
 
     def _resolve(self, name):
-        from ..utils import get_submodule
-        scheme = self.scheme
-        return get_submodule(scheme.model, scheme.path_template.format(block_index=scheme.block_id, path=name))
+        return self.scheme.resolve_in_block(name)
 
     def _geometry(self, module):
         spec = self._spec()
