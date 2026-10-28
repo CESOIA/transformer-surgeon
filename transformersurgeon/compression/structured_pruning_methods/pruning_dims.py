@@ -3,10 +3,10 @@ pruning_dims.py
 
 Dependency-free helpers for turning a structured-pruning ratio into an effective
 (kept) output dimension. This is the single source of truth for the
-ratio -> kept-neuron conversion, shared by the compression algorithms
-(``compression/structured_pruning_methods``) and the converted-graph blocks
-(``blocks/mlp.py``, ``blocks/mha.py``) so a pruned model and its exported graph
-agree on shapes.
+ratio -> kept-neuron conversion used by the compression algorithms
+(``compression/structured_pruning_methods``). The converted-graph blocks no
+longer recompute it: ``convert_for_export`` reads the pruned shapes from the
+source layers, so a pruned model and its exported graph agree on shapes.
 
 Lives in ``blocks`` (the lowest layer) because ``compression`` already imports
 ``blocks``; keeping the helper here avoids a blocks -> compression import cycle.

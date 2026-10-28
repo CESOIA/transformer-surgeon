@@ -421,9 +421,9 @@ class StructuredPruner(Compressor):
                 # full-length keep mask around under its own name, in both
                 # soft and hard mode. Unlike weight_mask -- which _hard_remove
                 # drops once it no longer matches the resized weight -- this
-                # buffer is never removed, so blocks/mha.py can look it up
+                # buffer is never removed, so blocks/attention/base.py can look it up
                 # after hard pruning to build the RoPE cos/sin projection
-                # (see build_rope_prune_projection in blocks/rope.py).
+                # (see build_rope_prune_projection in blocks/positions/rope_pruning.py).
                 module.register_buffer("rope_prune_mask", mask.clone())
             with torch.no_grad():
                 dtype = module.weight.dtype

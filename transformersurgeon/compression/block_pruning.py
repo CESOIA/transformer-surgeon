@@ -30,7 +30,7 @@ Soft apply zeroes the removed heads' input columns of the dependent layers
 uniform average, not zero). Hard apply removes the query rows and the
 dependent columns and records ``block_prune_mask`` (kept blocks) on the pruned
 layer; ``convert_for_export`` reads the kept head count from the pruned shapes
-(``blocks/mha.py::MHABase.finalize_head_pruning``).
+(``blocks/attention/base.py::MHABase.finalize_head_pruning``).
 """
 from __future__ import annotations
 

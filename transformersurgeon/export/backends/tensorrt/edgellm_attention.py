@@ -10,7 +10,7 @@ pool in place and runs the XQA decode kernel (NVRTC-compiled for the build GPU
 and serialized into the engine) over the ``context_lengths`` filled slots only.
 
 A model converted with ``cache_impl="io_paged"`` carries one
-``tsurgeon::paged_attention`` op per layer (``blocks/paged_attention_ops.py``,
+``tsurgeon::paged_attention`` op per layer (``blocks/attention/kernels/paged.py``,
 whose eager implementation follows the plugin's contract); this module maps it
 to the plugin node. Only single-token decode is supported (XQA): prefill runs
 token by token (max_input_len = 1). The engine needs

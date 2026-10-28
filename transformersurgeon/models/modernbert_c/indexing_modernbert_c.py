@@ -22,7 +22,7 @@ MODERNBERT_C_INDEXING = {
         # additionally replaces `attn_norm` with `nn.Identity()` (pre-norm
         # architecture, no norm before the first attention), which is harmless
         # here since only `nn.Linear` leaves are ever swapped for
-        # `LinearCompressed` (see `utils/modeling.py::replace_layers_upon_init`).
+        # `LinearCompressed` (see `compression/compressible_layers.py::replace_layers_upon_init`).
         'path_list': {
             'attn_norm': [],
             'attn': ['Wqkv', 'Wo'],
@@ -48,7 +48,7 @@ MODERNBERT_C_INDEXING = {
         # Alternating global/local attention layers each need their own rotary
         # embedding call keyed by layer type
         # (`rotary_emb(hidden_states, position_ids, layer_type)`), which the
-        # single block-wise cascade calibration flow in `utils/cascade.py`
+        # single block-wise cascade calibration flow in `compression/cascade.py`
         # (`_attach_position_embeddings_if_configured`) does not model -- it
         # calls the configured rotary module the same way for every block.
         # Cascade calibration is therefore unsupported here, same as bert_c

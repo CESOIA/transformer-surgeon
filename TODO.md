@@ -40,8 +40,10 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 - [ ] `compression/structured_pruning.py` conosce la topologia (sentinelle `preprocessing`,
       `final_layer`, `final_norm`, `preprocessing_conv`, `_hop_block_id`): spostare la risoluzione dei
       percorsi in un'API dello schema/manager, così il compressore riceve catene di moduli già risolte.
-- [ ] `compression/block_pruning.py` è specifico per le teste di attenzione e modifica un attributo
-      del modello HF (`owner.<blocks_per_unit_attr>`): documentare o generalizzare.
+- [x] `compression/block_pruning.py`: verificato che è già generico (blocchi di righe raggruppati in unità;
+      i nomi degli attributi `owner`/`block_size_attr`/`blocks_per_unit_attr` vengono dal dizionario del
+      modello). Rispetta la regola: da spiegare nel report. Corretti anche i riferimenti a file spostati
+      nelle docstring (`blocks/mha.py`, `blocks/rope.py`, `utils/cascade.py`, `utils/modeling.py`, ...).
 - [x] Contratto compressione→export: gli attributi privati (`_torchao_*`, `_act_quant_*`, ...) ora sono
       letti solo in `compression/quantization.py`, tramite le funzioni pubbliche `export_quant_info(module)`
       (descrittore usato da `export/quant_info.py`) e `copy_quant_state(old, new)` (usata da `export/convert.py`).
