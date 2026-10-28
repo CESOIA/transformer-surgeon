@@ -595,8 +595,10 @@ class CompressionSchemesManager:
             offload_to_cpu: If True, accumulate calibration tensors on CPU.
             verbose: If True, print progress.
             show_progress: If True, show calibration batch progress.
-            Note: For backward-based calibration summaries, set a loss callback
-                  first with set_calibration_loss(...).
+
+        Note:
+            For backward-based calibration summaries, set a loss callback
+            first with set_calibration_loss(...).
         
         Returns:
             Number of schemes calibrated.
@@ -718,8 +720,10 @@ class CompressionSchemesManager:
             device: Device where calibration batches should be moved before forward.
             offload_to_cpu: If True, calibration tensors are accumulated on CPU.
             show_progress: If True, show calibration batch progress.
-            Note: If selected compressors require backward-based calibration,
-                  set both calibration data and calibration loss first.
+
+        Note:
+            If selected compressors require backward-based calibration,
+            set both calibration data and calibration loss first.
         """
         self._validate_grouping(criteria=criteria)
         self._validate_coupling(hard=hard, criteria=criteria)

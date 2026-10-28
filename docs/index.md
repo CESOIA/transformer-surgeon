@@ -13,35 +13,23 @@ reversible by default.
 ```bash
 git clone https://github.com/CESOIA/transformer-surgeon.git
 cd transformer-surgeon
-pip install -e ".[test]"   # add [test] to also get pytest for running the test suite
+pip install -e ".[dev]"    # library + test dependencies
+pip install mkdocs mkdocs-material "mkdocstrings[python]"   # to build this site: mkdocs serve
 ```
 
 ---
 
 ## What's Included
 
-**Compression methods**
+**One pipeline, compression → export**, for many transformer families and four device backends.
 
-- `lrd` — low-rank decomposition (SVD, calibration-aware SVD-LLM-v2, AA-SVD)
-- `structured_pruning` — output neuron removal (magnitude/gradient/random) with per-head `granularity`, shared masks across coupled layers (`auto_groups`), and hard removal that cascades into the next layer's inputs
-- `unstructured_pruning` — weight-level sparsity masks
-- `quantization` — fixed-point and binary weights
-
-**Core abstractions**
-
-- `CompressionScheme` — per-layer compression config and application
-- `CompressionSchemesManager` — model-level orchestration with flexible layer filtering
-
-**Compression-ready building blocks**
-
-- `LinearCompressed` — drop-in `nn.Linear` replacement with built-in LRD support
-- `VCONBlock` — smooth transition between original and compressed modules during fine-tuning
-
-**Export**
-
-- `convert_for_export` — rewrite model to compact custom decoder/encoder graphs
-- `export_to_hf` — push compressed model to HuggingFace Hub
-- `export_to_backend` — export to ExecuTorch (`xnnpack`, `qnn`) or `tensorrt` under `transformersurgeon.export`, with mixed-precision export driven by per-layer compression metadata
+| Step | Folder | What it offers |
+|---|---|---|
+| Describe the model | [`models/`](folders/models.md) | one folder per family: a model dictionary and a family dictionary |
+| Compress | [`compression/`](folders/compression.md) | low-rank decomposition (SVD, SVD-LLM-v2, AA-SVD), structured / block / unstructured pruning, quantization, SmoothQuant; reversible (`hard=False`) or permanent |
+| Calibrate | [`calibration/`](folders/calibration.md) | covariance, activation ranges, gradients; standard or block-by-block (cascade) |
+| Build the export graph | [`blocks/`](folders/blocks.md) | a simplified transformer made of selectable atoms, listed in `BLOCK_CATALOG` |
+| Export | [`export/`](folders/export.md) | `export_to_backend` for XNNPACK, QNN, ONNX, TensorRT; choices per backend in `BACKEND_OPERATIONS`; `export_to_hf` for Hugging Face |
 
 ---
 
@@ -86,7 +74,10 @@ manager.restore()  # undo all compression, back to original weights
 
 ## Where to Go Next
 
-- [**Concepts**](concepts.md) — understand the mental model before diving into the API
-- [**Compression Methods**](compression_methods.md) — every compression type, method, and parameter, explained
+- [**Concepts**](concepts.md) — the folders, the two dictionaries and the three-layer compression model
+- [**Pipeline**](pipeline.md) — the compression → export flow, step by step
+- [**Folders**](folders/models.md) — one page per package folder, with the dictionaries' tables
+- [**How to add…**](recipes.md) — a model family, a method, a statistic, an atom, a backend
+- [**Compression Methods**](compression_methods.md) — every compression type, method and parameter
 - [**Examples**](examples/01_basic_lrd.md) — runnable scripts for common workflows
-- [**API Reference**](api/utils/manager.md) — full method-level documentation
+- [**API Reference**](api/compression.md) — generated from the docstrings

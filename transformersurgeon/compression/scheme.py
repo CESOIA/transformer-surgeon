@@ -24,16 +24,28 @@ from ..utils import get_submodule
 
 class CompressionScheme:
     """
-    Represents a compression scheme for a transformer block.
+    Compression of one layer of the model: its compressors, their options, its
+    calibration data and its place in the model (topology).
+
+    Built by ``CompressionSchemesManager`` from the model dictionary; never
+    instantiated directly.
 
     Args:
-        name (str): Name of the layer inside the block.
-        block_id (int): Block identifier.
-        path (str): Path to the block in the model.
-        pruning_ratio (float): Ratio for structured pruning.
-        pruning_mode (str): Mode for pruning ('structured' or 'unstructured').
-        lrd_rank (Union[int, str]): Rank for low-rank decomposition. Use "full" for no decomposition.
+        name (str): Name of the layer inside the block (e.g. ``"mlp.up_proj"``).
+        block_id (int): Block index, or None for layers outside the blocks.
+        path (str): Full dotted path of the layer in the model.
+        compression_config (dict, optional): Per-compression options of the layer.
         model (torch.nn.Module, optional): Reference to the model.
+        pruning_indexing (dict, optional): The ``pruning`` section of the model dictionary.
+        path_template (str, optional): Format string of a block layer's path.
+        path_list (list, optional): Flattened per-block layer order.
+        num_blocks (int, optional): Number of blocks.
+        preprocessing_path (str, optional): Resolved path of the embedding (sentinel ``'preprocessing'``).
+        final_layer_path (str, optional): Resolved path of the output head (sentinel ``'final_layer'``).
+        final_norm_path (str, optional): Resolved path of the final norm (sentinel ``'final_norm'``).
+        preprocessing_conv_extra_params_paths (list, optional): Raw parameters pruned
+            together with the patch-embedding convolution.
+        is_norm (bool): Whether the layer is a normalisation layer.
 
     Attributes:
         hard_applied (bool): Flags if compression is non-reversible.

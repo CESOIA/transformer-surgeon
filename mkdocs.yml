@@ -20,8 +20,11 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
+          paths: ["."]
           options:
             docstring_style: google
+            docstring_options:
+              warn_missing_types: false
             show_source: true
             show_root_heading: true
             show_if_no_docstring: false
@@ -30,44 +33,43 @@ plugins:
 nav:
   - Home: index.md
   - Concepts: concepts.md
+  - Pipeline: pipeline.md
+  - Folders:
+    - utils: folders/utils.md
+    - models: folders/models.md
+    - compression: folders/compression.md
+    - calibration: folders/calibration.md
+    - blocks: folders/blocks.md
+    - export: folders/export.md
+  - How to add…: recipes.md
   - Compression Methods: compression_methods.md
   - Examples:
     - Basic LRD: examples/01_basic_lrd.md
     - Calibrated LRD (SVD-LLM-v2): examples/02_calibrated_lrd_svd_llm_v2.md
     - HF Export Roundtrip: examples/03_hf_export_roundtrip.md
+    - KV-cache interfaces: examples/04_cache_impl_export_interface.md
   - API Reference:
-    - Compression:
-      - Compressor (ABC): api/compression/abstract.md
-      - LRDer: api/compression/lrd.md
-      - StructuredPruner: api/compression/structured_pruning.md
-      - UnstructuredPruner: api/compression/unstructured_pruning.md
-      - Quantizer: api/compression/quantization.md
-      - Registry: api/compression/registry.md
-    - Calibration:
-      - RawDataCollector (ABC): api/calibration/raw_data_base.md
-      - ActivationCollector: api/calibration/activation.md
-      - CalibrationSummary (ABC): api/calibration/summaries_base.md
-      - Covariance Summaries: api/calibration/covariance.md
-    - Manager:
-      - CompressionSchemesManager: api/utils/manager.md
-      - CompressionScheme: api/utils/scheme.md
-    - Blocks:
-      - LinearCompressed: api/blocks/linear_compressed.md
-      - VCONBlock: api/blocks/vcon_block.md
-    - Export:
-      - export_to_backend: api/export/export.md
-      - BackendExportConfig: api/export/config.md
-      - Registry: api/export/registry.md
-      - Common (shared machinery): api/export/common.md
-      - XNNPACK: api/export/xnnpack.md
-      - QNN: api/export/qnn.md
-      - ONNX: api/export/onnx.md
-      - TensorRT: api/export/tensorrt.md
+    - utils: api/utils.md
+    - models: api/models.md
+    - compression: api/compression.md
+    - calibration: api/calibration.md
+    - blocks: api/blocks.md
+    - export: api/export.md
+    - hf: api/hf.md
+  - Refactoring report: report.md
+
+not_in_nav: |
+  investigations/*
+  generated/*
 
 markdown_extensions:
   - admonition
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.superfences
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - tables
   - toc:
       permalink: true

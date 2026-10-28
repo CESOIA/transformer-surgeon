@@ -144,6 +144,11 @@ Idee chiave:
   conda run -n py312_tensorrt python -m pytest archive/tests -q -p no:cacheprovider --continue-on-collection-errors # vecchia suite
   conda run -n py312_tensorrt python -m pyflakes transformersurgeon                  # nomi non definiti
   ```
+- Sito della documentazione (solo `py312_tensorrt`):
+  ```bash
+  conda run -n py312_tensorrt env NO_MKDOCS_2_WARNING=1 python -m mkdocs build --strict -d <scratchpad>/site
+  conda run -n py312_tensorrt env PYTHONPATH=$PWD python docs/gen_tables.py   # dopo aver cambiato i due dizionari
+  ```
 - **Fallimenti attesi d'ambiente** (presenti già prima del refactoring, nella vecchia suite):
   - `py310-executorch-qnn`: `test_precision_passes` (manca `onnx`), `test_known_bugs::test_qnn_unavailable…`
     (l'SDK QNN è presente), 2 test `custom_sdpa` (operatori ExecuTorch mancanti),

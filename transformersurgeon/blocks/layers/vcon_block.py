@@ -10,8 +10,8 @@ class VCONBlock(nn.Module):
     When beta=1, the output is from the original module (block_a); when beta=0, the output is from the compressed module (block_b).
 
     Args:
-        original_module (nn.Module): The original (uncompressed) module.
-        compressed_module (nn.Module): The compressed module.
+        block_a (nn.Module): The original (uncompressed) module.
+        block_b (nn.Module): The compressed module.
 
     Methods:
         forward: Computes the affine combination of original and compressed outputs.

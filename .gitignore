@@ -253,4 +253,4 @@ experiments/
 transformers/
 
 # LLMS agent instructions
-!llms.txt
+!llms.txtsite/

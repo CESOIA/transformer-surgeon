@@ -106,8 +106,9 @@ class MHACausal(MHABase):
             x: ``(q_len, embed_dim)``, or ``(1, q_len, embed_dim)`` with ``add_batch_dim``.
             pos_id: ``(1,)`` position of the first new token.
             attn_mask: additive causal mask built once per step by the decoder.
-            key_cache/value_cache: incoming caches for graph-I/O caches; the internal
-                buffers are used when omitted. For pages, ``key_cache`` is the pool.
+            key_cache: incoming key cache for graph-I/O caches (the internal buffer
+                is used when omitted). For pages, the pool.
+            value_cache: incoming value cache, as ``key_cache`` (unused for pages).
             rope: ``(cos, sin)`` already indexed at the new positions.
             paged: per-step inputs of the paged kernel (see ``kernels/paged.py``).
         """

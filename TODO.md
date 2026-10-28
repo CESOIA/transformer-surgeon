@@ -82,17 +82,17 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
       (riscritto), `llms.txt`, `docs/concepts.md` (nuova sezione cartelle + dizionari, `weight_2` → `linear_V`,
       export e ricette). `docs/index.md` e `mkdocs.yml` restano per la sezione D (sito).
 
-## D. Sito web della documentazione (`docs/`)
+## D. Sito web della documentazione (`docs/`) — FATTO
 
-- [ ] `mkdocs`/`mkdocs-material`/`mkdocstrings` non sono installati in nessun ambiente:
-      installarli in `py312_tensorrt` (chiedere conferma all'utente) oppure generare HTML statico.
-- [ ] Pagine: introduzione e concetti; pipeline compressione → export; una pagina per cartella
-      (`utils`, `blocks` con tabella di `BLOCK_CATALOG`, `compression`, `calibration`, `models`
-      con lo schema del dizionario del modello e del dizionario di famiglia, `export` con la
-      tabella di `BACKEND_OPERATIONS`); ricette "come aggiungere…"; esempi d'uso (01–04);
-      riferimento API (mkdocstrings). Aggiornare `mkdocs.yml` (nav, `docs/api/*` con i nuovi percorsi).
-- [ ] Le tabelle dei due dizionari conviene generarle da codice (script in `docs/`), così restano allineate.
-- [ ] `docs/investigations/` resta come storico.
+- [x] `mkdocs`, `mkdocs-material`, `mkdocstrings[python]` installati in `py312_tensorrt` (approvato dall'utente).
+- [x] Pagine: Home, Concetti, Pipeline, una pagina per cartella (`docs/folders/`), "How to add…" (`recipes.md`),
+      Compression Methods, esempi 01–04 (sorgente incluso dal file con `pymdownx.snippets`), API per cartella
+      (`docs/api/<cartella>.md`, mkdocstrings), report (incluso da `notes/refactor/REPORT.md`).
+      `docs/investigations/` resta come storico (fuori dal menu).
+- [x] Tabelle di `BLOCK_CATALOG` e `BACKEND_OPERATIONS` generate da `docs/gen_tables.py` in `docs/generated/`;
+      `test/docs/test_generated_tables.py` fallisce se non sono aggiornate (rigenerare con
+      `PYTHONPATH=$PWD python docs/gen_tables.py`).
+- [x] `mkdocs build --strict` pulito (corrette 6 docstring obsolete segnalate da griffe).
 
 ## E. Report finale (in italiano)
 
