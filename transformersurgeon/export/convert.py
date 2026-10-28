@@ -22,7 +22,7 @@ import torch.nn as nn
 
 from ..blocks import build_block, resolve_atom
 from ..blocks.stacks.config import rmsnorm_impl_from_flags
-from ..compression.quantization import QUANT_RUNTIME_ATTRS, QUANT_RUNTIME_BUFFERS, extract_torchao_scale
+from ..compression.quantization import QUANT_RUNTIME_BUFFERS, copy_quant_state
 from ..utils import flatten_index_paths, get_block_config, get_parent_module, get_submodule, replace_parameter
 
 # Export implementation options understood by the converted stacks, with defaults.
@@ -68,8 +68,8 @@ def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> 
     Handles dynamic quantization buffers (_act_quant_scale, _act_quant_zero_point,
     _torchao_scale) that Quantizer.apply() registers on submodules: these appear in
     old_layer's state_dict but not in a freshly-created new_layer, so they are
-    pre-registered before load_state_dict is called. Non-tensor quant attributes
-    (_torchao_precision, _act_quant_precision, etc.) are copied explicitly afterwards.
+    pre-registered before load_state_dict is called. The rest of the quantisation
+    state is copied afterwards by ``compression.quantization.copy_quant_state``.
     """
     # Build a plain (float/int) state dict. Use duck-typing: any torch.Tensor subclass
     # with .dequantize() is treated as quantized (handles both old AffineQuantizedTensor
@@ -135,26 +135,7 @@ def _load_state_dict_dequantized(old_layer: nn.Module, new_layer: nn.Module) -> 
             if hasattr(old_submod, dim_attr):
                 setattr(new_submod, dim_attr, getattr(old_submod, dim_attr))
 
-        for attr in QUANT_RUNTIME_ATTRS:
-            if hasattr(old_submod, attr):
-                setattr(new_submod, attr, getattr(old_submod, attr))
-
-        # Fallback: if the weight is still a live quantized tensor and the scale was
-        # not already stashed into the state dict, extract and register it now.
-        w_old = old_submod.weight
-        if (
-            "_torchao_scale" not in new_submod._buffers
-            and isinstance(w_old, torch.Tensor)
-            and type(w_old) is not torch.Tensor
-        ):
-            scale = extract_torchao_scale(w_old)
-            if scale is not None:
-                new_submod.register_buffer("_torchao_scale", scale)
-
-        # Derive _torchao_per_channel from the scale buffer (authoritative source).
-        if "_torchao_scale" in new_submod._buffers:
-            new_submod._torchao_per_channel = (
-                new_submod._torchao_scale.numel() > 1 and not hasattr(new_submod, "_torchao_group_size"))
+        copy_quant_state(old_submod, new_submod)
 
 
 def _flatten_layer_matching(indexing, source_paths):

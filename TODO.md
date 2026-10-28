@@ -4,8 +4,8 @@ Leggere prima [HANDOFF.md](HANDOFF.md). Ordine consigliato; spuntare man mano.
 
 ## A. Nuova suite di test — FATTA (commit "Refactor phase 6")
 
-Nuova suite `test/` verde nei tre ambienti (2026-10-28): `py312_tensorrt` 210 passati / 4 saltati,
-`py312_executorch_xnnpack` 208/6, `py310-executorch-qnn` 208/6. Vecchia suite `archive/tests`:
+Nuova suite `test/` verde nei tre ambienti (2026-10-28): `py312_tensorrt` 211 passati / 4 saltati,
+`py312_executorch_xnnpack` 209/6, `py310-executorch-qnn` 209/6. Vecchia suite `archive/tests`:
 solo i fallimenti d'ambiente attesi di HANDOFF.md §6 (nessuna regressione).
 File: `test/{utils,blocks,compression,calibration,models}/`, `test/export/{test_operations,test_convert,
 test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
@@ -42,9 +42,10 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
       percorsi in un'API dello schema/manager, così il compressore riceve catene di moduli già risolte.
 - [ ] `compression/block_pruning.py` è specifico per le teste di attenzione e modifica un attributo
       del modello HF (`owner.<blocks_per_unit_attr>`): documentare o generalizzare.
-- [ ] Contratto compressione→export tramite attributi privati (`_torchao_*`, `_act_quant_*`,
-      `_soft_quant_precision`) letti da `export/quant_info.py`: introdurre un descrittore pubblico
-      (es. `Quantizer.export_info(module)`).
+- [x] Contratto compressione→export: gli attributi privati (`_torchao_*`, `_act_quant_*`, ...) ora sono
+      letti solo in `compression/quantization.py`, tramite le funzioni pubbliche `export_quant_info(module)`
+      (descrittore usato da `export/quant_info.py`) e `copy_quant_state(old, new)` (usata da `export/convert.py`).
+      Codice spostato senza cambi di logica.
 - [x] Export QNN: l'attenzione si riconosce dal marcatore `EXPORT_ROLE` sugli atomi (`MHACausal` =
       "attention", `TransformerDecoder` = "decoder_stack"), letto da `qnn/passes.py::_export_role`;
       verificato: stessi nodi del vecchio confronto per nome (mutable, io_inplace, sdpa).

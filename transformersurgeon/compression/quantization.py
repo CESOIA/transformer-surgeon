@@ -1,3 +1,6 @@
+import warnings
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -21,8 +24,9 @@ CALIBRATED_METHOD_DICT = {
 
 
 
-# Runtime state that Quantizer.apply() leaves on a quantized layer. Exporters and
-# the converter read it (export/convert.py, export/common.py); strip_runtime_state
+# Runtime state that Quantizer.apply() leaves on a quantized layer. Outside this
+# module it is read only through export_quant_info / copy_quant_state (the
+# converter also carries the buffers in the state dict); strip_runtime_state
 # removes it before saving.
 QUANT_RUNTIME_BUFFERS = (
     "_act_quant_scale", "_act_quant_zero_point",
@@ -309,6 +313,170 @@ def _make_fake_quant_hook(prefix: str, precision: int, scheme: str, output: bool
     return lambda module, inputs: (fake_quant(module, inputs[0]),) + inputs[1:]
 
 
+### EXPORT CONTRACT ###
+# The only readers of the runtime state above outside this module go through
+# these two functions (export/convert.py and export/quant_info.py).
+
+def export_quant_info(module: nn.Linear) -> dict | None:
+    """Backend-independent description of the quantisation decided for one linear layer.
+
+    Returns None for an unquantised layer, otherwise a dict with ``scale``
+    (per-channel/per-group weight scale; None for soft quantisation),
+    ``precision``, ``hard``, ``per_channel``, ``group_size``,
+    ``group_scale_bits``, ``act_dynamic`` and the ``act_*`` / ``act_out_*``
+    activation keys (``act_scale``/``act_out_scale`` None when not calibrated).
+
+    Side effects: a hard-quantised weight is dequantised in place (so
+    ``torch.export`` sees a plain float tensor) and the activation fake-quant
+    hooks are removed (the backend quantiser takes over).
+    """
+    try:
+        from torchao.dtypes import AffineQuantizedTensor
+    except ImportError:
+        AffineQuantizedTensor = None
+    info = _extract_weight_quant_info(module, AffineQuantizedTensor)
+    if info is not None:
+        _extract_act_quant_info(module, info)
+    return info
+
+
+def copy_quant_state(old: nn.Module, new: nn.Module) -> None:
+    """Copy the quantisation state of linear layer ``old`` onto its converted copy ``new``.
+
+    Tensor state (``QUANT_RUNTIME_BUFFERS``) travels with the state dict; this
+    copies the plain attributes and, if ``old`` still holds a live torchao
+    weight, stashes its scale on ``new``.
+    """
+    for attr in QUANT_RUNTIME_ATTRS:
+        if hasattr(old, attr):
+            setattr(new, attr, getattr(old, attr))
+
+    # Fallback: if the weight is still a live quantized tensor and the scale was
+    # not already stashed into the state dict, extract and register it now.
+    w_old = old.weight
+    if "_torchao_scale" not in new._buffers and isinstance(w_old, torch.Tensor) and type(w_old) is not torch.Tensor:
+        scale = extract_torchao_scale(w_old)
+        if scale is not None:
+            new.register_buffer("_torchao_scale", scale)
+
+    # Derive _torchao_per_channel from the scale buffer (authoritative source).
+    if "_torchao_scale" in new._buffers:
+        new._torchao_per_channel = new._torchao_scale.numel() > 1 and not hasattr(new, "_torchao_group_size")
+
+
+def _extract_weight_quant_info(
+    module: nn.Linear,
+    AffineQuantizedTensor: type | None,
+) -> dict[str, Any] | None:
+    """Return weight quantization info for one linear layer, or None if unquantised."""
+
+    has_torchao_tag = hasattr(module, '_torchao_precision')
+    is_live_aqt = (
+        AffineQuantizedTensor is not None
+        and isinstance(module.weight, AffineQuantizedTensor)
+    )
+    has_stashed_scale = hasattr(module, '_torchao_scale')
+
+    if has_torchao_tag and (is_live_aqt or has_stashed_scale):
+        # Hard-quantised layer.
+        #
+        # LRD factors are quantized separately (quantization runs after LRD):
+        # this module's own weight is the U factor [out, rank] and its stashed
+        # scale has one row per output row; linear_V is visited as its own
+        # nn.Linear. A stash whose rows do not match the weight belongs to a
+        # pre-LRD weight -- refuse instead of exporting the layer float.
+        w_rows = module.weight.shape[0]
+        if has_stashed_scale and module._torchao_scale.dim() == 2 and module._torchao_scale.shape[0] not in (1, w_rows):
+            raise RuntimeError(
+                f"{module}: stashed quantization scale {tuple(module._torchao_scale.shape)} does not match "
+                f"weight {tuple(module.weight.shape)} (quantized before LRD?).")
+
+        if has_stashed_scale and not is_live_aqt:
+            w = module.weight
+            if hasattr(w, "dequantize") and type(w) is not torch.Tensor and type(w) is not nn.Parameter:
+                module.weight = nn.Parameter(w.dequantize(), requires_grad=False)
+            elif isinstance(w, nn.Parameter) and hasattr(w.data, "dequantize") and type(w.data) is not torch.Tensor:
+                module.weight = nn.Parameter(w.data.dequantize(), requires_grad=False)
+
+        if is_live_aqt:
+            # Weight is still a torchao AffineQuantizedTensor (direct model pass).
+            # Dequantise in-place so torch.export sees a clean float parameter.
+            w = module.weight
+            scale       = w.tensor_impl.scale.detach().clone()
+            per_channel = scale.numel() > 1
+            module.weight = nn.Parameter(w.dequantize(), requires_grad=False)
+        else:
+            # Weight was dequantised earlier by _load_state_dict_dequantized
+            # (convert_for_export path); scale was stashed as _torchao_scale.
+            scale       = module._torchao_scale.detach().clone()
+            per_channel = getattr(module, '_torchao_per_channel', scale.numel() > 1)
+
+        group_size = getattr(module, '_torchao_group_size', None)
+        return {
+            "scale":       scale,
+            "precision":   module._torchao_precision,
+            "hard":        True,
+            "per_channel": per_channel and group_size is None,
+            # per-group: scale is (out_features, in_features // group_size)
+            "group_size":  group_size,
+            # LPBQ-style group scales (channel scale x integer in [1, 2**bits]), or None
+            "group_scale_bits": getattr(module, '_torchao_group_scale_bits', None),
+            # int8 asymmetric per-token dynamic activations (XNNPACK 8daXw)
+            "act_dynamic": bool(getattr(module, '_torchao_act_dynamic', False)),
+        }
+
+    if hasattr(module, '_soft_quant_precision'):
+        # Soft-quantised layer: weight is already fake-quantised float.
+        # Scales must be re-derived from a calibration pass.
+        warnings.warn(
+            f"Layer '{module}' was soft-quantized; re-deriving scale via calibration pass.",
+            stacklevel=3,
+        )
+        return {
+            "scale":       None,
+            "precision":   module._soft_quant_precision,
+            "hard":        False,
+            "per_channel": True,  # soft-quant always uses per-channel observers
+            "group_size":  None,
+            "act_dynamic": False,
+        }
+
+    return None  # unquantised — skip
+
+
+def _extract_act_quant_info(module: nn.Linear, info: dict) -> None:
+    """Populate activation quantization keys in *info* and remove the fake-quant hooks.
+
+    Extracts both input-side and output-side activation calibration.  If a side
+    has no stored calibration its *_scale key is set to None.
+    """
+    # Input activation (pre-linear).
+    if hasattr(module, '_act_quant_scale'):
+        info["act_scale"]      = module._act_quant_scale.detach().clone()
+        info["act_zero_point"] = module._act_quant_zero_point.detach().clone()
+        info["act_precision"]  = module._act_quant_precision
+        info["act_scheme"]     = module._act_quant_scheme
+        # PT2E inserts its own activation observers; the fake-quant hook is no longer needed.
+        if hasattr(module, '_act_quant_hook_handle'):
+            module._act_quant_hook_handle.remove()
+            del module._act_quant_hook_handle
+    else:
+        info["act_scale"] = None
+
+    # Output activation (post-linear).
+    if hasattr(module, '_act_out_quant_scale'):
+        info["act_out_scale"]      = module._act_out_quant_scale.detach().clone()
+        info["act_out_zero_point"] = module._act_out_quant_zero_point.detach().clone()
+        info["act_out_precision"]  = module._act_out_quant_precision
+        info["act_out_scheme"]     = module._act_out_quant_scheme
+        if hasattr(module, '_act_out_quant_hook_handle'):
+            module._act_out_quant_hook_handle.remove()
+            del module._act_out_quant_hook_handle
+    else:
+        info["act_out_scale"] = None
+
+
+
 def extract_torchao_scale(w: torch.Tensor) -> torch.Tensor | None:
     """Extract the quantization scale from any torchao quantized weight tensor.
 
@@ -406,6 +574,8 @@ validate_activation_scheme = one_of("Activation scheme", VALID_ACTIVATION_SCHEME
 
 __all__ = [
     "Quantizer",
+    "export_quant_info",
+    "copy_quant_state",
     "validate_quantization_method",
     "validate_activation_method",
     "validate_precision",
