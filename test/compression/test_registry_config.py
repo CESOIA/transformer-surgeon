@@ -80,3 +80,31 @@ def test_replace_layers_upon_init_swaps_listed_linears():
     replace_layers_upon_init(model, indexing, Cfg())
     assert isinstance(model.blocks[1].q, LinearCompressed) and model.blocks[1].q.rank == 2
     assert type(model.blocks[1].other) is torch.nn.Linear
+
+
+@pytest.mark.parametrize("make, good, bad", [
+    (lambda v: v.one_of("x", ["a", "b"]), ["a"], ["c", None]),
+    (lambda v: v.one_of("x", ["a"], allow_none=True), [None, "a"], ["b"]),
+    (lambda v: v.in_range("x", 0.0, 1.0), [0.0, 1.0, None], [-0.1, 1.1, True, "a"]),
+    (lambda v: v.in_range("x", 0.0, 1.0, include_high=False), [0.5], [1.0]),
+    (lambda v: v.positive_number("x"), [1e-6, 3], [0, -1, False, "1"]),
+    (lambda v: v.positive_int("x", also=["full"], allow_none=True), [1, "full", None], [0, 1.5, True, "half"]),
+    (lambda v: v.positive_int("x", low=2, high=16), [2, 16], [1, 17]),
+    (lambda v: v.boolean("x"), [True, False], [0, None]),
+])
+def test_validator_factories(make, good, bad):
+    from transformersurgeon.compression import validators
+
+    validate = make(validators)
+    for value in good:
+        validate(value)
+    for value in bad:
+        with pytest.raises(ValueError, match="^x must be"):
+            validate(value)
+
+
+def test_every_registered_option_validates_its_default():
+    for name, options in COMPRESSION_REGISTRY.items():
+        for key, meta in options.items():
+            if meta.get("validator") is not None:
+                meta["validator"](meta["default"])

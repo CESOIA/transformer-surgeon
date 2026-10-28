@@ -2,6 +2,7 @@ import logging
 import torch
 import torch.nn as nn
 
+from .validators import boolean, in_range, one_of, positive_int
 from .abstract import Compressor
 from .coupled_pruning import CoupledPruner
 from .structured_pruning_methods import (
@@ -727,23 +728,9 @@ class StructuredPruner(Compressor):
 
 ### CONFIGURATION VALIDATORS ###
 
-def validate_structured_pruning_ratio(ratio: float) -> None:
-    if ratio is not None and not (0.0 <= ratio <= 1.0):
-        raise ValueError(f"Pruning ratio must be between 0.0 and 1.0, but got {ratio}.")
-
-def validate_structured_pruning_method(method: str) -> None:
-    if method is not None and method not in VALID_METHODS:
-        raise ValueError(f"Pruning method must be one of {VALID_METHODS}, but got '{method}'.")
-
-def validate_structured_pruning_granularity(granularity) -> None:
-    if granularity in ("layer", None):
-        return
-    if isinstance(granularity, bool) or not isinstance(granularity, int):
-        raise ValueError(
-            f"Pruning granularity must be 'layer' or a positive integer, but got {granularity!r}."
-        )
-    if granularity <= 0:
-        raise ValueError(f"Pruning granularity must be a positive integer, but got {granularity}.")
+validate_structured_pruning_ratio = in_range("Pruning ratio", 0.0, 1.0)
+validate_structured_pruning_method = one_of("Pruning method", VALID_METHODS, allow_none=True)
+validate_structured_pruning_granularity = positive_int("Pruning granularity", also=["layer"], allow_none=True)
 
 def validate_structured_pruning_repeated_pattern(repeated_pattern) -> None:
     if isinstance(repeated_pattern, bool):
@@ -774,17 +761,8 @@ def validate_structured_pruning_coupled_repeated_pattern(coupled_repeated_patter
             f"coupled_repeated_pattern must be a positive integer, got {coupled_repeated_pattern}."
         )
 
-def validate_structured_pruning_share_mask(share_mask) -> None:
-    if not isinstance(share_mask, bool):
-        raise ValueError(f"share_mask must be a boolean, but got {type(share_mask)}.")
-
-def validate_structured_pruning_reduce_op(reduce_op) -> None:
-    if reduce_op in (None, ""):
-        return
-    if reduce_op not in VALID_REDUCE_OPS:
-        raise ValueError(
-            f"reduce_op must be one of {VALID_REDUCE_OPS} (or None), but got '{reduce_op}'."
-        )
+validate_structured_pruning_share_mask = boolean("share_mask")
+validate_structured_pruning_reduce_op = one_of("reduce_op", [*VALID_REDUCE_OPS, ""], allow_none=True)
 
 __all__ = [
     "StructuredPruner",

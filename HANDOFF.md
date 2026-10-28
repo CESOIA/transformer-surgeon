@@ -72,6 +72,7 @@ blocks/       catalog.py  ← BLOCK_CATALOG: famiglia → atomo → {object, sum
                           kv_cache/ mutable, io_scatter, io_concat, io_inplace, io_paged
               stacks/     decoder.py, encoder.py, config.py (riceve layer_specs = geometria dei lineari)
 compression/  manager.py, scheme.py, grouping.py, cascade.py, config.py, compressible_layers.py,
+              validators.py (fabbriche dei validatori delle opzioni),
               registry.py, compressori (lrd, structured/unstructured/block pruning, quantization, smoothquant)
               structured_pruning_methods/pruning_dims.py (spostato da blocks)
 calibration/  backbone.py, raw_data/, summaries/, input_absmax.py (collect_input_absmax, usato da SmoothQuant),
@@ -148,7 +149,7 @@ Idee chiave:
   - `py312_tensorrt`: nessuno (145 passati, 18 saltati).
   Senza `--continue-on-collection-errors` la vecchia suite negli ambienti ExecuTorch si ferma
   all'errore di raccolta di `test_precision_passes` (manca `onnx`).
-  **Nuova suite**: nessun fallimento atteso in nessun ambiente (200/4, 198/6, 198/6 passati/saltati).
+  **Nuova suite**: nessun fallimento atteso in nessun ambiente (210/4, 208/6, 208/6 passati/saltati al 2026-10-28).
   Nota: nel test QNN della nuova suite si usa `soc_model="SM8850"`, `quant_scope="all"` perché con lo
   scope di default questa versione del toolchain QNN non convalida alcuni operatori float sull'HTP
   (`aten.rms_norm` non delegato); il vecchio `test_export_qnn` fallisce invece con IndexError.
@@ -193,5 +194,6 @@ Idee chiave:
 | raccolta absmax di SmoothQuant fuori da `calibration/` | `calibration/input_absmax.py::collect_input_absmax` |
 | caricatore WikiText-2 copiato in 6 script/esempi + 2 benchmark | `calibration/datasets.py::token_windows_loader` / `wikitext2_loader` |
 | `scripts/executorch/qnn/full_quant_export.py` (~90% copia) | `exporter_function_test.py --quant-layers all` |
+| ~25 funzioni `validate_*` con 5 schemi ripetuti (insieme, intervallo, positivo, intero, booleano) | fabbriche di `compression/validators.py` |
 | `isinstance(compressor, Quantizer)` nel manager | hook generico `Compressor.prepare_for_save` |
 | nome del componente "text" fisso nell'export | componente con `structure == "transformer_decoder"` |

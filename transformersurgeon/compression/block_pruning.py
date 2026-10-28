@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import torch
 
+from .validators import in_range, one_of
 from .abstract import Compressor
 from .coupled_pruning import CoupledPruner
 
@@ -211,15 +212,8 @@ class BlockPruner(Compressor):
 
 ### CONFIGURATION VALIDATORS ###
 
-def validate_block_pruning_ratio(ratio) -> None:
-    if ratio is not None and not (0.0 <= ratio < 1.0):
-        raise ValueError(f"Block pruning ratio must be in [0, 1) (fraction of blocks per unit), got {ratio}.")
-
-
-def validate_block_pruning_method(method) -> None:
-    if method is not None and method not in VALID_METHODS:
-        raise ValueError(f"Block pruning method must be one of {VALID_METHODS}, got '{method}'.")
-
+validate_block_pruning_ratio = in_range("Block pruning ratio (fraction of blocks per unit)", 0.0, 1.0, include_high=False)
+validate_block_pruning_method = one_of("Block pruning method", VALID_METHODS, allow_none=True)
 
 def validate_block_pruning_blocks(blocks) -> None:
     if blocks is None:

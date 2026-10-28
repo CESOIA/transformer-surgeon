@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from typing import Union
 
+from .validators import boolean, one_of, positive_int, positive_number
 from .abstract import Compressor
 from .quantization_methods import METHOD_FUNCTIONS, ACT_METHOD_FUNCTIONS, activation_qrange
 from .unstructured_pruning_methods import METHOD_FUNCTIONS as SPARSITY_FUNCTIONS
@@ -393,67 +393,16 @@ def _apply_hard_quantization(module, method, precision, granularity, group_size,
         mod._torchao_act_dynamic = bool(dynamic_activation)
 
 
-def validate_quantization_method(method: str) -> None:
-    if method not in VALID_METHODS:
-        raise ValueError(f"Quantization method must be one of {VALID_METHODS}, but got '{method}'.")
-
-
-def validate_activation_method(method: str) -> None:
-    if method not in VALID_ACT_METHODS:
-        raise ValueError(f"Activation quantization method must be one of {VALID_ACT_METHODS}, but got '{method}'.")
-
-
-def validate_precision(precision: Union[str, int]) -> None:
-    if isinstance(precision, str):
-        if precision not in ["full", "binary"]:
-            raise ValueError(
-                f"Precision must be an integer, 'full' or 'binary', but got '{precision}'."
-            )
-    elif isinstance(precision, int):
-        if precision < 2 or precision > 16:
-            raise ValueError(
-                f"Precision must be a positive integer between 2 and 16, but got {precision}."
-            )
-    else:
-        raise ValueError(
-            f"Precision must be an integer, 'full' or 'binary', but got type {type(precision)}."
-        )
-
-def validate_sparse_method(sparse_method: str) -> None:
-    if sparse_method not in VALID_SPARSE_METHODS:
-        raise ValueError(f"Sparse method must be one of {VALID_SPARSE_METHODS}, but got '{sparse_method}'.")
-
-def validate_quantization_eps(eps: float) -> None:
-    if not isinstance(eps, (int, float)):
-        raise ValueError(f"Quantization eps must be numeric, but got type {type(eps)}.")
-    if eps <= 0:
-        raise ValueError(f"Quantization eps must be positive, but got {eps}.")
-
-def validate_quantization_granularity(granularity: str) -> None:
-    if granularity not in VALID_GRANULARITIES:
-        raise ValueError(
-            f"Quantization granularity must be one of {VALID_GRANULARITIES}, but got '{granularity}'."
-        )
-
-def validate_quantization_group_size(group_size: int) -> None:
-    if not isinstance(group_size, int) or isinstance(group_size, bool) or group_size <= 0:
-        raise ValueError(f"Quantization group_size must be a positive int, but got {group_size!r}.")
-
-def validate_quantization_group_scale_bits(bits) -> None:
-    if bits is None:
-        return
-    if not isinstance(bits, int) or isinstance(bits, bool) or not (1 <= bits <= 8):
-        raise ValueError(f"group_scale_bits must be None or an int in [1, 8], but got {bits!r}.")
-
-def validate_quantize_output_activation(value) -> None:
-    if not isinstance(value, bool):
-        raise ValueError(f"quantize_output_activation must be a bool, but got {value!r}.")
-
-def validate_activation_scheme(scheme: str) -> None:
-    if scheme not in VALID_ACTIVATION_SCHEMES:
-        raise ValueError(
-            f"Activation scheme must be one of {VALID_ACTIVATION_SCHEMES}, but got '{scheme}'."
-        )
+validate_quantization_method = one_of("Quantization method", VALID_METHODS)
+validate_activation_method = one_of("Activation quantization method", VALID_ACT_METHODS)
+validate_precision = positive_int("Precision", also=["full", "binary"], low=2, high=16)
+validate_sparse_method = one_of("Sparse method", VALID_SPARSE_METHODS)
+validate_quantization_eps = positive_number("Quantization eps")
+validate_quantization_granularity = one_of("Quantization granularity", VALID_GRANULARITIES)
+validate_quantization_group_size = positive_int("Quantization group_size")
+validate_quantization_group_scale_bits = positive_int("group_scale_bits", allow_none=True, high=8)
+validate_quantize_output_activation = boolean("quantize_output_activation")
+validate_activation_scheme = one_of("Activation scheme", VALID_ACTIVATION_SCHEMES)
 
 __all__ = [
     "Quantizer",

@@ -1,6 +1,6 @@
 import torch
-from typing import Union
 
+from .validators import one_of, positive_int, positive_number
 from .abstract import Compressor
 from .lrd_methods import METHOD_FUNCTIONS
 
@@ -120,32 +120,9 @@ class LRDer(Compressor):
 
 ### CONFIGURATION VALIDATORS ###
 
-def validate_lrd_rank(rank: Union[int, str]) -> None:
-    if rank is not None:
-        if isinstance(rank, str):
-            if rank != "full":
-                raise ValueError(f"LRD rank must be 'full' or a positive integer, but got '{rank}'.")
-        elif isinstance(rank, int):
-            if rank <= 0:
-                raise ValueError(f"LRD rank must be a positive integer, but got {rank}.")
-        else:
-            raise ValueError(f"LRD rank must be 'full' or a positive integer, but got type {type(rank)}.")
-
-
-def validate_lrd_method(method: str) -> None:
-    if not isinstance(method, str):
-        raise ValueError(f"LRD method must be a string, but got type {type(method)}.")
-
-    if method not in VALID_METHODS:
-        raise ValueError(f"Unsupported LRD method '{method}'. Supported methods are: {VALID_METHODS}.")
-
-
-def validate_lrd_eps(eps: float) -> None:
-    if not isinstance(eps, (int, float)):
-        raise ValueError(f"LRD eps must be numeric, but got type {type(eps)}.")
-    if eps <= 0:
-        raise ValueError(f"LRD eps must be positive, but got {eps}.")
-
+validate_lrd_rank = positive_int("LRD rank", also=["full"], allow_none=True)
+validate_lrd_method = one_of("LRD method", VALID_METHODS)
+validate_lrd_eps = positive_number("LRD eps")
 
 __all__ = [
     "LRDer",

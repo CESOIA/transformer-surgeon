@@ -4,8 +4,8 @@ Leggere prima [HANDOFF.md](HANDOFF.md). Ordine consigliato; spuntare man mano.
 
 ## A. Nuova suite di test — FATTA (commit "Refactor phase 6")
 
-Nuova suite `test/` verde nei tre ambienti (2026-10-28): `py312_tensorrt` 200 passati / 4 saltati,
-`py312_executorch_xnnpack` 198/6, `py310-executorch-qnn` 198/6. Vecchia suite `archive/tests`:
+Nuova suite `test/` verde nei tre ambienti (2026-10-28): `py312_tensorrt` 210 passati / 4 saltati,
+`py312_executorch_xnnpack` 208/6, `py310-executorch-qnn` 208/6. Vecchia suite `archive/tests`:
 solo i fallimenti d'ambiente attesi di HANDOFF.md §6 (nessuna regressione).
 File: `test/{utils,blocks,compression,calibration,models}/`, `test/export/{test_operations,test_convert,
 test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
@@ -19,7 +19,10 @@ test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
       `--quant-mlp`, `--precision`, `--quantize-activations`); originale in `archive/scripts/`;
       `run_full_quant.sh` = `exporter_function_test.py --quant-layers all`. Le citazioni di
       `full_quant_export.py` in `AGENTS.md` e `notes/refactor/recaps/` vanno sistemate al punto C.
-- [ ] Validatori duplicati in `compression/` (ratio, eps, method): un modulo `validators.py` con fabbriche.
+- [x] Validatori duplicati in `compression/`: `compression/validators.py` (`one_of`, `in_range`,
+      `positive_number`, `positive_int`, `boolean`); i nomi `validate_*` restano (registro invariato).
+      Tenuti a mano solo `repeated_pattern`, `coupled_repeated_pattern`, `blocks` (messaggi esplicativi).
+      Messaggi ora uniformi: `"<nome> must be <regola>, but got <valore>."`.
 - [ ] `export/backends/onnx/exporter.py::io_names` duplica i nomi I/O di `manifest.py`: unificare.
 - [ ] `utils/__init__` va bene; verificare con `pyflakes` che non restino import inutili
       (restano solo import fatti apposta per registrare operatori).
