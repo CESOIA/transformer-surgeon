@@ -96,17 +96,9 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 
 ## E. Report finale (in italiano)
 
-- [ ] File suggerito: `notes/refactor/REPORT.md` (e una pagina nel sito). Stile manuale tecnico:
-      niente gergo o abbreviazioni inventate, ogni termine definito alla prima occorrenza
-      (es. "decomposizione a basso rango (LRD, low-rank decomposition)", "cache KV",
-      "quantizzazione simulata", "backend"). Rileggerlo alla fine e chiarire le parti oscure.
-- [ ] Contenuti: obiettivo e regole; metodo (riepiloghi per cartella); cosa è cambiato per
-      cartella (prima/dopo); le duplicazioni eliminate (tabella in HANDOFF.md §8); i due dizionari (`BLOCK_CATALOG`, `BACKEND_OPERATIONS`) con esempi;
-      cosa è stato archiviato e perché; correzioni di comportamento (HANDOFF.md §5); duplicazioni
-      eliminate; test (vecchi archiviati, nuovi per oggetto, fallimenti d'ambiente attesi);
-      come aggiungere un modello / un metodo di compressione / una calibrazione / un backend;
-      limiti e lavoro futuro (es. selezione utente delle opzioni non-default, modelli con QKV
-      fuso come ModernBERT non esportabili, Qwen-VL senza `structure`).
+- [x] Prima stesura: `notes/refactor/REPORT.md` (termini, regole, metodo, cambiamenti per cartella, i due dizionari,
+      duplicazioni, correzioni, archivio, test, verifica delle regole, limiti). Affermazioni verificate sul codice.
+- [ ] Rilettura finale per chiarezza (fare dopo il sito, aggiornando i numeri dei test se cambiano) e pagina nel sito.
 
 ## F. Chiusura
 
