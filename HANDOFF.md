@@ -195,5 +195,6 @@ Idee chiave:
 | caricatore WikiText-2 copiato in 6 script/esempi + 2 benchmark | `calibration/datasets.py::token_windows_loader` / `wikitext2_loader` |
 | `scripts/executorch/qnn/full_quant_export.py` (~90% copia) | `exporter_function_test.py --quant-layers all` |
 | ~25 funzioni `validate_*` con 5 schemi ripetuti (insieme, intervallo, positivo, intero, booleano) | fabbriche di `compression/validators.py` |
+| nomi I/O delle cache in `manifest.py` e `onnx/exporter.py::io_names` | `export/manifest.py::cache_io_name` / `graph_io_names` |
 | `isinstance(compressor, Quantizer)` nel manager | hook generico `Compressor.prepare_for_save` |
 | nome del componente "text" fisso nell'export | componente con `structure == "transformer_decoder"` |

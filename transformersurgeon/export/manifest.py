@@ -20,6 +20,20 @@ def manifest_path_for(artifact_path: str) -> str:
     return os.path.splitext(artifact_path)[0] + ".manifest.json"
 
 
+def cache_io_name(kind: str, layer: int, output: bool = False) -> str:
+    """Graph I/O name of one layer's cache: ``past_<kind>_<i>`` in, ``present_<kind>_<i>`` out
+    (``kind`` is ``key``, ``value`` or ``kv`` for a paged pool)."""
+    return f"{'present' if output else 'past'}_{kind}_{layer}"
+
+
+def graph_io_names(num_layers: int, paged: bool = False) -> tuple[list[str], list[str]]:
+    """``(input_names, output_names)`` of a graph-I/O cache wrapper, in flattened argument order."""
+    kinds = ("kv",) if paged else ("key", "value")
+    inputs = ["input_ids", "pos_id"] + [cache_io_name(k, i) for k in kinds for i in range(num_layers)]
+    outputs = ["logits"] + [cache_io_name(k, i, output=True) for k in kinds for i in range(num_layers)]
+    return inputs, outputs
+
+
 def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend: str,
                        artifact: str, **extra: Any) -> dict[str, Any]:
     """Describe an exported LLM's runtime contract, for any backend.
@@ -31,18 +45,10 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
     """
     decoder = wrapper.decoder
     cache_impl = getattr(decoder, "cache_impl", "mutable")
+    kinds = ("kv",) if cache_impl == "io_paged" else ("key", "value")
     caches = [
-        {"layer": i, "kv": {"input": f"past_kv_{i}", "output": f"present_kv_{i}",
-                            "shape": list(block.attn.cache_shape("kv"))}}
-        for i, block in enumerate(decoder.blocks)
-    ] if cache_impl == "io_paged" else [
-        {
-            "layer": i,
-            "key": {"input": f"past_key_{i}", "output": f"present_key_{i}",
-                    "shape": list(block.attn.cache_shape("key"))},
-            "value": {"input": f"past_value_{i}", "output": f"present_value_{i}",
-                      "shape": list(block.attn.cache_shape("value"))},
-        }
+        {"layer": i, **{k: {"input": cache_io_name(k, i), "output": cache_io_name(k, i, output=True),
+                            "shape": list(block.attn.cache_shape(k))} for k in kinds}}
         for i, block in enumerate(decoder.blocks)
     ]
     eos = getattr(model_config, "eos_token_id", None) if model_config is not None else None
@@ -94,5 +100,5 @@ def zero_caches_from_manifest(
     return keys, values
 
 
-__all__ = ["MANIFEST_FORMAT", "manifest_path_for", "build_llm_manifest", "load_llm_manifest",
+__all__ = ["MANIFEST_FORMAT", "manifest_path_for", "cache_io_name", "graph_io_names", "build_llm_manifest", "load_llm_manifest",
            "zero_caches_from_manifest"]

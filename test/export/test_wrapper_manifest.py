@@ -146,3 +146,17 @@ def test_finalize_writes_the_manifest_next_to_the_artifact(tmp_path):
     manifest = load_llm_manifest(artifact)
     assert manifest["backend"] == "xnnpack" and manifest["precision"] == "full"
     assert manifest["artifact"] == "model.pte" and manifest["max_cache_len"] == CACHE
+
+
+def test_graph_io_names_match_the_manifest():
+    from transformersurgeon.export.manifest import graph_io_names
+
+    assert graph_io_names(2) == (
+        ["input_ids", "pos_id", "past_key_0", "past_key_1", "past_value_0", "past_value_1"],
+        ["logits", "present_key_0", "present_key_1", "present_value_0", "present_value_1"])
+    assert graph_io_names(1, paged=True) == (["input_ids", "pos_id", "past_kv_0"], ["logits", "present_kv_0"])
+    model = _model()
+    manifest = build_llm_manifest(_wrapper(model, "io_inplace"), model.config, backend="onnx", artifact="m.onnx")
+    inputs, outputs = graph_io_names(2)
+    assert [c[k]["input"] for k in ("key", "value") for c in manifest["caches"]] == inputs[2:]
+    assert [c[k]["output"] for k in ("key", "value") for c in manifest["caches"]] == outputs[1:]

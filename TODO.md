@@ -23,7 +23,8 @@ test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
       `positive_number`, `positive_int`, `boolean`); i nomi `validate_*` restano (registro invariato).
       Tenuti a mano solo `repeated_pattern`, `coupled_repeated_pattern`, `blocks` (messaggi esplicativi).
       Messaggi ora uniformi: `"<nome> must be <regola>, but got <valore>."`.
-- [ ] `export/backends/onnx/exporter.py::io_names` duplica i nomi I/O di `manifest.py`: unificare.
+- [x] Nomi I/O del grafo: una sola definizione `export/manifest.py::cache_io_name` / `graph_io_names`
+      (`onnx/exporter.py::io_names` ora è un alias).
 - [ ] `utils/__init__` va bene; verificare con `pyflakes` che non restino import inutili
       (restano solo import fatti apposta per registrare operatori).
 - [ ] Valutare se `hf/hf_export.py` debba ancora chiamare `manager.apply(hard=True)` (compressione

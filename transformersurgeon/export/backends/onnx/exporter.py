@@ -35,7 +35,7 @@ import torch
 
 from ...config import BackendExportConfig
 from ...exporter import Exporter, register_exporter
-from ...manifest import build_llm_manifest
+from ...manifest import build_llm_manifest, graph_io_names
 from ...quant_info import extract_layer_quant_info
 from ...result import BackendExportResult, finalize_export_result
 from ...wrapper import resolve_components_and_wrapper
@@ -96,18 +96,8 @@ class ONNXExportConfig(BackendExportConfig):
     graph_passes: list[Callable] = field(default_factory=list)
 
 
-def io_names(num_layers: int, paged: bool = False) -> tuple[list[str], list[str]]:
-    """(input_names, output_names) in torch.onnx's flattened arg/output order."""
-    if paged:
-        return (["input_ids", "pos_id"] + [f"past_kv_{i}" for i in range(num_layers)],
-                ["logits"] + [f"present_kv_{i}" for i in range(num_layers)])
-    inputs = ["input_ids", "pos_id"]
-    inputs += [f"past_key_{i}" for i in range(num_layers)]
-    inputs += [f"past_value_{i}" for i in range(num_layers)]
-    outputs = ["logits"]
-    outputs += [f"present_key_{i}" for i in range(num_layers)]
-    outputs += [f"present_value_{i}" for i in range(num_layers)]
-    return inputs, outputs
+# Graph I/O names are defined once, next to the manifest that records them.
+io_names = graph_io_names
 
 
 @register_exporter
