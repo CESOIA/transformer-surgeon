@@ -7,7 +7,8 @@ TensorRT fuses those casts into the kernel (the engine size does not change).
 
 Why: TensorRT 10.16 runs single-token (M=1) fp16 GEMMs with cuBLAS-style GEMV
 kernels that accumulate in fp16 (``gemvx_f16f16_f16_f16``). Dense layers tolerate
-it, but plain-SVD LRD makes Qwen2.5-1.5B ill-conditioned and amplifies the error.
+it, but plain-SVD LRD makes the factorized layers ill-conditioned and amplifies the
+error (measured on a 1.5B-parameter decoder).
 Measured on lrd0.5-mlp (L4): KL 0.10 vs the fp16 torch reference (torch's own fp16
 floor is 3e-3), and 3.5e-4 with this pass on every factorized GEMM, at 8.94 vs
 8.54 ms/token. fp32 accumulation is what torch's fp16 matmul already does, so this

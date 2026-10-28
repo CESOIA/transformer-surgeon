@@ -34,9 +34,9 @@ test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
 ## B2. Violazioni residue delle regole di architettura (verificate il 2026-10-28)
 
 Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
-- [ ] 27 **commenti** che citano modelli (Qwen, Llama, BERT, ViT) in `compression/`, `export/`,
-      `blocks/` (`grep -rniE "qwen|llama|bert" transformersurgeon --include=*.py`, escludendo
-      `torch.ops.llama`/`llama.fallback`/`llama3` che sono nomi di librerie): riformulare in modo generico.
+- [x] Commenti che citavano modelli in `compression/`, `export/`, `blocks/` riformulati in modo generico
+      (la caratteristica al posto del modello; le misure restano come "decoder da 1.5B parametri").
+      Resta solo `llama::custom_sdpa` in `export/operations.py`, nome di un operatore ExecuTorch.
 - [ ] `compression/structured_pruning.py` conosce la topologia (sentinelle `preprocessing`,
       `final_layer`, `final_norm`, `preprocessing_conv`, `_hop_block_id`): spostare la risoluzione dei
       percorsi in un'API dello schema/manager, così il compressore riceve catene di moduli già risolte.

@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 # sentinels in indexing's pruning.output_dependence / coupled_masks_all (see
 # _coupled_target_chains below and manager._resolve_sentinel_path). Not every
 # family supports this: models whose preprocessing module isn't a plain
-# nn.Embedding (e.g. ViT/Qwen-VL patch-embed Conv2d, BERT-style composite
-# embeddings) don't get a 'preprocessing' scheme, so only their 'final_layer'
+# nn.Embedding (e.g. a Conv2d/Conv3d patch embedding, or a composite embedding
+# module summing token, position and segment embeddings) don't get a 'preprocessing' scheme, so only their 'final_layer'
 # cascade applies.
 #
 # Normalization layers (input_layernorm, the final post-block norm, ...) sit
@@ -533,10 +533,10 @@ class StructuredPruner(Compressor):
 
         The last-block gating for the sentinels applies regardless of how
         deep in a chain they're reached: a source's own ``output_dependence``
-        entry may name ``'final_layer'``/``'final_norm'`` directly (e.g.
-        llama_c's ``mlp.down_proj``), or a normalization hop's *own*
-        ``output_dependence`` entry may (e.g. bert_c's post-norm
-        ``output.LayerNorm``, resolved through the recursion in
+        entry may name ``'final_layer'``/``'final_norm'`` directly (e.g. the
+        last MLP projection of a pre-norm decoder), or a normalization hop's *own*
+        ``output_dependence`` entry may (e.g. the output norm of a post-norm
+        encoder block, resolved through the recursion in
         ``_resolve_target_chains``) -- both must only fire once the walk has
         reached the last block, tracked via the ``block_id`` threaded through
         every hop by ``_hop_block_id``.
@@ -648,7 +648,7 @@ class StructuredPruner(Compressor):
 
     def _prune_extra_params(self, mask):
         """Index-select the last dim of any raw nn.Parameters co-located with
-        'preprocessing_conv' (e.g. ViT's cls_token/position_embeddings) by
+        'preprocessing_conv' (e.g. a class token and learned position embeddings) by
         the same keep-mask used to hard-prune the conv's out_channels.
 
         These aren't CompressionScheme members -- they're plain Parameters

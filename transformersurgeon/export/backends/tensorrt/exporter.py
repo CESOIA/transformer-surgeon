@@ -68,7 +68,7 @@ class TensorRTExportConfig(ONNXExportConfig):
     plugin_libraries: tuple[str, ...] = ()
     # Run MatMul(q, k^T) -> Add(mask) -> Softmax in fp32: TensorRT 10.16 fuses it
     # into an fp16-accumulating kernel that overflows on models with large
-    # attention logits (Qwen2.5: NaN logits). See attention_passes.py.
+    # attention logits (NaN logits otherwise). See attention_passes.py.
     fp32_attention_scores: bool = True
     # Accumulate the GEMMs of LRD-factorized linears in fp32 (weights/activations stay
     # fp16): TensorRT's M=1 fp16 GEMV kernels accumulate in fp16, which LRD models do not

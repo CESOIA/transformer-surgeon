@@ -89,7 +89,7 @@ class CompressionScheme:
         # without the manager itself orchestrating them.
         self.pruning_indexing = pruning_indexing or {}
         # Whether this layer's output rows are indexed by positional embedding
-        # (RoPE q/k projections; see e.g. llama_c's pruning.position_linked).
+        # (RoPE q/k projections, listed in the model dictionary's pruning.position_linked).
         # Consumed by StructuredPruner.apply to warn before hard-pruning it.
         self.position_linked = name in self.pruning_indexing.get('position_linked', ())
         self.path_template = path_template
@@ -107,13 +107,13 @@ class CompressionScheme:
         self.final_norm_path = final_norm_path
         # Dotted paths (relative to the model root) of raw nn.Parameters that
         # live alongside 'preprocessing_conv' in the same composite
-        # preprocessing wrapper (e.g. ViT's cls_token/position_embeddings,
+        # preprocessing wrapper (e.g. a class token and learned position embeddings,
         # concatenated/added directly to the conv's output along the hidden
         # dim) and therefore must be index-selected on their last dim in sync
         # with the conv's hard-pruning mask -- see
         # StructuredPruner._prune_extra_params. Only meaningful on the
         # 'preprocessing_conv' scheme itself; empty for models without such
-        # extra params (e.g. Qwen-VL's patch_embed, a bare reshape+conv).
+        # extra params (e.g. a patch embedding that is a bare reshape+conv).
         self.preprocessing_conv_extra_params_paths = preprocessing_conv_extra_params_paths or []
         # Normalization layers (e.g. RMSNorm/LayerNorm) get a scheme so the
         # manager/coupled-pruning cascade can route through them, but they are

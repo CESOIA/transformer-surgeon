@@ -281,7 +281,8 @@ def _inject_act_observer(observer: nn.Module, info: dict, use_out: bool = False)
 
     # Clip extreme asymmetric outliers. With per-tensor asymmetric INT8, a single
     # rare token can push act_max to 100-150× |act_min| (observed: act_max=2016 in
-    # Qwen2-0.5B layer 2 down_proj with 32-sample WikiText calibration). This yields
+    # the third MLP output projection of a 0.5B-parameter decoder, 32-sample WikiText
+    # calibration). This yields
     # scale≈8, leaving only 3-4 effective INT8 levels for typical ±20 activations.
     # Cap the positive side to 10× the negative side when asymmetry exceeds that ratio.
     _act_min_abs = abs(act_min_f)
@@ -408,7 +409,7 @@ def calibrate_pt2e_observers(
             # Real teacher-forced decode: positions 0..n-1 with the KV cache filling up,
             # so the attention/cache observers see the ranges they see at run time.
             # (Every token at pos 1 with an empty cache left them uncalibrated:
-            # Qwen2.5-1.5B 16a8w all-op, KL 0.96 -> 0.57 vs the unquantized-activation model.)
+            # 1.5B-parameter decoder, 16a8w all-op, KL 0.96 -> 0.57 vs the unquantized-activation model.)
             for ids in token_batches:
                 _reset_mutable_caches()
                 for pos_i, token_id in enumerate(ids):

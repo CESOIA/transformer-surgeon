@@ -906,8 +906,8 @@ class CompressionSchemesManager:
 
         Typical reload workflow::
 
-            model = Qwen2ForCausalLMCompress.from_pretrained("checkpoint")
-            manager = Qwen2CompressionSchemesManager(model)
+            model = <Family>ForCausalLMCompress.from_pretrained("checkpoint")
+            manager = <Family>CompressionSchemesManager(model)
             manager.load_state("checkpoint/compression_state.pt")
             manager.apply(hard=True, criteria=["mlp"])
         """
@@ -1039,11 +1039,11 @@ class CompressionSchemesManager:
             # Resolve the 'preprocessing'/'final_layer'/'preprocessing_conv'
             # singleton paths (if annotated and actually substituted with a
             # compressed module by replace_layers_upon_init -- e.g. composite
-            # BERT-style embeddings are not, and get no scheme). 'preprocessing'
+            # embedding modules are not, and get no scheme). 'preprocessing'
             # is the nn.Embedding case; 'preprocessing_conv' is a separate,
             # independently-annotated key for Conv2d/Conv3d patch-embed leaves
             # (the whole preprocessing wrapper generally isn't itself a bare
-            # conv -- see e.g. vit_c/qwen2_5_vl_c indexing).
+            # conv -- see the vision families' model dictionaries).
             preprocessing_path = self._resolve_sentinel_path(block_indexing, 'preprocessing')
             preprocessing_conv_path = self._resolve_sentinel_path(block_indexing, 'preprocessing_conv')
             final_layer_path = self._resolve_sentinel_path(block_indexing, 'final_layer')
@@ -1052,7 +1052,7 @@ class CompressionSchemesManager:
             # type-check gate needed, just confirm the path resolves.
             final_norm_path = self._resolve_final_norm_path(block_indexing)
             norm_layers = set(block_indexing.get('pruning', {}).get('norm_layers', ()))
-            # Raw nn.Parameters (e.g. ViT's cls_token/position_embeddings)
+            # Raw nn.Parameters (e.g. a class token and learned position embeddings)
             # co-located with 'preprocessing_conv' in the same composite
             # preprocessing wrapper, only meaningful if that sentinel actually
             # resolved to a scheme (see CompressionScheme.preprocessing_conv_extra_params_paths).
@@ -1124,7 +1124,7 @@ class CompressionSchemesManager:
         actually substituted with its compressed counterpart
         (EmbeddingCompressed/LinearCompressed/Conv2dCompressed/
         Conv3dCompressed) by replace_layers_upon_init. Returns None otherwise
-        (e.g. composite BERT-style embeddings, or unannotated).
+        (e.g. a composite embedding module, or unannotated).
         """
         full_path = block_indexing.get(sentinel_name)
         if not full_path:

@@ -89,9 +89,9 @@ class QNNExportConfig(BackendExportConfig):
     # Which ops a quantized export annotates:
     #   "linear" - (legacy) only the compressed linears; every other op stays fp16.
     #              Each quantized/float seam splits the graph: 169 HTP partitions +
-    #              CPU mul/add/sigmoid on Qwen2.5-0.5B, measured on SM8850 at
+    #              CPU mul/add/sigmoid on a 0.5B-parameter decoder, measured on SM8850 at
     #              ~20 tok/s vs 41 tok/s fp16.
-    #   "all"    - vendor recipe (ExecuTorch Qwen2.5 static-LLM recipes): every op
+    #   "all"    - vendor recipe (ExecuTorch static-LLM recipes for Qualcomm): every op
     #              gets 16-bit activations (MinMax, per-tensor), quantized linears
     #              use tsurgeon's exact per-channel scales (W4 -> 16a4w, W8 -> 16a8w)
     #              and linears the model left float are carried as 16a16w, so the
@@ -99,8 +99,8 @@ class QNNExportConfig(BackendExportConfig):
     quant_scope: str = field(default_factory=lambda: config_default("qnn", "quant_scope"))
     # quant_scope="all" only: a float linear carried as 16a16w computes its bias in
     # int32 with scale act_scale x weight_scale, which 16-bit weights make tiny
-    # (largest bias ~ input range x max|w| of the channel): Qwen2.5's q/k biases
-    # (up to ~316) overflow it by up to ~65x and are clipped in every layer. True
+    # (largest bias ~ input range x max|w| of the channel): large q/k biases
+    # (up to ~316 in a measured 0.5B decoder) overflow it by up to ~65x and are clipped in every layer. True
     # moves the bias of every linear that is not compression-quantized into a
     # separate add (the bias then gets its own 16-bit scale), keeping the 16-bit
     # weights so only the targeted linears change precision.

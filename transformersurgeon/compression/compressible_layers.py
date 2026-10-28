@@ -90,8 +90,8 @@ def replace_layers_upon_init(
         _replace_singleton_layer(model, full_path, type_map, get_config, config_dict)
 
 
-# Conv patch-embed preprocessing: either Conv2d (e.g. ViT) or Conv3d (e.g.
-# Qwen-VL's temporal patches) -- the substituted class depends on which the
+# Conv patch-embed preprocessing: either Conv2d (image patches) or Conv3d
+# (spatio-temporal patches of video models) -- the substituted class depends on which the
 # original module actually is.
 _CONV_TYPE_MAP = {
     torch.nn.Conv2d: Conv2dCompressed,
@@ -146,7 +146,7 @@ def _replace_singleton_layer(model, full_path, type_map, get_config, config_dict
     class to substitute (more than one entry when several original types are
     acceptable, e.g. Conv2d vs Conv3d patch-embed). Silently skips (with a
     warning) modules whose type isn't in ``type_map`` (e.g. a composite
-    BERT-style embeddings module), since those aren't supported.
+    embedding module summing token, position and segment embeddings), since those aren't supported.
     """
     split_path = full_path.split('.')
     parent_module = model

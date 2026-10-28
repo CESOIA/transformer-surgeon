@@ -3,7 +3,8 @@
 fp32_attention_scores: run the attention score path  MatMul(q, kᵀ) -> Add(mask) -> Softmax
 in float32 and cast the probabilities back to the model dtype.
 
-Why: Qwen2.5-1.5B has k-projection biases up to ~317, so some tokens produce
+Why: models with large k-projection biases (up to ~317 in a measured 1.5B decoder)
+make some tokens produce
 attention logits of ~1e4 whose fp16 partial dot-product sums exceed 65504.
 TensorRT 10.16 fuses this path into a kernel that accumulates in fp16 -> inf -> NaN
 logits (token 659 at position 0 is a reproducer). Eager PyTorch (fp32 accumulation)
