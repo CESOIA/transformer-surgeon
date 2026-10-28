@@ -18,16 +18,20 @@ from transformersurgeon.export.operations import (
     resolve_convert_options,
 )
 
-CATALOG_FAMILY = {"kv_cache": "kv_cache", "attention_kernel": "attention_kernel", "rmsnorm": "norm"}
+CATALOG_FAMILY = {"kv_cache": "kv_cache", "attention_kernel": "attention_kernel", "rmsnorm": "norm",
+                  "mlp": "mlp", "rope_frequencies": "rope_frequencies"}
 
 
 def test_every_entry_has_a_valid_default_for_every_backend():
     for block_type, spec in BACKEND_OPERATIONS.items():
         assert spec["description"]
-        assert ("convert_option" in spec) != ("config_field" in spec), block_type
+        assert sum(k in spec for k in ("convert_option", "config_field", "model_key")) == 1, block_type
         for backend in BACKENDS:
             entry = spec["backends"][backend]
-            assert entry["default"] in entry["options"], (block_type, backend)
+            if spec.get("model_key"):  # chosen by the model dictionary, not by the exporter
+                assert entry["default"] is None, (block_type, backend)
+            else:
+                assert entry["default"] in entry["options"], (block_type, backend)
             assert all(isinstance(text, str) and text for text in entry["options"].values())
 
 

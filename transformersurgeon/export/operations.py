@@ -13,7 +13,11 @@ Each block type also says how the choice reaches the code:
 - ``"convert_option"``: a key of ``convert_options`` (the atoms used to build
   the export-ready model, for example ``cache_impl``);
 - ``"config_field"``: a field of the backend's export configuration (for
-  example the XNNPACK ``quant_path``).
+  example the XNNPACK ``quant_path``);
+- ``"model_key"``: the choice is not the exporter's -- the model dictionary
+  names the operation under this key (``None``: one implementation only). These
+  entries have ``default: None`` (or their single option) and only document
+  which device operation each atom becomes.
 
 The exporters read this dictionary: missing convert options and configuration
 fields take the backend default from here, and a choice that is not listed for
@@ -153,6 +157,49 @@ BACKEND_OPERATIONS = {
             }},
             "onnx": {"default": "gemm", "options": {"gemm": "ONNX MatMul/Gemm."}},
             "tensorrt": {"default": "gemm", "options": {"gemm": "TensorRT matrix multiply."}},
+        },
+    },
+    # ---------------------------------------------- operations chosen by the model
+    "mlp": {
+        "description": "Feed-forward block (blocks/mlp); the model dictionary picks plain or gated.",
+        "model_key": "mlp_type",
+        "backends": {
+            backend: {"default": None, "options": {
+                "mlp": f"Two {op} with the activation in between.",
+                "mlp_gated": f"Three {op}; activation of the gate times the up projection.",
+            }} for backend, op in (("xnnpack", "XNNPACK fully-connected layers"),
+                                   ("qnn", "QNN FullyConnected (or 1x1 Conv2d) operations"),
+                                   ("onnx", "ONNX MatMul/Gemm nodes"),
+                                   ("tensorrt", "TensorRT matrix multiplies"))
+        },
+    },
+    "rope_frequencies": {
+        "description": "Rotary-embedding frequencies (blocks/positions); the model dictionary picks the variant.",
+        "model_key": "rope_type",
+        "backends": {
+            backend: {"default": None, "options": {
+                name: f"{text} cos/sin tables computed at conversion and stored as constants; "
+                      "the rotation is element-wise multiply/add on the device."
+                for name, text in (("default", "Plain"), ("llama3", "Band-scaled"))
+            }} for backend in BACKENDS
+        },
+    },
+    "embedding": {
+        "description": "Input token embedding (blocks/layers/embedding_compressed.py).",
+        "model_key": None,
+        "backends": {
+            backend: {"default": "embedding", "options": {"embedding": f"{op} on the embedding table."}}
+            for backend, op in (("xnnpack", "Embedding lookup (ExecuTorch CPU kernel)"), ("qnn", "QNN Gather"),
+                                ("onnx", "ONNX Gather"), ("tensorrt", "TensorRT Gather"))
+        },
+    },
+    "output_head": {
+        "description": "Projection of the last hidden state to the vocabulary (a compressed linear layer).",
+        "model_key": None,
+        "backends": {
+            backend: {"default": "linear", "options": {"linear": "Same lowering as every other linear "
+                                                                 "layer (see linear_lowering)."}}
+            for backend in BACKENDS
         },
     },
 }

@@ -54,9 +54,9 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 - [x] `hf/hf_export.py::export_to_hf` chiama `manager.apply(hard=True)`: tenuto e documentato (punto B).
 - [ ] `blocks/` contiene atomi legati a una backend (`custom_sdpa` ExecuTorch, `paged` Edge-LLM):
       ammesso perché sono atomi selezionabili, ma va detto nel report.
-- [ ] `BACKEND_OPERATIONS` copre attenzione, cache, RMSNorm, batch, softmax mascherata e lineari;
-      **mancano** MLP, RoPE, embedding e testa di uscita (oggi una sola implementazione: aggiungere
-      voci con il solo default per completezza, oppure spiegarlo nel report).
+- [x] `BACKEND_OPERATIONS` ora copre anche `mlp`, `rope_frequencies`, `embedding`, `output_head` con un
+      terzo tipo di voce `model_key` (scelta del dizionario del modello, `default: None`, o implementazione
+      unica): solo documentazione dell'operazione su dispositivo, il codice di risoluzione non cambia.
 - [ ] Verifica "un'aggiunta tocca una sola cartella": provare a scrivere (anche solo in bozza) una
       nuova famiglia di modello, un nuovo metodo LRD, un nuovo riepilogo di calibrazione e annotare
       quali file servono; riportarlo nel report.

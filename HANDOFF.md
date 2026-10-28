@@ -91,6 +91,8 @@ Idee chiave:
 - **Export → implementazioni**: `export/operations.py` dà, per backend, l'implementazione di
   default (`cache_impl`, `attn_impl`, `rmsnorm_impl`, `add_batch_dim`, `masked_softmax`, e i
   campi config `quant_path`/`quant_scope`/`int4_backend`/`convert_linear_to_conv2d`).
+  Le voci con `model_key` (MLP, frequenze RoPE, embedding, testa) non sono scelte dell'export: documentano
+  solo l'operazione su dispositivo dell'atomo scelto dal modello.
   `resolve_convert_options(backend, options)` completa e valida; `check_components` valida
   un decoder già convertito. Alias accettati: `use_sdpa`, `rmsnorm_prescale`, `rmsnorm_upcast`.
 - Default invariati per XNNPACK/QNN (`mutable`, `manual`, `rmsnorm_prescaled`); per
