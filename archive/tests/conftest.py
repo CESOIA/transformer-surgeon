@@ -10,3 +10,5 @@ import sys
 _TEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "test")
 if os.path.abspath(_TEST_DIR) not in sys.path:
     sys.path.insert(0, os.path.abspath(_TEST_DIR))
+
+from conftest import out_dir, torch_device  # noqa: E402,F401  (shared fixtures of test/conftest.py)

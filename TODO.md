@@ -1,34 +1,14 @@
 # TODO — refactoring `draft-prolucio-refactor`
 
-Leggere prima [AGENT.md](AGENT.md). Ordine consigliato; spuntare man mano.
+Leggere prima [HANDOFF.md](HANDOFF.md). Ordine consigliato; spuntare man mano.
 
-## A. Nuova suite di test (in corso)
+## A. Nuova suite di test — FATTA (commit "Refactor phase 6")
 
-Fatti e verdi in `py312_tensorrt` (non ancora eseguiti negli altri due ambienti):
-`test/utils/` (21), `test/blocks/` (52 + 1 saltato), `test/compression/` (40),
-`test/calibration/` (5), `test/models/` (33), `test/export/test_operations.py`,
-`test/export/test_convert.py`.
-
-- [ ] `test/export/test_convert.py`: aggiungere un test di **parità numerica degli encoder**
-      (BERT, DistilBERT, ViT contro HF). Lo script pronto è in
-      `/tmp/claude-10033318/.../scratchpad/encoder_parity.py` (potrebbe non esistere più):
-      BERT → `m.bert.encoder(m.bert.embeddings(ids))`, DistilBERT → `m.distilbert.transformer(emb, attn_mask=ones)`,
-      ViT → ciclo su `m.vit.layers` + `m.vit.layernorm`. Scarti misurati ≤ 2e-5.
-- [ ] `test/export/test_wrapper_manifest.py`: `LLMWrapper` (firme per cache interna / I/O / pagine),
-      `build_zero_caches`, `build_example_inputs`, `build_llm_manifest` + `load_llm_manifest` +
-      `zero_caches_from_manifest`, `extract_layer_quant_info` dopo quantizzazione hard,
-      `finalize_export_result` che scrive il manifest, `find_weight_mismatches`.
-- [ ] `test/export/test_exporter.py`: registro (`EXPORTERS` con 4 backend, `get_exporter` su nome
-      ignoto → errore, config di tipo sbagliato → `TypeError`), export ONNX reale su modello
-      minuscolo (gated `requires_onnx`, vedi `archive/tests/unit/test_onnx_tensorrt_export.py`),
-      TensorRT (gated GPU), XNNPACK e QNN (gated, `test/_helpers/capabilities.py`), pass QNN
-      (`_split_float_linear_bias`, vedi `archive/tests/unit/test_qnn_bias_split.py`), pass TensorRT
-      (`fp32_accumulate_lrd`, `fp32_attention_scores`).
-- [ ] `test/hf/test_hf_export.py`: `export_to_hf` in locale (senza Hub): salvataggio, `auto_map`
-      con `auto_class`, ricarica con risultati identici.
-- [ ] Aggiornare `pytest.ini`: `testpaths = test` (oggi punta a `test/unit test/e2e`, ora archiviati).
-- [ ] Eseguire la nuova suite nei tre ambienti; confrontare con `pytest archive/tests` (vecchia suite).
-- [ ] Commit "Refactor phase 6: new test suite mirroring the package".
+Nuova suite `test/` verde nei tre ambienti (2026-10-28): `py312_tensorrt` 200 passati / 4 saltati,
+`py312_executorch_xnnpack` 198/6, `py310-executorch-qnn` 198/6. Vecchia suite `archive/tests`:
+solo i fallimenti d'ambiente attesi di HANDOFF.md §6 (nessuna regressione).
+File: `test/{utils,blocks,compression,calibration,models}/`, `test/export/{test_operations,test_convert,
+test_wrapper_manifest,test_exporter}.py`, `test/hf/test_hf_export.py`.
 
 ## B. Pulizie rimaste
 
@@ -98,8 +78,8 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
       (es. "decomposizione a basso rango (LRD, low-rank decomposition)", "cache KV",
       "quantizzazione simulata", "backend"). Rileggerlo alla fine e chiarire le parti oscure.
 - [ ] Contenuti: obiettivo e regole; metodo (riepiloghi per cartella); cosa è cambiato per
-      cartella (prima/dopo); le duplicazioni eliminate (tabella in AGENT.md §8); i due dizionari (`BLOCK_CATALOG`, `BACKEND_OPERATIONS`) con esempi;
-      cosa è stato archiviato e perché; correzioni di comportamento (AGENT.md §5); duplicazioni
+      cartella (prima/dopo); le duplicazioni eliminate (tabella in HANDOFF.md §8); i due dizionari (`BLOCK_CATALOG`, `BACKEND_OPERATIONS`) con esempi;
+      cosa è stato archiviato e perché; correzioni di comportamento (HANDOFF.md §5); duplicazioni
       eliminate; test (vecchi archiviati, nuovi per oggetto, fallimenti d'ambiente attesi);
       come aggiungere un modello / un metodo di compressione / una calibrazione / un backend;
       limiti e lavoro futuro (es. selezione utente delle opzioni non-default, modelli con QKV
@@ -107,7 +87,7 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 
 ## F. Chiusura
 
-- [ ] Suite completa nei tre ambienti, nessuna regressione rispetto ad AGENT.md §6.
-- [ ] Ripassare la richiesta originale (AGENT.md §1) punto per punto e confermare che ogni regola è
+- [ ] Suite completa nei tre ambienti, nessuna regressione rispetto ad HANDOFF.md §6.
+- [ ] Ripassare la richiesta originale (HANDOFF.md §1) punto per punto e confermare che ogni regola è
       rispettata o che l'eccezione è motivata nel report.
 - [ ] `git push -u origin draft-prolucio-refactor` (chiedere conferma all'utente).

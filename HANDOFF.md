@@ -1,4 +1,4 @@
-# AGENT.md — ripartire da contesto vuoto (refactoring 2026-10-28)
+# HANDOFF.md — ripartire da contesto vuoto (refactoring 2026-10-28)
 
 Questo file spiega a un agente (o a una persona) **dove si trova il refactoring** del
 repository `transformer-surgeon` e **come proseguirlo**. Le cose ancora da fare sono in
@@ -52,7 +52,8 @@ Commit del refactoring (dal più vecchio):
 | `046bfb7` | riepiloghi per cartella in `notes/refactor/recaps/` |
 | `34fcaa4` | fase 1: `utils/` ridotto; manager/scheme/grouping/cascade/config → `compression/`; `convert_for_export` → `export/convert.py`; progetti collaterali in `archive/side_projects/` |
 | `8e97dc3` | fasi 2–5: `blocks/` ad atomi + catalogo, `export/` stratificato + dizionario operazioni, `models/` a dizionari + fabbrica, pulizie in `compression/` e `calibration/` |
-| `…` | esempio 03 corretto; poi il commit "WIP tests + AGENT/TODO" (nuova suite parziale, vedi TODO) |
+| `0a79938`, `b527fbd`, `2746d95` | esempio 03 corretto; nuova suite parziale; HANDOFF/TODO |
+| fase 6 | nuova suite completa (`test/export/test_wrapper_manifest.py`, `test_exporter.py`, `test/hf/`), parità encoder, `pytest.ini` → `testpaths = test`, fixture `out_dir`/`torch_device` riesportate in `archive/tests/conftest.py` |
 
 Il branch **non è ancora stato pushato** dopo il refactoring (solo `draft-prolucio` è su origin).
 
@@ -130,10 +131,10 @@ Idee chiave:
   `py312_tensorrt` (veloce, ha onnx/tensorrt/GPU, ha `pyflakes`), `py310-executorch-qnn`,
   `py312_executorch_xnnpack` (pytest installato durante questa sessione).
 - Gli script fuori dal repo vanno lanciati con `PYTHONPATH=$PWD`.
-- Test:
+- Test (`pytest.ini` raccoglie solo `test/`):
   ```bash
   conda run -n py312_tensorrt python -m pytest test -q -p no:cacheprovider          # nuova suite
-  conda run -n py312_tensorrt python -m pytest archive/tests -q -p no:cacheprovider # vecchia suite
+  conda run -n py312_tensorrt python -m pytest archive/tests -q -p no:cacheprovider --continue-on-collection-errors # vecchia suite
   conda run -n py312_tensorrt python -m pyflakes transformersurgeon                  # nomi non definiti
   ```
 - **Fallimenti attesi d'ambiente** (presenti già prima del refactoring, nella vecchia suite):
@@ -142,9 +143,18 @@ Idee chiave:
     `test_export_xnnpack*` (out-variants quantizzati mancanti), `test_export_qnn` (IndexError nel toolchain);
   - `py312_executorch_xnnpack`: `test_precision_passes`, `test_export_xnnpack`, `test_export_xnnpack_custom_sdpa`;
   - `py312_tensorrt`: nessuno (145 passati, 18 saltati).
+  Senza `--continue-on-collection-errors` la vecchia suite negli ambienti ExecuTorch si ferma
+  all'errore di raccolta di `test_precision_passes` (manca `onnx`).
+  **Nuova suite**: nessun fallimento atteso in nessun ambiente (200/4, 198/6, 198/6 passati/saltati).
+  Nota: nel test QNN della nuova suite si usa `soc_model="SM8850"`, `quant_scope="all"` perché con lo
+  scope di default questa versione del toolchain QNN non convalida alcuni operatori float sull'HTP
+  (`aten.rms_norm` non delegato); il vecchio `test_export_qnn` fallisce invece con IndexError.
   Qualsiasi altro fallimento è una regressione.
 
 ## 7. Convenzioni di lavoro
+
+- **Tenere HANDOFF.md e TODO.md sempre aggiornati** dopo ogni passo (richiesta dell'utente): devono
+  bastare per ripartire da contesto vuoto. Il file si chiamava `AGENT.md` (rinominato).
 
 - Commit piccoli per fase, messaggi in inglese che terminano con:
   ```

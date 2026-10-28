@@ -79,6 +79,32 @@ def test_encoder_families_convert_to_an_encoder_stack(family):
         assert stack(x).shape == x.shape
 
 
+def _encoder_reference(family, model):
+    """Embeddings and Hugging Face encoder output (no batch dimension) for one sample."""
+    if family == "bert":
+        emb = model.bert.embeddings(input_ids=torch.randint(0, 256, (1, 6)))
+        return emb[0], model.bert.encoder(emb)[0][0]
+    if family == "distilbert":
+        emb = model.distilbert.embeddings(torch.randint(0, 256, (1, 6)))
+        return emb[0], model.distilbert.transformer(emb, attn_mask=torch.ones(1, 6))[0][0]
+    emb = model.vit.embeddings(torch.randn(1, 3, 32, 32))
+    hidden = emb
+    for layer in model.vit.layers:
+        hidden = layer(hidden)
+        hidden = hidden[0] if isinstance(hidden, tuple) else hidden
+    return emb[0], model.vit.layernorm(hidden)[0]
+
+
+@pytest.mark.parametrize("family", ["bert", "distilbert", "vit"])
+def test_converted_encoder_matches_hf(family):
+    torch.manual_seed(0)
+    model = FAMILIES[family].build().float().eval()
+    stack = next(v for v in convert_for_export(model).values() if v is not None).eval()
+    with torch.no_grad():
+        emb, ref = _encoder_reference(family, model)
+        torch.testing.assert_close(stack(emb), ref, rtol=1e-4, atol=1e-4)
+
+
 def test_resolve_convert_options_defaults():
     assert resolve_convert_options()["cache_impl"] == "mutable"
     assert resolve_convert_options({"rmsnorm_upcast": True})["rmsnorm_impl"] == "rmsnorm_upcast"
