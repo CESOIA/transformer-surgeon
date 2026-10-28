@@ -8,7 +8,7 @@ from .unstructured_pruning_methods import METHOD_FUNCTIONS
 logger = logging.getLogger(__name__)
 
 
-VALID_METHODS = ["magnitude", "gradient", "random"]
+VALID_METHODS = list(METHOD_FUNCTIONS)  # unstructured_pruning_methods/ is the single list
 CALIBRATED_METHOD_DICT = {
     "gradient": ("weight_grad",),
 }

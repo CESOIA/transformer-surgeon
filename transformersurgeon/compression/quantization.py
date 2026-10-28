@@ -11,7 +11,7 @@ from .unstructured_pruning_methods import METHOD_FUNCTIONS as SPARSITY_FUNCTIONS
 from .unstructured_pruning import validate_unstructured_pruning_ratio
 
 
-VALID_METHODS = ["vanilla", "gptq", "hqq"]
+VALID_METHODS = list(METHOD_FUNCTIONS)  # quantization_methods/ is the single list
 # "dynamic_per_token": int8 asymmetric per-token scales computed at run time
 # (no calibration) -- the activation scheme of ExecuTorch/XNNPACK 8daXw kernels.
 VALID_ACT_METHODS = ["maxmin", "dynamic_per_token"]

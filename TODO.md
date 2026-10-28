@@ -57,9 +57,19 @@ Nessun ramo di codice specifico per un modello fuori da `models/`; restano:
 - [x] `BACKEND_OPERATIONS` ora copre anche `mlp`, `rope_frequencies`, `embedding`, `output_head` con un
       terzo tipo di voce `model_key` (scelta del dizionario del modello, `default: None`, o implementazione
       unica): solo documentazione dell'operazione su dispositivo, il codice di risoluzione non cambia.
-- [ ] Verifica "un'aggiunta tocca una sola cartella": provare a scrivere (anche solo in bozza) una
-      nuova famiglia di modello, un nuovo metodo LRD, un nuovo riepilogo di calibrazione e annotare
-      quali file servono; riportarlo nel report.
+- [x] Verifica "un'aggiunta tocca una sola cartella" (2026-10-28), risultati da riportare nel report:
+      - **nuova famiglia**: prova reale con Mistral in un worktree temporaneo: `models/mistral_c/` (3 file
+        copiati da `llama_c`, cambiate solo le classi HF) + una riga in `models/__init__.py::FAMILIES`.
+        LRD + potatura strutturata + `convert_for_export` → scarto da HF 9e-6. Nessun altro file.
+        (Per i test servirebbe anche una voce in `test/_helpers/model_factory.py`.)
+      - **nuovo metodo LRD/quantizzazione/potatura non strutturata**: un file in `compression/<tipo>_methods/`
+        + una voce in `METHOD_FUNCTIONS` del suo `__init__.py` (+ `CALIBRATED_METHOD_DICT` se serve
+        calibrazione). `VALID_METHODS` ora è derivato da `METHOD_FUNCTIONS` (prima era una copia).
+      - **nuovo riepilogo di calibrazione**: un file in `calibration/summaries/` + una voce in
+        `SUMMARY_REGISTRY` (+ un raccoglitore in `calibration/raw_data/` se servono dati grezzi nuovi).
+      - **nuovo backend**: una cartella/file in `export/backends/` con una sottoclasse di `Exporter`
+        decorata da `@register_exporter` + import in `export/backends/__init__.py` + le colonne del
+        backend in `BACKEND_OPERATIONS` (`export/operations.py`). Tutto dentro `export/`.
 
 ## C. Documentazione di progetto
 

@@ -5,7 +5,7 @@ from .abstract import Compressor
 from .lrd_methods import METHOD_FUNCTIONS
 
 
-VALID_METHODS = ["svd", "svd-llm-v2", "aa-svd"]
+VALID_METHODS = list(METHOD_FUNCTIONS)  # lrd_methods/ is the single list of methods
 CALIBRATED_METHOD_DICT = {
     "svd-llm-v2": ("covariance",),
     "aa-svd": ("cross_covariance", "shifted_covariance"),
