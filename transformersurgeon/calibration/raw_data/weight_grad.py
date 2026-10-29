@@ -14,9 +14,7 @@ class WeightGradCollector(RawDataCollector):
     # Gradient data is only available after loss.backward().
     requires_backward = True
     # A differentiable calibration loss is required and provided by the manager.
-    requires_loss = True
     # Labels are optional and fully defined by the user-provided loss function.
-    requires_labels = False
 
     def __init__(self, *, offload_to_cpu: bool = False):
         self.offload_to_cpu = offload_to_cpu

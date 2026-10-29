@@ -1,13 +1,14 @@
 import logging
 import torch
 
+from .validators import in_range, one_of, positive_int
 from .abstract import Compressor
 from .unstructured_pruning_methods import METHOD_FUNCTIONS
 
 logger = logging.getLogger(__name__)
 
 
-VALID_METHODS = ["magnitude", "gradient", "random"]
+VALID_METHODS = list(METHOD_FUNCTIONS)  # unstructured_pruning_methods/ is the single list
 CALIBRATED_METHOD_DICT = {
     "gradient": ("weight_grad",),
 }
@@ -132,22 +133,9 @@ class UnstructuredPruner(Compressor):
 
 ### CONFIGURATION VALIDATORS ###
 
-def validate_unstructured_pruning_ratio(ratio: float) -> None:
-    if ratio is not None and not (0.0 <= ratio <= 1.0):
-        raise ValueError(f"Pruning ratio must be between 0.0 and 1.0, but got {ratio}.")
-
-def validate_unstructured_pruning_method(method: str) -> None:
-    if method is not None and method not in VALID_METHODS:
-        raise ValueError(f"Pruning method must be one of {VALID_METHODS}, but got '{method}'.")
-
-def validate_unstructured_pruning_granularity(granularity: str) -> None:
-    valid_granularities = ["layer", "neuron"]
-    if granularity is not None and granularity not in valid_granularities and not (
-        isinstance(granularity, int) and granularity > 0
-    ):
-        raise ValueError(
-            f"Pruning granularity must be one of {valid_granularities} or a positive integer, but got '{granularity}'."
-        )
+validate_unstructured_pruning_ratio = in_range("Pruning ratio", 0.0, 1.0)
+validate_unstructured_pruning_method = one_of("Pruning method", VALID_METHODS, allow_none=True)
+validate_unstructured_pruning_granularity = positive_int("Pruning granularity", also=["layer", "neuron"], allow_none=True)
 
 __all__ = [
     "UnstructuredPruner",

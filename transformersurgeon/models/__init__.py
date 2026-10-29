@@ -1,42 +1,39 @@
-"""Model family exports.
+"""Model families: one folder per family, each holding two dictionaries.
 
-Import each family defensively so optional dependencies in one model do not
-prevent importing unrelated model families.
+- ``indexing_<name>.py``: the model dictionary (layout, compressible layers,
+  couplings, calibration groups, export atoms);
+- ``family_<name>.py``: the Hugging Face classes the family extends; the
+  compressible classes are generated from it by ``factory.build_family``.
+
+Adding a model means adding one such folder and listing it below.
 """
 
+import warnings
 from importlib import import_module
 
-
-def _safe_star_import(module_name):
-	try:
-		module = import_module(f"{__name__}.{module_name}")
-	except Exception:
-		return []
-
-	exported = getattr(module, "__all__", None)
-	if exported is None:
-		exported = [name for name in dir(module) if not name.startswith("_")]
-
-	for name in exported:
-		if hasattr(module, name):
-			globals()[name] = getattr(module, name)
-
-	return exported
-
+FAMILIES = [
+    "qwen2_c",
+    "qwen2_vl_c",
+    "qwen2_5_vl_c",
+    "vit_c",
+    "dinov2_c",
+    "bert_c",
+    "modernbert_c",
+    "distilbert_c",
+    "llama_c",
+    "mistral_c",
+]
 
 __all__ = []
-for _module in [
-	"qwen2_c",
-	"qwen2_vl_c",
-	"qwen2_5_vl_c",
-	"vit_c",
-	"bert_c",
-	"modernbert_c",
-	"distilbert_c",
-	"llama_c",
-]:
-	__all__.extend(_safe_star_import(_module))
+for _family in FAMILIES:
+    try:
+        _module = import_module(f"{__name__}.{_family}")
+    except ImportError as exc:
+        # The installed transformers version may lack this model family.
+        warnings.warn(f"Model family {_family!r} is unavailable: {exc}")
+        continue
+    for _name in _module.__all__:
+        globals()[_name] = getattr(_module, _name)
+    __all__.extend(_module.__all__)
 
-del _module
-del _safe_star_import
-del import_module
+del _family, _module, _name, import_module

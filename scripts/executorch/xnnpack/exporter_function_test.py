@@ -1,18 +1,15 @@
 import argparse
-import json
 import os
-import random
 
 import torch
-from datasets import load_dataset
-from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2ForCausalLMCompress
 from transformersurgeon.models.qwen2_c import Qwen2CompressionSchemesManager
 from transformersurgeon.export import export_to_backend
-from transformersurgeon.export.executorch_exporters.xnnpack import XNNPACKExportConfig
-from transformersurgeon.utils import convert_for_export
+from transformersurgeon.export.backends.xnnpack import XNNPACKExportConfig
+from transformersurgeon.export.convert import convert_for_export
+from transformersurgeon.calibration import wikitext2_loader
 
 
 _DTYPE_MAP = {
@@ -131,28 +128,18 @@ def parse_args():
              "cache as internal graph state; 'io_scatter'/'io_concat' expose it as "
              "explicit graph I/O (portable to functional runtimes).",
     )
+    parser.add_argument(
+        "--attn-impl",
+        type=str,
+        default="manual",
+        choices=["manual", "sdpa", "custom_sdpa"],
+        help="Attention kernel for the exported model. 'manual' is the explicit "
+             "GQA-aware softmax/matmul path (default). 'sdpa' uses "
+             "torch.nn.functional.scaled_dot_product_attention. 'custom_sdpa' uses "
+             "ExecuTorch's fused CPU custom ops (torch.ops.llama.custom_sdpa / "
+             "update_cache) -- XNNPACK-optimized, requires cache-impl=mutable.",
+    )
     return parser.parse_args()
-
-
-def _write_cache_metadata(output_path: str, model_config, args: argparse.Namespace) -> str:
-    """Write a JSON sidecar with the KV-cache geometry next to the exported .pte.
-
-    inference_exported_test.py needs num_layers/kv_num_heads/head_dim/max_cache_len
-    to build the io_* cache tensors; without this file those have to be typed in
-    by hand (and get out of sync with whatever model/--max-sequence-length the
-    engine was actually exported with).
-    """
-    meta = {
-        "cache_impl": args.cache_impl,
-        "num_layers": int(model_config.num_hidden_layers),
-        "kv_num_heads": int(model_config.num_key_value_heads),
-        "head_dim": int(model_config.hidden_size // model_config.num_attention_heads),
-        "max_cache_len": int(args.max_sequence_length),
-    }
-    meta_path = os.path.splitext(output_path)[0] + ".cache_meta.json"
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    return meta_path
 
 
 def _build_pte_stem(args: argparse.Namespace) -> str:
@@ -160,38 +147,6 @@ def _build_pte_stem(args: argparse.Namespace) -> str:
         act_tag = f"_a{args.act_precision}" if args.calibrate else ""
         return f"qwen2_{args.backend}_w{args.quant_precision}{act_tag}_{args.quant_mode}"
     return f"qwen2_{args.backend}_full"
-
-
-def _build_wikitext_calibration_loader(
-    tokenizer,
-    num_samples: int = 128,
-    seq_len: int = 512,
-    seed: int = 42,
-) -> DataLoader:
-    raw = load_dataset(
-        "EleutherAI/wikitext_document_level",
-        "wikitext-2-raw-v1",
-        split="train",
-    )
-    texts = [t for t in raw["page"] if isinstance(t, str) and len(t) > 0]
-    corpus = "\n\n".join(texts)
-
-    token_ids = tokenizer(corpus, truncation=False, padding=False,
-                          return_attention_mask=False)["input_ids"]
-
-    max_samples = len(token_ids) // seq_len
-    actual = min(num_samples, max_samples)
-
-    rng = random.Random(seed)
-    examples = []
-    for _ in range(actual):
-        start = rng.randint(0, len(token_ids) - seq_len - 1)
-        examples.append({
-            "input_ids": torch.tensor(token_ids[start:start + seq_len], dtype=torch.long),
-            "attention_mask": torch.ones(seq_len, dtype=torch.long),
-        })
-
-    return DataLoader(examples, batch_size=1, shuffle=False)
 
 
 def quantize_mlp_with_manager(model, args, calibration_loader=None):
@@ -240,7 +195,7 @@ def main():
         if args.calibrate:
             print(f"Building WikiText-2 calibration loader ({args.num_calibration_samples} samples, seq_len={args.calibration_seq_len})")
             tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-            calibration_loader = _build_wikitext_calibration_loader(
+            calibration_loader = wikitext2_loader(
                 tokenizer,
                 num_samples=args.num_calibration_samples,
                 seq_len=args.calibration_seq_len,
@@ -249,6 +204,7 @@ def main():
 
     convert_options = {
         "use_sdpa": False,
+        "attn_impl": args.attn_impl,
         "cache_impl": args.cache_impl,
         "max_cache_len": args.max_sequence_length,
     }
@@ -287,11 +243,11 @@ def main():
         config=export_config,
     )
 
-    meta_path = _write_cache_metadata(result.pte_path, model.config, args)
 
     print("\nExport result:")
     print(f"  pte_path         : {result.pte_path}")
-    print(f"  cache_meta_path  : {meta_path}")
+    print(f"  manifest_path    : {result.manifest_path}")
+    print(f"  attn_impl        : {args.attn_impl}")
     print(f"  backend          : {result.backend}")
     print(f"  precision        : {result.precision}")
     print(f"  mismatch_count   : {len(result.weight_mismatches)}")

@@ -28,13 +28,13 @@ class FamilySpec:
     mlp_prune_criteria: object
     is_causal: bool = False
     # Families that cannot yet build a manager / fully run are marked here so the
-    # e2e suite can xfail them with a pointer to FRAMEWORK_PROBLEMS.md.
+    # e2e suite can xfail them.
     known_broken: str = ""
     # Some families have a structural reason coupled/hard structured MLP pruning
     # can't apply cleanly (e.g. ModernBERT's fused Wqkv/Wi projections have no
-    # separate gate/up pair to couple — FRAMEWORK_PROBLEMS.md N1). Dual-tower VL
-    # models used to hit this too (auto_groups() mixing vision+text groups,
-    # FRAMEWORK_PROBLEMS.md #6) but that's now guarded/scoped per tower and works.
+    # separate gate/up pair to couple). Dual-tower VL
+    # models used to hit this too (auto_groups() mixing vision+text groups)
+    # but that's now guarded/scoped per tower and works.
     struct_prune_supported: bool = True
 
 
@@ -65,6 +65,16 @@ def _llama():
         tie_word_embeddings=False,
     )
     return T.LlamaForCausalLMCompress(cfg)
+
+
+def _mistral():
+    T = _import_ts()
+    cfg = T.MistralConfigCompress(
+        vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+        tie_word_embeddings=False,
+    )
+    return T.MistralForCausalLMCompress(cfg)
 
 
 def _bert():
@@ -103,6 +113,16 @@ def _vit():
         image_size=32, patch_size=16, num_channels=3, num_labels=10,
     )
     return T.ViTForImageClassificationCompress(cfg)
+
+
+def _dinov2():
+    T = _import_ts()
+    # layer_scale_init_value != 1 so that a missing layer scale shows up in the outputs.
+    cfg = T.Dinov2ConfigCompress(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4, mlp_ratio=2,
+        image_size=32, patch_size=16, num_channels=3, num_labels=10, layer_scale_init_value=0.5,
+    )
+    return T.Dinov2ForImageClassificationCompress(cfg)
 
 
 def _make_vl(model_attr, vis_attr, txt_attr, cfg_attr):
@@ -153,6 +173,11 @@ FAMILIES: Dict[str, FamilySpec] = {
         lrd_criteria="self_attn.q_proj",
         mlp_prune_criteria=["mlp.gate_proj", "mlp.up_proj"], is_causal=True,
     ),
+    "mistral": FamilySpec(
+        "mistral", _mistral, _mgr("MistralCompressionSchemesManager"), _ids(),
+        lrd_criteria="self_attn.q_proj",
+        mlp_prune_criteria=["mlp.gate_proj", "mlp.up_proj"], is_causal=True,
+    ),
     "bert": FamilySpec(
         "bert", _bert, _mgr("BertCompressionSchemesManager"), _ids(),
         lrd_criteria="attention.self.query",
@@ -170,7 +195,11 @@ FAMILIES: Dict[str, FamilySpec] = {
     ),
     "vit": FamilySpec(
         "vit", _vit, _mgr("ViTCompressionSchemesManager"), _pixels,
-        lrd_criteria="attention.attention.query", mlp_prune_criteria="intermediate.dense",
+        lrd_criteria="attention.q_proj", mlp_prune_criteria="mlp.fc1",
+    ),
+    "dinov2": FamilySpec(
+        "dinov2", _dinov2, _mgr("Dinov2CompressionSchemesManager"), _pixels,
+        lrd_criteria="attention.attention.query", mlp_prune_criteria="mlp.fc1",
     ),
     "qwen2_vl": FamilySpec(
         "qwen2_vl",

@@ -43,7 +43,7 @@ QWEN2_5_VL_C_INDEXING = {
             'output_dependence': {
                 # 'preprocessing_conv' is a sentinel: the conv's output feeds
                 # block 0's residual stream via norm1. Resolved directly (no
-                # block_index) by the manager/structured pruner, not via
+                # block_index) by CompressionScheme (compression/scheme.py), not via
                 # path_template.
                 'preprocessing_conv': ['norm1'],
                 'norm1': ['attn.qkv'],
@@ -62,7 +62,6 @@ QWEN2_5_VL_C_INDEXING = {
             'coupled_masks_all': [
                 ['attn.proj', 'mlp.down_proj', 'preprocessing_conv'],
             ],
-            'per_head_uniform': [],
             # Normalization layers: transparent to the embedding/hidden size,
             # never user-compressible, and only ever pruned by forwarding a
             # mask through them (see CoupledPruner.apply_chain).
@@ -72,7 +71,6 @@ QWEN2_5_VL_C_INDEXING = {
         'preprocessing': "model.visual.patch_embed",
         'preprocessing_conv': "model.visual.patch_embed.proj",
         'final_layer': "model.visual.merger",
-        'pruning_supported': [],
     },
     'text':
     {
@@ -105,7 +103,7 @@ QWEN2_5_VL_C_INDEXING = {
             'output_dependence': {
                 # 'preprocessing' is a sentinel: the embedding's output feeds
                 # block 0's residual stream via input_layernorm. Resolved
-                # directly (no block_index) by the manager/structured pruner,
+                # directly (no block_index) by CompressionScheme (compression/scheme.py),
                 # not via path_template.
                 'preprocessing': ['input_layernorm'],
                 'input_layernorm': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
@@ -113,7 +111,7 @@ QWEN2_5_VL_C_INDEXING = {
                 'mlp.up_proj': ['mlp.down_proj'],
                 # Wraps to the next block's input_layernorm (or, on the last
                 # block, to 'final_norm' -- see the 'final_norm'/'final_layer'
-                # gating in structured_pruning.py).
+                # gating in CompressionScheme.coupled_target_chains).
                 'mlp.down_proj': ['input_layernorm', 'final_norm'],
                 'self_attn.v_proj': ['self_attn.o_proj'],
                 'self_attn.o_proj': ['post_attention_layernorm', 'final_norm'],
@@ -132,7 +130,6 @@ QWEN2_5_VL_C_INDEXING = {
             'coupled_masks_all': [
                 ['self_attn.o_proj', 'mlp.down_proj', 'preprocessing'],
             ],
-            'per_head_uniform': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
             # position_linked: layers whose output rows are indexed by RoPE
             # position (q/k head slices are paired 1:1 with rotary sin/cos
             # bands). Hard structured pruning removes rows by importance score,
@@ -159,22 +156,14 @@ QWEN2_5_VL_C_INDEXING = {
         'attn_type': 'mha_causal',
         'mlp_type': 'mlp_gated',
         'norm_type': 'rmsnorm',
+        # RoPE variant for the converted text decoder (blocks/catalog.py). Text-only
+        # decoding has equal t/h/w positions, where M-RoPE equals plain RoPE.
+        'rope_type': 'default',
         'layer_matching': {
             'input_layernorm': 'norm_in',
             'self_attn': ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.out_proj'],
             'post_attention_layernorm': 'norm_out',
             'mlp': ['mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj'],
-        },
-        'bias_required': {
-            'attn.q_proj': True,
-            'attn.k_proj': True,
-            'attn.v_proj': True,
-            'attn.out_proj': False,
-            'mlp.gate_proj': False,
-            'mlp.up_proj': False,
-            'mlp.down_proj': False,
-            'norm_in': False,
-            'norm_out': False,
         },
         'extra_layers_matching': ["norm"],
     }

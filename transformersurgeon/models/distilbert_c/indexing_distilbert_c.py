@@ -59,18 +59,12 @@ DISTILBERT_C_INDEXING = {
             "coupled_masks_all": [
                 ["attention.out_lin", "ffn.lin2"],
             ],
-            "per_head_uniform": ["attention.q_lin", "attention.k_lin", "attention.v_lin"],
             # Normalization layers: transparent to the embedding/hidden size,
             # never user-compressible, and only ever pruned by forwarding a
             # mask through them (see CoupledPruner.apply_chain).
             "norm_layers": ["sa_layer_norm", "output_layer_norm"],
         },
         "path_template": "distilbert.transformer.layer.{block_index}.{path}",
-        "qkv_paths": [
-            "attention.q_lin",
-            "attention.k_lin",
-            "attention.v_lin",
-        ],
         "preprocessing": "distilbert.embeddings",
         "final_layer": "classifier",
 
@@ -85,16 +79,6 @@ DISTILBERT_C_INDEXING = {
             "sa_layer_norm": "norm_in",
             "ffn": ["mlp.up_proj", "mlp.down_proj"],
             "output_layer_norm": "norm_out",
-        },
-        "bias_required": {
-            "attn.q_proj": True,
-            "attn.k_proj": True,
-            "attn.v_proj": True,
-            "attn.out_proj": True,
-            "norm_in": False,
-            "mlp.up_proj": True,
-            "mlp.down_proj": True,
-            "norm_out": False,
         },
         "use_final_norm": False,
         "position_embedding_type": "none",

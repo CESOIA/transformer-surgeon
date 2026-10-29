@@ -1,21 +1,22 @@
-import os, json, shutil
+import json
+import os
+import shutil
+
 from huggingface_hub import HfApi, create_repo
 from transformers import PreTrainedModel
 
 def _infer_auto_map(model: PreTrainedModel):
-    # always map config and generic AutoModel
+    """Auto classes recorded in config.json for remote-code loading: configuration,
+    base model, and the family's own auto class (``auto_class`` of its family dictionary)."""
     auto_map = {
-        "AutoConfig": "autoload."+model.config.__class__.__name__,
-        "AutoModel": "autoload."+model.__class__.__name__,
+        "AutoConfig": "autoload." + model.config.__class__.__name__,
+        "AutoModel": "autoload." + model.__class__.__name__,
     }
-    # Heuristics for common specialized autos
-    name = model.__class__.__name__
-    if "ForConditionalGeneration" in name:
-        auto_map["AutoModelForConditionalGeneration"] = "autoload."+model.__class__.__name__
-    ### add more heuristics here if needed
-    ### ...
-
+    auto_class = getattr(model, "auto_class", None)
+    if auto_class:
+        auto_map[auto_class] = "autoload." + model.__class__.__name__
     return auto_map
+
 
 def export_to_hf(
         model: PreTrainedModel,
@@ -36,7 +37,9 @@ def export_to_hf(
             ``manager.apply(hard=True)`` followed by ``manager.prepare_for_save()``
             before serializing the model, which finalizes quantization (torchao)
             and strips runtime artifacts. If omitted you must call those methods
-            yourself before calling this function.
+            yourself before calling this function. This is the only place where
+            an export step triggers compression: it is a convenience kept for
+            the existing callers, equivalent to applying the manager first.
     """
     # Finalize compression if a manager is supplied
     if manager is not None:
@@ -52,16 +55,12 @@ def export_to_hf(
 
     # [optional] save tokenizer/processor from a base model (helps users load)
     if base_model:
-        try:
-            from transformers import AutoTokenizer, AutoProcessor
-            AutoTokenizer.from_pretrained(base_model).save_pretrained(out_dir)
-        except Exception:
-            pass
-        try:
-            from transformers import AutoProcessor
-            AutoProcessor.from_pretrained(base_model).save_pretrained(out_dir)
-        except Exception:
-            pass
+        from transformers import AutoProcessor, AutoTokenizer
+        for auto in (AutoTokenizer, AutoProcessor):
+            try:
+                auto.from_pretrained(base_model).save_pretrained(out_dir)
+            except Exception:
+                pass
 
     # [optional] save README
     if readme:

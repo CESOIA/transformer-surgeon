@@ -1,0 +1,776 @@
+"""
+compression.py
+
+Provides the CompressionScheme class for managing structured pruning and low-rank decomposition of transformer blocks.
+"""
+import copy
+import inspect
+import torch
+
+from ..blocks import LinearCompressed
+from ..blocks import EmbeddingCompressed
+from ..blocks import Conv2dCompressed, Conv3dCompressed
+from ..blocks import VCONBlock
+from .registry import (
+    COMPRESSOR_DICT,
+    COMPRESSION_REGISTRY,
+    APPLICATION_ORDER,
+)
+from ..utils import get_submodule
+
+# PROBLEM: when pruning a layer, the next layer should also be adjusted accordingly
+# but this is not easy for skip connections, e.g., residual connections in transformers
+# Maybe it is possible to do so by storing the masks of the previouse layers and use torch.scatter (that might be supported in executorch) to insert zeros where needed
+
+class CompressionScheme:
+    """
+    Compression of one layer of the model: its compressors, their options, its
+    calibration data and its place in the model (topology).
+
+    Built by ``CompressionSchemesManager`` from the model dictionary; never
+    instantiated directly.
+
+    Args:
+        name (str): Name of the layer inside the block (e.g. ``"mlp.up_proj"``).
+        block_id (int): Block index, or None for layers outside the blocks.
+        path (str): Full dotted path of the layer in the model.
+        compression_config (dict, optional): Per-compression options of the layer.
+        model (torch.nn.Module, optional): Reference to the model.
+        pruning_indexing (dict, optional): The ``pruning`` section of the model dictionary.
+        path_template (str, optional): Format string of a block layer's path.
+        path_list (list, optional): Flattened per-block layer order.
+        num_blocks (int, optional): Number of blocks.
+        preprocessing_path (str, optional): Resolved path of the embedding (sentinel ``'preprocessing'``).
+        final_layer_path (str, optional): Resolved path of the output head (sentinel ``'final_layer'``).
+        final_norm_path (str, optional): Resolved path of the final norm (sentinel ``'final_norm'``).
+        preprocessing_conv_extra_params_paths (list, optional): Raw parameters pruned
+            together with the patch-embedding convolution.
+        is_norm (bool): Whether the layer is a normalisation layer.
+
+    Attributes:
+        hard_applied (bool): Flags if compression is non-reversible.
+        soft_applied (bool): Flags if compression has been performed.
+        vcon_initialized (bool): Flags if VCONBlock has been initialized.
+
+    Methods:
+        get_module: Returns the module at the specified path.
+        set_module: Sets a new module at the specified path.
+        _is_to_compress: Checks if compression should be applied.
+        _module_copy: Returns a copy of the module.
+        init_vcon: Initializes VCON block.
+        cancel_vcon: Cancels VCON block.
+        set_vcon_beta: Sets beta for VCON block.
+        freeze_uncompressed_vcon: Freezes uncompressed VCON block.
+        apply: Applies compression (pruning and/or LRD).
+        restore: Restores original module.
+        _unstructured_maks: Generates a mask for unstructured pruning.
+        _structured_mask: Generates a mask for structured pruning.
+        _low_rank_decomposition: Performs low-rank decomposition.
+    """
+
+    def __init__(
+            self,
+            name,
+            block_id,
+            path,
+            # output_paths,
+            compression_config=None,
+            model=None,
+            pruning_indexing=None,
+            path_template=None,
+            path_list=None,
+            num_blocks=None,
+            preprocessing_path=None,
+            final_layer_path=None,
+            final_norm_path=None,
+            preprocessing_conv_extra_params_paths=None,
+            is_norm=False,
+            ):
+        self.name = name
+        self.block_id = block_id
+        self.path = path
+        self.model = model
+        self.hard_applied = False # this flags the compression as non-reversible when True
+        self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize with hard application
+        self.vcon_initialized = False # this flags if the VCONBlock has been initialized
+
+        # Groups this scheme belongs to (name -> SchemeGroup). At most one for now.
+        self.groups = {}
+        # Generic (model-agnostic) pruning indexing metadata + path template,
+        # plumbed in by the manager so compressors can resolve coupled targets
+        # without the manager itself orchestrating them.
+        self.pruning_indexing = pruning_indexing or {}
+        # Whether this layer's output rows are indexed by positional embedding
+        # (RoPE q/k projections, listed in the model dictionary's pruning.position_linked).
+        # Consumed by StructuredPruner.apply to warn before hard-pruning it.
+        self.position_linked = name in self.pruning_indexing.get('position_linked', ())
+        self.path_template = path_template
+        # Flattened per-block layer order and total block count, so coupled
+        # pruning can tell whether an output_dependence target sits later in
+        # the same block or wraps into the next one (see StructuredPruner).
+        self.path_list = path_list or []
+        self.num_blocks = num_blocks
+        # Resolved full paths of the 'preprocessing'/'final_layer' sentinel
+        # layers (if a scheme was built for them), so coupled-cascade code can
+        # resolve those output_dependence targets without re-deriving them
+        # from path_template (they aren't block-indexed).
+        self.preprocessing_path = preprocessing_path
+        self.final_layer_path = final_layer_path
+        self.final_norm_path = final_norm_path
+        # Dotted paths (relative to the model root) of raw nn.Parameters that
+        # live alongside 'preprocessing_conv' in the same composite
+        # preprocessing wrapper (e.g. a class token and learned position embeddings,
+        # concatenated/added directly to the conv's output along the hidden
+        # dim) and therefore must be index-selected on their last dim in sync
+        # with the conv's hard-pruning mask -- see
+        # StructuredPruner._prune_extra_params. Only meaningful on the
+        # 'preprocessing_conv' scheme itself; empty for models without such
+        # extra params (e.g. a patch embedding that is a bare reshape+conv).
+        self.preprocessing_conv_extra_params_paths = preprocessing_conv_extra_params_paths or []
+        # Normalization layers (e.g. RMSNorm/LayerNorm) get a scheme so the
+        # manager/coupled-pruning cascade can route through them, but they are
+        # never user-compressible (see set() below) -- pruning only ever
+        # forwards a mask through them via CoupledPruner.apply_chain.
+        self.is_norm = is_norm
+
+        # Generate compressor list based on the provided configuration
+        self.compressors = {}
+        self.config = compression_config
+        # Extract path-specific compression configuration, if provided
+        if self.config is not None:
+            for comp_name, comp_config in compression_config.items():
+                # Instantiate correct compressor with the provided configuration
+                compressor_class = COMPRESSOR_DICT.get(comp_name, None)
+                if compressor_class is None:
+                    raise ValueError(f"Unsupported compression type '{comp_name}' in configuration.")
+                self.compressors[comp_name] = compressor_class(comp_config)
+
+        self._sort_compressors()
+        self._link_compressors()
+
+        # Check if the module exists in the model
+        if self.model is not None:
+            self.get_module()
+
+        # Backup objects
+        self._weight_original = None # This will store the original weights for restoration if needed
+        self.calibration_data = {}
+
+    def get_module(self):
+        """
+        Returns the module connected to the compression scheme.
+        """
+        # Check if model has been provided
+        if not hasattr(self, 'model'):
+            raise ValueError("Model is not set. Please set the model before getting the module.")
+
+        return get_submodule(self.model, self.path)
+
+    def set(self, compression_name, compression_property, value, verbose=False):
+        """
+        Sets a specific property of a compression type in the compression scheme.
+
+        Args:
+            compression_name (str): The name of the compression type (e.g., 'pruning', 'lrd').
+            compression_property (str): The name of the property to set (e.g., 'ratio' for pruning).
+            value: The new value to set for the specified property.
+        """
+        if self.is_norm:
+            # Normalization layers are never user-compressible: they only
+            # ever get pruned indirectly, by CoupledPruner forwarding a mask
+            # through them. A no-op (not an error) keeps broadcast calls like
+            # manager.set(..., criteria=None) safe even when they happen to
+            # match a norm scheme.
+            if verbose:
+                print(f"Skipping {compression_property} of {compression_name} for normalization layer {self.path}: not user-compressible.")
+            return
+
+        if verbose:
+            print(f"Setting {compression_property} of {compression_name} to {value} for module {self.path}.")
+
+        # Check validity of the property value using COMPRESSION_REGISTRY
+        if compression_name not in COMPRESSION_REGISTRY:
+            raise ValueError(f"Unsupported compression type '{compression_name}' in configuration.")
+        if compression_property not in COMPRESSION_REGISTRY[compression_name]:
+            raise ValueError(f"Unsupported property '{compression_property}' for compression type '{compression_name}' in configuration.")
+        validator = COMPRESSION_REGISTRY[compression_name][compression_property]['validator']
+        if validator is not None:
+            validator(value) # This will raise an error if the value is invalid
+
+        if self.soft_applied or self.hard_applied:
+            raise RuntimeError(f"Cannot set {compression_property} for {compression_name} because compression has already been applied.")
+
+        # Generate compressor if necessary
+        if compression_name not in self.compressors:
+            # If compressor config existed, something went wrong
+            assert compression_name not in self.config, f"Configuration exists without related compressor for '{compression_name}'. Something went wrong."
+            # Get compressor class
+            compressor_class = COMPRESSOR_DICT.get(compression_name, None)
+            if compressor_class is None:
+                raise ValueError(f"Unsupported compression type '{compression_name}' in configuration.")
+            # Build default dict
+            self.config[compression_name] = {key: value["default"] for key, value in COMPRESSION_REGISTRY[compression_name].items()}
+            self.compressors[compression_name] = compressor_class(self.config[compression_name])
+            self.compressors[compression_name].scheme = self
+
+        # Set the specified (temp) property of the compressor
+        compressor = self.compressors[compression_name]
+        if hasattr(compressor, compression_property):
+            setattr(compressor, compression_property, value)
+        else:
+            raise ValueError(f"Compressor '{compression_name}' does not have property '{compression_property}'.")
+
+        self._sort_compressors()
+    
+    def _link_compressors(self):
+        """Plant a back-reference to this scheme on every compressor.
+
+        Compressors (e.g. the structured pruner) use it to reach group siblings
+        and the generic pruning indexing for coupled cascades. Set at construction
+        time only — never during apply.
+        """
+        for compressor in self.compressors.values():
+            compressor.scheme = self
+
+    def add_to_group(self, group):
+        """Register membership in ``group`` (enforces at most one group for now)."""
+        if self.groups and group.name not in self.groups:
+            existing = next(iter(self.groups))
+            raise ValueError(
+                f"Scheme '{self.path}' is already in group '{existing}'. "
+                "A scheme may belong to at most one group."
+            )
+        self.groups[group.name] = group
+
+    def remove_from_group(self, name):
+        """Drop membership in the named group if present."""
+        self.groups.pop(name, None)
+
+    def _sort_compressors(self):
+        """Re-order self.compressors to match APPLICATION_ORDER.
+
+        Any compressor type not listed in APPLICATION_ORDER is appended after
+        the known ones in their original relative order, so future additions
+        to the registry degrade gracefully rather than raising an error.
+        """
+        known = {name: self.compressors[name] for name in APPLICATION_ORDER if name in self.compressors}
+        unknown = {name: comp for name, comp in self.compressors.items() if name not in APPLICATION_ORDER}
+        self.compressors = {**known, **unknown}
+
+    def set_module(self, new_module):
+        """
+        Sets a new module at the position specified by the compression scheme.
+
+        Args:
+            new_module (torch.nn.Module): The new module to set.
+        """
+        # Check if model has been provided
+        if not hasattr(self, 'model'):
+            raise ValueError("Model is not set. Please set the model before setting the module.")
+        
+        # Check if init_vcon has been called
+        if self.vcon_initialized:
+            raise ValueError("Cannot set module when VCONBlock is initialized. Please cancel VCON first.")
+
+        split_path = self.path.split('.')
+        # Traverse the model iteratively to find the parent module
+        tmp_module = self.model
+        for path_piece in split_path[:-1]:
+            tmp_module = getattr(tmp_module, path_piece, None)
+
+            if tmp_module is None:
+                raise ValueError(f"Module at path '{self.path}' not found in the model.")
+        
+        # Set the new module at the specified path
+        setattr(tmp_module, split_path[-1], new_module)
+
+    def get_compression_module(self):
+        """
+        Returns the module that will be directly compressed.
+
+        If a VCONBlock is initialized, compression is applied to block_b.
+        """
+        module = self.get_module()
+        if self.vcon_initialized:
+            module = module.block_b
+        return module
+    
+    def _is_to_compress(self):
+        """
+        Checks if compression has been set for the module, or if the module is compatible with compression.
+        Compatible modules:
+            - LinearCompressed
+
+        Returns:
+            bool: True if compression should be applied, False otherwise.
+        """
+        # Navigate through the compressors to check if any compression is configured for this module
+        to_compress = False
+        for comp_name, compressor in self.compressors.items():
+            to_compress = to_compress or compressor._to_compress()
+
+        return to_compress and self._is_compatible()
+    
+    def _is_compatible(self):
+        """
+        Checks if the module is compatible with compression.
+        Compatible modules:
+            - LinearCompressed
+            - EmbeddingCompressed
+            - Conv2dCompressed
+            - Conv3dCompressed
+
+        Returns:
+            bool: True if the module is compatible, False otherwise.
+        """
+        compatible = False
+        compatible = compatible or self.vcon_initialized # if VCON is initialized, compatible by definition
+        module_type = type(self.get_module())
+        compatible = compatible or module_type is LinearCompressed
+        compatible = compatible or module_type is EmbeddingCompressed
+        compatible = compatible or module_type is Conv2dCompressed
+        compatible = compatible or module_type is Conv3dCompressed
+
+        return compatible
+    
+    def _module_copy(self, module):
+        """
+        Returns a hard copy of the module.
+
+        Args:
+            module (torch.nn.Module): Module to copy.
+
+        Returns:
+            torch.nn.Module: Copied module.
+        """
+        # Get the __init__ signature
+        sig = inspect.signature(type(module).__init__)
+        # Build kwargs from module attributes
+        kwargs = {}
+        for name, param in sig.parameters.items():
+            if name == 'self':
+                continue
+            if hasattr(module, name):
+                # check on bias, must be bool
+                if name == 'bias':
+                    kwargs["bias"] = True if module.bias is not None else False
+                else:
+                    kwargs[name] = getattr(module, name)
+        # Create a new instance of the same class
+        module_copy = type(module)(**kwargs)
+        src_param = next(module.parameters(), None)
+        if src_param is not None:
+            module_copy = module_copy.to(device=src_param.device)
+        with torch.no_grad():
+            for name, param in module.named_parameters(recurse=True):
+                *path, leaf = name.split('.')
+                target = module_copy
+                for step in path:
+                    target = getattr(target, step)
+                getattr(target, leaf).copy_(param.detach().clone())
+            for name, buf in module.named_buffers(recurse=False):
+                setattr(module_copy, name, buf.clone())
+            # Copy other attributes except parameters, buffers, and methods
+            for attr, value in module.__dict__.items():
+                if (
+                    not attr.startswith('_')
+                    and not isinstance(value, torch.nn.Parameter)
+                    and not isinstance(value, torch.Tensor)
+                    and not callable(value)
+                ):
+                    try:
+                        setattr(module_copy, attr, copy.deepcopy(value))
+                    except Exception:
+                        pass
+        return module_copy
+
+    def init_vcon(self, verbose=False):
+        """
+        Initializes a VCONBlock for the current module by duplicating it.
+        This method checks if compression is required and has not yet been applied.
+        If so, it creates a copy of the current module and instantiates a VCONBlock
+        with the original and copied modules as its components. The module is then
+        replaced with the VCONBlock. If `verbose` is True, a message indicating
+        successful initialization is printed. The method sets the `vcon_initialized`
+        flag to True upon completion.
+
+        Raises:
+            ValueError: If compression has already been applied (either soft or hard).
+            
+        Args:
+            verbose (bool, optional): If True, prints a message upon successful initialization.
+        """   
+        # check if the model is compatible with compression
+        if not self._is_compatible():
+            return # nothing to do
+        
+        # check if compression has already been applied
+        if self.soft_applied or self.hard_applied:
+            raise ValueError("Cannot initialize VCONBlock after compression has been applied.")
+
+        module = self.get_module()
+        module_copy = self._module_copy(module)
+        vcon_block = VCONBlock(block_a=module, block_b=module_copy)
+        self.set_module(vcon_block)
+        if verbose:
+            print(f"Initialized VCONBlock at {self.path}")
+        self.vcon_initialized = True
+
+    def cancel_vcon(self, keep_block_b=True, verbose=False):
+        """
+        Cancels and removes the VCONBlock from the module, retaining either `block_a` or `block_b`.
+        This method replaces the current module containing a VCONBlock with either its `block_a` or `block_b` submodule,
+        depending on the value of `keep_block_b`. It also updates the internal state to reflect that the VCONBlock
+        is no longer initialized.
+
+        Args:
+            keep_block_b (bool, optional): If True, retains `block_b` after cancellation; otherwise, retains `block_a`.
+                Defaults to True.
+            verbose (bool, optional): If True, prints a message indicating which block was kept and the path of the module.
+                Defaults to False.
+
+        Raises:
+            ValueError: If the VCONBlock is not initialized and cancellation is attempted.
+
+        Side Effects:
+            - Replaces the current module with the selected block.
+            - Updates `self.vcon_initialized` to False.
+            - Optionally prints a message if `verbose` is True.
+        """
+ 
+        if not self.vcon_initialized:
+            # Nothing to do
+            return
+        
+        self.vcon_initialized = False
+
+        module = self.get_module()
+        if keep_block_b:
+            module = module.block_b
+        else:
+            module = module.block_a
+        
+        self.set_module(module)
+
+        if verbose:
+            kept = "block_b" if keep_block_b else "block_a"
+            print(f"Cancelled VCONBlock at {self.path}, kept {kept}.")  
+
+    def set_vcon_beta(self, beta: float, verbose=False):
+        """
+        Set the beta value for the VCONBlock module.
+        This method updates the beta parameter of the VCONBlock, which controls the contribution
+        of each block in the model. The VCONBlock must be initialized before calling this method.
+
+        Args:
+            beta (float): The new beta value to set for the VCONBlock.
+            verbose (bool, optional): If True, prints a message indicating the beta value has been set. Defaults to False.
+
+        Raises:
+            ValueError: If the VCONBlock is not initialized.
+
+        Example:
+            >>> obj.set_vcon_beta(0.5, verbose=True)
+            Set VCONBlock beta to 0.5 at <path>.
+        """
+
+        if not self.vcon_initialized:
+            raise ValueError("VCONBlock is not initialized, cannot set beta.")
+        
+        module = self.get_module() # get the VCONBlock
+        module.set_beta(beta)
+        if verbose:
+            print(f"Set VCONBlock beta to {beta} at {self.path}.")
+
+    def freeze_uncompressed_vcon(self, verbose=False):
+        """
+        Freezes the parameters of the `block_a` submodule within a VCONBlock to prevent them from being updated during training.
+        This method sets `requires_grad` to `False` for all parameters in `block_a`, effectively freezing them.
+        It is typically used when you want to exclude the uncompressed part of the VCONBlock from optimization.
+
+        Args:
+            verbose (bool, optional): If True, prints a message indicating that the parameters have been frozen. Default is False.
+
+        Raises:
+            ValueError: If the VCONBlock has not been initialized (`self.vcon_initialized` is False).
+        """
+        if not self.vcon_initialized:
+            raise ValueError("VCONBlock is not initialized, cannot freeze uncompressed block.")
+        
+        module = self.get_module() # get the VCONBlock
+        for param in module.block_a.parameters():
+            param.requires_grad = False
+        if verbose:
+            print(f"Froze parameters of block_a in VCONBlock at {self.path}.")
+        
+    def apply(self, hard=False, verbose=False):
+        """
+        Applies magnitude-based structured pruning and Low Rank Decomposition (LRD) to the target module.
+
+        VCONBlock Handling:
+            - If the module is wrapped in a VCONBlock, compression is applied only to the second block (`block_b`).
+
+        Parameters:
+            hard (bool): If True, applies irreversible (hard) changes to the module. If False, applies reversible (soft) changes.
+            verbose (bool): If True, prints detailed information about the application process.
+
+        Returns:
+            None
+        """       
+
+        if not self._is_to_compress():
+            return # nothing to apply
+
+        if verbose:
+            
+            cmp_msg = "HARD (non-reversible)" if hard else "soft"
+            print(f"Applying ({cmp_msg}) compression scheme:\n{self}.")
+            
+            if self.soft_applied:
+                if hard:
+                    print("  ! Compression already hard applied, making the changes permanent (HARD mode)")
+                else:
+                    print("  ! Compression already soft applied, skipping re-application.")
+
+        if self.hard_applied or (self.soft_applied and not hard):
+            return # Nothing to do
+        
+        # Get the module to compress
+        module = self.get_compression_module()
+        
+        if not hard and not self.soft_applied: # Backup original weights if not already done
+            self._weight_original = module.weight.detach().clone() # Store original weights for restoration if needed
+        else: # Make changes permanent
+            self._weight_original = None
+
+        # Perform compression for each compressor in the scheme
+        for cname, compressor in self.compressors.items():
+            if verbose:
+                print(f"Applying compression '{cname}' for module {self.path}")
+            compressor.set_calibration_store(self.calibration_data)
+            compressor.apply(module=module, hard=hard, soft_applied=self.soft_applied)
+                    
+        # Flag as applied
+        self.soft_applied = True
+        self.hard_applied = hard
+
+    def restore(self, topology=False, verbose=False):
+        """
+        Restores the original topology of the model.
+        If the module is wrapped in a VCONBlock, restoration is applied only to the second block (`block_b`).
+        The function reverses any soft-applied changes, such as pruning masks and LRD, but raises an error if hard-applied (non-reversible) changes have been made.
+
+        Args:
+            topology (bool, optional): If True, restores only the original topology of the model, while compression is functionally maintained. Defaults to False.
+            verbose (bool, optional): If True, prints information about the restoration process. Defaults to False.
+
+        Raises:
+            ValueError: If the module has been hard applied and cannot be restored.
+        """
+        if not self._is_to_compress() or not self.soft_applied:
+            return # nothing to restore
+
+        if self.hard_applied:
+            raise ValueError("Cannot restore a module that has been hard applied (non-reversible changes).")
+        
+        module = self.get_compression_module()
+        
+        # For each compression type, if it has been applied, call the corresponding restore function
+        for comp_name, compressor in self.compressors.items():
+            if verbose:
+                print(f"Restoring topology for compression '{comp_name}' for module {self.path}.")
+            compressor.restore(module) # Call the restore function of the compressor to reverse the changes
+
+        if not topology: # Restore original weights before compression
+            # Raise error if original weights are missing
+            if self._weight_original is None:
+                raise ValueError("Original weights not found for restoration. Cannot restore the module.")
+            if verbose:
+                print(f"Restoring parameters for module {self.path}.")
+            with torch.no_grad():
+                module.weight.copy_(self._weight_original)
+
+        # Clean up the backup of original weights
+        self._weight_original = None
+        # Reset the soft application flag
+        self.soft_applied = False 
+
+    def reapply_masks(self):
+        """Re-apply pruning masks to the module after an optimizer step.
+
+        In STE-style fine-tuning, pruned weights receive non-zero gradient
+        updates (because dL/dW is independent of W for linear layers) and
+        drift away from zero after each optimizer step. Call this method to
+        zero them back.
+
+        No-op if compression has not been soft-applied, or has been hard-applied.
+        """
+        if not self.soft_applied or self.hard_applied:
+            return
+        module = self.get_compression_module()
+        for compressor in self.compressors.values():
+            compressor.reapply_mask(module)
+
+    def remove_masks(self):
+        """Remove weight_mask buffers from the module.
+
+        Drops the persistent mask buffers registered by pruning compressors.
+        Use before recomputing compression with different settings, or before
+        saving a deployment model where the mask buffers are not needed.
+        """
+        if not self._is_to_compress():
+            return
+        module = self.get_compression_module()
+        for compressor in self.compressors.values():
+            compressor.remove_mask(module)
+
+    # ------------------------------------------------------------------ topology
+    # Resolution of the model dictionary's layer names into modules. Compressors
+    # call these instead of reading paths, block indices or sentinel names.
+
+    def resolve_in_block(self, name):
+        """Module ``name`` (a per-block layer name of the dictionary) in this scheme's block."""
+        return get_submodule(self.model, self.path_template.format(block_index=self.block_id, path=name))
+
+    @staticmethod
+    def _hop_block_id(path_list, source_name, source_block_id, target_name):
+        """Resolve which block a coupled hop lives in, given its source hop.
+
+        ``output_dependence`` entries are declared per-block, at the granularity
+        of a single block's layer list (``path_list``). A dependency stays within
+        the same block if the target comes *later* in that per-block execution
+        order (e.g. self_attn.o_proj -> post_attention_layernorm, both consumed
+        within this block via the residual stream). If the target comes at the
+        same position or *earlier* (e.g. mlp.down_proj -> input_layernorm), the
+        dependency wraps around: this block's output feeds the *next* block's
+        input via the residual stream, so the coupled cascade must target
+        ``block_id + 1``.
+
+        Every output-writing layer touches every later block too (residual
+        skip connections), but ``coupled_masks_all`` already forces one shared
+        mask across all blocks' residual writers, so cascading strictly one
+        block ahead is sufficient -- that next block's own cascade continues
+        the chain from there. Generalized from a single scheme's own
+        name/block_id so it can also resolve hops *within* a chain (e.g. a
+        norm forwarding to its own output_dependence targets), not just the
+        scheme's immediate targets.
+        """
+        if not path_list or source_block_id is None:
+            return source_block_id
+        try:
+            source_pos = path_list.index(source_name)
+            target_pos = path_list.index(target_name)
+        except ValueError:
+            return source_block_id
+        return source_block_id + 1 if target_pos <= source_pos else source_block_id
+
+    def _resolve_named_module(self, name, block_id):
+        """Resolve a single ``output_dependence`` entry name to a module.
+
+        Handles the ``'final_layer'``/``'final_norm'`` singleton sentinels
+        (resolved off the scheme's pre-threaded paths, not block-indexed) and
+        ordinary ``path_list`` leaf names (block-indexed via
+        ``path_template``, dropped if out of range). Returns ``None`` if the
+        entry can't be resolved (missing sentinel path, block out of range,
+        or -- for the sentinels -- ``block_id`` isn't the last block).
+
+        The last-block gating for the sentinels applies regardless of how
+        deep in a chain they're reached: a source's own ``output_dependence``
+        entry may name ``'final_layer'``/``'final_norm'`` directly (e.g. the
+        last MLP projection of a pre-norm decoder), or a normalization hop's *own*
+        ``output_dependence`` entry may (e.g. the output norm of a post-norm
+        encoder block, resolved through the recursion in
+        ``_resolve_target_chains``) -- both must only fire once the walk has
+        reached the last block, tracked via the ``block_id`` threaded through
+        every hop by ``_hop_block_id``.
+        """
+        scheme, num_blocks = self, self.num_blocks
+        if name in ("final_layer", "final_norm"):
+            is_last_block = (
+                num_blocks is not None and block_id is not None and block_id == num_blocks - 1
+            )
+            if not is_last_block:
+                return None
+            sentinel_path = scheme.final_layer_path if name == "final_layer" else scheme.final_norm_path
+            if not sentinel_path:
+                return None
+            return get_submodule(scheme.model, sentinel_path)
+
+        if num_blocks is not None and (block_id is None or block_id >= num_blocks):
+            return None
+        full_path = scheme.path_template.format(block_index=block_id, path=name)
+        return get_submodule(scheme.model, full_path)
+
+    def _resolve_target_chains(self, name, block_id):
+        """Resolve one ``output_dependence`` entry to a list of hop chains.
+
+        A chain is ``[hop_1, ..., terminal]``: normalization-layer hops
+        (per indexing's ``pruning.norm_layers``, or the ``'final_norm'``
+        sentinel) are transparent, so resolution walks through them via
+        their *own* ``output_dependence`` entry -- which may fan out to
+        several onward targets, producing multiple chains rooted at the same
+        top-level name (e.g. ``input_layernorm`` -> q/k/v).
+        """
+        module = self._resolve_named_module(name, block_id)
+        if module is None:
+            return []
+
+        pruning_indexing = self.pruning_indexing
+        norm_layers = pruning_indexing.get("norm_layers", ())
+        if name not in norm_layers and name != "final_norm":
+            return [[module]]
+
+        onward_names = pruning_indexing.get("output_dependence", {}).get(name, [])
+        chains = []
+        for onward_name in onward_names:
+            onward_block_id = self._hop_block_id(self.path_list, name, block_id, onward_name)
+            for sub_chain in self._resolve_target_chains(onward_name, onward_block_id):
+                chains.append([module] + sub_chain)
+        return chains
+
+    def coupled_target_chains(self):
+        """Chains of modules whose input follows this layer's output (structured-pruning cascade).
+
+        Model specifics come only from the model dictionary's ``pruning``
+        section (``output_dependence``, ``norm_layers``); the compressors
+        receive the resolved chains and never see paths or sentinels.
+
+        One sentinel source gets special resolution: ``'preprocessing'`` --
+        the singleton embedding scheme itself (``scheme.block_id is None``)
+        always cascades into block 0. Every other name (including the
+        ``'final_layer'``/``'final_norm'`` sentinels, wherever they appear)
+        resolves generically through ``_resolve_target_chains``, which
+        applies the last-block gating itself (see
+        ``_resolve_named_module``).
+        """
+        scheme = self
+        dependence = self.pruning_indexing.get("output_dependence", {})
+        next_layers = dependence.get(scheme.name, [])
+        if not next_layers:
+            return []
+
+        num_blocks = self.num_blocks
+        chains = []
+        for next_layer in next_layers:
+            target_block_id = 0 if scheme.block_id is None else self._hop_block_id(
+                scheme.path_list, scheme.name, scheme.block_id, next_layer
+            )
+            if num_blocks is not None and target_block_id is not None and target_block_id >= num_blocks:
+                # No next block to cascade into (ordinary path_list target).
+                continue
+            chains.extend(self._resolve_target_chains(next_layer, target_block_id))
+        return chains
+
+    def __repr__(self):
+        string = f"CompressionScheme(name={self.name}, block_id={self.block_id}, path={self.path}, applied=(soft={self.soft_applied}, hard={self.hard_applied}))\n"
+        for comp_name, compressor in self.compressors.items():
+            if compressor._to_compress(): # Only include compressors that are set to be applied
+                string += comp_name + ": " + compressor.__repr__() + "\n"
+        # Remove the last newline character for cleaner formatting
+        string = string.rstrip("\n")
+        # Add indentation for better readability
+        string = string.replace("\n", "\n  ")
+        return string
+
+
+__all__ = ["CompressionScheme"]

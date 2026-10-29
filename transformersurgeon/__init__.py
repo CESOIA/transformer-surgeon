@@ -6,6 +6,6 @@ except Exception:
 	precompute_rope_inv_freqs = None
 
 try:
-	from .utils import convert_for_export
+	from .export.convert import convert_for_export
 except Exception:
 	convert_for_export = None

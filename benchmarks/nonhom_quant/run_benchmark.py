@@ -48,7 +48,6 @@ Usage
 import argparse
 import json
 import math
-import random
 from pathlib import Path
 
 import torch
@@ -58,11 +57,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import numpy as np
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2CompressionSchemesManager, Qwen2ForCausalLMCompress
+from transformersurgeon.calibration import wikitext2_loader
 
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
@@ -109,42 +108,13 @@ def parse_args():
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 def build_loaders(tokenizer, num_calib: int, num_test: int, seq_len: int):
-    """Return (calibration DataLoader, test DataLoader) from WikiText-2."""
-    train_raw = load_dataset(
-        "EleutherAI/wikitext_document_level", "wikitext-2-raw-v1", split="train"
-    )
-    test_raw = load_dataset(
-        "EleutherAI/wikitext_document_level", "wikitext-2-raw-v1", split="test"
-    )
+    """Return (calibration DataLoader, test DataLoader) from WikiText-2.
 
-    def _encode(ds):
-        texts = [t for t in ds["page"] if isinstance(t, str) and t.strip()]
-        return tokenizer("\n\n".join(texts), truncation=False,
-                         padding=False, return_attention_mask=False)["input_ids"]
-
-    calib_ids = _encode(train_raw)
-    test_ids  = _encode(test_raw)
-
-    rng = random.Random(RANDOM_SEED)
-
-    calib_examples = []
-    for _ in range(min(num_calib, len(calib_ids) // seq_len)):
-        start = rng.randint(0, len(calib_ids) - seq_len - 1)
-        calib_examples.append({
-            "input_ids":      torch.tensor(calib_ids[start:start + seq_len], dtype=torch.long),
-            "attention_mask": torch.ones(seq_len, dtype=torch.long),
-        })
-
-    test_examples = []
-    for i in range(min(num_test, len(test_ids) // seq_len)):
-        s = i * seq_len
-        test_examples.append({
-            "input_ids":      torch.tensor(test_ids[s:s + seq_len], dtype=torch.long),
-            "attention_mask": torch.ones(seq_len, dtype=torch.long),
-        })
-
-    return (DataLoader(calib_examples, batch_size=1, shuffle=False),
-            DataLoader(test_examples,  batch_size=1, shuffle=False))
+    Calibration: random windows of the train split; test: consecutive
+    non-overlapping windows of the test split (standard perplexity protocol).
+    """
+    return (wikitext2_loader(tokenizer, num_calib, seq_len, seed=RANDOM_SEED),
+            wikitext2_loader(tokenizer, num_test, seq_len, split="test", sequential=True))
 
 
 # ── Perplexity evaluation ──────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Mapping, Tuple
+from typing import Dict, Mapping, Tuple
 
 import torch
 
@@ -190,12 +190,3 @@ class SummaryRuntime:
             }
             self.summary.update_runtime(self, calibration_store, payload)
             self.num_updates += 1
-
-
-def unique_summaries(summary_names: Iterable[str]) -> Tuple[str, ...]:
-    # Order-preserving de-duplication for deterministic calibration behavior.
-    unique = []
-    for summary_name in summary_names:
-        if summary_name not in unique:
-            unique.append(summary_name)
-    return tuple(unique)

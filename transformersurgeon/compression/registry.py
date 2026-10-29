@@ -8,6 +8,12 @@ from .structured_pruning import (
     validate_structured_pruning_repeated_pattern,
     validate_structured_pruning_coupled_repeated_pattern,
 )
+from .block_pruning import (
+    BlockPruner,
+    validate_block_pruning_ratio,
+    validate_block_pruning_method,
+    validate_block_pruning_blocks,
+)
 from .unstructured_pruning import (
     UnstructuredPruner,
     validate_unstructured_pruning_ratio,
@@ -28,20 +34,26 @@ from .quantization import (
     validate_sparse_method,
     validate_quantization_eps,
     validate_quantization_granularity,
+    validate_quantization_group_size,
+    validate_quantize_output_activation,
+    validate_quantization_group_scale_bits,
     validate_activation_scheme,
 )
 
 COMPRESSOR_DICT = {
     "structured_pruning": StructuredPruner,
+    "block_pruning": BlockPruner,
     "unstructured_pruning": UnstructuredPruner,
     "lrd": LRDer,
     "quantization": Quantizer
 }
 
 # Canonical order in which compressors are applied to a module.
-# lrd first (changes weight shape), then pruning (masks the result),
-# then quantization (must see the final float weights).
-APPLICATION_ORDER = ["lrd", "structured_pruning", "unstructured_pruning", "quantization"]
+# block pruning first (removes whole heads, and the matching input columns of
+# dependent layers, before anything factorizes or quantizes them), then lrd
+# (changes weight shape), then pruning (masks the result), then quantization
+# (must see the final float weights).
+APPLICATION_ORDER = ["block_pruning", "lrd", "structured_pruning", "unstructured_pruning", "quantization"]
 
 # Compression properties that are group-scoped: they may be set ONLY through a
 # group name (manager.set(..., group=...)), never via plain criteria. Enabling
@@ -83,6 +95,18 @@ COMPRESSION_REGISTRY = {
         # Group-only option (see GROUP_OPTIONS): settable only via a group name.
         "share_mask": dict(default=False, validator=validate_structured_pruning_share_mask),
     },
+    # Whole-block removal (e.g. attention heads), separate from structured
+    # pruning; where blocks are and what they cascade to comes from the
+    # indexing's pruning.block_pruning (compression/block_pruning.py).
+    "block_pruning": {
+        # fraction of blocks removed in every unit (e.g. query heads per KV group):
+        # int(ratio * blocks_per_unit) blocks per unit.
+        "ratio": dict(default=0.0, validator=validate_block_pruning_ratio),
+        "method": dict(default="magnitude", validator=validate_block_pruning_method),
+        # explicit global block indices to remove (overrides ratio/method); must hit
+        # every unit equally.
+        "blocks": dict(default=None, validator=validate_block_pruning_blocks),
+    },
     "unstructured_pruning": {
         "ratio": dict(default=0.0, validator=validate_unstructured_pruning_ratio),
         "method": dict(default="magnitude", validator=validate_unstructured_pruning_method),
@@ -100,9 +124,18 @@ COMPRESSION_REGISTRY = {
         "sparse_method": dict(default="magnitude", validator=validate_sparse_method,),
         "eps": dict(default=1e-6, validator=validate_quantization_eps),
         "granularity": dict(default="per_tensor", validator=validate_quantization_granularity),
+        # group_size: input columns sharing one scale when granularity="per_group".
+        "group_size": dict(default=128, validator=validate_quantization_group_size),
+        # group_scale_bits: restrict per_group scales to channel_scale * m, m integer in
+        # [1, 2**bits] -- Qualcomm HTP LPBQ is 4 (the exact scales then reach the device).
+        "group_scale_bits": dict(default=None, validator=validate_quantization_group_scale_bits),
         "precision_activation": dict(default="full", validator=validate_precision),
         "method_activation": dict(default="maxmin", validator=validate_activation_method),
         "scheme_activation": dict(default="asymmetric", validator=validate_activation_scheme),
+        # Static activation quantization of the linear's output as well as its input.
+        # False = input only: the INT8 GEMMs of TensorRT (W8A8) take int8 inputs and
+        # write float outputs.
+        "quantize_output_activation": dict(default=True, validator=validate_quantize_output_activation),
     }
 }
 

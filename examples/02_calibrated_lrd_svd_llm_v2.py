@@ -15,14 +15,13 @@ Requirements:
 """
 
 import argparse
-import random
 
 import torch
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2CompressionSchemesManager, Qwen2ForCausalLMCompress
+from transformersurgeon.calibration import wikitext2_loader
 
 
 RANDOM_SEED = 42
@@ -44,35 +43,6 @@ def parse_args():
     parser.add_argument("--seq-len", type=int, default=2048,
                         help="Token sequence length per calibration sample")
     return parser.parse_args()
-
-
-def _build_wikitext_calibration_loader(tokenizer, num_samples, seq_len):
-    """Return a DataLoader of fixed-length token chunks from WikiText-2."""
-    raw = load_dataset(
-        "EleutherAI/wikitext_document_level",
-        "wikitext-2-raw-v1",
-        split="train",
-    )
-    texts = [t for t in raw["page"] if isinstance(t, str) and len(t) > 0]
-    corpus = "\n\n".join(texts)
-
-    token_ids = tokenizer(
-        corpus, truncation=False, padding=False, return_attention_mask=False
-    )["input_ids"]
-
-    max_samples = len(token_ids) // seq_len
-    actual = min(num_samples, max_samples)
-
-    rng = random.Random(RANDOM_SEED)
-    examples = []
-    for _ in range(actual):
-        start = rng.randint(0, len(token_ids) - seq_len - 1)
-        examples.append({
-            "input_ids": torch.tensor(token_ids[start : start + seq_len], dtype=torch.long),
-            "attention_mask": torch.ones(seq_len, dtype=torch.long),
-        })
-
-    return DataLoader(examples, batch_size=1, shuffle=False)
 
 
 def param_count(model):
@@ -97,8 +67,8 @@ def main():
     # --- Build calibration data ---
     print(f"Building WikiText-2 calibration loader "
           f"({args.num_calibration_samples} samples × {args.seq_len} tokens)...")
-    calibration_loader = _build_wikitext_calibration_loader(
-        tokenizer, args.num_calibration_samples, args.seq_len
+    calibration_loader = wikitext2_loader(
+        tokenizer, args.num_calibration_samples, args.seq_len, seed=RANDOM_SEED
     )
 
     # --- Configure SVD-LLM-v2 ---

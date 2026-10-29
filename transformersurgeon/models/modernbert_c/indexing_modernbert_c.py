@@ -22,7 +22,7 @@ MODERNBERT_C_INDEXING = {
         # additionally replaces `attn_norm` with `nn.Identity()` (pre-norm
         # architecture, no norm before the first attention), which is harmless
         # here since only `nn.Linear` leaves are ever swapped for
-        # `LinearCompressed` (see `utils/modeling.py::replace_layers_upon_init`).
+        # `LinearCompressed` (see `compression/compressible_layers.py::replace_layers_upon_init`).
         'path_list': {
             'attn_norm': [],
             'attn': ['Wqkv', 'Wo'],
@@ -39,25 +39,21 @@ MODERNBERT_C_INDEXING = {
         # already lives inside one matrix, and the framework's coupled/shared
         # -mask pruning operates on whole Linear rows across modules. Coupled
         # structured pruning is therefore not wired for this family, mirroring
-        # the fused `attn.qkv` vision tower in qwen2_vl_c (FRAMEWORK_PROBLEMS.md #6).
+        # the fused `attn.qkv` vision tower in qwen2_vl_c.
         'pruning': {
             'output_dependence': {},
             'coupled_masks': [],
             'coupled_masks_all': [],
-            'per_head_uniform': [],
         },
-        'pruning_supported': [],
         # Alternating global/local attention layers each need their own rotary
         # embedding call keyed by layer type
         # (`rotary_emb(hidden_states, position_ids, layer_type)`), which the
-        # single block-wise cascade calibration flow in `utils/cascade.py`
+        # single block-wise cascade calibration flow in `compression/cascade.py`
         # (`_attach_position_embeddings_if_configured`) does not model -- it
         # calls the configured rotary module the same way for every block.
-        # Cascade calibration is therefore unsupported here, same as bert_c
-        # (see FRAMEWORK_PROBLEMS.md #1 and `no_cascade_calibration` there).
+        # Cascade calibration is therefore unsupported here, same as bert_c.
         'no_cascade_calibration': True,
         'path_template': "model.layers.{block_index}.{path}",
-        'qkv_paths': ['attn.Wqkv'],
         'preprocessing': "model.embeddings",
         'final_layer': "classifier",
 

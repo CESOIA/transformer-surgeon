@@ -5,6 +5,33 @@ will make the API feel intuitive rather than arbitrary.
 
 ---
 
+## Folders and the Two Dictionaries
+
+The package is one pipeline, compression → export, and every folder has one job:
+`models/` describes models (as dictionaries), `compression/` decides and applies
+compression, `calibration/` only collects statistics, `blocks/` is a simplified
+export-ready transformer made of selectable *atoms*, `export/` turns the result
+into device artifacts, and `utils/` holds generic helpers. Code outside `models/`
+never mentions a specific model.
+
+Two dictionaries connect the folders:
+
+- the **model dictionary** (`models/<m>_c/indexing_<m>_c.py`) describes a model:
+  where its layers are, which ones can be compressed, how pruning couples them,
+  how to calibrate them, and which operations its export graph needs
+  (`structure`, `attn_type`, `mlp_type`, `norm_type`, `rope_type`), i.e. which
+  atoms of `blocks/catalog.py::BLOCK_CATALOG` build it;
+- **`BACKEND_OPERATIONS`** (`export/operations.py`) says, for every block type and
+  every backend, which implementation runs on the device by default and which
+  alternatives are supported (for example the KV cache: an internal mutable
+  buffer on XNNPACK/QNN, an in-place graph input/output on ONNX/TensorRT).
+
+So adding a model touches only `models/`, a compression method only
+`compression/`, a calibration statistic only `calibration/`, and a backend only
+`export/`.
+
+---
+
 ## The Three-Layer Model
 
 TransformerSurgeon separates three concerns:
@@ -39,17 +66,18 @@ target projection layer is **replaced at init time** with `LinearCompressed` —
 drop-in `nn.Linear` subclass.
 
 In its default **full-rank mode** `LinearCompressed` behaves identically to
-`nn.Linear`: `weight` has shape `[out_features, in_features]` and `weight_2` is
+`nn.Linear`: `weight` has shape `[out_features, in_features]` and `linear_V` is
 `None`. There is no overhead in forward pass, parameter count, or memory.
 
 After `module.init_lrd(rank)`:
 
-- `weight` is reshaped to `[out_features, rank]`
-- `weight_2` is added with shape `[rank, in_features]`
-- The forward pass computes `x @ weight_2.T @ weight.T` (two smaller matmuls)
+- `weight` is reshaped to `[out_features, rank]` (the U factor)
+- `linear_V` is added, a linear layer with weight `[rank, in_features]` (the V factor)
+- The forward pass computes `linear_V` then the U projection (two smaller matmuls)
 
 Call `module.cancel_lrd()` to merge the factors back into a single full-rank
-`weight` and remove `weight_2`. This is what `manager.restore()` triggers
+`weight` and remove `linear_V`. The two methods come from
+`blocks/layers/low_rank.py::LowRankMixin`, shared with `EmbeddingCompressed`. This is what `manager.restore()` triggers
 internally.
 
 A `Compressor.apply()` always receives a `LinearCompressed` instance — never a
@@ -94,14 +122,14 @@ For each scheme the manager:
    - Reads `self.calibration_store["covariance"]`
    - Factorizes `module.weight` using the whitened SVD variant
    - Calls `module.init_lrd(rank)` to set up the two-matrix structure
-   - Copies the factored matrices into `module.weight` and `module.weight_2`
+   - Copies the factored matrices into `module.weight` and `module.linear_V.weight`
 
 **Step 4 — `manager.restore()` (optional)**
 
 Calls `compressor.restore(module)` for each scheme:
 
-- Reconstructs `full_weight = module.weight @ module.weight_2`
-- Calls `module.cancel_lrd()` to remove `weight_2` and restore the original shape
+- Reconstructs `full_weight = module.weight @ module.linear_V.weight`
+- Calls `module.cancel_lrd()` to remove `linear_V` and restore the original shape
 - Copies `full_weight` back into `module.weight`
 
 ---
@@ -110,8 +138,9 @@ Calls `compressor.restore(module)` for each scheme:
 
 Structured pruning removes whole output neurons (rows) of a layer. Two mechanisms
 keep a pruned model consistent, both driven by generic annotations under the
-`pruning` key of each model's `indexing_*.py` (so `compression/` and `utils/`
-stay model-agnostic):
+`pruning` key of each model's `indexing_*.py` (so `compression/` stays
+model-agnostic). The scheme turns those names into module chains
+(`CompressionScheme.coupled_target_chains`); the compressors only receive chains:
 
 - **Coupling (`output_dependence`).** When a layer's output rows are removed,
   the input columns of the layers it feeds must shrink to match. Hard
@@ -119,9 +148,9 @@ stay model-agnostic):
   `weight`/`bias`/`out_features`), then cascades into each coupled next layer via
   `CoupledPruner` (input-column removal, hard-only). Soft apply just zeroes rows,
   so no cascade is needed. The kept-dimension formula lives once in
-  `blocks/pruning_dims.py` (`effective_out_features`) and is reused by the pruner,
-  the coupled pruner, and the converted MLP blocks — so a hard-pruned model
-  converts and exports with matching shapes.
+  `compression/structured_pruning_methods/pruning_dims.py` (`effective_out_features`);
+  `convert_for_export` reads the pruned shapes from the source layers, so a
+  hard-pruned model converts and exports with matching shapes.
 
 - **Grouping (shared masks).** Some layers must be pruned *identically* — e.g.
   `gate_proj`/`up_proj` (multiplied together) or `q_proj`/`k_proj` (matched
@@ -292,37 +321,56 @@ standard (non-VCON) module.
 
 ## Export Backends
 
-`transformersurgeon.export.export_to_backend(model, config)` lowers a model to a deployment backend. It dispatches through `EXPORT_ROUTINES` (`export/registry.py`) to one of three registered backends:
+`transformersurgeon.export.export_to_backend(model, config)` picks the exporter
+registered for `config.backend` (`export/exporter.py`) and runs the steps every
+backend shares (`Exporter.export`), then the backend's own `lower()`:
 
 | Backend | Config class | Output |
 |---|---|---|
 | `xnnpack` | `XNNPACKExportConfig` | ExecuTorch `.pte` |
 | `qnn` | `QNNExportConfig` | ExecuTorch `.pte` (Qualcomm NPU) |
-| `tensorrt` | `TensorRTExportConfig` | TensorRT engine / exported program |
+| `onnx` | `ONNXExportConfig` | Portable ONNX + manifest (I/O contract) |
+| `tensorrt` | `TensorRTExportConfig` | ONNX + TensorRT engine built from it |
 
-All three backends share the machinery in `export/common.py` rather than each reimplementing it:
+1. **Options.** `convert_options` are completed with the backend defaults of
+   `BACKEND_OPERATIONS`; unsupported choices are rejected before tracing.
+2. **Conversion.** `convert_for_export` (`export/convert.py`) builds the decoder
+   stack from `blocks/` atoms and copies shapes, ranks, biases and quantisation
+   state from the source layers.
+3. **Wrapper.** `export/wrapper.py::LLMWrapper` presents embedding, decoder and
+   output head with a fixed signature that depends only on the KV-cache atom.
+4. **Quantisation metadata.** `extract_layer_quant_info` (`export/quant_info.py`)
+   asks the compression step for each layer's description
+   (`compression/quantization.py::export_quant_info`). A layer is quantised in the
+   artifact if and only if it was quantised on the model.
+5. **Lowering.** PT2E backends (XNNPACK, QNN) annotate the quantised linears with
+   `export/pt2e_linear_quantizer.py::LinearOnlyQuantizer`, calibrate the observers
+   and inject the exact scales (`export/pt2e.py`); ONNX rewrites quantised weights
+   as `DequantizeLinear` (`export/backends/onnx/quantization.py`).
+6. **Result.** `export/result.py::finalize_export_result` runs the optional weight
+   check and writes the manifest (`export/manifest.py`).
 
-1. `resolve_components_and_wrapper()` — normalizes the input (full HF model, `{embedding, decoder, final_layer}` dict, or tuple) into a wrapper module plus example inputs.
-2. `extract_layer_quant_info()` — reads per-layer compression metadata (hard-quantized weights, calibrated activation scales) directly off the model's `LinearCompressed` layers. There is no separate quantization config to author — a layer is quantized in the exported artifact if and only if it was already quantized on the model.
-3. `prepare_pt2e(...)` with a backend-specific `Quantizer` that annotates only the linear layers named in the compression metadata — everything else stays float.
-4. `calibrate_pt2e_observers()` — a calibration forward pass so activation observers collect representative statistics.
-5. `inject_scales_into_pt2e_observers()` — overrides the PT2E observers with the *exact* surgeon scales (no re-calibration drift), then `convert_pt2e()`.
-6. `finalize_export_result()` — runs the optional weight-mismatch check and packages a `BackendExportResult` (backend-specific subclasses add aliases like `.pte_path` or `.engine_path`).
-
-This is what makes **mixed-precision export** work: a model with some layers hard-quantized to INT8/INT4 and others left float exports to a single `.pte`/engine, with only the quantized layers getting Q/DQ ops.
+This is what makes **mixed-precision export** work: only the quantised layers
+get quantise/dequantise operations.
 
 ```python
 from transformersurgeon.export import export_to_backend
-from transformersurgeon.export.tensorrt import TensorRTExportConfig
+from transformersurgeon.export.backends import TensorRTExportConfig
 
-config = TensorRTExportConfig(output_path="model.ep", backend="tensorrt", device="cuda:0")
-result = export_to_backend(model, config=config)
-print(result.engine_path)
+# Portable ONNX + manifest, and a TensorRT engine for the local GPU
+# (for a Jetson, set build_engine=False and build the engine on the device).
+config = TensorRTExportConfig(
+    output_path="out/model.onnx", max_input_len=512,
+    convert_options={"max_cache_len": 1024, "rmsnorm_impl": "rmsnorm_upcast"},
+)
+result = export_to_backend(model, config)
+print(result.onnx_path, result.engine_path)
 ```
 
-`export_to_executorch(...)` is a deprecated alias for `export_to_backend(...)`.
-
-TensorRT is the newest backend. It needs the `tensorrt` extra (`torch-tensorrt`) and a CUDA device; tests live in `test/e2e/test_export_pipelines.py` (capability-gated) and the CLI runner is `scripts/tensorrt/run_export.sh`, mirroring the ExecuTorch backends there.
+For TensorRT, the ONNX file + manifest are the portable artifact and the engine is
+built where it runs (`python -m transformersurgeon.export.backends.tensorrt.exporter
+model.manifest.json` on a Jetson). Tests: `test/export/test_exporter.py`
+(capability-gated).
 
 ---
 
@@ -355,47 +403,42 @@ TensorRT is the newest backend. It needs the `tensorrt` extra (`torch-tensorrt`)
 
 ### New model family
 
-Create two files in `transformersurgeon/models/newmodel_c/`:
+Create `transformersurgeon/models/newmodel_c/` with two dictionaries:
 
-1. **`indexing_newmodel_c.py`** — define the `INDEXING` dict with
-   `num_blocks_attr`, `path_list`, `path_template`, and optionally
-   `calibration_groups` and export metadata.
-2. **`define_newmodel_c.py`** — define three classes following the standard
-   pattern:
+1. **`indexing_newmodel_c.py`** — the model dictionary (`num_blocks_attr`,
+   `path_list`, `path_template`, and optionally `pruning`, `calibration_groups`
+   and the export keys `structure`, `attn_type`, `mlp_type`, `norm_type`,
+   `rope_type`). Start from the closest existing family.
+2. **`family_newmodel_c.py`** — the family dictionary, from which
+   `models/factory.py::build_family` generates the classes:
 
 ```python
-class NewModelConfigCompress(NewModelConfig):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        init_compressed_config(self)
+from ..factory import build_family
+from .indexing_newmodel_c import NEWMODEL_C_INDEXING
 
-class NewModelForTaskCompress(NewModelForTask):
-    config_class = NewModelConfigCompress
-    indexing = INDEXING
-    def __init__(self, config):
-        super().__init__(config)
-        replace_layers_upon_init(self, INDEXING)
-
-class NewModelCompressionSchemesManager(CompressionSchemesManager):
-    def __init__(self, model):
-        super().__init__(model, INDEXING)
+NEWMODEL_C_FAMILY = {
+    "indexing": NEWMODEL_C_INDEXING,
+    "hf_config": "transformers.models.newmodel.configuration_newmodel.NewModelConfig",
+    "hf_model": "transformers.models.newmodel.modeling_newmodel.NewModelForCausalLM",
+    "class_names": {"config": "NewModelConfigCompress", "model": "NewModelForCausalLMCompress",
+                    "manager": "NewModelCompressionSchemesManager"},
+    "auto_class": "AutoModelForCausalLM",
+}
+_classes = build_family(NEWMODEL_C_FAMILY, __name__)
 ```
 
-Export the three classes from `models/newmodel_c/__init__.py` and add them to
-`models/__init__.py`. No changes to the manager or compression logic are needed.
+Add an `__init__.py` re-exporting both modules and one line to
+`models/__init__.py::FAMILIES`. Nothing else changes (`mistral_c` was added this way,
+as a copy of `llama_c`).
 
 ### New export backend
 
-1. Create `transformersurgeon/export/<backend>/` with a `<backend>_export.py` defining:
-   - A config dataclass extending `export.common.ExporterConfig` (which extends `BackendExportConfig`) with backend-specific fields.
-   - A result dataclass extending `export.common.BackendExportResult`, optionally adding a backend-flavoured alias property (see `TensorRTExportResult.engine_path`).
-   - An `export_with_<backend>(model_or_graph, *, config)` function that calls, in order: `resolve_components_and_wrapper`, `extract_layer_quant_info`, a backend-specific PT2E `Quantizer` (see below) via `prepare_pt2e`/`convert_pt2e`, `calibrate_pt2e_observers`, `inject_scales_into_pt2e_observers`, the backend's own compile/save step, then `finalize_export_result`.
-2. If the backend needs its own PT2E annotation logic, add a `quantizer.py` building a `torchao.quantization.pt2e.quantizer.Quantizer` subclass that annotates only `aten.linear` nodes named in the compression metadata (see `export/tensorrt/quantizer.py` for a minimal reference implementation with no ExecuTorch dependency).
-3. Register the backend in `transformersurgeon/export/registry.py`:
-   ```python
-   EXPORT_ROUTINES["<backend>"] = {
-       "export": export_with_<backend>,
-       "config_class": <Backend>ExportConfig,
-   }
-   ```
-4. Add a capability-gated test case in `test/e2e/test_export_pipelines.py` mirroring the existing `test_export_xnnpack`/`test_export_tensorrt` pattern.
+1. In `transformersurgeon/export/backends/`, subclass `Exporter`
+   (`export/exporter.py`) with `backend`, `config_class` (a `BackendExportConfig`
+   subclass) and `lower(components, config)`; decorate it with
+   `@register_exporter` and import it in `export/backends/__init__.py`.
+   ExecuTorch backends can start from `executorch_base.py::ExecuTorchExporter`
+   (`write_program`, `finalize`).
+2. Add the backend to every entry of `export/operations.py::BACKEND_OPERATIONS`
+   (default and supported implementations).
+3. Add a capability-gated test in `test/export/test_exporter.py`.

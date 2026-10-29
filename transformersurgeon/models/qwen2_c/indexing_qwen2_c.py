@@ -33,6 +33,15 @@ QWEN2_C_INDEXING = {
             ['input_layernorm', 'self_attn'],
             ['post_attention_layernorm', 'mlp'],
         ],
+        # SmoothQuant groups (compression/smoothquant.py): producer -> consumers that read its
+        # output, joined only by per-channel-commuting ops (norm directly; up_proj through
+        # act(gate) * up). o_proj is not listed: its producer (v_proj) reaches it through
+        # attention and GQA head sharing.
+        'smoothing': {
+            'input_layernorm': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
+            'post_attention_layernorm': ['mlp.gate_proj', 'mlp.up_proj'],
+            'mlp.up_proj': ['mlp.down_proj'],
+        },
         'calibration_groups': {
             'self_attn': [['q_proj', 'k_proj', 'v_proj'], ['o_proj']],
             'mlp': [['gate_proj', 'up_proj'], ['down_proj']],
@@ -41,13 +50,11 @@ QWEN2_C_INDEXING = {
         # - output_dependence: layer whose OUTPUT rows are pruned -> layers whose
         #   INPUT columns must shrink to match (drives coupled_pruning).
         # - coupled_masks: layers that must share ONE output pruning mask.
-        # - per_head_uniform: layers needing uniform ratio per head (recorded only,
-        #   not yet consumed).
         'pruning': {
             'output_dependence': {
                 # 'preprocessing' is a sentinel: the embedding's output feeds
                 # block 0's residual stream via input_layernorm. Resolved
-                # directly (no block_index) by the manager/structured pruner,
+                # directly (no block_index) by CompressionScheme (compression/scheme.py),
                 # not via path_template.
                 'preprocessing': ['input_layernorm'],
                 'input_layernorm': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
@@ -55,7 +62,7 @@ QWEN2_C_INDEXING = {
                 'mlp.up_proj': ['mlp.down_proj'],
                 # Wraps to the next block's input_layernorm (or, on the last
                 # block, to 'final_norm' -- see the 'final_norm'/'final_layer'
-                # gating in structured_pruning.py).
+                # gating in CompressionScheme.coupled_target_chains).
                 'mlp.down_proj': ['input_layernorm', 'final_norm'],
                 'self_attn.v_proj': ['self_attn.o_proj'],
                 'self_attn.o_proj': ['post_attention_layernorm', 'final_norm'],
@@ -75,7 +82,6 @@ QWEN2_C_INDEXING = {
             'coupled_masks_all': [
                 ['self_attn.o_proj', 'mlp.down_proj', 'preprocessing'],
             ],
-            'per_head_uniform': ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'],
             # position_linked: layers whose output rows are indexed by RoPE
             # position (q/k head slices are paired 1:1 with rotary sin/cos
             # bands). Hard structured pruning removes rows by importance score,
@@ -87,6 +93,19 @@ QWEN2_C_INDEXING = {
             # never user-compressible, and only ever pruned by forwarding a
             # mask through them (see CoupledPruner.apply_chain).
             'norm_layers': ['input_layernorm', 'post_attention_layernorm'],
+            # block_pruning: whole-block removal (compression/block_pruning.py),
+            # separate from structured pruning. One q_proj block = one query head
+            # (head_dim rows); removing it removes the same o_proj input columns,
+            # uniformly per KV group, and sets self_attn.num_key_value_groups to
+            # the kept query heads per KV head.
+            'block_pruning': {
+                'self_attn.q_proj': {
+                    'owner': 'self_attn',
+                    'block_size_attr': 'head_dim',
+                    'blocks_per_unit_attr': 'num_key_value_groups',
+                    'input_dependence': ['self_attn.o_proj'],
+                },
+            },
         },
         'path_template': "model.layers.{block_index}.{path}",
         'extra_layers': ["model.norm"],
@@ -102,22 +121,14 @@ QWEN2_C_INDEXING = {
         'attn_type': 'mha_causal',
         'mlp_type': 'mlp_gated',
         'norm_type': 'rmsnorm',
+        # RoPE variant for the converted decoder (blocks/catalog.py, family "rope_frequencies").
+        # Qwen2/2.5 use plain RoPE; a scaled config (e.g. YaRN) raises at conversion.
+        'rope_type': 'default',
         'layer_matching': {
             'input_layernorm': 'norm_in',
             'self_attn': ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.out_proj'],
             'post_attention_layernorm': 'norm_out',
             'mlp': ['mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj'],
-        },
-        'bias_required': {
-            'attn.q_proj': True,
-            'attn.k_proj': True,
-            'attn.v_proj': True,
-            'attn.out_proj': False,
-            'mlp.gate_proj': False,
-            'mlp.up_proj': False,
-            'mlp.down_proj': False,
-            'norm_in': False,
-            'norm_out': False,
         },
         'extra_layers_matching': ["norm"],
     }
