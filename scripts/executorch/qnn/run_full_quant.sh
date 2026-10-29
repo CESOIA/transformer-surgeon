@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launcher for exporter_function_test.py with every attention+MLP linear quantized
-# (the former full_quant_export.py, archived in archive/scripts/; its flags
+# (the former full_quant_export.py; its flags
 # --precision / --quantize-activations are accepted as aliases).
 # Sets LD_LIBRARY_PATH before Python starts (glibc caches it at process init,
 # so os.environ changes inside Python are too late for dlopen to see them).

@@ -5,8 +5,7 @@ Adds compression (LRD, pruning, quantization) to Hugging Face transformer models
 (XNNPACK, QNN, ONNX, TensorRT) through one generic pipeline.
 
 **Read [AGENTS.md](AGENTS.md) before changing code**: folder rules, file map, test commands, parameter
-reference, invariants, anti-patterns and extension recipes. Refactoring status: [HANDOFF.md](HANDOFF.md),
-[TODO.md](TODO.md).
+reference, invariants, anti-patterns and extension recipes.
 
 ## Core loop
 
@@ -48,8 +47,7 @@ only `calibration/`; a backend only `export/` (plus new `blocks/` atoms when an 
 
 ```bash
 pytest                                                   # test/ mirrors the package; tiny models, no downloads
-pytest archive/tests --continue-on-collection-errors     # legacy suite (regression reference)
 ```
 
 Use the conda environments `py312_tensorrt`, `py310-executorch-qnn`, `py312_executorch_xnnpack`; backends are
-capability-gated. Expected environment failures are listed in HANDOFF.md §6.
+capability-gated.

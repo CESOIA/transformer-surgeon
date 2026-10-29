@@ -28,13 +28,13 @@ class FamilySpec:
     mlp_prune_criteria: object
     is_causal: bool = False
     # Families that cannot yet build a manager / fully run are marked here so the
-    # e2e suite can xfail them with a pointer to docs/investigations/FRAMEWORK_PROBLEMS.md.
+    # e2e suite can xfail them.
     known_broken: str = ""
     # Some families have a structural reason coupled/hard structured MLP pruning
     # can't apply cleanly (e.g. ModernBERT's fused Wqkv/Wi projections have no
-    # separate gate/up pair to couple — docs/investigations/FRAMEWORK_PROBLEMS.md N1). Dual-tower VL
-    # models used to hit this too (auto_groups() mixing vision+text groups,
-    # docs/investigations/FRAMEWORK_PROBLEMS.md #6) but that's now guarded/scoped per tower and works.
+    # separate gate/up pair to couple). Dual-tower VL
+    # models used to hit this too (auto_groups() mixing vision+text groups)
+    # but that's now guarded/scoped per tower and works.
     struct_prune_supported: bool = True
 
 

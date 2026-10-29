@@ -143,7 +143,7 @@ Notes:
   (also used per-layer by `repeated_pattern`), settable via `criteria` or `group=`.
 - `granularity=<int>` prunes uniformly within each chunk (e.g. per attention head);
   `repeated_pattern=True` lets layers with different chunk counts (GQA `q_proj`/`k_proj`) share one mask.
-- MLP pruning and GQA-aware attention pruning (q/k head-dim via RoPE, v→o cascade) are both wired through convert/export; see `archive/tests/e2e/test_gqa_attention_pruning.py`.
+- MLP pruning and GQA-aware attention pruning (q/k head-dim via RoPE, v→o cascade) are both wired through convert/export.
 - See `scripts/compression/compress_infer_qwen.py` (compress, calibrate, convert and run a Qwen model).
 
 ### Compress, then convert to the export-ready graph
@@ -179,7 +179,7 @@ print(result.onnx_path, result.engine_path)
 
 Device placement is handled internally — `model` can live on CPU or CUDA; components are traced on CPU.
 
-> The ONNX path needs `pip install -e ".[onnx]"`; building/running engines also needs the `tensorrt` Python package matching your CUDA (e.g. `tensorrt-cu13`) and a CUDA device. `TensorRTLLMSession` (`export/backends/tensorrt/session.py`) runs the engine (prefill + CUDA-graph decode). CLI: `scripts/tensorrt/export_and_generate.py`. End-to-end examples: `test/export/test_exporter.py`; details: `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
+> The ONNX path needs `pip install -e ".[onnx]"`; building/running engines also needs the `tensorrt` Python package matching your CUDA (e.g. `tensorrt-cu13`) and a CUDA device. `TensorRTLLMSession` (`export/backends/tensorrt/session.py`) runs the engine (prefill + CUDA-graph decode). CLI: `scripts/tensorrt/export_and_generate.py`. End-to-end examples: `test/export/test_exporter.py`.
 
 ## 🎯 Filtering Layers with `criteria`
 
@@ -248,7 +248,6 @@ These groups are consumed by `CompressionSchemesManager` exactly like previous u
 ## 📂 References
 
 - [test/](test/) — one test folder per package folder (`models/`, `compression/`, `calibration/`, `blocks/`, `export/`, `hf/`), tiny random models, backend tests capability-gated
-- [archive/tests/](archive/tests/) — the pre-refactoring suite, kept as a regression reference
 - [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package layout and data flow
 - [AGENTS.md](AGENTS.md) — folder rules, file map, parameter reference, extension recipes
 

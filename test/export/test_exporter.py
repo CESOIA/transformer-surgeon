@@ -140,6 +140,47 @@ def test_qnn_export_writes_a_program(tmp_path):
     assert os.path.getsize(pte) > 0 and os.path.isfile(result.manifest_path)
 
 
+@caps.requires_qnn
+def test_qnn_quantize_float_model_requires_quant_scope_all(tmp_path):
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    cfg = QNNExportConfig(output_path=str(tmp_path / "m.pte"), soc_model="SM8850", max_seq_len=CACHE,
+                          quant_scope="linear", quantize_float_model=True, run_weight_mismatch_check=False,
+                          verbose=False)
+    with pytest.raises(ValueError, match="quantize_float_model"):
+        export_to_backend(_components(_model(), {"max_cache_len": CACHE}), cfg)
+
+
+@caps.requires_qnn
+def test_qnn_quantize_float_model_lowers_an_uncompressed_model_as_fixed_point(tmp_path):
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    # Activation-only reference: no compression-quantized linear, yet the graph is 16a16w everywhere.
+    options = {"max_cache_len": CACHE, "use_sdpa": False, "masked_softmax": True}
+    tokens = [5, 17, 99, 3, 42, 200, 7, 64]
+
+    def logits(module):
+        out = []
+        with torch.no_grad():
+            for pos, tok in enumerate(tokens):
+                o = module(torch.tensor([tok]), torch.tensor([pos]))
+                out.append((o[0] if isinstance(o, (tuple, list)) else o).float().reshape(-1))
+        return torch.stack(out)
+
+    ref = logits(build_wrapper(_components(_model(), options)).eval())
+    cfg = QNNExportConfig(output_path=str(tmp_path / "m.pte"), soc_model="SM8850", max_seq_len=CACHE,
+                          convert_options=options, quant_scope="all", quantize_float_model=True,
+                          keep_reference_module=True,
+                          calibration_token_ids=[[(i * 37 + j * 11) % 256 for j in range(CACHE)] for i in range(4)],
+                          run_weight_mismatch_check=False, verbose=False)
+    gm = export_to_backend(_components(_model(), options), cfg).reference_module
+    targets = {str(n.target) for n in gm.graph.nodes if n.op == "call_function"}
+    assert any("quantize_per_tensor" in t for t in targets), "no activation fake-quant in the reference"
+    assert any("quantize_per_channel" in t for t in targets), "no 16-bit weight fake-quant in the reference"
+    fq = logits(gm)
+    assert bool((fq.argmax(-1) == ref.argmax(-1)).all()) and (fq - ref).abs().max().item() < 0.1
+
+
 # --------------------------------------------------------------------------- #
 # Backend graph passes
 # --------------------------------------------------------------------------- #

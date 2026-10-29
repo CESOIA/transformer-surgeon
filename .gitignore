@@ -253,4 +253,13 @@ experiments/
 transformers/
 
 # LLMS agent instructions
-!llms.txtsite/
+!llms.txt
+site/
+
+# AI agent working artifacts (not published)
+/HANDOFF.md
+/TODO.md
+/notes/
+/docs/report.md
+/docs/investigations/
+/archive/

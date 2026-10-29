@@ -23,4 +23,3 @@
 ## Optional
 
 - [Test Suite](test/): one folder per package folder, tiny random models; executable usage patterns
-- [Legacy tests](archive/tests/): the pre-refactoring suite, kept as a regression reference

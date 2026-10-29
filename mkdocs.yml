@@ -56,10 +56,8 @@ nav:
     - blocks: api/blocks.md
     - export: api/export.md
     - hf: api/hf.md
-  - Refactoring report: report.md
 
 not_in_nav: |
-  investigations/*
   generated/*
 
 markdown_extensions:

@@ -1,8 +1,7 @@
 # AGENTS.md — transformer-surgeon
 
 Agent-oriented guide for working on this codebase. For user-facing docs read [README.md](README.md); for the
-architecture in depth read [docs/concepts.md](docs/concepts.md). Work in progress on the refactoring branch is
-tracked in [HANDOFF.md](HANDOFF.md) and [TODO.md](TODO.md).
+architecture in depth read [docs/concepts.md](docs/concepts.md).
 
 ---
 
@@ -29,12 +28,11 @@ export_to_backend(model, QNNExportConfig(output_path="model.pte"))
 ```bash
 pip install -e ".[dev]"
 pytest                     # the suite in test/ (one folder per package folder), tiny random models, no downloads
-pytest archive/tests --continue-on-collection-errors   # legacy suite, kept as a regression reference
 ```
 
 Backends are capability-gated (`test/_helpers/capabilities.py`): tests skip when ExecuTorch, the QNN SDK, ONNX,
 TensorRT or a GPU are missing. On the development machine use the conda environments `py312_tensorrt`,
-`py310-executorch-qnn`, `py312_executorch_xnnpack` (see HANDOFF.md §6 for the expected environment failures).
+`py310-executorch-qnn`, `py312_executorch_xnnpack`.
 
 ---
 
@@ -131,7 +129,7 @@ graph I/O names. Runners use `load_llm_manifest` and `zero_caches_from_manifest`
 
 ### ONNX → plain TensorRT (`onnx`, `tensorrt`) — the Jetson path
 
-A TensorRT engine only runs on the GPU architecture + TensorRT version it was built with, so for edge targets (Jetson Orin) the artifact is the ONNX file; the engine is built on the device (`python -m transformersurgeon.export.backends.tensorrt.exporter model.manifest.json`). Needs `pip install -e ".[onnx]"` plus the `tensorrt` Python package matching the CUDA version (e.g. `tensorrt-cu13`). CLI: `scripts/tensorrt/export_and_generate.py`. Measured at parity with NVIDIA's TensorRT Edge-LLM for decode — see `docs/investigations/TENSORRT_ONNX_EXPORT.md`.
+A TensorRT engine only runs on the GPU architecture + TensorRT version it was built with, so for edge targets (Jetson Orin) the artifact is the ONNX file; the engine is built on the device (`python -m transformersurgeon.export.backends.tensorrt.exporter model.manifest.json`). Needs `pip install -e ".[onnx]"` plus the `tensorrt` Python package matching the CUDA version (e.g. `tensorrt-cu13`). CLI: `scripts/tensorrt/export_and_generate.py`. Measured at parity with NVIDIA's TensorRT Edge-LLM for decode.
 
 - **Cache:** convert with `cache_impl="io_inplace"`: BHSD `(1, kv_heads, max_cache_len, head_dim)` caches as graph I/O, written by `tsurgeon::kv_cache_update` (`blocks/attention/kv_cache/io_inplace.py`) which exports as opset-24 `TensorScatter`. TensorRT aliases each `present_*` output to its `past_*` input and updates it in place — bind both to the same buffer. `mutable` is rejected (ONNX has no state).
 - **Fused decode attention (`cache_impl="io_paged"`, opt-in):** one paged K+V pool per layer `(2, ceil(max_cache_len/128), 128, kv_heads, head_dim)` (`past_kv_i`/`present_kv_i`, bind both to one buffer: the plugin writes in place without declaring the alias) and one `tsurgeon::paged_attention` op per layer (RoPE + cache write + attention over the filled slots; eager implementation in `blocks/attention/kernels/paged.py`). The TensorRT backend maps it to TensorRT Edge-LLM's `AttentionPlugin` (XQA decode kernels, NVRTC-compiled at engine build): decode cost follows the context, not `max_cache_len`, unlike the static-cache MatMul/Softmax path which reads every slot. Needs `EDGELLM_PLUGIN_PATH`, equal q/k/v head dims (head_dim 32/64/128, q:kv 1–8) and unpruned RoPE (within-head pruning keeps per-kv-group frequencies: use `io_inplace`); whole-head pruning works. Decode only (`max_input_len=1`; prompts run token by token). The plain `onnx` backend rejects it (no standard ONNX form).
@@ -142,7 +140,7 @@ A TensorRT engine only runs on the GPU architecture + TensorRT version it was bu
 - **Runtime:** `export/backends/tensorrt/session.py::TensorRTLLMSession` (prefill + CUDA-graph greedy decode, manifest-driven); `export/backends/tensorrt/engine.py` (engine build/run helpers).
 - **Extending to a new target:** `ONNXExportConfig.custom_translations` (torch op → onnxscript) and `graph_passes` (post-export `(model, manifest)` rewrites) — `edgellm_int4.py` is the worked example.
 
-Tests: `test/export/test_exporter.py` (ONNX, TensorRT, graph passes), `test/blocks/test_attention.py` (cache and kernel atoms); the more detailed legacy tests are kept in `archive/tests/unit/test_io_inplace_cache.py`, `test_onnx_tensorrt_export.py`, `test_paged_attention.py` (gated by `requires_onnx` / `requires_tensorrt` / `requires_edgellm_plugin`). Benchmark workspace with the Edge-LLM vendor baseline: `../trt-models/`.
+Tests: `test/export/test_exporter.py` (ONNX, TensorRT, graph passes), `test/blocks/test_attention.py` (cache and kernel atoms), gated by `requires_onnx` / `requires_tensorrt` / `requires_edgellm_plugin`. Benchmark workspace with the Edge-LLM vendor baseline: `../trt-models/`.
 
 ### XNNPACK: `attn_impl` — optimized causal attention
 
@@ -156,7 +154,7 @@ Tests: `test/export/test_exporter.py` (ONNX, TensorRT, graph passes), `test/bloc
 
 `custom_sdpa` needs ExecuTorch's `executorch.extension.llm.custom_ops` extension importable both at **export** time (`kernels/custom_sdpa.py` imports it lazily, guarded with a clear `RuntimeError` if unavailable) and at **inference** time in whatever process later loads the `.pte` — the AOT registration from the export process does not carry over to a separate process. `scripts/executorch/xnnpack/inference_exported_test.py` handles this by conditionally re-importing the extension, keyed off an `attn_impl` field in the `.cache_meta.json` sidecar written by `exporter_function_test.py`.
 
-CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,sdpa,custom_sdpa}`. Tests: `test/blocks/test_attention.py`; legacy `archive/tests/unit/test_mha_causal_custom_sdpa.py` (numeric parity vs `"manual"`, plus the validation guards) — both gated by `test/_helpers/capabilities.py::requires_custom_sdpa` (narrower than `requires_executorch`: a minimal ExecuTorch install may lack the LLM custom-ops extension).
+CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,sdpa,custom_sdpa}`. Tests: `test/blocks/test_attention.py`, gated by `test/_helpers/capabilities.py::requires_custom_sdpa` (narrower than `requires_executorch`: a minimal ExecuTorch install may lack the LLM custom-ops extension).
 
 ### XNNPACK: `add_batch_dim` — experimental leading batch dimension
 
@@ -165,8 +163,7 @@ and every component's hidden states carry an explicit leading batch dim
 (`(1, in_seq_len, ...)`) instead of the framework's usual bare `(in_seq_len,
 ...)` contract — matching ExecuTorch's own llama exporter's convention, on the
 hypothesis that XNNPACK may select faster GEMM/FC microkernels or weight
-packing for batched shapes (see `docs/investigations/XNNPACK_DECODE_SPEED_FIX.md` for the
-investigation this came out of). Threaded through `blocks/stacks/config.py`,
+packing for batched shapes. Threaded through `blocks/stacks/config.py`,
 `export/convert.py`, `blocks/stacks/decoder.py` exactly like `attn_impl`/`cache_impl`.
 
 Scoped narrowly to minimize risk: `MHACausal` absorbs the batch dim
@@ -216,12 +213,12 @@ float → 16a16w) were garbage on device *and* in the fake-quant reference. With
 biased linear that is not compression-quantized becomes `add(linear(x, W), b)` before PT2E: the
 weights stay 16-bit and the bias gets its own 16-bit activation scale, so only the targeted linears
 change precision. Compression-quantized (W8/W4) linears keep the fused derived int32 bias (8-bit
-weights have ~250× more headroom). Still 1 delegate / 0 CPU ops. Test: `test/export/test_exporter.py::test_qnn_split_float_linear_bias_moves_only_float_biases_and_keeps_outputs` (legacy: `archive/tests/unit/test_qnn_bias_split.py`).
+weights have ~250× more headroom). Still 1 delegate / 0 CPU ops. Test: `test/export/test_exporter.py::test_qnn_split_float_linear_bias_moves_only_float_biases_and_keeps_outputs`.
 
 **Activation-only reference (`quantize_float_model`, default False, needs `quant_scope="all"`).** Lowers a
 model with *no* compression-quantized linear as the same fixed-point graph (16a16w everywhere, bias split
 as above) instead of fp16. Its distance from fp16 is the cost of HTP's 16-bit activations alone, so a
-compressed config measured against it isolates the weight compression. Test: `archive/tests/unit/test_qnn_activation_only.py`.
+compressed config measured against it isolates the weight compression. Tests: `test/export/test_exporter.py::test_qnn_quantize_float_model_*`.
 
 ### QNN: activation calibration and masked softmax
 
@@ -277,10 +274,6 @@ copy of the matrix: a bigger file, and the same decode reads.
   dequantizes; call it only before `save_pretrained`, never before export.
 
 ### QNN: decode-speed options
-
-See [QNN_DECODE_SPEED_FIX.md](docs/investigations/QNN_DECODE_SPEED_FIX.md) for the investigation and
-measurements, and [QNN_SPEED_SUMMARY.md](docs/investigations/QNN_SPEED_SUMMARY.md) for the plain-language
-version.
 
 | Option | Where | Default | Notes |
 |---|---|---|---|
@@ -393,7 +386,7 @@ Scope: both MLP and attention (q/k/v) structured pruning are wired end-to-end
 at conversion time (`blocks/attention/base.py::MHABase.finalize_rope_pruning()`, then
 `MHACausal.finalize_cache_geometry()` resizes the internal KV buffers to the pruned
 key/value head dims), and a hard-pruned `v_proj` cascades into `o_proj` via
-`coupled_repeated_pattern`. See `archive/tests/e2e/test_gqa_attention_pruning.py`.
+`coupled_repeated_pattern`.
 **Never resize module buffers inside `forward()`:** `torch.export` traces the reassignment
 as a fresh tensor per call (`aten.full`), not a mutable buffer. That is how head_dim-pruned
 mutable-cache exports (QNN, XNNPACK) silently lost their KV cache until 2026-10-13;
