@@ -11,6 +11,9 @@ A converted stack is described by a Hugging-Face-style configuration holding:
   ``rmsnorm_impl``, ...), see ``export/operations.py``;
 - ``layer_specs``: the geometry of every already-compressed linear layer
   (``{"blocks.0.attn.q_proj": {"in_features", "out_features", "rank", "bias"}}``).
+  ``mlp_hidden_dim_attr`` may be omitted when the source configuration has no
+  such attribute (e.g. DINOv2's ``mlp_ratio``): the MLP width then comes from
+  these specifications alone.
 """
 
 from transformers import PretrainedConfig
@@ -18,6 +21,7 @@ from transformers import PretrainedConfig
 from ..positions.rope import resolve_rope_type
 
 # Source-configuration attribute names read through the model dictionary.
+_OPTIONAL_GEOMETRY_KEYS = {"mlp_hidden_dim_attr"}
 _GEOMETRY_KEYS = {
     "num_hidden_layers": "num_blocks_attr",
     "hidden_size": "embed_dim_attr",
@@ -85,8 +89,10 @@ class _ConvertedStackConfig(PretrainedConfig):
                 return getattr(source_config, attr)
             raise KeyError(f"Source config is missing attribute '{attr}' mapped by '{index_key}'.")
 
-        values = {field: read(key) for field, key in _GEOMETRY_KEYS.items()}
-        consumed = {indexing[key] for key in _GEOMETRY_KEYS.values()}
+        geometry = {field: key for field, key in _GEOMETRY_KEYS.items()
+                    if key in indexing or key not in _OPTIONAL_GEOMETRY_KEYS}
+        values = {field: read(key) for field, key in geometry.items()}
+        consumed = {indexing[key] for key in geometry.values()}
         if "kv_num_heads_attr" in indexing:
             values["num_key_value_heads"] = read("kv_num_heads_attr")
             consumed.add(indexing["kv_num_heads_attr"])
@@ -132,7 +138,7 @@ class CustomEncoderConfigCompress(_ConvertedStackConfig):
 
     model_type = "transformersurgeon-custom-encoder"
     _model_keys = {"attn_type": "mha_encoder", "mlp_type": "mlp", "norm_type": "layernorm",
-                   "norm_position": "pre", "use_final_norm": True}
+                   "norm_position": "pre", "use_final_norm": True, "layer_scale": False}
     _defaults = dict(_model_keys)
 
     def __init__(self, **kwargs):

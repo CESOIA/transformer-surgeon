@@ -1,7 +1,7 @@
 # How to add…
 
 Every addition stays inside one folder (plus a new atom in `blocks/` when an operation does not exist yet).
-These recipes were checked on the code; the model-family one by actually adding Mistral.
+These recipes were checked on the code; the model-family one by adding Mistral (`models/mistral_c/`).
 
 ## A model family
 

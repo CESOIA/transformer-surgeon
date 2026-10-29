@@ -72,7 +72,7 @@ def test_save_and_load_calibration_state(tmp_path):
                                summaries["model.layers.0.mlp.up_proj"]["covariance"])
 
 
-@pytest.mark.parametrize("family", ["qwen2", "llama"])
+@pytest.mark.parametrize("family", ["qwen2", "llama", "mistral"])
 def test_smoothquant_preserves_the_float_output(family):
     spec, model, mgr = _model(family)
     model.model.layers[0].input_layernorm.weight.data[3] *= 200.0

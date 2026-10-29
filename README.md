@@ -4,6 +4,9 @@
 
 Apply low-rank decomposition, pruning, or quantization to any supported model in a few lines — then keep calling `model.generate()` as usual. Compression is reversible by default.
 
+📖 **Documentation:** [docs/index.md](docs/index.md) — concepts, pipeline, compression methods, examples and API reference.
+Browse it as a website with `pip install mkdocs-material "mkdocstrings[python]" && mkdocs serve`.
+
 ## ⚡ Quick Install
 
 ```bash
@@ -39,12 +42,14 @@ pip install -e ".[test]"   # add [test] to also get pytest for running the test 
 |---|---|---|
 | Qwen2 | Causal LM | `Qwen2ForCausalLMCompress` |
 | Llama | Causal LM | `LlamaForCausalLMCompress` |
+| Mistral | Causal LM | `MistralForCausalLMCompress` |
 | Qwen2-VL | Vision-language | `Qwen2VLForConditionalGenerationCompress` |
 | Qwen2.5-VL | Vision-language | `Qwen2_5_VLForConditionalGenerationCompress` |
 | BERT | Encoder | `BertForSequenceClassificationCompress` |
 | ModernBERT | Encoder | `ModernBertForSequenceClassificationCompress` |
 | DistilBERT | Encoder | `DistilBertForSequenceClassificationCompress` |
 | ViT | Vision encoder | `ViTForImageClassificationCompress` |
+| DINOv2 | Vision encoder | `Dinov2ForImageClassificationCompress` |
 
 All follow the same three-class pattern: a compressed config, a compressed model, and a compression manager — all HuggingFace-compatible.
 
@@ -247,6 +252,7 @@ These groups are consumed by `CompressionSchemesManager` exactly like previous u
 
 ## 📂 References
 
+- [docs/](docs/index.md) — full documentation (site source for `mkdocs serve`)
 - [test/](test/) — one test folder per package folder (`models/`, `compression/`, `calibration/`, `blocks/`, `export/`, `hf/`), tiny random models, backend tests capability-gated
 - [FRAMEWORK_STRUCTURE.md](FRAMEWORK_STRUCTURE.md) — package layout and data flow
 - [AGENTS.md](AGENTS.md) — folder rules, file map, parameter reference, extension recipes

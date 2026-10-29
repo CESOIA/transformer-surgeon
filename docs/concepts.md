@@ -428,7 +428,7 @@ _classes = build_family(NEWMODEL_C_FAMILY, __name__)
 ```
 
 Add an `__init__.py` re-exporting both modules and one line to
-`models/__init__.py::FAMILIES`. Nothing else changes (verified by adding Mistral
+`models/__init__.py::FAMILIES`. Nothing else changes (`mistral_c` was added this way,
 as a copy of `llama_c`).
 
 ### New export backend

@@ -16,10 +16,12 @@ FAMILIES = [
     "qwen2_vl_c",
     "qwen2_5_vl_c",
     "vit_c",
+    "dinov2_c",
     "bert_c",
     "modernbert_c",
     "distilbert_c",
     "llama_c",
+    "mistral_c",
 ]
 
 __all__ = []

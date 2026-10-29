@@ -33,7 +33,7 @@ def _wrapper(model, options):
 
 
 @pytest.mark.parametrize("cache_impl", ["mutable", "io_scatter", "io_inplace"])
-@pytest.mark.parametrize("family", ["qwen2", "llama"])
+@pytest.mark.parametrize("family", ["qwen2", "llama", "mistral"])
 def test_converted_decoder_matches_hf(family, cache_impl):
     torch.manual_seed(0)
     model = FAMILIES[family].build().float().eval()
@@ -69,7 +69,7 @@ def test_components_without_structure_are_skipped():
     assert all(v is None for v in converted.values())
 
 
-@pytest.mark.parametrize("family", ["bert", "distilbert", "vit"])
+@pytest.mark.parametrize("family", ["bert", "distilbert", "vit", "dinov2"])
 def test_encoder_families_convert_to_an_encoder_stack(family):
     model = FAMILIES[family].build().eval()
     stack = next(v for v in convert_for_export(model).values() if v is not None)
@@ -87,6 +87,9 @@ def _encoder_reference(family, model):
     if family == "distilbert":
         emb = model.distilbert.embeddings(torch.randint(0, 256, (1, 6)))
         return emb[0], model.distilbert.transformer(emb, attn_mask=torch.ones(1, 6))[0][0]
+    if family == "dinov2":
+        emb = model.dinov2.embeddings(torch.randn(1, 3, 32, 32))
+        return emb[0], model.dinov2.layernorm(model.dinov2.encoder(emb).last_hidden_state)[0]
     emb = model.vit.embeddings(torch.randn(1, 3, 32, 32))
     hidden = emb
     for layer in model.vit.layers:
@@ -95,7 +98,7 @@ def _encoder_reference(family, model):
     return emb[0], model.vit.layernorm(hidden)[0]
 
 
-@pytest.mark.parametrize("family", ["bert", "distilbert", "vit"])
+@pytest.mark.parametrize("family", ["bert", "distilbert", "vit", "dinov2"])
 def test_converted_encoder_matches_hf(family):
     torch.manual_seed(0)
     model = FAMILIES[family].build().float().eval()

@@ -80,7 +80,7 @@ Two dictionaries join the folders:
 | Add / change a model family | `models/<m>_c/` (two dictionaries) + one line in `models/__init__.py::FAMILIES` |
 | Change calibration hooks / statistics | `calibration/raw_data/`, `calibration/summaries/` (+ their `registry.py`) |
 | Calibration data (token windows, WikiText-2) | `calibration/datasets.py` |
-| Change the compressible layers | `blocks/layers/` (`LinearCompressed`, `EmbeddingCompressed`, `Conv2d/3dCompressed`, `LowRankMixin`, `VCONBlock`) |
+| Change the compressible layers | `blocks/layers/` (`LinearCompressed`, `EmbeddingCompressed`, `Conv2d/3dCompressed`, `LowRankMixin`, `VCONBlock, AtomicSum, LayerScale`) |
 | Change an export atom | `blocks/attention/{kernels,kv_cache}/`, `blocks/norm/`, `blocks/mlp/`, `blocks/positions/`, `blocks/stacks/` |
 | Add an atom | new file in the right `blocks/` subfolder + entry in `blocks/catalog.py` (+ `BACKEND_OPERATIONS` if the export chooses it) |
 | Change HF model → `blocks/` conversion | `export/convert.py::convert_for_export` |
@@ -529,11 +529,14 @@ Passed to `manager.set()`, `manager.apply()`, `manager.restore()`, etc.:
 
 1. Create `models/<m>_c/indexing_<m>_c.py` (model dictionary; copy the closest family). Required keys per
    component: `num_blocks_attr`, `path_list`, `path_template`; for export also `structure`, `attn_type`,
-   `mlp_type`, `norm_type`, `rope_type` (`"auto"` takes the HF configuration's RoPE type).
+   `mlp_type`, `norm_type`, `rope_type` (`"auto"` takes the HF configuration's RoPE type). Encoders also take
+   `norm_position`, `use_final_norm` and `layer_scale` (per-channel branch scaling, as in `dinov2_c`).
+   `mlp_hidden_dim_attr` can be omitted when the HF configuration has no MLP width (the width then comes from
+   the weights).
 2. Create `models/<m>_c/family_<m>_c.py` (family dictionary: `indexing`, `hf_config`, `hf_model`,
    `class_names`, `auto_class`, optional `sub_configs`, `checkpoint_key_mapping`) and call `build_family`.
 3. Add `__init__.py` re-exporting both modules, and one line to `models/__init__.py::FAMILIES`.
-   Verified on 2026-10-28 with Mistral (copy of `llama_c` with the HF classes changed): nothing else is needed.
+   `mistral_c` was added this way (copy of `llama_c` with the HF classes changed): nothing else is needed.
 4. For tests, add a tiny builder to `test/_helpers/model_factory.py::FAMILIES`.
 
 ### Adding a compression method variant

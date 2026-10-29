@@ -7,9 +7,11 @@ outside `models/` never branches on a model name.
 |---|---|---|
 | `qwen2_c` | `Qwen2ForCausalLM` | `Qwen2ConfigCompress`, `Qwen2ForCausalLMCompress`, `Qwen2CompressionSchemesManager` |
 | `llama_c` | `LlamaForCausalLM` | `Llama...Compress`, `LlamaCompressionSchemesManager` |
+| `mistral_c` | `MistralForCausalLM` | `Mistral...Compress`, `MistralCompressionSchemesManager` (copy of `llama_c`) |
 | `qwen2_vl_c`, `qwen2_5_vl_c` | `Qwen2(.5)VLForConditionalGeneration` | vision + text configurations, model, manager |
 | `bert_c`, `distilbert_c`, `modernbert_c` | `...ForSequenceClassification` | configuration, model, manager |
 | `vit_c` | `ViTForImageClassification` | configuration, model, manager |
+| `dinov2_c` | `Dinov2ForImageClassification` | configuration, model, manager (layer scale exported as `LayerScale`; residual-dimension pruning not supported) |
 
 ## The family dictionary (`family_<m>_c.py`)
 

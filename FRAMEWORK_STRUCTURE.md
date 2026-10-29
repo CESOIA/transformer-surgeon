@@ -35,7 +35,7 @@ transformersurgeon/
 │   └── datasets.py         token-window calibration loaders (WikiText-2)
 ├── blocks/         export-ready transformer, split into selectable atoms
 │   ├── catalog.py          BLOCK_CATALOG: family -> atom -> {object, summary, implements, selected_by}
-│   ├── layers/             LinearCompressed, EmbeddingCompressed, Conv2d/3dCompressed, LowRankMixin, VCONBlock
+│   ├── layers/             LinearCompressed, EmbeddingCompressed, Conv2d/3dCompressed, LowRankMixin, VCONBlock, AtomicSum, LayerScale
 │   ├── norm/               rmsnorm, rmsnorm_prescaled, rmsnorm_upcast, layernorm
 │   ├── mlp/                plain, gated, activations
 │   ├── positions/          rope, frequency tables, rope_pruning

@@ -39,12 +39,14 @@ pip install mkdocs mkdocs-material "mkdocstrings[python]"   # to build this site
 |---|---|---|
 | Qwen2 | Causal LM | `Qwen2ForCausalLMCompress` |
 | Llama | Causal LM | `LlamaForCausalLMCompress` |
+| Mistral | Causal LM | `MistralForCausalLMCompress` |
 | Qwen2-VL | Vision-language | `Qwen2VLForConditionalGenerationCompress` |
 | Qwen2.5-VL | Vision-language | `Qwen2_5_VLForConditionalGenerationCompress` |
 | BERT | Encoder | `BertForSequenceClassificationCompress` |
 | ModernBERT | Encoder | `ModernBertForSequenceClassificationCompress` |
 | DistilBERT | Encoder | `DistilBertForSequenceClassificationCompress` |
 | ViT | Vision encoder | `ViTForImageClassificationCompress` |
+| DINOv2 | Vision encoder | `Dinov2ForImageClassificationCompress` |
 
 ---
 

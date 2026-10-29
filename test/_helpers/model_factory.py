@@ -67,6 +67,16 @@ def _llama():
     return T.LlamaForCausalLMCompress(cfg)
 
 
+def _mistral():
+    T = _import_ts()
+    cfg = T.MistralConfigCompress(
+        vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+        tie_word_embeddings=False,
+    )
+    return T.MistralForCausalLMCompress(cfg)
+
+
 def _bert():
     T = _import_ts()
     cfg = T.BertConfigCompress(
@@ -103,6 +113,16 @@ def _vit():
         image_size=32, patch_size=16, num_channels=3, num_labels=10,
     )
     return T.ViTForImageClassificationCompress(cfg)
+
+
+def _dinov2():
+    T = _import_ts()
+    # layer_scale_init_value != 1 so that a missing layer scale shows up in the outputs.
+    cfg = T.Dinov2ConfigCompress(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4, mlp_ratio=2,
+        image_size=32, patch_size=16, num_channels=3, num_labels=10, layer_scale_init_value=0.5,
+    )
+    return T.Dinov2ForImageClassificationCompress(cfg)
 
 
 def _make_vl(model_attr, vis_attr, txt_attr, cfg_attr):
@@ -153,6 +173,11 @@ FAMILIES: Dict[str, FamilySpec] = {
         lrd_criteria="self_attn.q_proj",
         mlp_prune_criteria=["mlp.gate_proj", "mlp.up_proj"], is_causal=True,
     ),
+    "mistral": FamilySpec(
+        "mistral", _mistral, _mgr("MistralCompressionSchemesManager"), _ids(),
+        lrd_criteria="self_attn.q_proj",
+        mlp_prune_criteria=["mlp.gate_proj", "mlp.up_proj"], is_causal=True,
+    ),
     "bert": FamilySpec(
         "bert", _bert, _mgr("BertCompressionSchemesManager"), _ids(),
         lrd_criteria="attention.self.query",
@@ -171,6 +196,10 @@ FAMILIES: Dict[str, FamilySpec] = {
     "vit": FamilySpec(
         "vit", _vit, _mgr("ViTCompressionSchemesManager"), _pixels,
         lrd_criteria="attention.q_proj", mlp_prune_criteria="mlp.fc1",
+    ),
+    "dinov2": FamilySpec(
+        "dinov2", _dinov2, _mgr("Dinov2CompressionSchemesManager"), _pixels,
+        lrd_criteria="attention.attention.query", mlp_prune_criteria="mlp.fc1",
     ),
     "qwen2_vl": FamilySpec(
         "qwen2_vl",

@@ -3,7 +3,7 @@
 import torch
 
 from ..catalog import build_block, norm_atom_name
-from ..layers import AtomicSum
+from ..layers import AtomicSum, LayerScale
 from .config import CustomEncoderConfigCompress
 
 
@@ -18,6 +18,9 @@ class TransformerEncoderBlock(torch.nn.Module):
 
     - ``"pre"``:  ``x + attn(norm_in(x))``, then ``x + mlp(norm_out(x))``;
     - ``"post"``: ``norm_in(x + attn(x))``, then ``norm_out(x + mlp(x))``.
+
+    With ``layer_scale`` (pre-norm only) each branch output is scaled per channel
+    (``scale_attn``, ``scale_mlp``) before the residual addition.
     """
 
     def __init__(self, config, block_index):
@@ -39,12 +42,19 @@ class TransformerEncoderBlock(torch.nn.Module):
             "mlp", config.mlp_type, config.hidden_size, config.intermediate_size,
             activation=config.hidden_act, linear_specs=config.block_layer_specs(block_index, "mlp"),
         )
+        if getattr(config, "layer_scale", False):
+            if self.norm_position != "pre":
+                raise ValueError("layer_scale requires norm_position='pre'")
+            self.scale_attn = LayerScale(config.hidden_size)
+            self.scale_mlp = LayerScale(config.hidden_size)
+        else:
+            self.scale_attn = self.scale_mlp = torch.nn.Identity()
         self.atomic_sum = AtomicSum()
 
     def forward(self, x, rope=None):
         if self.norm_position == "pre":
-            x = self.atomic_sum(self.attn(self.norm_in(x), rope=rope), x)
-            return self.atomic_sum(self.mlp(self.norm_out(x)), x)
+            x = self.atomic_sum(self.scale_attn(self.attn(self.norm_in(x), rope=rope)), x)
+            return self.atomic_sum(self.scale_mlp(self.mlp(self.norm_out(x))), x)
         x = self.norm_in(self.atomic_sum(self.attn(x, rope=rope), x))
         return self.norm_out(self.atomic_sum(self.mlp(x), x))
 

@@ -6,7 +6,7 @@ Face model. It never decides what to compress: shapes, ranks and biases are read
 It is split into **atoms**, one component per file, grouped in sub-folders:
 
 ```
-layers/      LinearCompressed, EmbeddingCompressed, Conv2d/3dCompressed, LowRankMixin, VCONBlock
+layers/      LinearCompressed, EmbeddingCompressed, Conv2d/3dCompressed, LowRankMixin, VCONBlock, AtomicSum, LayerScale
 norm/        rmsnorm, rmsnorm_prescaled, rmsnorm_upcast, layernorm
 mlp/         plain, gated, activations
 positions/   rope, frequency tables, rope_pruning
