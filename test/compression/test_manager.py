@@ -104,3 +104,21 @@ def test_cascade_calibration_is_refused_where_the_dictionary_forbids_it():
     mgr.set_calibration_data(_loader())
     with pytest.raises(ValueError, match="no_cascade_calibration"):
         mgr.apply(hard=False, show_progress=False)
+
+
+@pytest.mark.parametrize("vcon", [False, True])
+def test_reapply_masks_with_structured_pruning_only(vcon):
+    """The unconfigured unstructured pruner must not touch the structured 1-D weight_mask."""
+    _, model, mgr = _model("qwen2")
+    mgr.set("structured_pruning", "method", "magnitude", criteria="mlp.up_proj")
+    mgr.set("structured_pruning", "ratio", 0.5, criteria="mlp.up_proj")
+    if vcon:
+        mgr.init_vcon(criteria="mlp.up_proj")
+    mgr.apply(hard=False, criteria="mlp.up_proj")
+    module = next(iter(mgr.iter_filtered(criteria="mlp.up_proj"))).get_compression_module()
+    pruned = module.weight_mask == 0
+    with torch.no_grad():
+        module.weight.add_(1.0)  # emulates an optimizer step reviving pruned rows
+    mgr.reapply_masks(criteria="mlp.up_proj")
+    assert module.weight[pruned].abs().sum() == 0
+    assert module.weight[~pruned].abs().sum() > 0

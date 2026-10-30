@@ -111,6 +111,8 @@ class UnstructuredPruner(Compressor):
         Call after optimizer.step() in STE fine-tuning loops to prevent mask
         drift.
         """
+        if not self._to_compress():
+            return  # the mask on the module may belong to another pruner (e.g. structured)
         mask = module._buffers.get('weight_mask')
         if mask is None:
             return

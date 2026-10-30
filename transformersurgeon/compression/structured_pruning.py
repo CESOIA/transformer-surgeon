@@ -565,6 +565,8 @@ class StructuredPruner(Compressor):
 
     def reapply_mask(self, module):
         """Re-zero pruned rows using the stored weight_mask buffer (STE fine-tuning)."""
+        if not self._to_compress():
+            return  # the mask on the module may belong to another pruner (e.g. unstructured)
         mask = module._buffers.get("weight_mask")
         if mask is None:
             return
