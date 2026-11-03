@@ -11,7 +11,7 @@ outside `models/` never branches on a model name.
 | `qwen2_vl_c`, `qwen2_5_vl_c` | `Qwen2(.5)VLForConditionalGeneration` | vision + text configurations, model, manager |
 | `bert_c`, `distilbert_c`, `modernbert_c` | `...ForSequenceClassification` | configuration, model, manager |
 | `vit_c` | `ViTForImageClassification` | configuration, model, manager |
-| `dinov2_c` | `Dinov2ForImageClassification` | configuration, model, manager (layer scale exported as `LayerScale`; residual-dimension pruning not supported) |
+| `dinov2_c` | `Dinov2ForImageClassification` | configuration, model, manager (layer scale exported as `LayerScale`; residual-dimension pruning not supported; pooling `cls_patch_mean`). Checkpoints with `use_swiglu_ffn=True` (giant) use the `Dinov2SwiGLU*` classes: fused SwiGLU MLP (`mlp_gated_fused`), MLP hidden dimension not prunable |
 
 ## The family dictionary (`family_<m>_c.py`)
 

@@ -77,7 +77,10 @@ class TensorRTExportConfig(ONNXExportConfig):
 
 
 def engine_profiles(manifest: dict) -> list[OptimizationProfile]:
-    """Decode profile (+ prefill profile when the graph has a dynamic seq)."""
+    """Decode profile (+ prefill profile when the graph has a dynamic seq); none for a
+    static encoder graph."""
+    if manifest.get("structure") == "transformer_encoder":
+        return []
     profiles = [OptimizationProfile(shapes={"input_ids": ((1,), (1,), (1,))})]
     max_input_len = int(manifest.get("max_input_len", 1))
     if max_input_len > 1:
@@ -121,6 +124,7 @@ class TensorRTExporter(Exporter):
 
     backend = "tensorrt"
     config_class = TensorRTExportConfig
+    supports_encoder = True
 
     def lower(self, components, config):
         return export_tensorrt(components, config)

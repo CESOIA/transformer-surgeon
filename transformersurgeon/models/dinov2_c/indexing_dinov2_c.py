@@ -77,7 +77,29 @@ DINOV2_C_INDEXING = {
         'extra_layers_matching': ["norm"],
         'use_final_norm': True,
         'position_embedding_type': 'none',
+        # The classifier reads [CLS token, mean of the patch tokens].
+        'pooling': 'cls_patch_mean',
     },
 }
 
-__all__ = ["DINOV2_C_INDEXING"]
+# DINOv2 checkpoints with use_swiglu_ffn=True (giant): the MLP is one fused
+# gate/up projection (weights_in, 2 x hidden wide, gate first) and weights_out,
+# with SiLU regardless of the configuration's hidden_act. The MLP hidden
+# dimension is not prunable here (the fused projection would need its two halves
+# pruned together).
+_DINOV2_SWIGLU = DINOV2_C_INDEXING['dinov2']
+DINOV2_SWIGLU_C_INDEXING = {
+    'dinov2': {
+        **_DINOV2_SWIGLU,
+        'path_list': {**_DINOV2_SWIGLU['path_list'], 'mlp': ['weights_in', 'weights_out']},
+        'calibration_groups': {**_DINOV2_SWIGLU['calibration_groups'], 'mlp': [['weights_in'], ['weights_out']]},
+        'pruning': {
+            **_DINOV2_SWIGLU['pruning'],
+            'output_dependence': {'attention.attention.value': ['attention.output.dense']},
+        },
+        'mlp_type': 'mlp_gated_fused',
+        'mlp_activation': 'silu',
+    },
+}
+
+__all__ = ["DINOV2_C_INDEXING", "DINOV2_SWIGLU_C_INDEXING"]

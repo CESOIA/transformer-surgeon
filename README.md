@@ -49,7 +49,7 @@ pip install -e ".[test]"   # add [test] to also get pytest for running the test 
 | ModernBERT | Encoder | `ModernBertForSequenceClassificationCompress` |
 | DistilBERT | Encoder | `DistilBertForSequenceClassificationCompress` |
 | ViT | Vision encoder | `ViTForImageClassificationCompress` |
-| DINOv2 | Vision encoder | `Dinov2ForImageClassificationCompress` |
+| DINOv2 | Vision encoder | `Dinov2ForImageClassificationCompress` (giant: `Dinov2SwiGLUForImageClassificationCompress`) |
 
 All follow the same three-class pattern: a compressed config, a compressed model, and a compression manager — all HuggingFace-compatible.
 

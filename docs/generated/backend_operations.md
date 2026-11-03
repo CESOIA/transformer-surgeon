@@ -136,12 +136,16 @@ Feed-forward block (blocks/mlp); the model dictionary picks plain or gated. Chos
 |---|---|---|
 | xnnpack | `mlp` | Two XNNPACK fully-connected layers with the activation in between. |
 | xnnpack | `mlp_gated` | Three XNNPACK fully-connected layers; activation of the gate times the up projection. |
+| xnnpack | `mlp_gated_fused` | Two XNNPACK fully-connected layers; the first is split into gate and up halves. |
 | qnn | `mlp` | Two QNN FullyConnected (or 1x1 Conv2d) operations with the activation in between. |
 | qnn | `mlp_gated` | Three QNN FullyConnected (or 1x1 Conv2d) operations; activation of the gate times the up projection. |
+| qnn | `mlp_gated_fused` | Two QNN FullyConnected (or 1x1 Conv2d) operations; the first is split into gate and up halves. |
 | onnx | `mlp` | Two ONNX MatMul/Gemm nodes with the activation in between. |
 | onnx | `mlp_gated` | Three ONNX MatMul/Gemm nodes; activation of the gate times the up projection. |
+| onnx | `mlp_gated_fused` | Two ONNX MatMul/Gemm nodes; the first is split into gate and up halves. |
 | tensorrt | `mlp` | Two TensorRT matrix multiplies with the activation in between. |
 | tensorrt | `mlp_gated` | Three TensorRT matrix multiplies; activation of the gate times the up projection. |
+| tensorrt | `mlp_gated_fused` | Two TensorRT matrix multiplies; the first is split into gate and up halves. |
 
 ### `rope_frequencies`
 

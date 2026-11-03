@@ -7,7 +7,11 @@
    ``export/operations.py`` and reject unsupported choices;
 2. resolve the export components (input embedding, converted decoder stack,
    output head), converting the Hugging Face model with ``convert_for_export``
-   when needed;
+   when needed; for an encoder model (a component with
+   ``structure="transformer_encoder"`` and no decoder) the components are the
+   embedding, the converted encoder stack, the pooling named by the model
+   dictionary and the output head, and only backends with
+   ``supports_encoder`` accept them;
 3. move the components to CPU (tracing device) and to the requested dtype;
 4. call the backend's :meth:`Exporter.lower`, which traces, quantises, lowers
    and writes the artifact, and returns the result.
@@ -23,7 +27,7 @@ from ..blocks import TransformerDecoder
 from ..utils import get_submodule
 from .config import BackendExportConfig
 from .convert import convert_for_export
-from .operations import check_components, check_config_choices, resolve_convert_options
+from .operations import check_choice, check_components, check_config_choices, resolve_convert_options
 from .wrapper import _normalize_component_devices
 
 EXPORTERS: dict[str, type] = {}
@@ -50,6 +54,47 @@ def _decoder_component(model):
         if indexing.get("structure") == "transformer_decoder":
             return name, indexing
     return None, {}
+
+
+def _encoder_component(model):
+    """Name and model dictionary of the component converted into an encoder stack
+    (only for models without a decoder component)."""
+    indexing = getattr(model, "indexing", None)
+    if not isinstance(indexing, dict) or _decoder_component(model)[0] is not None:
+        return None, {}
+    for name, entry in indexing.items():
+        if entry.get("structure") == "transformer_encoder":
+            return name, entry
+    return None, {}
+
+
+def resolve_encoder_components(model_or_graph: Any, *, convert_options=None, verbose=False):
+    """Encoder export components, or ``None`` if the input is not an encoder model.
+
+    Accepts a dict ``{embedding, encoder, final_layer[, pooling, config]}`` or a
+    compressed Hugging Face encoder model. For a model, the embedding and the
+    output head are the component's ``preprocessing`` and ``final_layer``
+    modules (with their compression), and ``pooling`` comes from its
+    dictionary (default ``"cls"``).
+    """
+    if isinstance(model_or_graph, dict):
+        if "encoder" not in model_or_graph:
+            return None
+        return {"pooling": "cls", "config": None, **model_or_graph}
+    name, indexing = _encoder_component(model_or_graph)
+    if name is None:
+        return None
+    if not indexing.get("preprocessing"):
+        raise ValueError(f"Encoder component {name!r} has no 'preprocessing' (input embedding) in its dictionary.")
+    final_layer = get_submodule(model_or_graph, indexing["final_layer"]) if indexing.get("final_layer") else None
+    encoder = convert_for_export(model_or_graph, options=convert_options, verbose=verbose)[name]
+    return {
+        "embedding": get_submodule(model_or_graph, indexing["preprocessing"]),
+        "encoder": encoder,
+        "final_layer": final_layer,
+        "pooling": indexing.get("pooling", "cls"),
+        "config": getattr(model_or_graph, "config", None),
+    }
 
 
 def resolve_components(model_or_graph: Any, *, convert_options=None, verbose=False):
@@ -92,6 +137,8 @@ class Exporter:
 
     backend: str = None
     config_class: type = BackendExportConfig
+    # True if lower() accepts encoder components (see resolve_encoder_components).
+    supports_encoder: bool = False
 
     def export(self, model_or_graph: Any, config: BackendExportConfig):
         if not isinstance(config, self.config_class):
@@ -105,6 +152,10 @@ class Exporter:
             options["max_cache_len"] = config.max_seq_len
         options = resolve_convert_options(self.backend, options)
 
+        encoder = resolve_encoder_components(model_or_graph, convert_options=options, verbose=config.verbose)
+        if encoder is not None:
+            return self._export_encoder(encoder, config)
+
         embedding, decoder, final_layer, model_config = resolve_components(
             model_or_graph, convert_options=options, verbose=config.verbose)
         check_components(self.backend, decoder)
@@ -114,6 +165,20 @@ class Exporter:
 
         os.makedirs(os.path.dirname(os.path.abspath(config.output_path)), exist_ok=True)
         components = {"embedding": embedding, "decoder": decoder, "final_layer": final_layer, "config": model_config}
+        return self.lower(components, config)
+
+    def _export_encoder(self, components, config):
+        if not self.supports_encoder:
+            raise NotImplementedError(f"The {self.backend} exporter does not export encoder models "
+                                      "(available: backends with supports_encoder, e.g. onnx, tensorrt).")
+        blocks = components["encoder"].blocks
+        if len(blocks):
+            check_choice(self.backend, "attention_kernel", blocks[0].attn.attn_impl)
+        modules = {k: components[k] for k in ("embedding", "encoder", "final_layer") if components[k] is not None}
+        for key, module in modules.items():
+            module = module.to("cpu")
+            components[key] = module.to(config.float_type) if config.float_type is not None else module
+        os.makedirs(os.path.dirname(os.path.abspath(config.output_path)), exist_ok=True)
         return self.lower(components, config)
 
     def check_available(self):
@@ -131,4 +196,5 @@ def export_to_backend(model_or_graph: Any, config: BackendExportConfig | None = 
     return get_exporter(config.backend).export(model_or_graph, config)
 
 
-__all__ = ["Exporter", "EXPORTERS", "register_exporter", "get_exporter", "resolve_components", "export_to_backend"]
+__all__ = ["Exporter", "EXPORTERS", "register_exporter", "get_exporter", "resolve_components",
+           "resolve_encoder_components", "export_to_backend"]

@@ -12,7 +12,7 @@ from transformersurgeon.export import (
     EXPORTERS, BackendExportConfig, build_wrapper, build_zero_caches, convert_for_export, export_to_backend,
     extract_layer_quant_info, get_exporter,
 )
-from transformersurgeon.export.exporter import resolve_components
+from transformersurgeon.export.exporter import resolve_components, resolve_encoder_components
 
 CACHE = 16
 IO_INPLACE = {"cache_impl": "io_inplace", "max_cache_len": CACHE}
@@ -261,3 +261,101 @@ def test_fp32_attention_scores_wraps_the_score_path_in_casts():
     onnx.checker.check_model(model)
     with pytest.raises(RuntimeError, match="no MatMul"):
         fp32_attention_scores(_onnx_graph([helper.make_node("Relu", ["x"], ["y"])], [], [4], [4]))
+
+
+@caps.requires_onnx
+def test_fp32_attention_scores_handles_unmasked_scores_and_bfloat16():
+    import onnx
+    from onnx import TensorProto, helper
+
+    from transformersurgeon.export.backends.tensorrt.attention_passes import fp32_attention_scores
+
+    def graph(elem):
+        x = helper.make_tensor_value_info("x", elem, [4, 4])
+        y = helper.make_tensor_value_info("y", elem, [4, 4])
+        w = helper.make_tensor("w", elem, [1], [1.0])  # the weight dtype is the model dtype
+        nodes = [helper.make_node("MatMul", ["x", "x"], ["s"], name="mm"),
+                 helper.make_node("Softmax", ["s"], ["y"], name="sm")]
+        return helper.make_model(helper.make_graph(nodes, "g", [x], [y], [w]),
+                                 opset_imports=[helper.make_opsetid("", 21)])
+
+    for elem in (TensorProto.FLOAT16, TensorProto.BFLOAT16):
+        model = graph(elem)
+        fp32_attention_scores(model)
+        casts = [helper.get_attribute_value(n.attribute[0]) for n in model.graph.node if n.op_type == "Cast"]
+        assert casts.count(TensorProto.FLOAT) == 2 and casts.count(elem) == 1
+        onnx.checker.check_model(model)
+    model = graph(TensorProto.FLOAT)
+    fp32_attention_scores(model)  # a float32 model is left unchanged
+    assert not any(n.op_type == "Cast" for n in model.graph.node)
+
+
+# --------------------------------------------------------------------------- #
+# Encoder models (EncoderWrapper)
+
+def _encoder_model(quantize=False):
+    torch.manual_seed(0)
+    spec = FAMILIES["dinov2"]
+    model = spec.build().float().eval()
+    if quantize:
+        mgr = spec.manager(model)
+        mgr.set("quantization", "precision", 8, criteria="mlp")
+        mgr.set("quantization", "granularity", "per_channel", criteria="mlp")
+        mgr.apply(hard=True, show_progress=False)
+    return model
+
+
+def test_encoder_wrapper_matches_the_hf_classifier():
+    from transformersurgeon.export import EncoderWrapper
+
+    model = _encoder_model()
+    components = resolve_encoder_components(model)
+    assert components["pooling"] == "cls_patch_mean"
+    wrapper = EncoderWrapper(components["embedding"], components["encoder"], components["final_layer"],
+                             components["pooling"]).eval()
+    x = torch.randn(1, 3, 32, 32)
+    with torch.no_grad():
+        torch.testing.assert_close(wrapper(x), model(x).logits, rtol=1e-4, atol=1e-4)
+    assert resolve_encoder_components(_model()) is None  # decoders keep the LLM path
+
+
+def test_backends_without_encoder_support_reject_encoders(tmp_path):
+    components = resolve_encoder_components(_encoder_model())
+    with pytest.raises(NotImplementedError, match="encoder"):
+        get_exporter("qnn")._export_encoder(components, BackendExportConfig(backend="qnn", output_path=str(tmp_path / "m.pte")))
+
+
+@caps.requires_onnx
+def test_onnx_encoder_export_is_static_and_quantizes_the_listed_layers(tmp_path):
+    import onnx
+    from transformersurgeon.export.backends import ONNXExportConfig
+
+    result = export_to_backend(_encoder_model(quantize=True), ONNXExportConfig(output_path=str(tmp_path / "model.onnx")))
+    graph = onnx.load(result.onnx_path, load_external_data=False).graph
+    assert [i.name for i in graph.input] == ["pixel_values"] and [o.name for o in graph.output] == ["logits"]
+    assert [d.dim_value for d in graph.input[0].type.tensor_type.shape.dim] == [1, 3, 32, 32]
+    manifest = json.load(open(result.manifest_path))
+    assert manifest["format"] == "tsurgeon-encoder/1" and manifest["outputs"]["logits"]["shape"] == [1, 10]
+    assert sorted(manifest["quantized_layers"]) == [f"encoder.blocks.{i}.mlp.{p}" for i in range(2)
+                                                    for p in ("down_proj", "up_proj")]
+    assert sum(n.op_type == "DequantizeLinear" for n in graph.node) == 4
+
+
+@caps.requires_tensorrt
+def test_tensorrt_encoder_engine_matches_the_eager_wrapper(tmp_path):
+    from transformersurgeon.export import EncoderWrapper
+    from transformersurgeon.export.backends import TensorRTExportConfig
+    from transformersurgeon.export.backends.tensorrt.engine import TensorRTEngineRunner
+
+    model = _encoder_model()
+    x = torch.randn(1, 3, 32, 32)
+    with torch.no_grad():
+        want = model(x).logits
+    result = export_to_backend(model, TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"),
+                                                           float_type=torch.float16))
+    runner = TensorRTEngineRunner(result.engine_path)
+    runner.bind({"pixel_values": x.half().cuda()})
+    out = runner.allocate_outputs()["logits"]
+    runner.run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float().cpu(), want, rtol=2e-2, atol=2e-2)

@@ -111,3 +111,25 @@ def test_converted_encoder_matches_hf(family):
 def test_resolve_convert_options_defaults():
     assert resolve_convert_options()["cache_impl"] == "mutable"
     assert resolve_convert_options({"rmsnorm_upcast": True})["rmsnorm_impl"] == "rmsnorm_upcast"
+
+
+def _dinov2_swiglu():
+    import transformersurgeon as T
+
+    cfg = T.Dinov2SwiGLUConfigCompress(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4, mlp_ratio=2, use_swiglu_ffn=True,
+        image_size=32, patch_size=16, num_channels=3, num_labels=10, layer_scale_init_value=0.5,
+    )
+    return T.Dinov2SwiGLUForImageClassificationCompress(cfg)
+
+
+def test_dinov2_swiglu_converts_to_a_fused_gated_mlp_and_matches_hf():
+    torch.manual_seed(0)
+    model = _dinov2_swiglu().float().eval()
+    stack = convert_for_export(model)["dinov2"].eval()
+    mlp = stack.blocks[0].mlp
+    assert type(mlp).__name__ == "MLPGatedFused" and isinstance(mlp.activation, torch.nn.SiLU)
+    with torch.no_grad():
+        emb = model.dinov2.embeddings(torch.randn(1, 3, 32, 32))
+        ref = model.dinov2.layernorm(model.dinov2.encoder(emb).last_hidden_state)[0]
+        torch.testing.assert_close(stack(emb[0]), ref, rtol=1e-4, atol=1e-4)

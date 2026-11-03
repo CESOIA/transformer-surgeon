@@ -167,6 +167,7 @@ BACKEND_OPERATIONS = {
             backend: {"default": None, "options": {
                 "mlp": f"Two {op} with the activation in between.",
                 "mlp_gated": f"Three {op}; activation of the gate times the up projection.",
+                "mlp_gated_fused": f"Two {op}; the first is split into gate and up halves.",
             }} for backend, op in (("xnnpack", "XNNPACK fully-connected layers"),
                                    ("qnn", "QNN FullyConnected (or 1x1 Conv2d) operations"),
                                    ("onnx", "ONNX MatMul/Gemm nodes"),

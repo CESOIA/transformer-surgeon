@@ -93,6 +93,17 @@ BLOCK_CATALOG = {
     "mlp": {
         "mlp": _atom("mlp.plain.MLP", "down(act(up(x))).", "mlp", "model"),
         "mlp_gated": _atom("mlp.gated.MLPGated", "down(act(gate(x)) * up(x)).", "mlp_gated", "model"),
+        "mlp_gated_fused": _atom("mlp.gated_fused.MLPGatedFused",
+                                 "down(act(x1) * x2) with [x1, x2] = up(x) (one fused gate/up projection).",
+                                 "mlp_gated", "model"),
+    },
+    # Reduction of an encoder's tokens before its output head. Model key: "pooling".
+    "pooling": {
+        "cls": _atom("heads.pooling.ClsPooling", "First (class) token.", "pooling", "model"),
+        "mean": _atom("heads.pooling.MeanPooling", "Mean over all tokens.", "pooling", "model"),
+        "cls_patch_mean": _atom("heads.pooling.ClsPatchMeanPooling",
+                                "Class token concatenated with the mean of the other tokens.", "pooling", "model"),
+        "none": _atom("heads.pooling.NoPooling", "Every token, unchanged.", "pooling", "model"),
     },
     # Normalisations. Model key: "norm_type" names the operation; for RMS
     # normalisation the export option "rmsnorm_impl" picks the implementation.

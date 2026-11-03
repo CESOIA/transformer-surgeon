@@ -20,6 +20,11 @@ With ``cache_impl="io_inplace"`` the cache write is an opset-24 TensorScatter:
 consumers should bind each present_* to the same buffer as its past_* (TensorRT
 requires it -- it aliases them and updates in place).
 
+Encoder models (``export/wrapper.py::EncoderWrapper``) have a static contract:
+
+  inputs   pixel_values (1, C, H, W) model dtype   (or input_ids (1, seq) int64)
+  outputs  logits       (1, num_outputs)
+
 With ``cache_impl="io_paged"`` each layer has one paged K+V pool instead
 (past_kv_i / present_kv_i, also updated in place) and attention is the fused
 ``tsurgeon::paged_attention`` op, which has no standard ONNX form: the target
@@ -35,10 +40,10 @@ import torch
 
 from ...config import BackendExportConfig
 from ...exporter import Exporter, register_exporter
-from ...manifest import build_llm_manifest, graph_io_names
+from ...manifest import build_encoder_manifest, build_llm_manifest, graph_io_names
 from ...quant_info import extract_layer_quant_info
 from ...result import BackendExportResult, finalize_export_result
-from ...wrapper import resolve_components_and_wrapper
+from ...wrapper import resolve_components_and_wrapper, resolve_encoder_wrapper
 from .quantization import apply_activation_quantization, apply_weight_quantization
 
 
@@ -81,6 +86,9 @@ class ONNXExportConfig(BackendExportConfig):
     graph_passes       - callables (onnx.ModelProto, manifest dict) -> None run
                          on the exported model before it is saved (target-
                          specific rewrites).
+    input_shape        - encoder models only: shape of the (static) graph
+                         input; default (1, num_channels, image_size,
+                         image_size) for image models, (1, 128) otherwise.
     int4_block_size    - INT4 weight DQ block size along in_features. None
                          keeps tsurgeon's per-channel scales exactly; a block
                          size (e.g. 128, what INT4 GEMM kernels expect)
@@ -92,6 +100,7 @@ class ONNXExportConfig(BackendExportConfig):
     opset: int = 24
     optimize: bool = True
     int4_block_size: int | None = None
+    input_shape: tuple[int, ...] | None = None
     custom_translations: dict[Any, Callable] = field(default_factory=dict)
     graph_passes: list[Callable] = field(default_factory=list)
 
@@ -106,6 +115,7 @@ class ONNXExporter(Exporter):
 
     backend = "onnx"
     config_class = ONNXExportConfig
+    supports_encoder = True
 
     def lower(self, components, config):
         return export_onnx(components, config)
@@ -113,9 +123,8 @@ class ONNXExporter(Exporter):
 
 def export_onnx(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
     """ONNX lowering of resolved export components (shared with the TensorRT exporter)."""
-    import onnx
-
-    out_dir = os.path.dirname(os.path.abspath(config.output_path))
+    if "encoder" in components:
+        return export_onnx_encoder(components, config)
     wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
     cache_impl = wrapper.cache_impl
     if config.max_input_len > 1 and cache_impl != "io_inplace":
@@ -171,9 +180,17 @@ def export_onnx(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
                                  **act_quantized.get(name, {})}
                           for name, q in quantized.items()},
     )
+    return _save_and_finalize(model, manifest, wrapper, model_config, config, quantized)
+
+
+def _save_and_finalize(model, manifest, wrapper, model_config, config, quantized) -> ONNXExportResult:
+    """Run the graph passes, save the model with external weights, check it and write the manifest."""
+    import onnx
+
     for graph_pass in config.graph_passes:
         graph_pass(model, manifest)
 
+    out_dir = os.path.dirname(os.path.abspath(config.output_path))
     data_file = os.path.basename(config.output_path) + ".data"
     if os.path.exists(os.path.join(out_dir, data_file)):
         os.remove(os.path.join(out_dir, data_file))  # save_model appends to existing data files
@@ -196,11 +213,51 @@ def export_onnx(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
     )
 
 
+def export_onnx_encoder(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
+    """ONNX lowering of encoder components (static single-input graph, see the module docstring)."""
+    wrapper, model_config, example_inputs = resolve_encoder_wrapper(components, input_shape=config.input_shape)
+    layer_info = extract_layer_quant_info(wrapper)
+    x = example_inputs[0]
+    input_name = "input_ids" if x.dtype == torch.long else "pixel_values"
+    with torch.no_grad():
+        logits = wrapper(*example_inputs)
+
+    program = torch.onnx.export(
+        wrapper,
+        example_inputs,
+        dynamo=True,
+        opset_version=config.opset,
+        input_names=[input_name],
+        output_names=["logits"],
+        custom_translation_table={**default_translations(), **config.custom_translations},
+        optimize=config.optimize,
+        verbose=config.verbose,
+    )
+    model = program.model_proto
+
+    quantized = (apply_weight_quantization(model, layer_info, int4_block_size=config.int4_block_size)
+                 if layer_info else {})
+    act_quantized = apply_activation_quantization(model, layer_info) if layer_info else {}
+    manifest = build_encoder_manifest(
+        wrapper, model_config, backend=config.backend, artifact=config.output_path,
+        input_name=input_name, input_shape=list(x.shape), input_dtype=str(x.dtype).replace("torch.", ""),
+        output_shape=list(logits.shape), output_dtype=str(logits.dtype).replace("torch.", ""),
+        precision="mixed" if quantized else "full",
+        onnx_file=os.path.basename(config.output_path),
+        opset=config.opset,
+        quantized_layers={name: {"precision": q["precision"], "granularity": q["granularity"],
+                                 **act_quantized.get(name, {})}
+                          for name, q in quantized.items()},
+    )
+    return _save_and_finalize(model, manifest, wrapper, model_config, config, quantized)
+
+
 __all__ = [
     "ONNXExportConfig",
     "ONNXExportResult",
     "ONNXExporter",
     "default_translations",
     "export_onnx",
+    "export_onnx_encoder",
     "io_names",
 ]

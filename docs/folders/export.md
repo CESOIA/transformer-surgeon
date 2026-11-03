@@ -26,6 +26,22 @@ print(result.output_path, result.manifest_path)
 | `onnx` | `ONNXExportConfig` | `model.onnx` + manifest |
 | `tensorrt` | `TensorRTExportConfig` | ONNX + TensorRT engine |
 
+## Encoder models
+
+A model whose dictionary has an encoder component (`structure="transformer_encoder"`) and no decoder is exported
+as an `EncoderWrapper`: input embedding → converted encoder → pooling (model key `pooling`) → output head, one
+static call per input. Only `onnx` and `tensorrt` accept it (`Exporter.supports_encoder`).
+
+```python
+from transformersurgeon import Dinov2ForImageClassificationCompress
+from transformersurgeon.export.backends import TensorRTExportConfig
+
+model = Dinov2ForImageClassificationCompress.from_pretrained("facebook/dinov2-small-imagenet1k-1-layer").eval()
+result = export_to_backend(model, TensorRTExportConfig(output_path="out/model.onnx", float_type=torch.float16,
+                                                       input_shape=(1, 3, 224, 224)))
+# graph: pixel_values (1, 3, 224, 224) float16 -> logits (1, 1000); manifest format "tsurgeon-encoder/1"
+```
+
 ## The operations dictionary
 
 For every block type and backend: the default implementation and the supported alternatives, each with the
