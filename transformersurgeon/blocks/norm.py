@@ -17,7 +17,10 @@ class RMSNorm(torch.nn.Module):
     it when exporting in float32, or in float16 for a model whose activations
     are known to stay in range; keep the prescale when fp16 overflow is a real
     risk. Note the two are not bit-identical: rescaling changes how ``eps``
-    enters the variance.
+    enters the variance (eps weighs max|x|**2 more). ``prescale_threshold=t``
+    rescales only rows with max|x| > t, down to max t: fp16-safe for t <= 128
+    and equal to the unscaled norm to < 1e-7 for Qwen2.5 (decisions D-78 of
+    compression-benchmark); eps stays a constant, so QNN still fuses the norm.
 
     ``upcast=True`` is the third option, and the Hugging Face / TensorRT
     Edge-LLM formulation: normalize in float32 and cast back, then apply the
@@ -26,12 +29,13 @@ class RMSNorm(torch.nn.Module):
     are nearly free; it takes precedence over ``prescale``.
     """
 
-    def __init__(self, hidden_size, dtype=None, prescale=True, upcast=False, eps=1e-5):
+    def __init__(self, hidden_size, dtype=None, prescale=True, upcast=False, eps=1e-5, prescale_threshold=None):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.prescale = prescale
         self.upcast = upcast
         self.eps = eps
+        self.prescale_threshold = prescale_threshold
 
     def forward(self, x):
         if self.upcast:
@@ -43,7 +47,14 @@ class RMSNorm(torch.nn.Module):
         if self.prescale:
             # Normalize by max absolute value for stability
             max_x = torch.max(x.abs(), dim=-1, keepdim=True).values
-            max_x = torch.clamp(max_x, min=1.0)  # Scaling is useless if max_x < 1
+            if self.prescale_threshold is None:
+                max_x = torch.clamp(max_x, min=1.0)  # Scaling is useless if max_x < 1
+            else:
+                # Rescale only rows whose max exceeds the threshold, down to it. Rows below are
+                # untouched, so eps enters exactly as unscaled; rows above have a variance
+                # >= threshold**2 / hidden_size, which makes the rescaled eps negligible
+                # (128 on 1536 wide: < 1e-7 relative) while x*x stays <= threshold**2.
+                max_x = torch.clamp(max_x / self.prescale_threshold, min=1.0)
             x = x / max_x
 
         # Evaluate variance. x * x, not x.pow(2): ExecuTorch's QNN RecomposeRmsNorm

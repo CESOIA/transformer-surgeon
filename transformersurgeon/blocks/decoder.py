@@ -40,6 +40,8 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.rmsnorm_prescale = getattr(config, "rmsnorm_prescale", True)
         self.rmsnorm_upcast = getattr(config, "rmsnorm_upcast", False)
         self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
+        self.rmsnorm_prescale_threshold = getattr(config, "rmsnorm_prescale_threshold", None)
+        self.center_keys = getattr(config, "center_keys", False)
         self.dtype = config.dtype
 
         # Extract configuration (optional)
@@ -63,7 +65,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         # Instantiate normalization modules
         if self.norm_type == "rmsnorm":
             norm_kwargs = dict(dtype=self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast,
-                               eps=self.rms_norm_eps)
+                               eps=self.rms_norm_eps, prescale_threshold=self.rmsnorm_prescale_threshold)
             self.norm_in = RMSNorm(self.embed_dim, **norm_kwargs)
             self.norm_out = RMSNorm(self.embed_dim, **norm_kwargs)
         else:
@@ -80,6 +82,7 @@ class TransformerDecoderBlock(torch.nn.Module):
                 use_sdpa=self.use_sdpa,
                 attn_impl=self.attn_impl,
                 masked_softmax=self.masked_softmax,
+                center_keys=self.center_keys,
                 max_cache_len=self.max_cache_len,
                 cache_impl=self.cache_impl,
                 add_batch_dim=self.add_batch_dim,
@@ -184,7 +187,8 @@ class TransformerDecoder(torch.nn.Module):
         self.rmsnorm_prescale = getattr(config, "rmsnorm_prescale", True)
         self.rmsnorm_upcast = getattr(config, "rmsnorm_upcast", False)
         self.norm = RMSNorm(config.hidden_size, self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast,
-                            eps=getattr(config, "rms_norm_eps", 1e-5))
+                            eps=getattr(config, "rms_norm_eps", 1e-5),
+                            prescale_threshold=getattr(config, "rmsnorm_prescale_threshold", None))
         head_dim = config.hidden_size // config.num_attention_heads
 
         self.max_cache_len = config.max_cache_len

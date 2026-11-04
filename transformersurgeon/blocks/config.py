@@ -32,6 +32,8 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         rmsnorm_upcast=False,
         rope_type="default",
         masked_softmax=False,
+        rmsnorm_prescale_threshold=None,
+        center_keys=False,
         indexing=None,
         **kwargs,
     ):
@@ -59,6 +61,10 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         self.rope_type = rope_type
         # Attention masking as masked softmax instead of an additive penalty (blocks/mha.py attention()).
         self.masked_softmax = masked_softmax
+        # RMSNorm rescale only above this max |x| (blocks/norm.py); None = always rescale.
+        self.rmsnorm_prescale_threshold = rmsnorm_prescale_threshold
+        # Store keys relative to the position-0 key (blocks/mha.py MHACausal).
+        self.center_keys = center_keys
         self.bias_required = bias_required or {"attn": {}, "mlp": {}}
 
         if indexing is None:
@@ -86,6 +92,8 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         rmsnorm_prescale=True,
         rmsnorm_upcast=False,
         masked_softmax=False,
+        rmsnorm_prescale_threshold=None,
+        center_keys=False,
     ):
         """Build converted decoder config from source HF config using indexing metadata."""
 
@@ -136,6 +144,8 @@ class CustomDecoderConfigCompress(PretrainedConfig):
                 "rmsnorm_upcast",
                 "rope_type",
                 "masked_softmax",
+                "rmsnorm_prescale_threshold",
+                "center_keys",
             }
         }
 
@@ -164,6 +174,8 @@ class CustomDecoderConfigCompress(PretrainedConfig):
             rmsnorm_upcast=rmsnorm_upcast,
             rope_type=resolve_rope_type(source_config_obj, source_indexing.get("rope_type", "default")),
             masked_softmax=masked_softmax,
+            rmsnorm_prescale_threshold=rmsnorm_prescale_threshold,
+            center_keys=center_keys,
             indexing=converted_indexing,
             **passthrough_kwargs,
         )
