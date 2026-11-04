@@ -47,6 +47,17 @@ def test_calibrated_lrd_uses_the_covariance_summary():
     assert model.model.layers[1].mlp.down_proj.rank == 8
 
 
+def test_wanda_pruning_uses_the_input_norm_summary():
+    model, mgr = _model()
+    mgr.set("unstructured_pruning", "method", "wanda", criteria="mlp.down_proj")
+    mgr.set("unstructured_pruning", "ratio", 0.5, criteria="mlp.down_proj")
+    mgr.set("unstructured_pruning", "granularity", "neuron", criteria="mlp.down_proj")
+    mgr.set_calibration_data(_loader())
+    mgr.apply(hard=False, show_progress=False)
+    weight = model.model.layers[0].mlp.down_proj.weight
+    assert ((weight == 0).sum(1) == weight.shape[1] // 2).all()  # half of every output row
+
+
 def test_structured_pruning_soft_zeroes_and_hard_removes_rows():
     model, mgr = _model()
     for name, paths in mgr.auto_groups().items():

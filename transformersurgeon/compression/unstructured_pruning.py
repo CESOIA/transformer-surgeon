@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 VALID_METHODS = list(METHOD_FUNCTIONS)  # unstructured_pruning_methods/ is the single list
 CALIBRATED_METHOD_DICT = {
     "gradient": ("weight_grad",),
+    "wanda": ("input_sq_mean",),
 }
 
 
@@ -62,6 +63,14 @@ class UnstructuredPruner(Compressor):
                 mask = METHOD_FUNCTIONS[method](
                     module.weight,
                     weight_grad,
+                    pruning_ratio=ratio,
+                    granularity=granularity,
+                )
+
+            elif method == "wanda":
+                mask = METHOD_FUNCTIONS[method](
+                    module.weight,
+                    self.calibration_store["input_sq_mean"],
                     pruning_ratio=ratio,
                     granularity=granularity,
                 )

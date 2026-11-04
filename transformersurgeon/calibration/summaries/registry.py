@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .activation_range import ActivationRangeSummary, OutputActivationRangeSummary
 from .covariance import CovarianceSummary, CrossCovarianceSummary, ShiftedCovarianceSummary
+from .input_sq_mean import InputSqMeanSummary
 from .weight_grad import WeightGradSummary
 from .params import WeightSummary, BiasSummary
 from .raw_activation import InputActivationSummary, OutputActivationSummary
@@ -16,6 +17,8 @@ SUMMARY_REGISTRY = {
     "shifted_covariance": ShiftedCovarianceSummary(),
     # Running cross covariance between base and shifted activations.
     "cross_covariance": CrossCovarianceSummary(),
+    # Running per-input-channel mean of x^2, used by activation-aware pruning (wanda).
+    "input_sq_mean": InputSqMeanSummary(),
     # Running weight-gradient average, used by gradient-based pruning methods.
     "weight_grad": WeightGradSummary(),
     # Running min/max of input activations, used by static activation fake-quant.

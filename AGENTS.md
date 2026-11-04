@@ -423,8 +423,8 @@ manager.apply(hard=True)
 | param | default | valid values |
 |---|---|---|
 | `ratio` | `0.0` | `float` in `[0, 1)` |
-| `method` | `"magnitude"` | `"magnitude"`, `"gradient"`, `"random"` |
-| `granularity` | `"layer"` | `"layer"` |
+| `method` | `"magnitude"` | `"magnitude"`, `"gradient"`, `"wanda"` (needs `"input_sq_mean"` calibration), `"random"` |
+| `granularity` | `"layer"` | `"layer"`, `"neuron"`, or positive `int` |
 
 Pruning masks survive `restore()` for STE fine-tuning. Call `manager.remove_masks()` to drop them.
 

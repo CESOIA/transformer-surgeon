@@ -50,9 +50,10 @@ def test_summaries_match_direct_computation():
     x, y = _captured_io(model, loader)
     mgr.set_calibration_data(loader)
     out = mgr.extract_summaries(criteria=[["mlp.down_proj", 0]], show_progress=False, summaries=[
-        "covariance", "activation_range", "output_activation_range", "weight",
+        "covariance", "input_sq_mean", "activation_range", "output_activation_range", "weight",
         "input_activation", "output_activation"])[LAYER]
     torch.testing.assert_close(out["covariance"], x.T @ x / len(x), rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(out["input_sq_mean"], x.pow(2).mean(0), rtol=1e-4, atol=1e-5)
     assert torch.isclose(out["activation_range"]["min"], x.min()) and torch.isclose(out["activation_range"]["max"], x.max())
     assert torch.isclose(out["output_activation_range"]["max"], y.max())
     torch.testing.assert_close(out["weight"], model.get_submodule(LAYER).weight)

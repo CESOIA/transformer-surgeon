@@ -98,6 +98,16 @@ def test_unstructured_masks_hit_the_requested_sparsity(method):
     assert mask.dtype == torch.bool and (~mask).sum() == 16
 
 
+def test_wanda_scores_weights_by_input_channel_norm():
+    w = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    uniform = UNSTRUCTURED["wanda"](w, torch.ones(4), pruning_ratio=0.5, granularity="neuron")
+    assert uniform.tolist() == [[False, False, True, True]]  # equal norms: same mask as magnitude
+    skewed = UNSTRUCTURED["wanda"](w, torch.tensor([100.0, 100.0, 1e-4, 1e-4]), pruning_ratio=0.5, granularity="neuron")
+    assert skewed.tolist() == [[True, True, False, False]]  # large-activation channels kept despite small weights
+    with pytest.raises(ValueError):
+        UNSTRUCTURED["wanda"](w, None, pruning_ratio=0.5)
+
+
 def test_coupled_pruner_removes_and_restores_input_columns():
     lin = torch.nn.Linear(6, 2)
     original = lin.weight.detach().clone()
