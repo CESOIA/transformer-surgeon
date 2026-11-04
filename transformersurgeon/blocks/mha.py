@@ -593,16 +593,14 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         if self.attn_impl not in ATTN_IMPLS:
             raise ValueError(f"Unsupported attn_impl {self.attn_impl!r}; expected one of {ATTN_IMPLS}")
 
-        # center_keys: write k - k_0 into the cache, k_0 = the key of position 0 (kept in
-        # key_anchor). q.k_0 is the same for every key of a query, so softmax cancels it
-        # and the attention is unchanged; the scores shrink from |q.k| (~2e4 on Qwen2.5,
-        # fp16 step 16) to |q.(k - k_0)|, which a 16-bit score matmul resolves (D-78 of
-        # compression-benchmark). One subtract per new key instead of one per cache row.
+        # center_keys: attend over k - k_0, k_0 = the cached key of position 0. q.k_0 is the
+        # same for every key of a query, so softmax cancels it and the attention is
+        # unchanged; the scores shrink from |q.k| (~2e4 on Qwen2.5, fp16 step 16) to
+        # |q.(k - k_0)|, which a 16-bit score matmul resolves (D-78 of compression-benchmark).
+        # The cache keeps the raw keys: no extra graph state, one subtract over the cache.
         self.center_keys = bool(kwargs.get("center_keys", False))
-        if self.center_keys and (self.cache_impl != "mutable" or self.attn_impl == "custom_sdpa"):
-            raise ValueError("center_keys=True needs cache_impl='mutable' and attn_impl 'manual' or 'sdpa'.")
-        self.register_buffer("key_anchor", torch.zeros(self.kv_num_heads, self.key_head_dim, dtype=self.dtype),
-                             persistent=False)
+        if self.center_keys and self.attn_impl not in ("manual", "sdpa"):
+            raise ValueError("center_keys=True needs attn_impl 'manual' or 'sdpa'.")
 
         if self.attn_impl == "custom_sdpa":
             if self.cache_impl != "mutable":
@@ -645,8 +643,7 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         if self.cache_impl == "io_paged":
             return True
         ok = (tuple(self.key_cache.shape) == self.cache_shape("key")
-              and tuple(self.value_cache.shape) == self.cache_shape("value")
-              and self.key_anchor.shape[-1] == self.key_head_dim)
+              and tuple(self.value_cache.shape) == self.cache_shape("value"))
         if self.attn_impl == "custom_sdpa":
             ok = ok and (self.custom_sdpa_key_cache.shape[-1] == self.key_head_dim
                          and self.custom_sdpa_value_cache.shape[-1] == self.value_head_dim)
@@ -696,10 +693,6 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         if tuple(self.value_cache.shape) != self.cache_shape("value"):
             self.value_cache = torch.zeros(
                 self.cache_shape("value"), dtype=self.value_cache.dtype, device=self.value_cache.device,
-            )
-        if self.key_anchor.shape[-1] != self.key_head_dim:
-            self.key_anchor = torch.zeros(
-                self.kv_num_heads, self.key_head_dim, dtype=self.key_anchor.dtype, device=self.key_anchor.device,
             )
 
         if self.attn_impl == "custom_sdpa":
@@ -894,12 +887,6 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             # buffers above are left untouched/unused on this path.
             attn_output = self._forward_custom_sdpa(q, k, v, pos_id, attn_mask)
         else:
-            if self.center_keys:  # one token per call (mutable path): it is the anchor at position 0
-                anchor = torch.where((pos_id.reshape(-1)[:1] == 0).view(1, 1), k[0], self.key_anchor)
-                with torch.no_grad():
-                    self.key_anchor.copy_(anchor)
-                k = k - anchor
-
             # Write new K/V into the fixed-size cache (mechanism per cache_impl).
             write_index = torch.clamp(pos_id, 0, self.max_cache_length-1).long()
             if self.cache_impl == "mutable":
@@ -915,6 +902,9 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             kv_layout = "hsd" if self.cache_impl == "io_inplace" else "shd"
             key_read = key_cache[0] if kv_layout == "hsd" else key_cache
             value_read = value_cache[0] if kv_layout == "hsd" else value_cache
+            if self.center_keys:  # position 0 is always written before it is attended to
+                seq_axis = 1 if kv_layout == "hsd" else 0
+                key_read = key_read - key_read.narrow(seq_axis, 0, 1)
 
             if self.attn_impl == "sdpa":
                 q_t = q.transpose(0, 1) # (num_heads, in_seq_len, head_dim)
