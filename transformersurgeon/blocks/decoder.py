@@ -42,6 +42,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
         self.rmsnorm_prescale_threshold = getattr(config, "rmsnorm_prescale_threshold", None)
         self.rmsnorm_safe_sum = getattr(config, "rmsnorm_safe_sum", False)
+        self.rmsnorm_prescale_exact_eps = getattr(config, "rmsnorm_prescale_exact_eps", False)
         self.center_keys = getattr(config, "center_keys", False)
         self.kv_cache_quant = getattr(config, "kv_cache_quant", None)
         self.dtype = config.dtype
@@ -68,7 +69,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         if self.norm_type == "rmsnorm":
             norm_kwargs = dict(dtype=self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast,
                                eps=self.rms_norm_eps, prescale_threshold=self.rmsnorm_prescale_threshold,
-                               safe_sum=self.rmsnorm_safe_sum)
+                               safe_sum=self.rmsnorm_safe_sum, prescale_exact_eps=self.rmsnorm_prescale_exact_eps)
             self.norm_in = RMSNorm(self.embed_dim, **norm_kwargs)
             self.norm_out = RMSNorm(self.embed_dim, **norm_kwargs)
         else:
@@ -193,7 +194,8 @@ class TransformerDecoder(torch.nn.Module):
         self.norm = RMSNorm(config.hidden_size, self.dtype, prescale=self.rmsnorm_prescale, upcast=self.rmsnorm_upcast,
                             eps=getattr(config, "rms_norm_eps", 1e-5),
                             prescale_threshold=getattr(config, "rmsnorm_prescale_threshold", None),
-                            safe_sum=getattr(config, "rmsnorm_safe_sum", False))
+                            safe_sum=getattr(config, "rmsnorm_safe_sum", False),
+                            prescale_exact_eps=getattr(config, "rmsnorm_prescale_exact_eps", False))
         head_dim = config.hidden_size // config.num_attention_heads
 
         self.max_cache_len = config.max_cache_len

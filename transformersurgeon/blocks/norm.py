@@ -30,7 +30,7 @@ class RMSNorm(torch.nn.Module):
     """
 
     def __init__(self, hidden_size, dtype=None, prescale=True, upcast=False, eps=1e-5, prescale_threshold=None,
-                 safe_sum=False):
+                 safe_sum=False, prescale_exact_eps=False):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.prescale = prescale
@@ -41,6 +41,11 @@ class RMSNorm(torch.nn.Module):
         # each term is <= t**2 / n, so the reduction stays in fp16 range even when the backend accumulates it in fp16
         # (XNNPACK fp16: mean(x*x) of 1536 terms up to 128**2 overflows, KL 7 vs the reference). Breaks QNN fusion.
         self.safe_sum = safe_sum
+        # prescale_exact_eps: with the max prescale (prescale_threshold None), add eps / max**2 instead of eps, so
+        # x / rsqrt(mean((x/m)**2) + eps/m**2) / m is the unscaled norm exactly; each term stays <= 1, so the reduction
+        # is fp16-safe with fp16 accumulation (XNNPACK fp16 on ARM: the mean of the thresholded norm overflows,
+        # safe_sum gives NaN). eps/m**2 underflows only where it is negligible against the variance (>= 1/n).
+        self.prescale_exact_eps = prescale_exact_eps
 
     def forward(self, x):
         if self.upcast:
@@ -49,6 +54,7 @@ class RMSNorm(torch.nn.Module):
             x = x * torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + self.eps)
             return self.weight * x.to(input_dtype)
 
+        eps = self.eps
         if self.prescale:
             # Normalize by max absolute value for stability
             max_x = torch.max(x.abs(), dim=-1, keepdim=True).values
@@ -61,6 +67,10 @@ class RMSNorm(torch.nn.Module):
                 # (128 on 1536 wide: < 1e-7 relative) while x*x stays <= threshold**2.
                 max_x = torch.clamp(max_x / self.prescale_threshold, min=1.0)
             x = x / max_x
+            if self.prescale_exact_eps:
+                if self.prescale_threshold is not None:
+                    raise ValueError("prescale_exact_eps needs prescale_threshold=None")
+                eps = (self.eps / max_x) / max_x
 
         # Evaluate variance. x * x, not x.pow(2): ExecuTorch's QNN RecomposeRmsNorm
         # fuses [mul(w, mul(x, rsqrt(mean(x*x) + eps)))] into one HTP RmsNorm op, and
@@ -74,7 +84,7 @@ class RMSNorm(torch.nn.Module):
             variance = (x * x).mean(dim=-1, keepdim=True)
 
         # Normalize with variance
-        x = x * torch.rsqrt(variance + self.eps)
+        x = x * torch.rsqrt(variance + eps)
 
         # Multiply element-wise with the learned weights
         x = self.weight * x
