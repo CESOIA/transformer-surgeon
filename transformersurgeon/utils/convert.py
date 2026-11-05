@@ -315,6 +315,7 @@ def convert_for_export(model, options=None, verbose=False):
             rmsnorm_upcast = options.get('rmsnorm_upcast', False)
             masked_softmax = options.get('masked_softmax', False)
             rmsnorm_prescale_threshold = options.get('rmsnorm_prescale_threshold', None)
+            rmsnorm_safe_sum = options.get('rmsnorm_safe_sum', False)
             center_keys = options.get('center_keys', False)
             kv_cache_quant = options.get('kv_cache_quant', None)
 
@@ -344,6 +345,7 @@ def convert_for_export(model, options=None, verbose=False):
                 rmsnorm_upcast=rmsnorm_upcast,
                 masked_softmax=masked_softmax,
                 rmsnorm_prescale_threshold=rmsnorm_prescale_threshold,
+                rmsnorm_safe_sum=rmsnorm_safe_sum,
                 center_keys=center_keys,
                 kv_cache_quant=kv_cache_quant,
             )

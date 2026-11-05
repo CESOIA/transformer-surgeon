@@ -29,13 +29,18 @@ class RMSNorm(torch.nn.Module):
     are nearly free; it takes precedence over ``prescale``.
     """
 
-    def __init__(self, hidden_size, dtype=None, prescale=True, upcast=False, eps=1e-5, prescale_threshold=None):
+    def __init__(self, hidden_size, dtype=None, prescale=True, upcast=False, eps=1e-5, prescale_threshold=None,
+                 safe_sum=False):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.prescale = prescale
         self.upcast = upcast
         self.eps = eps
         self.prescale_threshold = prescale_threshold
+        # safe_sum: variance as sum((x / sqrt(n))**2) instead of mean(x*x), the same value. With prescale_threshold t
+        # each term is <= t**2 / n, so the reduction stays in fp16 range even when the backend accumulates it in fp16
+        # (XNNPACK fp16: mean(x*x) of 1536 terms up to 128**2 overflows, KL 7 vs the reference). Breaks QNN fusion.
+        self.safe_sum = safe_sum
 
     def forward(self, x):
         if self.upcast:
@@ -62,7 +67,11 @@ class RMSNorm(torch.nn.Module):
         # the QNN exporter rewrites pow(x, 2) to pow.Tensor_Tensor, which it does not
         # match. Decomposed and quantized, x*x of Qwen2.5's ~5e3 activations spans ~2.5e7
         # in one 16-bit scale (all-op 16a8w: KL 0.25 vs 0.066 with the norm float).
-        variance = (x * x).mean(dim=-1, keepdim=True)
+        if self.safe_sum:
+            xs = x * (x.shape[-1] ** -0.5)
+            variance = (xs * xs).sum(dim=-1, keepdim=True)
+        else:
+            variance = (x * x).mean(dim=-1, keepdim=True)
 
         # Normalize with variance
         x = x * torch.rsqrt(variance + self.eps)

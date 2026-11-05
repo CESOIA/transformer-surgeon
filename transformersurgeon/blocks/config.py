@@ -33,6 +33,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         rope_type="default",
         masked_softmax=False,
         rmsnorm_prescale_threshold=None,
+        rmsnorm_safe_sum=False,
         center_keys=False,
         kv_cache_quant=None,
         indexing=None,
@@ -64,6 +65,8 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         self.masked_softmax = masked_softmax
         # RMSNorm rescale only above this max |x| (blocks/norm.py); None = always rescale.
         self.rmsnorm_prescale_threshold = rmsnorm_prescale_threshold
+        # RMSNorm variance as sum((x/sqrt(n))**2): fp16-safe reduction (blocks/norm.py).
+        self.rmsnorm_safe_sum = rmsnorm_safe_sum
         # Store keys relative to the position-0 key (blocks/mha.py MHACausal).
         self.center_keys = center_keys
         # Quantized KV cache ("int8": per token and head, blocks/mha.py MHACausal); None = model dtype.
@@ -96,6 +99,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         rmsnorm_upcast=False,
         masked_softmax=False,
         rmsnorm_prescale_threshold=None,
+        rmsnorm_safe_sum=False,
         center_keys=False,
         kv_cache_quant=None,
     ):
@@ -149,6 +153,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
                 "rope_type",
                 "masked_softmax",
                 "rmsnorm_prescale_threshold",
+                "rmsnorm_safe_sum",
                 "center_keys",
                 "kv_cache_quant",
             }
@@ -180,6 +185,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
             rope_type=resolve_rope_type(source_config_obj, source_indexing.get("rope_type", "default")),
             masked_softmax=masked_softmax,
             rmsnorm_prescale_threshold=rmsnorm_prescale_threshold,
+            rmsnorm_safe_sum=rmsnorm_safe_sum,
             center_keys=center_keys,
             kv_cache_quant=kv_cache_quant,
             indexing=converted_indexing,
