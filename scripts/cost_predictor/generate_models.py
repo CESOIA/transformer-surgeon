@@ -16,12 +16,12 @@ Graph shape. Static-cache graphs (all backends here) read every cache slot, so d
 per P with ``max_cache_len = round_up(P + G_max, 128)`` (``--shared-graph`` exports a single graph sized for the
 largest P instead). Artifacts: ``<exp>/models/<config>/<backend>/P<P>/``.
 
-KV-cache precision. b_KV is baked into the graph as ``convert_options["kv_precision"]`` (``"int8"``/``"int4"``:
-uint8 cache rows of codes plus one scale per row, ``blocks/attention/kv_precision``), so every (weights, b_KV) pair
-is its own artifact. Only backends whose ``BACKEND_OPERATIONS["kv_precision"]`` lists the integer precisions can
-export them (xnnpack, onnx). By default the KV alternatives are exactly those the backend supports, so qnn and
-tensorrt get a weights-only plan (E0, E1, E4, E5 at the reference KV precision); ``--kv-alts`` naming a precision
-the backend cannot export is an error.
+KV-cache precision. b_KV is baked into each artifact, so every (weights, b_KV) pair is its own artifact. It is
+either the graph's ``convert_options["kv_precision"]`` (``"int8"``/``"int4"``: uint8 cache rows of codes plus one
+scale per row, ``blocks/attention/kv_precision``) or, on QNN, ``QNNExportConfig.kv_cache_bits=8`` (the QNN quantiser
+keeps the cache as an 8-bit fixed-point activation; QNN exports use quant_scope="all", whose reference cache is
+16-bit, label INT16). ``BACKEND_OPERATIONS`` says what each backend supports; by default the KV alternatives are
+exactly those, and ``--kv-alts`` naming a precision the backend cannot export is an error.
 """
 
 import argparse
@@ -61,7 +61,8 @@ PROFILES = {
     "xnnpack": Profile(torch.float32, "F32", {8: _GROUP, 4: _GROUP}, "mutable",
                        {"precision_activation": 8, "method_activation": "dynamic_per_token"}),
     # QNN holds block weights only as LPBQ (4-bit multipliers per block); INT8 per-group raises on QNN/TensorRT.
-    "qnn": Profile(torch.float16, "F16",
+    # Exported with quant_scope="all" (one HTP partition), where the cache is a 16-bit fixed-point activation.
+    "qnn": Profile(torch.float16, "INT16",
                    {8: {"granularity": "per_channel"}, 4: {**_GROUP, "group_scale_bits": 4}}, "mutable"),
     "tensorrt": Profile(torch.float16, "F16", {8: {"granularity": "per_channel"}, 4: _GROUP}, "io_inplace"),
     "onnx": Profile(torch.float16, "F16", {8: {"granularity": "per_channel"}, 4: _GROUP}, "io_inplace"),
@@ -70,19 +71,29 @@ PROFILES = {
 
 
 KV_OPTIONS = {"INT8": "int8", "INT4": "int4"}   # b_KV label -> convert_options["kv_precision"] ("full" = reference)
+KV_QUANTISER_BITS = {"INT8": 8}                  # b_KV label -> bits of a cache the backend's quantiser keeps
 
 
 def supported_kv_alts(backend):
-    """b_KV labels the backend can bake into a graph besides its reference (``BACKEND_OPERATIONS``)."""
+    """b_KV labels the backend can bake into a graph besides its reference (``BACKEND_OPERATIONS``): integer
+    rows of the graph (``kv_precision``) or a cache precision of the backend's quantiser (``kv_cache_bits``)."""
     if backend == "none":
         return []
     from transformersurgeon.export.operations import options_for
-    options = options_for(backend, "kv_precision")
-    return [label for label, option in KV_OPTIONS.items() if option in options]
+    rows = options_for(backend, "kv_precision")
+    quantiser = options_for(backend, "kv_cache_quantization")
+    return [label for label in ("INT8", "INT4")
+            if KV_OPTIONS[label] in rows or KV_QUANTISER_BITS.get(label) in quantiser]
 
 
-def kv_option(kv_label, profile: Profile):
-    return "full" if kv_label == profile.kv_ref else KV_OPTIONS[kv_label]
+def kv_settings(backend, kv_label, profile: Profile):
+    """``(convert_options["kv_precision"], QNN kv_cache_bits)`` that realise ``kv_label`` on ``backend``."""
+    if kv_label == profile.kv_ref:
+        return "full", 16
+    from transformersurgeon.export.operations import options_for
+    if KV_OPTIONS[kv_label] in options_for(backend, "kv_precision"):
+        return KV_OPTIONS[kv_label], 16
+    return "full", KV_QUANTISER_BITS[kv_label]
 
 
 def artifact_key(c, args):
@@ -140,7 +151,8 @@ def compress(model, manager_cls, weights, profile: Profile):
     return counts
 
 
-def export_config(backend, out_dir: Path, cache_len, input_len, profile: Profile, args, kv_precision="full"):
+def export_config(backend, out_dir: Path, cache_len, input_len, profile: Profile, args, kv_precision="full",
+                  kv_cache_bits=16):
     base = {"max_cache_len": cache_len, "kv_precision": kv_precision}
     if profile.cache_impl:
         base["cache_impl"] = profile.cache_impl
@@ -151,7 +163,8 @@ def export_config(backend, out_dir: Path, cache_len, input_len, profile: Profile
     if backend == "qnn":
         from transformersurgeon.export.backends.qnn import QNNExportConfig
         return QNNExportConfig(output_path=str(out_dir / "model.pte"), max_seq_len=cache_len,
-                               convert_options=base, soc_model=args.soc_model)
+                               convert_options=base, soc_model=args.soc_model, quant_scope="all",
+                               kv_cache_bits=kv_cache_bits)
     if backend == "tensorrt":
         from transformersurgeon.export.backends.tensorrt import TensorRTExportConfig
         return TensorRTExportConfig(output_path=str(out_dir / "model.onnx"), max_seq_len=cache_len,
@@ -177,7 +190,9 @@ def graph_shapes(args):
 def generate_one(spec, owner_dir: Path, model_source, args, profile, classes):
     """Compress + export one (weights, KV precision) configuration for every graph shape; resumable."""
     model_cls, manager_cls = classes
-    kv_precision = kv_option(spec["kv"], profile) if spec["kv"] in args.kv_in_graph else "full"
+    kv_label = spec["kv"] if spec["kv"] in args.kv_in_graph else args.kv_ref
+    kv_precision, kv_cache_bits = kv_settings(args.backend, kv_label, profile) if args.backend != "none" \
+        else ("full", 16)
     results = []
     for tag, input_len, cache_len in graph_shapes(args):
         out_dir = owner_dir / args.backend / tag
@@ -188,7 +203,7 @@ def generate_one(spec, owner_dir: Path, model_source, args, profile, classes):
         out_dir.mkdir(parents=True, exist_ok=True)
         status = {"config_id": spec["config_id"], "backend": args.backend, "graph": tag,
                   "max_input_len": input_len, "max_cache_len": cache_len, "dtype": str(profile.dtype),
-                  "kv_precision": kv_precision}
+                  "b_KV": kv_label, "kv_precision": kv_precision, "kv_cache_bits": kv_cache_bits}
         t0 = time.time()
         try:
             model = model_cls.from_pretrained(model_source, dtype=profile.dtype).eval()
@@ -198,7 +213,8 @@ def generate_one(spec, owner_dir: Path, model_source, args, profile, classes):
                 status["note"] = "compression only (no export)"
             else:
                 from transformersurgeon.export import export_to_backend
-                config = export_config(args.backend, out_dir, cache_len, input_len, profile, args, kv_precision)
+                config = export_config(args.backend, out_dir, cache_len, input_len, profile, args, kv_precision,
+                                       kv_cache_bits)
                 result = export_to_backend(model, config=config)
                 status["status"] = "ok"
                 status["artifacts"] = {k: str(v) for k, v in vars(result).items() if isinstance(v, (str, Path)) and v}
@@ -261,7 +277,7 @@ def main():
     elif args.backend != "none" and set(args.kv_alts) - set(supported):
         parser.error(f"the {args.backend} backend cannot export KV precision(s) "
                      f"{sorted(set(args.kv_alts) - set(supported))} (supported: {supported or 'none'}; "
-                     "see BACKEND_OPERATIONS['kv_precision'])")
+                     "see BACKEND_OPERATIONS['kv_precision'] and ['kv_cache_quantization'])")
     args.kv_in_graph = set(supported)
 
     out = Path(args.out_dir)

@@ -43,7 +43,7 @@ EXECUTION_ORDER = PROJECTIONS
 PRECISIONS = (16, 8, 4)
 PRECISION_NAMES = {16: "FP16", 8: "INT8", 4: "INT4"}
 REF_WEIGHT_BITS = 8
-KV_LABELS = {"F16": 16, "F32": 32, "INT8": 8, "INT4": 4}
+KV_LABELS = {"F16": 16, "F32": 32, "INT16": 16, "INT8": 8, "INT4": 4}   # INT16: QNN's fixed-point cache
 GROUP_SIZE = 128   # Appendix A: per-group, g=128, FP16 scales (used for the byte estimates)
 
 # Estimated kernel family each weight precision runs on, per backend (Appendix A "kernel-family transitions").
@@ -380,7 +380,8 @@ def add_plan_args(parser):
     parser.add_argument("--eval-g", nargs="+", type=int, default=[1, 8, 32, 128])
     parser.add_argument("--weight-alts", nargs="+", type=int, default=[16, 4], choices=[16, 8, 4, 6, 3, 2],
                         help="alternative weight precisions b of E1 (16 = FP16)")
-    parser.add_argument("--kv-ref", default="F16", choices=["F16", "F32"], help="backend default KV precision")
+    parser.add_argument("--kv-ref", default="F16", choices=["F16", "F32", "INT16"],
+                        help="backend default KV precision")
     parser.add_argument("--kv-alts", nargs="*", default=[], choices=["INT8", "INT4"],
                         help="alternative KV-cache precisions, adds E2/E3 (default: none, a weights-only plan; "
                              "generate_models.py defaults to what the backend can export)")

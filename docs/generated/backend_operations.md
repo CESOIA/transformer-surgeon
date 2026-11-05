@@ -6,6 +6,7 @@ Defaults per backend (— = chosen by the model dictionary):
 |---|---|---|---|---|---|
 | `kv_cache` | convert option `cache_impl` | `mutable` | `mutable` | `io_inplace` | `io_inplace` |
 | `kv_precision` | convert option `kv_precision` | `full` | `full` | `full` | `full` |
+| `kv_cache_quantization` | config field `qnn.kv_cache_bits` | `kv_precision` | `16` | `kv_precision` | `kv_precision` |
 | `attention_kernel` | convert option `attn_impl` | `manual` | `manual` | `manual` | `manual` |
 | `masked_softmax` | convert option `masked_softmax` | `False` | `False` | `False` | `False` |
 | `rmsnorm` | convert option `rmsnorm_impl` | `rmsnorm_prescaled` | `rmsnorm_prescaled` | `rmsnorm_prescaled` | `rmsnorm_prescaled` |
@@ -52,6 +53,18 @@ What one stored key/value row holds (blocks/attention/kv_precision). Integer row
 | onnx | `int8` | uint8 cache I/O; encode/decode are standard element-wise ONNX operations. |
 | onnx | `int4` | uint8 cache I/O with two codes per byte; encode/decode are standard ONNX operations. |
 | tensorrt | `full` (default) | Cache in the model dtype. |
+
+### `kv_cache_quantization`
+
+Bits of a KV cache that the backend's own quantiser keeps as a fixed-point activation (the graph stores it in the model dtype, kv_precision='full'). Chosen by: config field `qnn.kv_cache_bits`.
+
+| Backend | Option | Device operation |
+|---|---|---|
+| xnnpack | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
+| qnn | `16` (default) | Cache at the activation precision of the graph (16-bit with quant_scope='all'). |
+| qnn | `8` | The cache writes get an 8-bit activation configuration (8a8w): an 8-bit fixed-point cache. Needs quant_scope='all' and float_attention_core=False. |
+| onnx | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
+| tensorrt | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 
 ### `attention_kernel`
 

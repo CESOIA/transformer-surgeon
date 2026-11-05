@@ -25,6 +25,7 @@ from .passes import (
     _canonicalize_pow_tensor_scalar,
     _decompose_wrap_with_set_grad_enabled,
     _float_attention_nodes,
+    _kv_cache_write_predicate,
     _linear_block_sizes,
     _split_float_linear_bias,
     _untie_shared_weights,
@@ -115,6 +116,10 @@ class QNNExportConfig(BackendExportConfig):
     # quant_scope="all" only: keep the attention core (RoPE, KV cache, scores,
     # mask, softmax, A.V) in fp16 instead of 16-bit fixed point.
     float_attention_core: bool = False
+    # quant_scope="all" only (and float_attention_core=False): bits of the fixed-point
+    # KV cache. 8 gives the cache writes of every attention module an 8a8w configuration;
+    # the graph itself keeps kv_precision="full". Not yet validated on a device.
+    kv_cache_bits: int = field(default_factory=lambda: config_default("qnn", "kv_cache_bits"))
     # Token-id sequences for PT2E activation calibration (each decoded from position 0
     # with the KV cache filling up). None = a few built-in sentences. Use real text
     # from the target distribution: static 16-bit ranges come only from these.
@@ -234,6 +239,9 @@ class QNNExporter(ExecuTorchExporter):
             raise RuntimeError(_QNN_UNAVAILABLE_MSG)
 
     def lower(self, components, config):
+        if config.kv_cache_bits != 16 and (config.quant_scope != "all" or config.float_attention_core):
+            raise ValueError("QNNExportConfig.kv_cache_bits=8 requires quant_scope='all' and "
+                             "float_attention_core=False: only then is the KV cache a fixed-point activation.")
         wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
         layer_info = extract_layer_quant_info(wrapper)
 
@@ -251,7 +259,7 @@ class QNNExporter(ExecuTorchExporter):
 
         if config.quantize_float_model and config.quant_scope != "all":
             raise ValueError("QNNExportConfig.quantize_float_model requires quant_scope='all'.")
-        quantize = bool(layer_info) or config.quantize_float_model
+        quantize = bool(layer_info) or config.quantize_float_model or config.kv_cache_bits != 16
         model_for_edge, exported_for_mismatch = module, None
         if quantize:
             model_for_edge, exported_for_mismatch = self._quantize(module, layer_info, model_config,
@@ -344,11 +352,16 @@ class QNNExporter(ExecuTorchExporter):
             quantizer.default_quant_config = float_config
 
         # Same order as the vendor recipe: default config first, then per-layer configs.
-        quantizer.set_submodule_qconfig_list([
+        submodule_configs = [
             (_layer_predicate(frozenset(layers)),
              ModuleQConfig(quant_dtype=qdtype, is_linear_per_channel=True, act_observer=act_observer))
             for qdtype, layers in layers_by_qdtype.items()
-        ])
+        ]
+        if config.kv_cache_bits == 8:
+            # The cache writes are not inside any linear layer, so no per-layer predicate matches them.
+            submodule_configs.append((_kv_cache_write_predicate(),
+                                      ModuleQConfig(quant_dtype=QuantDtype.use_8a8w, act_observer=act_observer)))
+        quantizer.set_submodule_qconfig_list(submodule_configs)
         if block_layers:
             quantizer.set_block_size_map(_linear_block_sizes(module, block_layers))
         return quantizer

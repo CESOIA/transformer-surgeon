@@ -71,16 +71,34 @@ BACKEND_OPERATIONS = {
                         "the XNNPACK delegate (portable ExecuTorch kernels).",
                 "int4": "uint8 mutable cache with two codes per byte; encode/decode as for int8.",
             }},
-            # HTP keeps the cache as a fixed-point activation: 8-bit KV there is a quantiser annotation of the
-            # cache tensors, not integer rows (not implemented).
+            # HTP keeps the cache as an activation of the graph: an 8-bit cache comes from the QNN quantiser
+            # (kv_cache_quantization / QNNExportConfig.kv_cache_bits), not from integer rows.
             "qnn": {"default": "full", "options": {"full": "Cache in the activation precision of the graph."}},
             "onnx": {"default": "full", "options": {
                 "full": "Cache in the model dtype.",
                 "int8": "uint8 cache I/O; encode/decode are standard element-wise ONNX operations.",
                 "int4": "uint8 cache I/O with two codes per byte; encode/decode are standard ONNX operations.",
             }},
-            # TensorRT accepts uint8 only as network I/O and casts: the in-place cache update cannot run on it.
+            # No integer cache on TensorRT (checked with TensorRT 11.4): uint8 is refused for intermediate
+            # tensors; the in-place KV-cache update layer (io_inplace) takes only a Float/Half/BFloat16 cache that
+            # is a network input; INT8 ScatterND builds only as dequantize-whole-cache -> scatter -> requantize,
+            # a full cache rewrite per step that would measure the workaround rather than an INT8 cache.
             "tensorrt": {"default": "full", "options": {"full": "Cache in the model dtype."}},
+        },
+    },
+    "kv_cache_quantization": {
+        "description": "Bits of a KV cache that the backend's own quantiser keeps as a fixed-point activation "
+                       "(the graph stores it in the model dtype, kv_precision='full').",
+        "config_field": {"qnn": "kv_cache_bits"},
+        "backends": {
+            "qnn": {"default": 16, "options": {
+                16: "Cache at the activation precision of the graph (16-bit with quant_scope='all').",
+                8: "The cache writes get an 8-bit activation configuration (8a8w): an 8-bit fixed-point cache. "
+                   "Needs quant_scope='all' and float_attention_core=False.",
+            }},
+            **{backend: {"default": "kv_precision", "options": {
+                "kv_precision": "Not chosen by a quantiser: the convert option kv_precision decides the cache.",
+            }} for backend in ("xnnpack", "onnx", "tensorrt")},
         },
     },
     "attention_kernel": {

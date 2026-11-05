@@ -132,3 +132,68 @@ def test_onnx_export_with_an_integer_cache_has_uint8_cache_io(tmp_path, name):
     with torch.no_grad():
         expected = wrapper(torch.tensor([3]), torch.tensor([0]), keys, values)[0]
     torch.testing.assert_close(torch.from_numpy(logits).reshape(expected.shape), expected, atol=1e-3, rtol=1e-3)
+
+
+# --------------------------------------------------------------------------- #
+# QNN: an 8-bit fixed-point cache chosen by the QNN quantiser (kv_cache_bits)
+# --------------------------------------------------------------------------- #
+def _qnn_components(cache_impl="mutable"):
+    model = _model()
+    decoder = convert_for_export(model, options={"cache_impl": cache_impl, "max_cache_len": CACHE})["text"]
+    return {"embedding": model.get_input_embeddings(), "decoder": decoder, "final_layer": model.lm_head,
+            "config": model.config}
+
+
+@pytest.mark.parametrize("cache_impl", ["mutable", "io_scatter"])
+def test_qnn_kv_cache_predicate_selects_the_cache_writes(cache_impl):
+    pytest.importorskip("torchao")  # imported by the export backends
+    from transformersurgeon.export.backends.qnn.passes import (
+        _decompose_wrap_with_set_grad_enabled, _kv_cache_write_predicate,
+    )
+    from transformersurgeon.export.wrapper import resolve_components_and_wrapper
+
+    wrapper, _, example_inputs = resolve_components_and_wrapper(_qnn_components(cache_impl))
+    with torch.inference_mode():  # as the QNN exporter traces it
+        module = torch.export.export(wrapper, example_inputs).module()
+    try:
+        _decompose_wrap_with_set_grad_enabled(module)  # as the QNN exporter does (needs ExecuTorch)
+    except ImportError:
+        pass  # an inference-mode trace has no grad-mode wrapper to inline
+    predicate = _kv_cache_write_predicate()
+    writes = [node for node in module.graph.nodes if predicate(node)]
+    assert len(writes) == 2 * len(wrapper.decoder.blocks)  # one key and one value write per layer
+
+
+def test_qnn_kv_cache_bits_needs_a_fully_quantised_graph():
+    pytest.importorskip("torchao")
+    from transformersurgeon.export.backends import QNNExportConfig
+    from transformersurgeon.export.backends.qnn.exporter import QNNExporter
+    from transformersurgeon.export.operations import check_config_choices
+
+    assert QNNExportConfig(output_path="x").kv_cache_bits == 16
+    check_config_choices("qnn", QNNExportConfig(output_path="x", kv_cache_bits=8))
+    with pytest.raises(ValueError, match="not supported by the qnn backend"):
+        check_config_choices("qnn", QNNExportConfig(output_path="x", kv_cache_bits=4))
+    for bad in ({"quant_scope": "linear"}, {"quant_scope": "all", "float_attention_core": True}):
+        config = QNNExportConfig(output_path="x", kv_cache_bits=8, **bad)
+        with pytest.raises(ValueError, match="kv_cache_bits=8 requires quant_scope='all'"):
+            QNNExporter().lower(_qnn_components(), config)
+
+
+@caps.requires_qnn
+def test_qnn_kv_cache_bits_8_quantises_the_cache_writes_to_8_bits(tmp_path):
+    from transformersurgeon.export import export_to_backend
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    cfg = QNNExportConfig(output_path=str(tmp_path / "model.pte"), max_seq_len=CACHE, quant_scope="all",
+                          kv_cache_bits=8, keep_reference_module=True, run_weight_mismatch_check=False,
+                          convert_options={"max_cache_len": CACHE})
+    result = export_to_backend(_model(), cfg)
+    assert os.path.getsize(cfg.output_path) > 0
+    # In the fake-quant model the .pte was lowered from, what each cache write stores is
+    # dequantised from an 8-bit range (16-bit everywhere else).
+    graph = result.reference_module.graph
+    writes = [n for n in graph.nodes if n.op == "call_function" and "index_copy" in str(n.target)]
+    ranges = [w.args[3].args[4] for w in writes
+              if isinstance(w.args[3], torch.fx.Node) and "dequantize" in str(w.args[3].target)]
+    assert writes and ranges and max(ranges) <= 255

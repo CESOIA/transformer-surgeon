@@ -171,12 +171,25 @@ no code is clipped. The atom (`blocks/attention/kv_precision/`) sits between `MH
 - **Dequantize-first**: attention never reads integer rows natively; each step decodes the whole cache, so the
   cache footprint shrinks but compute grows (decode cost can rise, which is what a cost model should see).
 - **Backends** (`BACKEND_OPERATIONS["kv_precision"]`): `xnnpack` and `onnx` accept `int8`/`int4`; `qnn` and
-  `tensorrt` only `"full"`. HTP's 8-bit KV is a quantiser annotation of the cache tensors, and TensorRT accepts
-  `uint8` only as network I/O and casts (the in-place cache update cannot run on it); neither is implemented.
+  `tensorrt` only `"full"`. The ONNX export (uint8 cache I/O, TensorScatter) runs in ONNX Runtime and matches the
+  eager wrapper (tested with onnxruntime 1.31).
+- **QNN** gets its 8-bit cache from the QNN quantiser instead (`BACKEND_OPERATIONS["kv_cache_quantization"]`):
+  `QNNExportConfig(quant_scope="all", kv_cache_bits=8)` gives the cache writes of every `MHACausal`
+  (`passes.py::_kv_cache_write_predicate`: `index_copy`/`index_put` inside an `EXPORT_ROLE == "attention"` module)
+  an 8a8w configuration; the graph keeps `kv_precision="full"`. Needs `quant_scope="all"` and
+  `float_attention_core=False` (the cache is a fixed-point activation only then). HTP has no 4-bit activations, so
+  no int4 cache. Written without the QNN SDK: only `test_qnn_kv_cache_bits_8_quantises_the_cache_writes_to_8_bits`
+  (`requires_qnn`) exercises the lowering.
+- **TensorRT has no integer cache** (checked with TensorRT 11.4 on an RTX 4070): `uint8` intermediate tensors are
+  refused ("does not support UINT8 types for intermediate tensors"); the in-place KV-cache update behind
+  `io_inplace` takes only a cache that is a Float/Half/BFloat16 network input ("cache has type Int8 but must have
+  type Float, Half, or BFloat16", "The cache tensor must be a network input"); an INT8 `io_scatter` cache builds
+  only as dequantize-whole-cache → ScatterND → requantize, a full cache rewrite per step (not implemented). Native
+  INT8/FP8 KV would need TensorRT's LLM attention plugins (the `io_paged` Edge-LLM `AttentionPlugin`).
 - Incompatible with kernels that keep their own float cache (`custom_sdpa`, `paged`/`io_paged`): rejected at
   construction. Encode/decode trace with `torch.export` (float element-wise ops, one reduction, casts).
-- Lowering on XNNPACK/ONNX is covered by capability-gated tests (`test/export/test_kv_precision.py`), not yet
-  measured on a device.
+- XNNPACK lowering is covered only by capability-gated tests (`test/export/test_kv_precision.py`); nothing has been
+  measured on a device yet.
 
 ### XNNPACK: `add_batch_dim` — experimental leading batch dimension
 

@@ -301,6 +301,26 @@ def _float_attention_nodes(graph_module) -> list[str]:
     return names
 
 
+# Operations that write the KV cache of an attention module: index_copy for the mutable
+# cache, index_put for io_scatter (functional or in place, before/after functionalisation).
+_KV_CACHE_WRITES = {
+    torch.ops.aten.index_copy.default, torch.ops.aten.index_copy_.default,
+    torch.ops.aten.index_put.default, torch.ops.aten.index_put_.default,
+}
+
+
+def _kv_cache_write_predicate():
+    """Quantiser predicate: the KV-cache writes of every MHACausal (``EXPORT_ROLE ==
+    "attention"``). Giving these nodes an 8-bit configuration makes the cache, which they
+    produce and the attention reads, an 8-bit fixed-point tensor (QNNExportConfig.kv_cache_bits)."""
+    def _pred(node: torch.fx.Node) -> bool:
+        if node.op != "call_function" or node.target not in _KV_CACHE_WRITES:
+            return False
+        stack = node.meta.get("nn_module_stack", {}).values()
+        return any(_export_role(t[1] if isinstance(t, tuple) else t) == "attention" for t in stack)
+    return _pred
+
+
 @functools.lru_cache(maxsize=None)
 def _module_class(type_name) -> type | None:
     """Class of an ``nn_module_stack`` entry (a class, or its ``"module.Class"`` name)."""
