@@ -287,6 +287,15 @@ class QNNExportConfig(ExecutorchExporterConfig):
     # quant_scope="all" only: keep the attention core (RoPE, KV cache, scores,
     # mask, softmax, A.V) in fp16 instead of 16-bit fixed point.
     float_attention_core: bool = False
+    # quant_scope="all" only: bit width of the cached K/V (mutable cache). 8 annotates both attention
+    # matmuls 16a8w (query / probabilities 16-bit, cached K / V 8-bit) and the cache write and the view
+    # ops between them 8-bit, so the cache lives in DDR at 1 byte per value. Adapted from ExecuTorch's
+    # annotate_kv_8bit (static-LLM recipes), which expects a cat-based cache instead of index_copy_.
+    kv_cache_bits: int = 16
+    # quant_scope="all" only: keep the mutable KV cache quantized at the delegate boundary (uint8/uint16
+    # per kv_cache_bits). Without it the cache buffer stays in the traced dtype (fp32 for quantized graphs):
+    # HTP dequantizes the whole cache to fp32 at the output and requantizes it at the input of every step.
+    quantized_kv_io: bool = False
     # Token-id sequences for PT2E activation calibration (each decoded from position 0
     # with the KV cache filling up). None = a few built-in sentences. Use real text
     # from the target distribution: static 16-bit ranges come only from these.
@@ -455,6 +464,49 @@ def _linear_block_sizes(graph_module: torch.nn.Module, block_layers: dict[str, i
     return sizes
 
 
+def _annotate_kv_cache_8bit(gm: torch.fx.GraphModule) -> None:
+    """kv_cache_bits=8: q.K^T and P.V become 16a8w; walking back from each matmul's second input
+    through the layout ops (shared qparams) to the cache write (index_copy_ on the mutable buffer),
+    the cache and its view chain get one 8-bit symmetric per-tensor spec, taken at the new k/v rows."""
+    from executorch.backends.qualcomm.quantizer.qconfig import get_16a8w_qnn_ptq_config, get_8a8w_qnn_ptq_config
+    from torchao.quantization.pt2e import MinMaxObserver
+    from torchao.quantization.pt2e.quantizer import QuantizationAnnotation, SharedQuantizationSpec
+    from executorch.backends.qualcomm.quantizer.rules import Q_ANNOTATION_KEY
+
+    cfg16a8w = get_16a8w_qnn_ptq_config(act_observer=MinMaxObserver)
+    act8 = get_8a8w_qnn_ptq_config(act_symmetric=True, act_observer=MinMaxObserver).input_activation
+    layout_ops = {torch.ops.aten.permute.default, torch.ops.aten.transpose.int, torch.ops.aten.unsqueeze.default,
+                  torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten.expand.default}
+    cache_writes = {torch.ops.aten.index_copy_.default, torch.ops.aten.index_copy.default}
+
+    def share(node, src):
+        node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={src: act8}, output_qspec=SharedQuantizationSpec((src, node)), _annotated=True)
+
+    n_matmul = 0
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.matmul.default:
+            continue
+        chain, cur = [], node.args[1]
+        while isinstance(cur, torch.fx.Node) and cur.op == "call_function" and cur.target in layout_ops:
+            chain.append(cur)
+            cur = cur.args[0]
+        if not (isinstance(cur, torch.fx.Node) and cur.target in cache_writes):
+            continue  # not a K/V cache read
+        node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={node.args[0]: cfg16a8w.input_activation, node.args[1]: cfg16a8w.weight},
+            output_qspec=cfg16a8w.output_activation, _annotated=True)
+        value = cur.args[3]  # index_copy_(cache, dim, index, new_rows): the mutable buffer itself stays unannotated
+        cur.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={value: act8}, output_qspec=SharedQuantizationSpec((value, cur)), _annotated=True)
+        for v in reversed(chain):
+            share(v, v.args[0])
+        n_matmul += 1
+    if n_matmul == 0:
+        raise RuntimeError("kv_cache_bits=8: no attention matmul reads a mutable KV cache (cache_impl='mutable')")
+    print(f"  QNN: 8-bit KV cache on {n_matmul} attention matmuls")
+
+
 def _float_attention_nodes(graph_module) -> list[str]:
     """Nodes kept fp16 inside a quant_scope="all" graph: the attention core of every
     MHACausal (RoPE, KV-cache read/write, scores, mask, softmax, A.V -- everything
@@ -621,6 +673,13 @@ def export_with_qnn(
             _discard = _float_attention_nodes(sanitized_module)
             quantizer.add_discard_nodes(_discard)
 
+        if config.kv_cache_bits not in (8, 16):
+            raise ValueError(f"kv_cache_bits must be 8 or 16, got {config.kv_cache_bits}")
+        if config.kv_cache_bits == 8:
+            if config.quant_scope != "all" or config.float_attention_core:
+                raise ValueError("kv_cache_bits=8 needs quant_scope='all' and a fixed-point attention core")
+            quantizer.add_custom_quant_annotations((_annotate_kv_cache_8bit,))
+
         if config.quant_scope == "all" and config.split_float_linear_bias:
             _split = _split_float_linear_bias(sanitized_module, frozenset(layer_info))
             if _split:
@@ -783,6 +842,42 @@ def export_with_qnn(
         edge_kwargs["passes_job"] = passes_job
         edge_kwargs["dep_table"] = dep_table
 
+    if config.quantized_kv_io:
+        if not quantize or config.quant_scope != "all":
+            raise ValueError("quantized_kv_io needs a quantized quant_scope='all' export")
+        from executorch.backends.qualcomm._passes import TagQuantIO
+        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_capture_program_passes
+        from executorch.backends.qualcomm.utils.constants import (
+            QCOM_PASS_ACTIVATE_KEY as _ACT,
+            QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY as _ARGS,
+        )
+        _kv_dtype = torch.uint8 if config.kv_cache_bits == 8 else torch.uint16
+        _tagged = []
+
+        def _kv_io_dtype(node):
+            # cache buffer (lifted placeholder) and the cache write that feeds its mutation output
+            is_buf = node.op == "placeholder" and node.name.endswith(("attn_key_cache", "attn_value_cache"))
+            is_write = False
+            if node.op == "call_function" and any(u.op == "output" for u in node.users):
+                cur = node  # output <- [dequantize <- quantize <-] cache write (index_copy, index_put in edge)
+                for _ in range(3):
+                    if "index_copy" in str(cur.target) or "index_put" in str(cur.target):
+                        is_write = True
+                        break
+                    if not (cur.args and isinstance(cur.args[0], torch.fx.Node)
+                            and "quantize" in str(cur.target)):
+                        break
+                    cur = cur.args[0]
+            if is_buf or is_write:
+                _tagged.append(node.name)
+                return _kv_dtype
+            return None
+
+        passes_job = edge_kwargs.get("passes_job", get_capture_program_passes())
+        passes_job[TagQuantIO][_ACT] = True
+        passes_job[TagQuantIO][_ARGS]["get_quant_io_dtype_fn"] = _kv_io_dtype
+        edge_kwargs["passes_job"] = passes_job
+
     edge = to_edge_transform_and_lower_to_qnn(
         model_for_edge,
         example_inputs,
@@ -791,7 +886,13 @@ def export_with_qnn(
         **edge_kwargs,
     )
 
+    _et_passes = []
+    if config.quantized_kv_io:
+        from executorch.backends.qualcomm._passes.build_quant_io import BuildQuantIo
+        _et_passes.append(BuildQuantIo())
+        print(f"  QNN: quantized KV I/O ({_kv_dtype}) on {len(_tagged)} nodes, e.g. {_tagged[:2]}")
     executorch_config = ExecutorchBackendConfig(
+        passes=_et_passes,
         memory_planning_pass=MemoryPlanningPass(
             alloc_graph_input=True,
             alloc_graph_output=True,
