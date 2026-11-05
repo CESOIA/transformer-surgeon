@@ -1,11 +1,11 @@
 """Orchestrator: plan the E0-E5 experiments and generate (compress + export) every model they need.
 
-    # 1. plan + generate everything for one backend
-    python scripts/cost_predictor/generate_models.py --backend xnnpack --out-dir experiments/cost_predictor
+    # 1. plan + generate everything for one backend (one output folder per backend)
+    python scripts/cost_predictor/generate_models.py --backend xnnpack --out-dir experiments/cp_xnnpack
     # 2. only some experiments, other backend, resume later (finished artifacts are skipped)
-    python scripts/cost_predictor/generate_models.py --backend tensorrt --experiments E0 E1 E2 E3
+    python scripts/cost_predictor/generate_models.py --backend tensorrt --out-dir experiments/cp_tensorrt --experiments E0 E1
     # 3. pipeline test without a backend: compress only, tiny random model
-    python scripts/cost_predictor/generate_models.py --backend none --tiny --e4-count 6 --e5-count 3
+    python scripts/cost_predictor/generate_models.py --backend none --tiny --e4-count 6 --e5-count 3 --out-dir /tmp/cp_test
 
 Steps: (1) ``experiment_plan.build_plan`` writes the experiment folders; (2) every configuration that owns its
 weights is compressed (hard, per-layer INT8/INT4, FP16 = untouched) and exported once per graph; (3) an
@@ -16,10 +16,12 @@ Graph shape. Static-cache graphs (all backends here) read every cache slot, so d
 per P with ``max_cache_len = round_up(P + G_max, 128)`` (``--shared-graph`` exports a single graph sized for the
 largest P instead). Artifacts: ``<exp>/models/<config>/<backend>/P<P>/``.
 
-KV-cache precision. The library stores the cache in the model dtype and has no KV quantisation, so INT8/INT4 KV
-cannot be baked into an artifact. Those configurations (E2, E3 and part of E4/E5) reuse the weights artifact of the
-same weights and carry ``b_KV`` in the index (``kv_in_artifact=false``): the profiling runtime must apply the KV
-precision (or this has to be added to ``blocks/attention/kv_cache``).
+KV-cache precision. b_KV is baked into the graph as ``convert_options["kv_precision"]`` (``"int8"``/``"int4"``:
+uint8 cache rows of codes plus one scale per row, ``blocks/attention/kv_precision``), so every (weights, b_KV) pair
+is its own artifact. Only backends whose ``BACKEND_OPERATIONS["kv_precision"]`` lists the integer precisions can
+export them (xnnpack, onnx). By default the KV alternatives are exactly those the backend supports, so qnn and
+tensorrt get a weights-only plan (E0, E1, E4, E5 at the reference KV precision); ``--kv-alts`` naming a precision
+the backend cannot export is an error.
 """
 
 import argparse
@@ -67,6 +69,37 @@ PROFILES = {
 }
 
 
+KV_OPTIONS = {"INT8": "int8", "INT4": "int4"}   # b_KV label -> convert_options["kv_precision"] ("full" = reference)
+
+
+def supported_kv_alts(backend):
+    """b_KV labels the backend can bake into a graph besides its reference (``BACKEND_OPERATIONS``)."""
+    if backend == "none":
+        return []
+    from transformersurgeon.export.operations import options_for
+    options = options_for(backend, "kv_precision")
+    return [label for label, option in KV_OPTIONS.items() if option in options]
+
+
+def kv_option(kv_label, profile: Profile):
+    return "full" if kv_label == profile.kv_ref else KV_OPTIONS[kv_label]
+
+
+def artifact_key(c, args):
+    """Configurations with equal keys share one artifact: same weights, and the same KV precision when the
+    backend bakes it into the graph."""
+    return c.weights_key, (c.kv if c.kv in args.kv_in_graph else args.kv_ref)
+
+
+def artifact_owners(experiments, args):
+    """``{artifact key: "<experiment dir>/<config_id>"}``: the first configuration needing each artifact exports it."""
+    owners = {}
+    for exp in experiments:
+        for c in exp.configs:
+            owners.setdefault(artifact_key(c, args), f"{exp.dirname}/{c.config_id}")
+    return owners
+
+
 def round_up(n, m=128):
     return -(-n // m) * m
 
@@ -107,8 +140,8 @@ def compress(model, manager_cls, weights, profile: Profile):
     return counts
 
 
-def export_config(backend, out_dir: Path, cache_len, input_len, profile: Profile, args):
-    base = {"max_cache_len": cache_len}
+def export_config(backend, out_dir: Path, cache_len, input_len, profile: Profile, args, kv_precision="full"):
+    base = {"max_cache_len": cache_len, "kv_precision": kv_precision}
     if profile.cache_impl:
         base["cache_impl"] = profile.cache_impl
     if backend == "xnnpack":
@@ -142,8 +175,9 @@ def graph_shapes(args):
 
 
 def generate_one(spec, owner_dir: Path, model_source, args, profile, classes):
-    """Compress + export one weights configuration for every graph shape; resumable."""
+    """Compress + export one (weights, KV precision) configuration for every graph shape; resumable."""
     model_cls, manager_cls = classes
+    kv_precision = kv_option(spec["kv"], profile) if spec["kv"] in args.kv_in_graph else "full"
     results = []
     for tag, input_len, cache_len in graph_shapes(args):
         out_dir = owner_dir / args.backend / tag
@@ -153,7 +187,8 @@ def generate_one(spec, owner_dir: Path, model_source, args, profile, classes):
             continue
         out_dir.mkdir(parents=True, exist_ok=True)
         status = {"config_id": spec["config_id"], "backend": args.backend, "graph": tag,
-                  "max_input_len": input_len, "max_cache_len": cache_len, "dtype": str(profile.dtype)}
+                  "max_input_len": input_len, "max_cache_len": cache_len, "dtype": str(profile.dtype),
+                  "kv_precision": kv_precision}
         t0 = time.time()
         try:
             model = model_cls.from_pretrained(model_source, dtype=profile.dtype).eval()
@@ -163,7 +198,8 @@ def generate_one(spec, owner_dir: Path, model_source, args, profile, classes):
                 status["note"] = "compression only (no export)"
             else:
                 from transformersurgeon.export import export_to_backend
-                result = export_to_backend(model, config=export_config(args.backend, out_dir, cache_len, input_len, profile, args))
+                config = export_config(args.backend, out_dir, cache_len, input_len, profile, args, kv_precision)
+                result = export_to_backend(model, config=config)
                 status["status"] = "ok"
                 status["artifacts"] = {k: str(v) for k, v in vars(result).items() if isinstance(v, (str, Path)) and v}
             del model
@@ -179,19 +215,20 @@ def generate_one(spec, owner_dir: Path, model_source, args, profile, classes):
     return results
 
 
-def write_index(out: Path, experiments, args):
+def write_index(out: Path, experiments, args, owners):
     rows = []
     for exp in experiments:
         for c in exp.configs:
-            owner = out / c.weights_owner.split("/")[0] / "models" / c.weights_owner.split("/")[1]
+            owner_name = owners[artifact_key(c, args)]
+            owner = out / owner_name.split("/")[0] / "models" / owner_name.split("/")[1]
             for tag, _, _ in graph_shapes(args):
                 status_path = owner / args.backend / tag / "export_status.json"
                 status = json.loads(status_path.read_text()) if status_path.exists() else {}
-                kv_native = c.kv == PROFILES[args.backend].kv_ref
                 rows.append({
                     "experiment": exp.name, "config_id": c.config_id, "backend": args.backend, "graph": tag,
-                    "P": "all" if args.shared_graph else tag[1:], "b_KV": c.kv, "kv_in_artifact": kv_native,
-                    "weights_owner": c.weights_owner, "status": status.get("status", "missing"),
+                    "P": "all" if args.shared_graph else tag[1:], "b_KV": c.kv,
+                    "kv_in_artifact": c.kv == args.kv_ref or c.kv in args.kv_in_graph,
+                    "artifact_owner": owner_name, "status": status.get("status", "missing"),
                     "artifact_dir": str((owner / args.backend / tag).relative_to(out)),
                 })
     with open(out / "index_artifacts.csv", "w", newline="") as fh:
@@ -204,7 +241,7 @@ def write_index(out: Path, experiments, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     plan_mod.add_plan_args(parser)
-    parser.set_defaults(backends=None)
+    parser.set_defaults(backends=None, kv_alts=None)   # kv_alts None: what the backend can export
     parser.add_argument("--backend", default="xnnpack", choices=sorted(PROFILES))
     parser.add_argument("--family", default="qwen2", choices=sorted(FAMILIES))
     parser.add_argument("--experiments", nargs="+", default=["E0", "E1", "E2", "E3", "E4", "E5"])
@@ -218,19 +255,33 @@ def main():
     profile = PROFILES[args.backend]
     args.backends = [args.backend] if args.backend != "none" else ["xnnpack"]
     args.kv_ref = profile.kv_ref      # the backend's default KV precision is the reference
+    supported = supported_kv_alts(args.backend)
+    if args.kv_alts is None:
+        args.kv_alts = supported
+    elif args.backend != "none" and set(args.kv_alts) - set(supported):
+        parser.error(f"the {args.backend} backend cannot export KV precision(s) "
+                     f"{sorted(set(args.kv_alts) - set(supported))} (supported: {supported or 'none'}; "
+                     "see BACKEND_OPERATIONS['kv_precision'])")
+    args.kv_in_graph = set(supported)
 
     out = Path(args.out_dir)
     experiments, _ = plan_mod.build_plan(args)
     selected = [e for e in experiments if e.name in args.experiments]
+    if not selected:
+        parser.error("none of the selected experiments is in the plan (E2/E3 need KV alternatives: --kv-alts, "
+                     "on a backend that can export them)")
+    if not args.kv_alts:
+        print(f"weights-only plan: no KV-cache alternative for {args.backend} (E2/E3 left out)")
 
-    # One export per distinct weights; the owner may live in an experiment that was not selected.
-    needed = {c.weights_key for s in selected for c in s.configs}
+    # One export per artifact key; the owner may live in an experiment that was not selected.
+    owners = artifact_owners(experiments, args)
+    needed = {artifact_key(c, args) for s in selected for c in s.configs}
     todo = [(exp, c) for exp in experiments for c in exp.configs
-            if c.weights_key in needed and c.weights_owner == f"{exp.dirname}/{c.config_id}"]
+            if artifact_key(c, args) in needed and owners[artifact_key(c, args)] == f"{exp.dirname}/{c.config_id}"]
     if args.limit:
         todo = todo[:args.limit]
     n_graphs = len(graph_shapes(args))
-    print(f"{len(todo)} weight configurations x {n_graphs} graph(s) = {len(todo) * n_graphs} {args.backend} artifacts")
+    print(f"{len(todo)} configurations x {n_graphs} graph(s) = {len(todo) * n_graphs} {args.backend} artifacts")
     if args.dry_run:
         for exp, c in todo:
             print(f"  {exp.dirname}/{c.config_id}  (KV {c.kv}, {c.description})")
@@ -245,7 +296,7 @@ def main():
         report.append({"config": f"{exp.dirname}/{c.config_id}", "results": results})
         print(f"[{i}/{len(todo)}] {exp.dirname}/{c.config_id}: " + ", ".join(f"{t}={s}" for t, s in results), flush=True)
 
-    rows = write_index(out, selected, args)
+    rows = write_index(out, selected, args, owners)
     failed = [r for r in rows if r["status"] not in ("ok",)]
     (out / f"generation_report_{args.backend}.json").write_text(json.dumps(report, indent=2))
     print(f"index: {out / 'index_artifacts.csv'}  ({len(rows)} rows, {len(failed)} not ok)")

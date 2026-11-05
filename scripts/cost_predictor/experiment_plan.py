@@ -16,6 +16,10 @@ the script writes one folder:
 Configuration c = per-layer weight precision of the 7 projection types of every block (16 = FP16, 8, 4)
 + one KV-cache precision. Experiments that need the same weights share one artifact (``weights_owner``).
 
+Without ``--kv-alts`` the plan is weights-only (E0, E1, E4, E5, every configuration at the reference KV precision).
+``--kv-alts INT8 INT4`` adds E2 (KV sweep) and E3 (weight-KV separability) and spreads the KV precisions over E4/E5.
+``generate_models.py`` defaults to the KV precisions the target backend can export (xnnpack, onnx: INT8, INT4).
+
     python scripts/cost_predictor/experiment_plan.py --out-dir experiments/cost_predictor
     python scripts/cost_predictor/experiment_plan.py --out-dir /tmp/plan --tiny --e4-count 10 --e5-count 4
 """
@@ -209,7 +213,9 @@ def sample_mixed(dims, count, forbidden_keys, kv_options, rng, prefix, experimen
         attempts += 1
         if attempts > 5000 * max(count, 1):
             raise RuntimeError(f"cannot sample {count} distinct configurations (got {len(specs)})")
-        strategy = MIXED_STRATEGIES[len(specs) % len(MIXED_STRATEGIES)]
+        # Strategies take turns per attempt, not per accepted configuration, so one whose space runs out
+        # (alternating has only 6 assignments) is skipped instead of blocking the others.
+        strategy = MIXED_STRATEGIES[(attempts - 1) % len(MIXED_STRATEGIES)]
         weights = sample_mixed_weights(dims, rng, strategy)
         flat = {b for row in weights for b in row}
         key = weights_key(weights)
@@ -262,21 +268,26 @@ def build_experiments(dims, args, backends):
                 f"E1_{proj}_{PRECISION_NAMES[b]}", "E1", f"all {proj} layers at {PRECISION_NAMES[b]}, rest INT8", w, kv_ref,
                 tags={"tau": proj, "b": PRECISION_NAMES[b], "N_tau": dims.num_blocks}, weights_key=weights_key(w)))
 
-    e2 = Experiment("E2_kv_sweep", "E2", "KV structured term: reference weights, change only the KV-cache precision",
-                    "DeltaT_KV^pre(b_KV, P), DeltaT_KV^dec(b_KV, P, G)", reference_config="E0_reference/E0_ref")
-    for kv in kv_alts:
-        e2.configs.append(ConfigSpec(f"E2_kv{kv}", "E2", f"reference INT8 weights, KV {kv}", ref_w, kv,
-                                     tags={"b_KV": kv}, weights_key=ref_key))
+    # E2/E3 need artifacts with a quantised KV cache: without KV alternatives the plan is weights-only.
+    kv_experiments = []
+    if kv_alts:
+        e2 = Experiment("E2_kv_sweep", "E2",
+                        "KV structured term: reference weights, change only the KV-cache precision",
+                        "DeltaT_KV^pre(b_KV, P), DeltaT_KV^dec(b_KV, P, G)", reference_config="E0_reference/E0_ref")
+        for kv in kv_alts:
+            e2.configs.append(ConfigSpec(f"E2_kv{kv}", "E2", f"reference INT8 weights, KV {kv}", ref_w, kv,
+                                         tags={"b_KV": kv}, weights_key=ref_key))
 
-    w4 = uniform(dims, 4)
-    e3 = Experiment("E3_separability", "E3", "Weight-KV separability: repeat the KV sweep on uniform W4 weights",
-                    "S_KV(b_KV, P) = DeltaT_KV(b_KV; W4) - DeltaT_KV(b_KV; W8)  (needs the E2 + E3 runs)",
-                    reference_config="E0_reference/E0_ref")
-    for kv in [kv_ref] + list(kv_alts):
-        e3.configs.append(ConfigSpec(f"E3_w4_kv{kv}", "E3", f"uniform W4 weights, KV {kv}", w4, kv,
-                                     tags={"b_KV": kv}, weights_key=weights_key(w4)))
+        w4 = uniform(dims, 4)
+        e3 = Experiment("E3_separability", "E3", "Weight-KV separability: repeat the KV sweep on uniform W4 weights",
+                        "S_KV(b_KV, P) = DeltaT_KV(b_KV; W4) - DeltaT_KV(b_KV; W8)  (needs the E2 + E3 runs)",
+                        reference_config="E0_reference/E0_ref")
+        for kv in [kv_ref] + list(kv_alts):
+            e3.configs.append(ConfigSpec(f"E3_w4_kv{kv}", "E3", f"uniform W4 weights, KV {kv}", w4, kv,
+                                         tags={"b_KV": kv}, weights_key=weights_key(w4)))
+        kv_experiments = [e2, e3]
 
-    controlled = [c.weights_key for e in (e0, e1, e2, e3) for c in e.configs]
+    controlled = [c.weights_key for e in [e0, e1, *kv_experiments] for c in e.configs]
     rng = random.Random(args.seed)
     kv_options = [kv_ref] + list(kv_alts)
     e4 = Experiment("E4_residual", "E4",
@@ -289,7 +300,7 @@ def build_experiments(dims, args, backends):
     e5.configs = sample_mixed(dims, args.e5_count, controlled + [c.weights_key for c in e4.configs], kv_options,
                               rng, "H", "E5")
 
-    experiments = [e0, e1, e2, e3, e4, e5]
+    experiments = [e for e in [e0, e1, *kv_experiments, e4, e5] if e.configs]   # e.g. --e5-count 0 drops E5
     owners = {}
     for e in experiments:
         for c in e.configs:
@@ -303,19 +314,27 @@ def build_experiments(dims, args, backends):
 # Output
 # ----------------------------------------------------------------------------------------------------------------
 
-def flat_row(exp: Experiment, c: ConfigSpec, backends):
-    f = c.features
-    row = {"experiment": exp.name, "config_id": c.config_id, "b_KV": c.kv, "description": c.description,
-           "weights_owner": c.weights_owner, "weights_key": c.weights_key,
-           "weight_bytes": round(f["weight_bytes_total"]), "avg_weight_bits": round(f["effective_avg_weight_bits"], 3),
+def feature_columns(f, backends):
+    """The numeric features f(c) of one configuration as flat columns (the residual model's input)."""
+    row = {"weight_bytes": round(f["weight_bytes_total"]), "avg_weight_bits": round(f["effective_avg_weight_bits"], 3),
            "frac_w4": round(f["fraction_w4_layers"], 4), "precision_transitions": f["precision_transitions"],
            "kv_bytes_per_token": f["kv_bytes_per_token"]}
     for proj in PROJECTIONS:
         for b in PRECISIONS:
             row[f"n_{proj}_{PRECISION_NAMES[b]}"] = f["precision_counts_per_type"][proj][PRECISION_NAMES[b]]
+    for a in PRECISIONS:
+        for b in PRECISIONS:
+            if a != b:
+                key = f"{PRECISION_NAMES[a]}->{PRECISION_NAMES[b]}"
+                row[f"trans_{PRECISION_NAMES[a]}_to_{PRECISION_NAMES[b]}"] = f["directed_transitions"].get(key, 0)
     for b in backends:
         row[f"kernel_transitions_{b}"] = f["kernel_family_transitions"][b]
     return row
+
+
+def flat_row(exp: Experiment, c: ConfigSpec, backends):
+    return {"experiment": exp.name, "config_id": c.config_id, "b_KV": c.kv, "description": c.description,
+            "weights_owner": c.weights_owner, "weights_key": c.weights_key, **feature_columns(c.features, backends)}
 
 
 RESULT_COLUMNS = ["config_id", "backend", "P", "G_max", "b_KV", "prefill_ms", "prefill_energy_j", "decode_trace_ms",
@@ -362,7 +381,9 @@ def add_plan_args(parser):
     parser.add_argument("--weight-alts", nargs="+", type=int, default=[16, 4], choices=[16, 8, 4, 6, 3, 2],
                         help="alternative weight precisions b of E1 (16 = FP16)")
     parser.add_argument("--kv-ref", default="F16", choices=["F16", "F32"], help="backend default KV precision")
-    parser.add_argument("--kv-alts", nargs="+", default=["INT8", "INT4"], choices=["INT8", "INT4"])
+    parser.add_argument("--kv-alts", nargs="*", default=[], choices=["INT8", "INT4"],
+                        help="alternative KV-cache precisions, adds E2/E3 (default: none, a weights-only plan; "
+                             "generate_models.py defaults to what the backend can export)")
     parser.add_argument("--e4-count", type=int, default=40, help="mixed configurations to learn the residual")
     parser.add_argument("--e5-count", type=int, default=15, help="held-out configurations")
     parser.add_argument("--seed", type=int, default=0)
@@ -392,6 +413,7 @@ def build_plan(args):
         writer.writerows(all_rows)
     plan = {"model": "tiny-random-qwen2" if args.tiny else args.model_name, "dims": asdict(dims),
             "projection_types": PROJECTIONS, "reference": {"weights": f"INT{REF_WEIGHT_BITS}", "kv": args.kv_ref},
+            "kv_alternatives": list(args.kv_alts),
             "prompt_lengths": args.prompt_lengths, "g_max": args.g_max, "eval_g": args.eval_g, "seed": args.seed,
             "group_size": GROUP_SIZE, "backends": backends,
             "experiments": {e.name: {"dir": e.dirname, "configs": len(e.configs)} for e in experiments},
