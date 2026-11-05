@@ -221,6 +221,9 @@ class TransformerDecoder(torch.nn.Module):
         )
         self.register_buffer("rope_cos", rope[0].to(config.dtype), persistent=True)
         self.register_buffer("rope_sin", rope[1].to(config.dtype), persistent=True)
+        self.force_uniform_rope_latency_only = bool(getattr(config, "force_uniform_rope_latency_only", False))
+        self._rope_type = getattr(config, "rope_type", "default")
+        self._rope_params = rope_parameters_from_config(config)
         if self.cache_impl == "io_paged":
             # Fused paged attention applies RoPE itself from a float32 (1, max_pos,
             # head_dim) cos|sin table, and reads the pool through a page table
@@ -237,6 +240,62 @@ class TransformerDecoder(torch.nn.Module):
         # negative fp16 value, so it is representable in every model dtype.
         self.register_buffer('mask_penalty', torch.tensor(-65504.0, dtype=config.dtype), persistent=True)
 
+
+    # Head dims the Edge-LLM XQA decode kernel is built for (0.10.1: static_assert in its sources).
+    PAGED_HEAD_DIMS = (64, 128, 256, 512)
+
+    def finalize_paged_rope(self):
+        """io_paged only, conversion-time (utils.convert calls it after every block's finalize_rope_pruning).
+
+        The fused paged attention (TensorRT Edge-LLM AttentionPlugin) applies RoPE from ONE cos|sin table shared
+        by every head. Within-head structured pruning keeps different rotary frequencies per kv group, which that
+        table cannot express, so such a model cannot be exported this way: this raises, unless the config sets
+        ``force_uniform_rope_latency_only=True``.
+
+        ``force_uniform_rope_latency_only=True`` is a LATENCY-ONLY substitution that CHANGES THE MODEL OUTPUT: each
+        pruned block attends with a standard RoPE table of its pruned head dim (as if the model had been built with
+        that head dim), so tensor shapes, the KV cache size and the work per token match the pruned model while the
+        logits do not. Use it only to time the pruned geometry; judge accuracy on the unforced torch model, and judge
+        export parity against this converted graph run eagerly (same substitution). The pruned head dim must be one
+        the kernel is built for (``PAGED_HEAD_DIMS``) and equal for q/k and v.
+        """
+        if self.cache_impl != "io_paged":
+            return
+        import warnings
+        forced = []
+        for i, block in enumerate(self.blocks):
+            attn = block.attn
+            if not getattr(attn, "rope_pruned", False):
+                continue
+            d = attn.key_head_dim
+            if not self.force_uniform_rope_latency_only:
+                raise ValueError(
+                    f"Block {i}: within-head pruned attention (q/k head dim {d}, rotary frequencies pruned per kv "
+                    "group) cannot be exported with cache_impl='io_paged' (TensorRT Edge-LLM AttentionPlugin): the "
+                    "kernel applies one RoPE table to every head. Use cache_impl='io_inplace' (exact), or set "
+                    "force_uniform_rope_latency_only=True to time the pruned geometry with a standard RoPE of head dim "
+                    f"{d} -- LATENCY ONLY: the model output changes.")
+            if d != attn.value_head_dim or attn.q_proj.out_features != attn.num_heads * d:
+                raise ValueError(
+                    f"Block {i}: force_uniform_rope_latency_only needs equal q/k/v head dims for io_paged, got q/k {d}, "
+                    f"v {attn.value_head_dim}.")
+            if d not in self.PAGED_HEAD_DIMS:
+                raise ValueError(
+                    f"Block {i}: pruned head dim {d} has no Edge-LLM XQA decode kernel (built for {self.PAGED_HEAD_DIMS});"
+                    " io_paged cannot run this model even with force_uniform_rope_latency_only.")
+            name = f"rope_cos_sin_hd{d}"
+            if not hasattr(self, name):
+                inv = precompute_rope_inv_freqs_for(self._rope_type, d, self._rope_params)
+                cos, sin = precompute_rope_cos_sin_half(inv, self.max_cache_len, start_pos=0)
+                self.register_buffer(name, torch.cat([cos, sin], dim=-1).squeeze(1).unsqueeze(0).float(),
+                                     persistent=False)
+            attn.paged_rope_table = name
+            attn.paged_uniform_rope = True
+            forced.append(i)
+        if forced:
+            warnings.warn(
+                f"force_uniform_rope_latency_only: {len(forced)} within-head pruned blocks use a standard RoPE of their "
+                "pruned head dim. LATENCY-ONLY MODEL: its output is NOT the compressed model's.", stacklevel=2)
 
     def forward(
             self,
@@ -272,9 +331,11 @@ class TransformerDecoder(torch.nn.Module):
             # length after this step and derives positions and causality from it.
             in_seq_len = x.shape[1] if self.add_batch_dim else x.shape[0]
             start = pos_id.to(torch.int32)
-            paged = (start + in_seq_len, self.rope_cos_sin, start, self.kv_page_table)
             new_pools = []
             for i, block in enumerate(self.blocks):
+                key = getattr(block.attn, "paged_rope_table", None)  # set by finalize_paged_rope (latency-only)
+                table = getattr(self, key) if key else self.rope_cos_sin
+                paged = (start + in_seq_len, table, start, self.kv_page_table)
                 x, pool, _ = block(x, pos_id=pos_id, attn_mask=None, key_cache=key_caches[i], paged=paged)
                 new_pools.append(pool)
             return self.norm(x), new_pools, None

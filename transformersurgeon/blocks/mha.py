@@ -194,6 +194,9 @@ class MHABase(torch.nn.Module):
         # blocks/ conversion, and before any forward() call. See
         # finalize_rope_pruning/_project_rope below.
         self.rope_pruned = False
+        # io_paged + force_uniform_rope_latency_only: set by TransformerDecoder.finalize_paged_rope (latency-only RoPE).
+        self.paged_uniform_rope = False
+        self.paged_rope_table = None
         self.register_buffer("rope_freq_proj", None, persistent=False)
 
     @property
@@ -853,10 +856,15 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         ``paged`` = (context_lengths, rope_cos_sin, kvcache_start_index,
         kv_page_table), built once per step by TransformerDecoder."""
         head_dim = self.value_head_dim
-        if self.rope_pruned or self.key_head_dim != head_dim or self.q_proj.out_features != self.num_heads * head_dim:
+        if self.rope_pruned and not getattr(self, "paged_uniform_rope", False):
             raise NotImplementedError(
-                "cache_impl='io_paged' needs equal q/k/v head dims and unpruned RoPE (one cos/sin table "
-                "for every head); use 'io_inplace' for within-head pruned attention.")
+                "cache_impl='io_paged' (TensorRT Edge-LLM AttentionPlugin) cannot run within-head pruned attention: "
+                "it applies one RoPE table to every head, while pruning kept different rotary frequencies per kv "
+                "group. Use cache_impl='io_inplace' (exact), or force_uniform_rope_latency_only=True (LATENCY ONLY, "
+                "changes the output; see TransformerDecoder.finalize_paged_rope).")
+        if self.key_head_dim != head_dim or self.q_proj.out_features != self.num_heads * head_dim:
+            raise NotImplementedError(
+                "cache_impl='io_paged' needs equal q/k/v head dims; use 'io_inplace' for this attention.")
         qkv = torch.cat([self.q_proj(x), self.k_proj(x), self.v_proj(x)], dim=-1)
         qkv = qkv.reshape(1, in_seq_len, qkv.shape[-1])
         context_lengths, rope_cos_sin, start_index, page_table = paged

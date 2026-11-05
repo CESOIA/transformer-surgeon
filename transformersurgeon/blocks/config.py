@@ -34,6 +34,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         masked_softmax=False,
         rmsnorm_prescale_threshold=None,
         rmsnorm_safe_sum=False,
+        force_uniform_rope_latency_only=False,
         center_keys=False,
         kv_cache_quant=None,
         indexing=None,
@@ -67,6 +68,10 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         self.rmsnorm_prescale_threshold = rmsnorm_prescale_threshold
         # RMSNorm variance as sum((x/sqrt(n))**2): fp16-safe reduction (blocks/norm.py).
         self.rmsnorm_safe_sum = rmsnorm_safe_sum
+        # LATENCY-ONLY, CHANGES THE MODEL OUTPUT (blocks/decoder.py finalize_paged_rope): io_paged attention of
+        # within-head pruned q/k uses a standard RoPE table of the pruned head dim instead of the per-kv-group
+        # surviving frequencies, which the Edge-LLM kernel cannot express.
+        self.force_uniform_rope_latency_only = force_uniform_rope_latency_only
         # Store keys relative to the position-0 key (blocks/mha.py MHACausal).
         self.center_keys = center_keys
         # Quantized KV cache ("int8": per token and head, blocks/mha.py MHACausal); None = model dtype.
@@ -100,6 +105,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         masked_softmax=False,
         rmsnorm_prescale_threshold=None,
         rmsnorm_safe_sum=False,
+        force_uniform_rope_latency_only=False,
         center_keys=False,
         kv_cache_quant=None,
     ):
@@ -154,6 +160,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
                 "masked_softmax",
                 "rmsnorm_prescale_threshold",
                 "rmsnorm_safe_sum",
+                "force_uniform_rope_latency_only",
                 "center_keys",
                 "kv_cache_quant",
             }
@@ -186,6 +193,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
             masked_softmax=masked_softmax,
             rmsnorm_prescale_threshold=rmsnorm_prescale_threshold,
             rmsnorm_safe_sum=rmsnorm_safe_sum,
+            force_uniform_rope_latency_only=force_uniform_rope_latency_only,
             center_keys=center_keys,
             kv_cache_quant=kv_cache_quant,
             indexing=converted_indexing,
