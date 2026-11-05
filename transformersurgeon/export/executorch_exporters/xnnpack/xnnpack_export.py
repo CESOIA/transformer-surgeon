@@ -77,6 +77,10 @@ def _torchao_quantize_linears(wrapper, layer_info: dict[str, dict[str, Any]]) ->
             scale = scale.reshape(1, 1).expand(n, 1).contiguous()
             block = (1, k)
             gran = "per_tensor"
+        if bits == 8 and g is None:
+            # XNNPACK rejects channelwise int8 weights with fp16 scales (xnn_status_invalid_parameter on
+            # load); same values, stored as fp32
+            scale = scale.float()
         qmax = 2 ** (bits - 1) - 1
         qmin = -qmax - 1
         qdata = torch.clamp(
