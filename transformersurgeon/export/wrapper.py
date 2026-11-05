@@ -27,8 +27,8 @@ def build_zero_caches(decoder: nn.Module) -> tuple[list[torch.Tensor], list[torc
         return [], []
     if decoder.cache_impl == "io_paged":
         return [torch.zeros(b.attn.cache_shape("kv"), dtype=b.attn.dtype) for b in decoder.blocks], []
-    key_caches = [torch.zeros(b.attn.cache_shape("key"), dtype=b.attn.dtype) for b in decoder.blocks]
-    value_caches = [torch.zeros(b.attn.cache_shape("value"), dtype=b.attn.dtype) for b in decoder.blocks]
+    key_caches = [torch.zeros(b.attn.cache_shape("key"), dtype=b.attn.cache_dtype) for b in decoder.blocks]
+    value_caches = [torch.zeros(b.attn.cache_shape("value"), dtype=b.attn.cache_dtype) for b in decoder.blocks]
     return key_caches, value_caches
 
 

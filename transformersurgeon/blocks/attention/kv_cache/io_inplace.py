@@ -38,8 +38,7 @@ class InplaceCache(KVCache):
     multi_token = True
 
     def shape(self, attn, which):
-        head_dim = attn.key_head_dim if which == "key" else attn.value_head_dim
-        return (1, attn.kv_num_heads, attn.max_cache_length, head_dim)
+        return (1, attn.kv_num_heads, attn.max_cache_length, attn.cache_width(which))
 
     def write(self, attn, k, v, write_index, key_cache, value_cache):
         key_cache = kv_cache_update(key_cache, k.transpose(0, 1).unsqueeze(0), write_index)

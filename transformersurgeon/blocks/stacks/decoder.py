@@ -47,6 +47,7 @@ class TransformerDecoderBlock(torch.nn.Module):
             max_cache_len=config.max_cache_len,
             add_batch_dim=getattr(config, "add_batch_dim", False),
             masked_softmax=getattr(config, "masked_softmax", False),
+            kv_precision=getattr(config, "kv_precision", "full"),
         )
         self.mlp = build_block(
             "mlp", config.mlp_type, config.hidden_size, config.intermediate_size,

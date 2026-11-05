@@ -89,6 +89,22 @@ BLOCK_CATALOG = {
             "Paged pool as graph input/output; written and read by the paged kernel.",
             "kv_cache", "export"),
     },
+    # What one stored key/value row holds. Export option: "kv_precision".
+    "kv_precision": {
+        "full": _atom(
+            "attention.kv_precision.full.FullPrecision",
+            "Rows kept in the model dtype.",
+            "kv_precision", "export"),
+        "int8": _atom(
+            "attention.kv_precision.int8.Int8Precision",
+            "uint8 rows: 8-bit symmetric codes plus one 2-byte scale per row; decoded before attention.",
+            "kv_precision", "export"),
+        "int4": _atom(
+            "attention.kv_precision.int4.Int4Precision",
+            "uint8 rows: 4-bit symmetric codes, two per byte, plus one 2-byte scale per row; decoded before "
+            "attention.",
+            "kv_precision", "export"),
+    },
     # Feed-forward blocks. Model key: "mlp_type".
     "mlp": {
         "mlp": _atom("mlp.plain.MLP", "down(act(up(x))).", "mlp", "model"),

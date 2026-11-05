@@ -5,6 +5,7 @@ Defaults per backend (— = chosen by the model dictionary):
 | Block type | Chosen by | xnnpack | qnn | onnx | tensorrt |
 |---|---|---|---|---|---|
 | `kv_cache` | convert option `cache_impl` | `mutable` | `mutable` | `io_inplace` | `io_inplace` |
+| `kv_precision` | convert option `kv_precision` | `full` | `full` | `full` | `full` |
 | `attention_kernel` | convert option `attn_impl` | `manual` | `manual` | `manual` | `manual` |
 | `masked_softmax` | convert option `masked_softmax` | `False` | `False` | `False` | `False` |
 | `rmsnorm` | convert option `rmsnorm_impl` | `rmsnorm_prescaled` | `rmsnorm_prescaled` | `rmsnorm_prescaled` | `rmsnorm_prescaled` |
@@ -36,6 +37,21 @@ Storage and update of past keys/values (blocks/attention/kv_cache). Chosen by: c
 | tensorrt | `io_scatter` | TensorRT ScatterND. |
 | tensorrt | `io_concat` | TensorRT Select. |
 | tensorrt | `io_paged` | Paged KV pool of the TensorRT Edge-LLM AttentionPlugin. |
+
+### `kv_precision`
+
+What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are uint8: symmetric codes plus one 2-byte scale per row (token, KV head), decoded to float before attention; the attention kernel never reads them natively. Chosen by: convert option `kv_precision`.
+
+| Backend | Option | Device operation |
+|---|---|---|
+| xnnpack | `full` (default) | Cache in the model dtype. |
+| xnnpack | `int8` | uint8 mutable cache; encode/decode are element-wise float operations, partly outside the XNNPACK delegate (portable ExecuTorch kernels). |
+| xnnpack | `int4` | uint8 mutable cache with two codes per byte; encode/decode as for int8. |
+| qnn | `full` (default) | Cache in the activation precision of the graph. |
+| onnx | `full` (default) | Cache in the model dtype. |
+| onnx | `int8` | uint8 cache I/O; encode/decode are standard element-wise ONNX operations. |
+| onnx | `int4` | uint8 cache I/O with two codes per byte; encode/decode are standard ONNX operations. |
+| tensorrt | `full` (default) | Cache in the model dtype. |
 
 ### `attention_kernel`
 

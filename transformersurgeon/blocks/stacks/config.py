@@ -121,6 +121,7 @@ class CustomDecoderConfigCompress(_ConvertedStackConfig):
         "max_cache_len": 2048,
         "add_batch_dim": False,
         "masked_softmax": False,
+        "kv_precision": "full",
     }
 
     def __init__(self, **kwargs):

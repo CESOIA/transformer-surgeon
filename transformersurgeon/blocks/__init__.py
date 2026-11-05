@@ -6,7 +6,7 @@ Sub-packages (one atom per file):
 - ``norm/``      normalisations;
 - ``mlp/``       feed-forward blocks and activations;
 - ``positions/`` rotary position embeddings;
-- ``attention/`` attention modules, attention kernels and KV-cache atoms;
+- ``attention/`` attention modules, attention kernels, KV-cache and KV-precision atoms;
 - ``stacks/``    complete decoder/encoder stacks and their configurations.
 
 ``catalog.py`` lists every selectable atom (``BLOCK_CATALOG``). Nothing here
@@ -19,5 +19,6 @@ from .catalog import *
 from .norm import *
 from .mlp import *
 from .positions import *
-from .attention import MHABase, MHACausal, MHAEncoder, ATTENTION_KERNELS, KV_CACHES, CACHE_IMPLS, ATTN_IMPLS
+from .attention import (MHABase, MHACausal, MHAEncoder, ATTENTION_KERNELS, KV_CACHES, KV_PRECISIONS, CACHE_IMPLS,
+                        ATTN_IMPLS)
 from .stacks import *

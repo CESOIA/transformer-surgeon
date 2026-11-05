@@ -59,6 +59,30 @@ BACKEND_OPERATIONS = {
             }},
         },
     },
+    "kv_precision": {
+        "description": "What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are "
+                       "uint8: symmetric codes plus one 2-byte scale per row (token, KV head), decoded to float "
+                       "before attention; the attention kernel never reads them natively.",
+        "convert_option": "kv_precision",
+        "backends": {
+            "xnnpack": {"default": "full", "options": {
+                "full": "Cache in the model dtype.",
+                "int8": "uint8 mutable cache; encode/decode are element-wise float operations, partly outside "
+                        "the XNNPACK delegate (portable ExecuTorch kernels).",
+                "int4": "uint8 mutable cache with two codes per byte; encode/decode as for int8.",
+            }},
+            # HTP keeps the cache as a fixed-point activation: 8-bit KV there is a quantiser annotation of the
+            # cache tensors, not integer rows (not implemented).
+            "qnn": {"default": "full", "options": {"full": "Cache in the activation precision of the graph."}},
+            "onnx": {"default": "full", "options": {
+                "full": "Cache in the model dtype.",
+                "int8": "uint8 cache I/O; encode/decode are standard element-wise ONNX operations.",
+                "int4": "uint8 cache I/O with two codes per byte; encode/decode are standard ONNX operations.",
+            }},
+            # TensorRT accepts uint8 only as network I/O and casts: the in-place cache update cannot run on it.
+            "tensorrt": {"default": "full", "options": {"full": "Cache in the model dtype."}},
+        },
+    },
     "attention_kernel": {
         "description": "How attention scores and the weighted sum are computed (blocks/attention/kernels).",
         "convert_option": "attn_impl",
@@ -293,6 +317,7 @@ def check_components(backend, decoder):
     check_choice(backend, "batch_dim", bool(getattr(decoder, "add_batch_dim", False)))
     if len(decoder.blocks):
         check_choice(backend, "attention_kernel", decoder.blocks[0].attn.attn_impl)
+        check_choice(backend, "kv_precision", getattr(decoder.blocks[0].attn, "kv_precision", "full"))
 
 
 __all__ = [

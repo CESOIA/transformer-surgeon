@@ -81,7 +81,8 @@ Two dictionaries join the folders:
 | Change calibration hooks / statistics | `calibration/raw_data/`, `calibration/summaries/` (+ their `registry.py`) |
 | Calibration data (token windows, WikiText-2) | `calibration/datasets.py` |
 | Change the compressible layers | `blocks/layers/` (`LinearCompressed`, `EmbeddingCompressed`, `Conv2d/3dCompressed`, `LowRankMixin`, `VCONBlock, AtomicSum, LayerScale`) |
-| Change an export atom | `blocks/attention/{kernels,kv_cache}/`, `blocks/norm/`, `blocks/mlp/`, `blocks/positions/`, `blocks/stacks/` |
+| Change an export atom | `blocks/attention/{kernels,kv_cache,kv_precision}/`, `blocks/norm/`, `blocks/mlp/`, `blocks/positions/`, `blocks/stacks/` |
+| Change the KV-cache precision (int8/int4 rows) | `blocks/attention/kv_precision/` + its `BACKEND_OPERATIONS["kv_precision"]` entry |
 | Add an atom | new file in the right `blocks/` subfolder + entry in `blocks/catalog.py` (+ `BACKEND_OPERATIONS` if the export chooses it) |
 | Change HF model → `blocks/` conversion | `export/convert.py::convert_for_export` |
 | Change the traced wrapper / example inputs | `export/wrapper.py` |
@@ -155,6 +156,27 @@ Tests: `test/export/test_exporter.py` (ONNX, TensorRT, graph passes), `test/bloc
 `custom_sdpa` needs ExecuTorch's `executorch.extension.llm.custom_ops` extension importable both at **export** time (`kernels/custom_sdpa.py` imports it lazily, guarded with a clear `RuntimeError` if unavailable) and at **inference** time in whatever process later loads the `.pte` — the AOT registration from the export process does not carry over to a separate process. `scripts/executorch/xnnpack/inference_exported_test.py` handles this by conditionally re-importing the extension, keyed off an `attn_impl` field in the `.cache_meta.json` sidecar written by `exporter_function_test.py`.
 
 CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,sdpa,custom_sdpa}`. Tests: `test/blocks/test_attention.py`, gated by `test/_helpers/capabilities.py::requires_custom_sdpa` (narrower than `requires_executorch`: a minimal ExecuTorch install may lack the LLM custom-ops extension).
+
+### `kv_precision` — integer KV cache
+
+`convert_options={"kv_precision": "int8" | "int4"}` (default `"full"`) stores every cached key/value row (one
+token, one KV head) as `uint8`: symmetric codes (`int8`: one byte per element; `int4`: two per byte, needs an even
+head dim) followed by two scale bytes, scale = `(1 + m/256) * 2**(e-128)`, rounded up from the row's max |x|/qmax so
+no code is clipped. The atom (`blocks/attention/kv_precision/`) sits between `MHACausal` and its KV-cache atom:
+`encode` before the write, `decode` (to float) before the kernel, so every storage atom (`mutable`, `io_scatter`,
+`io_concat`, `io_inplace`) works unchanged and the cache shape/dtype (`cache_shape`, `cache_dtype`, manifest
+`cache_dtype`/`kv_precision`) follows. A fresh zero cache decodes to ~0. Error per element: ≤ 0.4 % (int8) /
+≤ 7.2 % (int4) of the row's max |x|.
+
+- **Dequantize-first**: attention never reads integer rows natively; each step decodes the whole cache, so the
+  cache footprint shrinks but compute grows (decode cost can rise, which is what a cost model should see).
+- **Backends** (`BACKEND_OPERATIONS["kv_precision"]`): `xnnpack` and `onnx` accept `int8`/`int4`; `qnn` and
+  `tensorrt` only `"full"`. HTP's 8-bit KV is a quantiser annotation of the cache tensors, and TensorRT accepts
+  `uint8` only as network I/O and casts (the in-place cache update cannot run on it); neither is implemented.
+- Incompatible with kernels that keep their own float cache (`custom_sdpa`, `paged`/`io_paged`): rejected at
+  construction. Encode/decode trace with `torch.export` (float element-wise ops, one reduction, casts).
+- Lowering on XNNPACK/ONNX is covered by capability-gated tests (`test/export/test_kv_precision.py`), not yet
+  measured on a device.
 
 ### XNNPACK: `add_batch_dim` — experimental leading batch dimension
 

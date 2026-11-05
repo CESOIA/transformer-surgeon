@@ -26,12 +26,13 @@ class KVCache:
     requires_kernel = None
 
     def shape(self, attn, which):
-        """Shape of the ``which`` (``"key"``/``"value"``) cache of ``attn``."""
-        head_dim = attn.key_head_dim if which == "key" else attn.value_head_dim
-        return (attn.max_cache_length, attn.kv_num_heads, head_dim)
+        """Shape of the ``which`` (``"key"``/``"value"``) cache of ``attn``. The last dim is the
+        stored row width (``attn.cache_width``: the head dim, or its packed integer form)."""
+        return (attn.max_cache_length, attn.kv_num_heads, attn.cache_width(which))
 
     def write(self, attn, k, v, write_index, key_cache, value_cache):
-        """Return the caches updated with ``k``/``v`` (``(q_len, kv_heads, dim)``) at ``write_index``."""
+        """Return the caches updated with the stored rows ``k``/``v`` (``(q_len, kv_heads, width)``)
+        at ``write_index``."""
         raise NotImplementedError
 
     def read(self, cache):

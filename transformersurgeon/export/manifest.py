@@ -62,6 +62,8 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         "cache_layout": {"io_inplace": "BHSD", "io_paged": "PAGED"}.get(cache_impl, "SHD"),
         # The allocated cache buffer, not config.dtype (None for configs without one).
         "cache_dtype": str(decoder.blocks[0].attn.key_cache.dtype).replace("torch.", ""),
+        # "full", or "int8"/"int4": uint8 rows of codes + a 2-byte scale (blocks/attention/kv_precision).
+        "kv_precision": getattr(decoder.blocks[0].attn, "kv_precision", "full"),
         "max_cache_len": int(decoder.max_cache_len),
         "num_layers": len(decoder.blocks),
         "add_batch_dim": bool(getattr(wrapper, "add_batch_dim", False)),
