@@ -502,8 +502,13 @@ def _ensure_custom_sdpa_ops():
 
 
 def _ensure_quantized_decomposed_ops():
-    """Register torch.ops.quantized_decomposed (per-token int8 qparams / quantize)."""
+    """Register torch.ops.quantized_decomposed (per-token int8 qparams / quantize) and, when ExecuTorch is
+    installed, their out variants (executorch.kernels.quantized), which to_executorch() needs."""
     import torch.ao.quantization.fx._decomposed  # noqa: F401
+    try:
+        from executorch.kernels import quantized  # noqa: F401
+    except ImportError:
+        pass
 
 
 def _quantize_per_token_int8(x):
