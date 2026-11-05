@@ -316,6 +316,7 @@ def convert_for_export(model, options=None, verbose=False):
             masked_softmax = options.get('masked_softmax', False)
             rmsnorm_prescale_threshold = options.get('rmsnorm_prescale_threshold', None)
             center_keys = options.get('center_keys', False)
+            kv_cache_quant = options.get('kv_cache_quant', None)
 
             converted_indexing = _build_converted_decoder_indexing(indexing)
             converted_compression_config = _build_converted_compression_config(
@@ -344,6 +345,7 @@ def convert_for_export(model, options=None, verbose=False):
                 masked_softmax=masked_softmax,
                 rmsnorm_prescale_threshold=rmsnorm_prescale_threshold,
                 center_keys=center_keys,
+                kv_cache_quant=kv_cache_quant,
             )
 
             new_model = TransformerDecoder(config=converted_config)

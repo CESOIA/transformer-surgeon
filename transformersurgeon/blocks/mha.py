@@ -501,6 +501,19 @@ def _ensure_custom_sdpa_ops():
         ) from e
 
 
+def _ensure_quantized_decomposed_ops():
+    """Register torch.ops.quantized_decomposed (per-token int8 qparams / quantize)."""
+    import torch.ao.quantization.fx._decomposed  # noqa: F401
+
+
+def _quantize_per_token_int8(x):
+    """Asymmetric int8 over the last dim, one (scale, zero point) per leading index: for a
+    (1, seq, heads, head_dim) tensor that is per token and head. Returns (int8, fp32 scale, int8 zp)."""
+    scale, zp = torch.ops.quantized_decomposed.choose_qparams_per_token_asymmetric.default(x, torch.int8)
+    q = torch.ops.quantized_decomposed.quantize_per_token(x, scale, zp, -128, 127, torch.int8)
+    return q, scale.to(torch.float32), zp.to(torch.int8)
+
+
 class MHACausal(MHABase): # Causal MHA with caching for decoder use
     """Causal multi-head attention over a fixed-size KV cache.
 
@@ -602,6 +615,16 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         if self.center_keys and self.attn_impl not in ("manual", "sdpa"):
             raise ValueError("center_keys=True needs attn_impl 'manual' or 'sdpa'.")
 
+        # kv_cache_quant="int8": the custom_sdpa caches hold int8 values with one fp32 scale and int8 zero
+        # point per (token, kv head), and attention reads them through torch.ops.llama.custom_quantized_sdpa
+        # (q is quantized per token the same way). This is ExecuTorch's QuantizedKVCache + QuantizedSDPA
+        # (examples/models/llama/source_transformation): 1 byte per cached value instead of 4.
+        self.kv_cache_quant = kwargs.get("kv_cache_quant", None)
+        if self.kv_cache_quant not in (None, "int8"):
+            raise ValueError(f"Unsupported kv_cache_quant {self.kv_cache_quant!r}; expected None or 'int8'")
+        if self.kv_cache_quant and self.attn_impl != "custom_sdpa":
+            raise ValueError("kv_cache_quant='int8' needs attn_impl='custom_sdpa'.")
+
         if self.attn_impl == "custom_sdpa":
             if self.cache_impl != "mutable":
                 raise ValueError(
@@ -614,16 +637,25 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             # Dedicated fp32, batched (bsz=1) caches -- torch.ops.llama.custom_sdpa/
             # update_cache require rank-4 (bsz, seqlen, kv_heads, head_dim) float32
             # tensors, unlike this class's existing unbatched, model-dtype buffers.
+            cache_dtype = torch.int8 if self.kv_cache_quant else torch.float32
             self.register_buffer(
                 "custom_sdpa_key_cache",
-                torch.zeros(1, self.max_cache_length, self.kv_num_heads, self.key_head_dim, dtype=torch.float32),
+                torch.zeros(1, self.max_cache_length, self.kv_num_heads, self.key_head_dim, dtype=cache_dtype),
                 persistent=False,
             )
             self.register_buffer(
                 "custom_sdpa_value_cache",
-                torch.zeros(1, self.max_cache_length, self.kv_num_heads, self.value_head_dim, dtype=torch.float32),
+                torch.zeros(1, self.max_cache_length, self.kv_num_heads, self.value_head_dim, dtype=cache_dtype),
                 persistent=False,
             )
+            if self.kv_cache_quant:
+                _ensure_quantized_decomposed_ops()
+                qparam_shape = (1, self.max_cache_length, self.kv_num_heads, 1)
+                for which in ("key", "value"):
+                    self.register_buffer(f"custom_sdpa_{which}_scales", torch.ones(qparam_shape, dtype=torch.float32),
+                                         persistent=False)
+                    self.register_buffer(f"custom_sdpa_{which}_zero_points",
+                                         torch.zeros(qparam_shape, dtype=torch.int8), persistent=False)
 
     def cache_shape(self, which):
         """Shape of the ``which`` ("key" or "value") cache for this cache_impl.
@@ -700,12 +732,12 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
             if self.custom_sdpa_key_cache.shape[-1] != self.key_head_dim:
                 self.custom_sdpa_key_cache = torch.zeros(
                     1, self.max_cache_length, self.kv_num_heads, self.key_head_dim,
-                    dtype=torch.float32, device=self.custom_sdpa_key_cache.device,
+                    dtype=self.custom_sdpa_key_cache.dtype, device=self.custom_sdpa_key_cache.device,
                 )
             if self.custom_sdpa_value_cache.shape[-1] != self.value_head_dim:
                 self.custom_sdpa_value_cache = torch.zeros(
                     1, self.max_cache_length, self.kv_num_heads, self.value_head_dim,
-                    dtype=torch.float32, device=self.custom_sdpa_value_cache.device,
+                    dtype=self.custom_sdpa_value_cache.dtype, device=self.custom_sdpa_value_cache.device,
                 )
 
     def _write_mutable(self, k, v, write_index, key_cache, value_cache):
@@ -751,10 +783,12 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         k_b = k.unsqueeze(0).to(torch.float32)  # (1, in_seq_len, kv_num_heads, key_head_dim)
         v_b = v.unsqueeze(0).to(torch.float32)  # (1, in_seq_len, kv_num_heads, value_head_dim)
 
+        scale = self.score_scale  # original head_dim, as in attention()
+        if self.kv_cache_quant:
+            return self._forward_custom_quantized_sdpa(q_b, k_b, v_b, start_pos, scale, orig_dtype)
+
         _ = torch.ops.llama.update_cache(k_b, self.custom_sdpa_key_cache, start_pos)
         _ = torch.ops.llama.update_cache(v_b, self.custom_sdpa_value_cache, start_pos)
-
-        scale = self.score_scale  # original head_dim, as in attention()
 
         # Let the kernel derive the causal mask itself from start_pos
         # (is_causal=True, attn_mask=None) instead of handing it an explicit
@@ -788,6 +822,25 @@ class MHACausal(MHABase): # Causal MHA with caching for decoder use
         )  # (1, in_seq_len, num_heads, value_head_dim)
 
         return attn_output.squeeze(0).to(orig_dtype).transpose(0, 1)  # (num_heads, in_seq_len, value_head_dim)
+
+    def _forward_custom_quantized_sdpa(self, q_b, k_b, v_b, start_pos, scale, orig_dtype):
+        """kv_cache_quant == 'int8': quantize the new k/v rows per (token, kv head), append them with
+        their scales and zero points, and attend over the int8 cache (custom_quantized_sdpa scans
+        [0, start_pos + in_seq_len) like custom_sdpa)."""
+        q_q, q_scale, q_zp = _quantize_per_token_int8(q_b)
+        for which, x in (("key", k_b), ("value", v_b)):
+            x_q, x_scale, x_zp = _quantize_per_token_int8(x)
+            _ = torch.ops.llama.update_cache(x_q, getattr(self, f"custom_sdpa_{which}_cache"), start_pos)
+            _ = torch.ops.llama.update_cache(x_scale, getattr(self, f"custom_sdpa_{which}_scales"), start_pos)
+            _ = torch.ops.llama.update_cache(x_zp, getattr(self, f"custom_sdpa_{which}_zero_points"), start_pos)
+        attn_output = torch.ops.llama.custom_quantized_sdpa(
+            q_q, self.custom_sdpa_key_cache, self.custom_sdpa_value_cache,
+            start_pos, None, 0.0, True, scale,
+            q_zp, q_scale,
+            self.custom_sdpa_key_zero_points, self.custom_sdpa_key_scales,
+            self.custom_sdpa_value_zero_points, self.custom_sdpa_value_scales,
+        )  # (1, in_seq_len, num_heads, value_head_dim), fp32
+        return attn_output.squeeze(0).to(orig_dtype).transpose(0, 1)
 
     def _forward_paged(self, x, in_seq_len, kv_pool, paged):
         """cache_impl == 'io_paged': packed q|k|v -> fused RoPE + paged cache

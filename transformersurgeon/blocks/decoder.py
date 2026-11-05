@@ -42,6 +42,7 @@ class TransformerDecoderBlock(torch.nn.Module):
         self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
         self.rmsnorm_prescale_threshold = getattr(config, "rmsnorm_prescale_threshold", None)
         self.center_keys = getattr(config, "center_keys", False)
+        self.kv_cache_quant = getattr(config, "kv_cache_quant", None)
         self.dtype = config.dtype
 
         # Extract configuration (optional)
@@ -83,6 +84,7 @@ class TransformerDecoderBlock(torch.nn.Module):
                 attn_impl=self.attn_impl,
                 masked_softmax=self.masked_softmax,
                 center_keys=self.center_keys,
+                kv_cache_quant=self.kv_cache_quant,
                 max_cache_len=self.max_cache_len,
                 cache_impl=self.cache_impl,
                 add_batch_dim=self.add_batch_dim,

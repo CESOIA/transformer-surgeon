@@ -34,6 +34,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         masked_softmax=False,
         rmsnorm_prescale_threshold=None,
         center_keys=False,
+        kv_cache_quant=None,
         indexing=None,
         **kwargs,
     ):
@@ -65,6 +66,8 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         self.rmsnorm_prescale_threshold = rmsnorm_prescale_threshold
         # Store keys relative to the position-0 key (blocks/mha.py MHACausal).
         self.center_keys = center_keys
+        # Quantized KV cache ("int8": per token and head, blocks/mha.py MHACausal); None = model dtype.
+        self.kv_cache_quant = kv_cache_quant
         self.bias_required = bias_required or {"attn": {}, "mlp": {}}
 
         if indexing is None:
@@ -94,6 +97,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
         masked_softmax=False,
         rmsnorm_prescale_threshold=None,
         center_keys=False,
+        kv_cache_quant=None,
     ):
         """Build converted decoder config from source HF config using indexing metadata."""
 
@@ -146,6 +150,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
                 "masked_softmax",
                 "rmsnorm_prescale_threshold",
                 "center_keys",
+                "kv_cache_quant",
             }
         }
 
@@ -176,6 +181,7 @@ class CustomDecoderConfigCompress(PretrainedConfig):
             masked_softmax=masked_softmax,
             rmsnorm_prescale_threshold=rmsnorm_prescale_threshold,
             center_keys=center_keys,
+            kv_cache_quant=kv_cache_quant,
             indexing=converted_indexing,
             **passthrough_kwargs,
         )
