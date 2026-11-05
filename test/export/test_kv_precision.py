@@ -134,6 +134,70 @@ def test_onnx_export_with_an_integer_cache_has_uint8_cache_io(tmp_path, name):
     torch.testing.assert_close(torch.from_numpy(logits).reshape(expected.shape), expected, atol=1e-3, rtol=1e-3)
 
 
+def _run_onnx(session, manifest, tokens):
+    """Decode ``tokens`` one by one in ONNX Runtime, feeding back the model's own caches."""
+    import numpy as np
+
+    keys, values = zero_caches_from_manifest(manifest)
+    caches = {f"past_key_{i}": k.numpy() for i, k in enumerate(keys)}
+    caches.update({f"past_value_{i}": v.numpy() for i, v in enumerate(values)})
+    outputs = [o.name for o in session.get_outputs()]
+    steps = []
+    for t, token in enumerate(tokens):
+        feeds = {"input_ids": np.array([token], dtype=np.int64), "pos_id": np.array([t], dtype=np.int64), **caches}
+        results = dict(zip(outputs, session.run(outputs, feeds)))
+        caches = {name.replace("present_", "past_"): value for name, value in results.items() if name != "logits"}
+        steps.append(torch.from_numpy(results["logits"]).reshape(-1))
+    return torch.stack(steps), caches
+
+
+@caps.requires_onnx
+def test_chosen_kv_precision_reaches_the_exported_model(tmp_path):
+    """End to end: choose the KV precision, export, and show the exported model really uses it.
+
+    For each choice the ONNX graph's cache inputs have that precision's stored dtype and row width,
+    the manifest records it, and ONNX Runtime decoding several tokens with its own caches reproduces
+    the eager model built with the same choice. The integer choices change the result (they are not
+    ignored) and int4 moves it further from the float cache than int8.
+    """
+    import onnx
+    ort = pytest.importorskip("onnxruntime")
+    from transformersurgeon.blocks import KV_PRECISIONS
+    from transformersurgeon.export import export_to_backend
+    from transformersurgeon.export.backends import ONNXExportConfig
+
+    model = _model()
+    head_dim = model.config.hidden_size // model.config.num_attention_heads
+    tokens = [3, 17, 42, 5, 99, 7]
+    logits = {}
+    for name in ("full", "int8", "int4"):
+        cfg = ONNXExportConfig(output_path=str(tmp_path / name / "model.onnx"),
+                               convert_options={"max_cache_len": CACHE, "kv_precision": name})
+        result = export_to_backend(_model(), cfg)
+
+        manifest = json.load(open(result.manifest_path))
+        assert manifest["kv_precision"] == name
+        cache_inputs = [i for i in onnx.load(result.onnx_path, load_external_data=False).graph.input
+                        if i.name.startswith("past_")]
+        stored = onnx.TensorProto.FLOAT if name == "full" else onnx.TensorProto.UINT8
+        assert all(i.type.tensor_type.elem_type == stored for i in cache_inputs)
+        assert cache_inputs[0].type.tensor_type.shape.dim[-1].dim_value == KV_PRECISIONS[name].row_width(head_dim)
+
+        try:
+            session = ort.InferenceSession(result.onnx_path)
+        except Exception as exc:  # an onnxruntime without the opset-24 TensorScatter
+            pytest.skip(f"onnxruntime cannot load the exported model: {exc}")
+        logits[name], caches = _run_onnx(session, manifest, tokens)
+        assert {str(c.dtype) for c in caches.values()} == {"float32" if name == "full" else "uint8"}
+        eager = _greedy_logits(_wrapper(model, "io_inplace", name), tokens)
+        torch.testing.assert_close(logits[name], eager, atol=1e-3, rtol=1e-3)
+
+    def distance(name):
+        return ((logits[name] - logits["full"]).norm() / logits["full"].norm()).item()
+
+    assert 0 < distance("int8") < distance("int4") < 0.25
+
+
 # --------------------------------------------------------------------------- #
 # QNN: an 8-bit fixed-point cache chosen by the QNN quantiser (kv_cache_bits)
 # --------------------------------------------------------------------------- #
