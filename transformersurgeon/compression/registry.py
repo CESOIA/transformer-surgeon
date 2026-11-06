@@ -13,6 +13,7 @@ from .channel_pruning import (
     validate_channel_pruning_ratio,
     validate_channel_pruning_method,
     validate_bias_compensation,
+    validate_channel_group_size,
 )
 from .block_pruning import (
     BlockPruner,
@@ -109,6 +110,8 @@ COMPRESSION_REGISTRY = {
         "method": dict(default="flap", validator=validate_channel_pruning_method),
         # replace the pruned channels by their calibration mean through an added bias
         "bias_compensation": dict(default=True, validator=validate_bias_compensation),
+        # channels pruned together in consecutive groups of this size (e.g. head_dim for attention heads)
+        "group_size": dict(default=1, validator=validate_channel_group_size),
     },
     # Whole-block removal (e.g. attention heads), separate from structured
     # pruning; where blocks are and what they cascade to comes from the

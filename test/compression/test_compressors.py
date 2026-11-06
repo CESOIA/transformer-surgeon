@@ -170,3 +170,21 @@ def test_flap_hard_matches_soft_and_shrinks_the_mlp():
     assert layer.down_proj.in_features == layer.gate_proj.out_features == layer.up_proj.out_features
     assert layer.down_proj.in_features < 128
     torch.testing.assert_close(_logits(model), soft, rtol=1e-4, atol=1e-4)
+
+
+def test_flap_groups_prune_whole_heads_across_attention_and_mlp():
+    model, mgr = _model()
+    head_dim = model.config.hidden_size // model.config.num_attention_heads
+    mgr.set("channel_pruning", "ratio", 0.4, criteria=["mlp.down_proj", "self_attn.o_proj"])
+    mgr.set("channel_pruning", "group_size", head_dim, criteria="self_attn.o_proj")
+    mgr.set_calibration_data(_loader(4))
+    dense = _logits(model)
+    mgr.apply(hard=False, show_progress=False)
+    for blk in model.model.layers:
+        m = blk.self_attn.o_proj.input_mask.view(-1, head_dim)
+        assert (m.all(1) | (~m).all(1)).all()  # a head is kept or dropped as a whole
+    cost = lambda l: l.in_features * l.out_features
+    pruned = sum(int((~b.mlp.down_proj.input_mask).sum()) * b.mlp.down_proj.out_features + int((~b.self_attn.o_proj.input_mask).sum()) * b.self_attn.o_proj.out_features for b in model.model.layers)
+    total = sum(cost(b.mlp.down_proj) + cost(b.self_attn.o_proj) for b in model.model.layers)
+    assert abs(pruned / total - 0.4) < 0.05
+    assert not torch.allclose(_logits(model), dense)
