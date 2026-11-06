@@ -177,6 +177,8 @@ def test_flap_groups_prune_whole_heads_across_attention_and_mlp():
     head_dim = model.config.hidden_size // model.config.num_attention_heads
     mgr.set("channel_pruning", "ratio", 0.4, criteria=["mlp.down_proj", "self_attn.o_proj"])
     mgr.set("channel_pruning", "group_size", head_dim, criteria="self_attn.o_proj")
+    mgr.set("channel_pruning", "rank_group", "attn", criteria="self_attn.o_proj")
+    mgr.set("channel_pruning", "rank_group", "mlp", criteria="mlp.down_proj")
     mgr.set_calibration_data(_loader(4))
     dense = _logits(model)
     mgr.apply(hard=False, show_progress=False)
@@ -187,4 +189,7 @@ def test_flap_groups_prune_whole_heads_across_attention_and_mlp():
     pruned = sum(int((~b.mlp.down_proj.input_mask).sum()) * b.mlp.down_proj.out_features + int((~b.self_attn.o_proj.input_mask).sum()) * b.self_attn.o_proj.out_features for b in model.model.layers)
     total = sum(cost(b.mlp.down_proj) + cost(b.self_attn.o_proj) for b in model.model.layers)
     assert abs(pruned / total - 0.4) < 0.05
+    attn = [b.self_attn.o_proj for b in model.model.layers]
+    frac = sum(int((~l.input_mask).sum()) for l in attn) / sum(l.in_features for l in attn)
+    assert abs(frac - 0.4) < 0.15  # each pool has its own threshold for the same ratio
     assert not torch.allclose(_logits(model), dense)

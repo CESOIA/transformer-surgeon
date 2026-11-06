@@ -33,6 +33,7 @@ class ChannelPruner(Compressor):
         self.method = self.config["method"]
         self.bias_compensation = self.config["bias_compensation"]
         self.group_size = self.config.get("group_size", 1)
+        self.rank_group = self.config.get("rank_group", "all")
         self.calibration_store = None
         self.scheme = None
 
@@ -145,4 +146,9 @@ validate_channel_pruning_ratio = in_range("Channel pruning ratio", 0.0, 1.0)
 validate_bias_compensation = boolean("bias_compensation")
 validate_channel_group_size = positive_int("Channel pruning group_size")
 
-__all__ = ["ChannelPruner", "validate_channel_pruning_method", "validate_channel_pruning_ratio", "validate_bias_compensation", "validate_channel_group_size"]
+
+def validate_rank_group(value) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"rank_group must be a non-empty string, got {value!r}.")
+
+__all__ = ["ChannelPruner", "validate_channel_pruning_method", "validate_channel_pruning_ratio", "validate_bias_compensation", "validate_channel_group_size", "validate_rank_group"]

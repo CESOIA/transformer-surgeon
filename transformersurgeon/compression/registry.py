@@ -14,6 +14,7 @@ from .channel_pruning import (
     validate_channel_pruning_method,
     validate_bias_compensation,
     validate_channel_group_size,
+    validate_rank_group,
 )
 from .block_pruning import (
     BlockPruner,
@@ -112,6 +113,8 @@ COMPRESSION_REGISTRY = {
         "bias_compensation": dict(default=True, validator=validate_bias_compensation),
         # channels pruned together in consecutive groups of this size (e.g. head_dim for attention heads)
         "group_size": dict(default=1, validator=validate_channel_group_size),
+        # layers with the same label are ranked together (one threshold per label); the default pools all of them
+        "rank_group": dict(default="all", validator=validate_rank_group),
     },
     # Whole-block removal (e.g. attention heads), separate from structured
     # pruning; where blocks are and what they cascade to comes from the
