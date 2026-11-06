@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .raw_data import instantiate_raw_collector
-from .summaries import SummaryRuntime, get_summary
+from .summaries import SummaryRuntime, get_global_summary, get_summary
 from ..utils import build_progress_bar, normalize_batch
 from ..utils import get_submodule, infer_model_device, move_to_device
 
@@ -379,4 +379,24 @@ def run_compression_calibration(
     return len(calibrated_schemes)
 
 
-__all__ = ["run_compression_calibration"]
+def compute_global_summaries(schemes, requests, global_store):
+    """Compute global summaries over ``schemes`` (call after their per-scheme summaries are in place).
+
+    Args:
+        schemes: candidate schemes; a scheme takes part in a global summary when its calibration store holds
+            every per-scheme summary the global one ``requires``.
+        requests: ``{global_summary_name: options}``.
+        global_store: shared dict that receives ``global_store[name]``.
+    """
+    for name, options in requests.items():
+        summary = get_global_summary(name)
+        entries = [(scheme, scheme.calibration_data) for scheme in schemes
+                   if all(req in scheme.calibration_data for req in summary.requires)]
+        if len(entries) == 0:
+            raise RuntimeError(
+                f"Global calibration summary '{name}' found no scheme with the required summaries {summary.requires}."
+            )
+        summary.compute(entries, options, global_store)
+
+
+__all__ = ["run_compression_calibration", "compute_global_summaries"]

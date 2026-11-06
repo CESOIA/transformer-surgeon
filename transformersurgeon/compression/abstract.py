@@ -110,6 +110,17 @@ class Compressor(ABC):
         """
         pass
 
+    def needs_global_calibration(self):
+        """Return the global calibration summaries this compressor needs, as ``{name: options}``.
+
+        Global summaries (``calibration/summaries/global_base.py``) are computed once across layers after the
+        per-scheme summaries; the result is shared through ``scheme.global_calibration_data[name]``. Compressors
+        asking for the same summary must pass identical options.
+
+        Default: ``{}``.
+        """
+        return {}
+
     def needs_grouping(self):
         """Return whether this compressor requires the scheme to belong to a group.
 

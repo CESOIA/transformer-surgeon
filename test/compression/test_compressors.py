@@ -124,3 +124,49 @@ def test_static_activation_quantisation_installs_and_strips_hooks():
     _logits(model)
     mgr.prepare_for_save()
     assert not hasattr(layer, "_act_quant_hook_handle") and not hasattr(layer, "_act_quant_scale")
+
+
+def _flap_setup(ratio=0.5, bias_compensation=True):
+    model, mgr = _model()
+    mgr.set("channel_pruning", "ratio", ratio, criteria="mlp.down_proj")
+    mgr.set("channel_pruning", "bias_compensation", bias_compensation, criteria="mlp.down_proj")
+    mgr.set_calibration_data(_loader(4))
+    return model, mgr
+
+
+def test_flap_prunes_the_requested_fraction_globally_and_adds_the_baseline_bias():
+    model, mgr = _flap_setup(0.5)
+    dense = _logits(model)
+    mgr.apply(hard=False, show_progress=False)
+    layers = [blk.mlp.down_proj for blk in model.model.layers]
+    kept = sum(int(l.input_mask.sum()) for l in layers)
+    total = sum(l.in_features for l in layers)
+    assert abs(kept / total - 0.5) < 0.02
+    for l in layers:
+        assert (l.weight[:, ~l.input_mask] == 0).all()
+        assert l.bias is not None
+    assert not torch.allclose(_logits(model), dense)
+    mgr.restore()
+    assert all(blk.mlp.down_proj.bias is None for blk in model.model.layers)
+    torch.testing.assert_close(_logits(model), dense)
+
+
+def test_flap_bias_compensation_improves_over_plain_zeroing():
+    errs = {}
+    for comp in (True, False):
+        model, mgr = _flap_setup(0.5, comp)
+        dense = _logits(model)
+        mgr.apply(hard=False, show_progress=False)
+        errs[comp] = (_logits(model) - dense).pow(2).mean().item()
+    assert errs[True] <= errs[False]
+
+
+def test_flap_hard_matches_soft_and_shrinks_the_mlp():
+    model, mgr = _flap_setup(0.5)
+    mgr.apply(hard=False, show_progress=False)
+    soft = _logits(model)
+    mgr.apply(hard=True, show_progress=False)
+    layer = model.model.layers[0].mlp
+    assert layer.down_proj.in_features == layer.gate_proj.out_features == layer.up_proj.out_features
+    assert layer.down_proj.in_features < 128
+    torch.testing.assert_close(_logits(model), soft, rtol=1e-4, atol=1e-4)
