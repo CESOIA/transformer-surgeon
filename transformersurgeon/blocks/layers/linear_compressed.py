@@ -7,6 +7,18 @@ from torch.nn import functional as F
 from .low_rank import LowRankMixin
 
 
+class _BinarizeSTE(torch.autograd.Function):
+    """sign(w) forward (zeros map to +1), identity gradient backward (straight-through estimator)."""
+
+    @staticmethod
+    def forward(ctx, w):
+        return torch.where(w >= 0, torch.ones_like(w), -torch.ones_like(w))
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
 class LinearCompressed(LowRankMixin, nn.Linear):
     """Drop-in replacement of ``nn.Linear`` used by every compressible linear layer.
 
@@ -36,6 +48,9 @@ class LinearCompressed(LowRankMixin, nn.Linear):
         super().__init__(in_features=in_features, out_features=out_features, bias=bias,
                          device=device, dtype=dtype)
         self.linear_V = None
+        # Binary QAT (quantization option ``qat``): per-output-channel trainable scale, shape (out, 1).
+        # When set, ``weight`` is a latent float tensor and the layer computes ``bin_scale * sign(weight)``.
+        self.bin_scale = None
         self.init_lrd(rank)
 
     @property
@@ -56,7 +71,10 @@ class LinearCompressed(LowRankMixin, nn.Linear):
             x = x.reshape(-1, x.shape[-1])
         if isinstance(self.rank, int):
             x = self.linear_V(x)
-        y = F.linear(x, self.weight, self.bias)
+        w = self.weight
+        if getattr(self, "bin_scale", None) is not None:
+            w = _BinarizeSTE.apply(w) * self.bin_scale.to(w.dtype)
+        y = F.linear(x, w, self.bias)
         if restore_shape is not None:
             y = y.reshape(*restore_shape, y.shape[-1])
         return y

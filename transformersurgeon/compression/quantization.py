@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from .validators import boolean, one_of, positive_int, positive_number
 from .abstract import Compressor
-from .quantization_methods import METHOD_FUNCTIONS, ACT_METHOD_FUNCTIONS, activation_qrange
+from .quantization_methods import gptq_binarize, METHOD_FUNCTIONS, ACT_METHOD_FUNCTIONS, activation_qrange
 from .unstructured_pruning_methods import METHOD_FUNCTIONS as SPARSITY_FUNCTIONS
 from .unstructured_pruning import validate_unstructured_pruning_ratio
 
@@ -59,6 +59,8 @@ class Quantizer(Compressor):
         self.method_activation = self.config["method_activation"]
         self.scheme_activation = self.config["scheme_activation"]
         self.quantize_output_activation = self.config.get("quantize_output_activation", True)
+        # qat: keep the latent float weight trainable and fake-quantise in forward (binary precision only).
+        self.qat = self.config.get("qat", False)
         self.calibration_store = None
 
     def set_calibration_store(self, calibration_data):
@@ -120,6 +122,8 @@ class Quantizer(Compressor):
                     dynamic_activation=(precision_activation != "full"
                                         and method_activation == "dynamic_per_token"),
                 )
+            elif self.qat and not soft_applied:
+                self._apply_binary_qat(module, method, precision, granularity, eps)
             elif not soft_applied:
                 # Soft-path: fake-quant via dequantize.
                 for name, param in module.named_parameters():
@@ -239,6 +243,33 @@ class Quantizer(Compressor):
                 _make_fake_quant_hook("_act_out_quant", precision_activation, scheme_activation, output=True)
             )
 
+    def _apply_binary_qat(self, module, method, precision, granularity, eps):
+        """Binary QAT: leave ``weight`` as the latent float tensor and attach a trainable per-channel scale.
+
+        The scale starts from the method's own scale (``vanilla``: mean |w| per channel). The layer then computes
+        ``bin_scale * sign(weight)`` with a straight-through gradient (see ``LinearCompressed.forward``).
+        """
+        validate_qat(self.qat)
+        if precision != "binary":
+            raise NotImplementedError("qat is implemented for precision='binary' only.")
+        if granularity == "per_group":
+            raise NotImplementedError("qat does not support per_group granularity.")
+        if isinstance(getattr(module, "rank", "full"), int):
+            raise NotImplementedError("qat does not support low-rank decomposed layers.")
+        kwargs = {}
+        if method in CALIBRATED_METHOD_DICT and self.calibration_store:
+            for key in CALIBRATED_METHOD_DICT[method]:
+                if key in self.calibration_store:
+                    kwargs[key] = self.calibration_store[key]
+        if method == "gptq":  # calibrated: the latent weight is the Hessian-compensated one (sign = binary weight)
+            latent, scale = gptq_binarize(module.weight.data, kwargs.get("covariance"), eps=eps)
+            module.weight.data.copy_(latent)
+        else:
+            _, scale, _ = METHOD_FUNCTIONS[method](module.weight.data, precision, eps, "per_channel", **kwargs)
+        module.bin_scale = nn.Parameter(scale.reshape(-1, 1).to(module.weight.dtype).clone())
+        module._soft_quant_precision = precision
+        self.config["qat"] = True
+
     def _calibration_kwargs(self, method):
         kw = {}
         if method in CALIBRATED_METHOD_DICT and self.calibration_store:
@@ -248,6 +279,9 @@ class Quantizer(Compressor):
         return kw
 
     def restore(self, module):
+        self.config["qat"] = False
+        if getattr(module, "bin_scale", None) is not None:
+            module.bin_scale = None
         self.config["method"] = "vanilla"
         self.config["precision"] = "full"
         self.config["sparsity"] = 0.0
@@ -570,6 +604,7 @@ validate_quantization_granularity = one_of("Quantization granularity", VALID_GRA
 validate_quantization_group_size = positive_int("Quantization group_size")
 validate_quantization_group_scale_bits = positive_int("group_scale_bits", allow_none=True, high=8)
 validate_quantize_output_activation = boolean("quantize_output_activation")
+validate_qat = boolean("qat")
 validate_activation_scheme = one_of("Activation scheme", VALID_ACTIVATION_SCHEMES)
 
 __all__ = [
@@ -585,4 +620,5 @@ __all__ = [
     "validate_quantization_group_scale_bits",
     "validate_activation_scheme",
     "validate_quantize_output_activation",
+    "validate_qat",
 ]

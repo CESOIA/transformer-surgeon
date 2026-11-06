@@ -124,3 +124,49 @@ def test_static_activation_quantisation_installs_and_strips_hooks():
     _logits(model)
     mgr.prepare_for_save()
     assert not hasattr(layer, "_act_quant_hook_handle") and not hasattr(layer, "_act_quant_scale")
+
+
+def test_binary_qat_trains_latent_weight_and_channel_scale():
+    model, mgr = _model()
+    mgr.set("quantization", "precision", "binary", criteria="mlp.down_proj")
+    mgr.set("quantization", "granularity", "per_channel", criteria="mlp.down_proj")
+    mgr.set("quantization", "qat", True, criteria="mlp.down_proj")
+    layer = model.model.layers[0].mlp.down_proj
+    latent = layer.weight.detach().clone()
+    mgr.apply(hard=False)
+    assert layer.bin_scale.shape == (layer.out_features, 1) and layer.bin_scale.requires_grad
+    torch.testing.assert_close(layer.weight, latent)  # latent weight untouched
+    torch.testing.assert_close(layer.bin_scale.detach(), latent.abs().mean(dim=1, keepdim=True))
+    model.train()
+    model(input_ids=IDS).logits.sum().backward()
+    assert layer.weight.grad is not None and layer.weight.grad.abs().sum() > 0  # STE passes the gradient
+    assert layer.bin_scale.grad is not None and layer.bin_scale.grad.abs().sum() > 0
+    x = torch.randn(3, layer.in_features)
+    expected = x @ (layer.bin_scale.detach() * torch.where(latent >= 0, 1.0, -1.0)).T + layer.bias.detach() if layer.bias is not None else x @ (layer.bin_scale.detach() * torch.where(latent >= 0, 1.0, -1.0)).T
+    torch.testing.assert_close(layer(x), expected)
+    mgr.restore()
+    assert layer.bin_scale is None
+
+
+def test_binary_qat_requires_binary_precision():
+    model, mgr = _model()
+    mgr.set("quantization", "precision", 8, criteria="mlp.down_proj")
+    mgr.set("quantization", "qat", True, criteria="mlp.down_proj")
+    with pytest.raises(NotImplementedError):
+        mgr.apply(hard=False)
+
+
+def test_gptq_binary_qat_uses_the_covariance_summary():
+    model, mgr = _model()
+    crit = "mlp.down_proj"
+    mgr.set("quantization", "method", "gptq", criteria=crit)
+    mgr.set("quantization", "precision", "binary", criteria=crit)
+    mgr.set("quantization", "granularity", "per_channel", criteria=crit)
+    mgr.set("quantization", "qat", True, criteria=crit)
+    mgr.set_calibration_data(_loader())
+    layer = model.model.layers[0].mlp.down_proj
+    latent = layer.weight.detach().clone()
+    mgr.apply(hard=False, show_progress=False)
+    assert layer.bin_scale is not None
+    assert not torch.allclose(layer.weight, latent)  # Hessian compensation moved the latent weight
+    torch.testing.assert_close(layer.bin_scale.detach(), latent.abs().mean(dim=1, keepdim=True))

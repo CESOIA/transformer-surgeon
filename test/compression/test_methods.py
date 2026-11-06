@@ -117,3 +117,20 @@ def test_coupled_pruner_removes_and_restores_input_columns():
     assert lin.in_features == 4 and torch.equal(lin.weight, original[:, keep])
     pruner.revert(lin)
     assert lin.in_features == 6 and torch.equal(lin.weight, original)
+
+
+def test_gptq_binarize_beats_plain_binarization_on_correlated_inputs():
+    from transformersurgeon.compression.quantization_methods import gptq_binarize
+    torch.manual_seed(0)
+    X = torch.randn(2048, 64) @ torch.randn(64, 64)  # correlated inputs
+    W = torch.randn(32, 64)
+    cov = X.T @ X / X.shape[0]
+    latent, scale = gptq_binarize(W, cov)
+    plain = scale * torch.where(W >= 0, 1.0, -1.0)
+    calibrated = scale * torch.where(latent >= 0, 1.0, -1.0)
+    err = lambda Q: ((X @ (W - Q).T) ** 2).mean()
+    assert err(calibrated) < err(plain)
+    assert scale.shape == (32, 1)
+    # without covariance it is plain binarisation of the original weight
+    lat0, _ = gptq_binarize(W, None)
+    torch.testing.assert_close(lat0, W)

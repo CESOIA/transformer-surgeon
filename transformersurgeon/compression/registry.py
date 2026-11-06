@@ -36,6 +36,7 @@ from .quantization import (
     validate_quantization_granularity,
     validate_quantization_group_size,
     validate_quantize_output_activation,
+    validate_qat,
     validate_quantization_group_scale_bits,
     validate_activation_scheme,
 )
@@ -136,6 +137,8 @@ COMPRESSION_REGISTRY = {
         # False = input only: the INT8 GEMMs of TensorRT (W8A8) take int8 inputs and
         # write float outputs.
         "quantize_output_activation": dict(default=True, validator=validate_quantize_output_activation),
+        # Binary QAT: keep the latent float weight and train a per-channel scale through an STE (precision="binary").
+        "qat": dict(default=False, validator=validate_qat),
     }
 }
 

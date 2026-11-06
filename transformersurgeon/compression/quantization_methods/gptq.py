@@ -35,7 +35,10 @@ def quantize_gptq(
         signature of other quantization method functions.
     """
     if precision == "binary":
-        raise ValueError("GPTQ does not support 'binary' precision.")
+        if granularity != "per_channel":
+            raise ValueError("GPTQ binary precision needs granularity='per_channel'.")
+        latent, scale = gptq_binarize(weight, covariance, eps=eps, block_size=block_size, percdamp=percdamp)
+        return torch.where(latent >= 0, 1, -1).to(torch.int8), scale, _dequantize_symmetric
 
     W = weight.clone().float()
     out_features, in_features = W.shape
@@ -104,6 +107,53 @@ def quantize_gptq(
     return q_int, scale, _dequantize_symmetric
 
 
+def gptq_binarize(
+    weight: torch.Tensor,
+    covariance: Optional[torch.Tensor] = None,
+    *,
+    eps: float = 1e-6,
+    block_size: int = 128,
+    percdamp: float = 0.01,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """GPTQ with 1-bit weights (GPTQ-PB without the salient-weight split; Shang et al., 2023).
+
+    Each row is binarised to ``scale * sign(w)`` with ``scale = mean |w|`` of the original row; columns are
+    processed left to right and the error of every column is spread over the not-yet-binarised ones through the
+    inverse Hessian, as in :func:`quantize_gptq`.
+
+    Returns:
+        ``(latent, scale)``: ``latent`` [out, in] holds, for each column, the weight as it was just before being
+        binarised (so ``sign(latent)`` is the binary weight and its magnitude keeps the information a straight-through
+        optimiser needs); ``scale`` is [out, 1]. Without ``covariance`` the latent is the original weight.
+    """
+    W = weight.clone().float()
+    out_features, in_features = W.shape
+    scale = W.abs().mean(dim=1, keepdim=True).clamp(min=eps)
+    if covariance is None:
+        return W.to(weight.dtype), scale
+
+    H = 2.0 * covariance.float().to(W.device)
+    damp = percdamp * H.diagonal().mean()
+    H.diagonal().add_(damp)
+    H_inv = _cholesky_inv_upper(H, damp)
+
+    latent = torch.zeros_like(W)
+    for block_start in range(0, in_features, block_size):
+        block_end = min(block_start + block_size, in_features)
+        W1 = W[:, block_start:block_end].clone()
+        Err1 = torch.zeros_like(W1)
+        H1 = H_inv[block_start:block_end, block_start:block_end]
+        for j in range(block_end - block_start):
+            w = W1[:, j]
+            latent[:, block_start + j] = w
+            q = torch.where(w >= 0, 1.0, -1.0) * scale[:, 0]
+            err = (w - q) / H1[j, j]
+            Err1[:, j] = err
+            W1[:, j + 1:] -= err.unsqueeze(1) * H1[j, j + 1:].unsqueeze(0)
+        W[:, block_end:] -= Err1 @ H_inv[block_start:block_end, block_end:]
+    return latent.to(weight.dtype), scale
+
+
 def _cholesky_inv_upper(H: torch.Tensor, damp: float) -> torch.Tensor:
     """Return upper Cholesky factor of H^{-1}, with a retry on LinAlgError."""
     try:
@@ -117,4 +167,4 @@ def _cholesky_inv_upper(H: torch.Tensor, damp: float) -> torch.Tensor:
         return torch.linalg.cholesky(H_inv, upper=True)
 
 
-__all__ = ["quantize_gptq"]
+__all__ = ["quantize_gptq", "gptq_binarize"]
