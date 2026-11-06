@@ -1095,6 +1095,8 @@ def zero_caches_from_manifest(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Per-layer zero (key, value) caches with the exported shapes and dtype
     (io_paged: (kv pools, []) )."""
+    if not manifest["caches"]:  # decoder with no blocks
+        return [], []
     dtype = getattr(torch, manifest["cache_dtype"])
     if manifest.get("cache_layout") == "PAGED":
         return [torch.zeros(layer["kv"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]], []

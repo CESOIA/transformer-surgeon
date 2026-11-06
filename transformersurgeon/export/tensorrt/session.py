@@ -45,9 +45,10 @@ class TensorRTLLMSession:
         if self.max_input_len > 1 and self.decoder.engine.num_optimization_profiles > PREFILL_PROFILE:
             self.prefiller = TensorRTEngineRunner(self.decoder, profile=PREFILL_PROFILE, device=self.device)
 
-        cache_dtype = _DTYPES[self.manifest["cache_dtype"]]
         self.caches: dict[str, torch.Tensor] = {}
-        kinds = [k for k in ("key", "value", "kv") if k in self.manifest["caches"][0]]
+        caches = self.manifest["caches"]  # empty for decoders with no blocks (embedding + lm_head only)
+        cache_dtype = _DTYPES[self.manifest["cache_dtype"]] if caches else None
+        kinds = [k for k in ("key", "value", "kv") if k in caches[0]] if caches else []
         for layer in self.manifest["caches"]:
             for kind in kinds:
                 spec = layer[kind]
