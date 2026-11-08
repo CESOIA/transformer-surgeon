@@ -283,7 +283,8 @@ class CostPredictor:
     metric.
 
     ``predict(weights, kv, P, G)`` takes the per-layer weight bits ``weights[block][projection]`` (16, 8 or 4, in
-    the order of ``experiment_plan.PROJECTIONS``) and a KV label (the reference, ``"INT8"``, ``"INT4"`` or ``"FP8"``).
+    the order of ``experiment_plan.PROJECTIONS``) and a KV label (the reference, ``"INT8"``, ``"INT4"``, ``"FP8"`` or
+    ``"NVFP4"``).
     """
 
     def __init__(self, meta, structured, residuals):

@@ -22,11 +22,16 @@ class KVPrecision:
 
     - ``bits``: stored bits per element (``None``: the model dtype, unchanged).
     - ``requires_cache``: the only KV-cache atom that can hold these rows, or ``None``.
+    - ``scale_dtype``: dtype of a second stored tensor per cache holding block scales, or
+      ``None``. With one, a cache is the pair ``(rows, scales)`` wherever it is passed
+      (``encode`` returns it, ``decode`` takes it) and the graph has a ``*_scale`` input
+      and output next to each cache.
     """
 
     name = None
     bits = None
     requires_cache = None
+    scale_dtype = None
 
     def storage_dtype(self, dtype):
         """dtype of the cache buffers of a module computing in ``dtype``."""
@@ -36,12 +41,17 @@ class KVPrecision:
         """Stored width of a ``head_dim``-wide row."""
         raise NotImplementedError
 
+    def scale_width(self, head_dim):
+        """Stored width of the block scales of a ``head_dim``-wide row (only with ``scale_dtype``)."""
+        raise NotImplementedError
+
     def encode(self, x):
-        """``(..., head_dim)`` float rows -> ``(..., row_width)`` stored rows."""
+        """``(..., head_dim)`` float rows -> ``(..., row_width)`` stored rows (with ``scale_dtype``:
+        ``(rows, scales)``, the scales ``(..., scale_width)``)."""
         raise NotImplementedError
 
     def decode(self, rows, dtype):
-        """``(..., row_width)`` stored rows -> ``(..., head_dim)`` rows in ``dtype``."""
+        """``(..., row_width)`` stored rows (or ``(rows, scales)``) -> ``(..., head_dim)`` rows in ``dtype``."""
         raise NotImplementedError
 
 

@@ -36,14 +36,14 @@ Storage and update of past keys/values (blocks/attention/kv_cache). Chosen by: c
 | onnx | `io_concat` | ONNX Where on a one-hot position mask. |
 | onnx | `io_paged` | Only with a custom translation of tsurgeon::paged_attention (the tensorrt backend provides one). |
 | tensorrt | `io_inplace` (default) | TensorScatter executed in place by TensorRT (output aliased to input). |
-| tensorrt | `io_rows` | Cache as a read-only engine input; the engine returns the new rows and the runner writes them (the only cache for int8/int4/fp8 rows). |
+| tensorrt | `io_rows` | Cache as a read-only engine input; the engine returns the new rows and the runner writes them (the only cache for int8/int4/fp8/nvfp4 rows). |
 | tensorrt | `io_scatter` | TensorRT ScatterND. |
 | tensorrt | `io_concat` | TensorRT Select. |
 | tensorrt | `io_paged` | Paged KV pool of the TensorRT Edge-LLM AttentionPlugin. |
 
 ### `kv_precision`
 
-What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are uint8: symmetric codes plus one 2-byte scale per row (token, KV head); FP8 rows are float8_e4m3fn with a unit scale. Both are decoded to float before attention; the attention kernel never reads them natively. A backend entry may name the cache a precision needs there (requires_cache). Chosen by: convert option `kv_precision`.
+What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are uint8: symmetric codes plus one 2-byte scale per row (token, KV head); FP8 rows are float8_e4m3fn with a unit scale; NVFP4 rows are FP4 (E2M1) with a second tensor of FP8 block scales (one per 16 elements). All are decoded to float before attention; the attention kernel never reads them natively. A backend entry may name the cache a precision needs there (requires_cache). Chosen by: convert option `kv_precision`.
 
 | Backend | Option | Device operation |
 |---|---|---|
@@ -59,6 +59,7 @@ What one stored key/value row holds (blocks/attention/kv_precision). Integer row
 | tensorrt | `int8` | uint8 cache I/O; encode/decode are element-wise operations around the attention. |
 | tensorrt | `int4` | uint8 cache I/O with two codes per byte; encode/decode as for int8. |
 | tensorrt | `fp8` | FP8 cache I/O: a QuantizeLinear writes the rows, a DequantizeLinear reads the cache (checked on compute capability 8.9; older GPUs, e.g. Jetson Orin, may refuse FP8). With INT8 weights in the same engine it builds only on Blackwell or newer GPUs. |
+| tensorrt | `nvfp4` | NVFP4 cache I/O: FP4 rows plus an FP8 block-scale tensor per cache (unit per-tensor scale); QuantizeLinear writes both, a double DequantizeLinear reads them. Checked on compute capability 8.9, where TensorRT warns that FP4 is not accelerated (Blackwell has FP4 hardware). The scales are FP8, so the INT8-weights rule of fp8 applies. |
 
 ### `kv_cache_quantization`
 

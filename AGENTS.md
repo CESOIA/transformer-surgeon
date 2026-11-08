@@ -82,7 +82,7 @@ Two dictionaries join the folders:
 | Calibration data (token windows, WikiText-2) | `calibration/datasets.py` |
 | Change the compressible layers | `blocks/layers/` (`LinearCompressed`, `EmbeddingCompressed`, `Conv2d/3dCompressed`, `LowRankMixin`, `VCONBlock, AtomicSum, LayerScale`) |
 | Change an export atom | `blocks/attention/{kernels,kv_cache,kv_precision}/`, `blocks/norm/`, `blocks/mlp/`, `blocks/positions/`, `blocks/stacks/` |
-| Change the KV-cache precision (int8/int4/fp8 rows) | `blocks/attention/kv_precision/` + its `BACKEND_OPERATIONS["kv_precision"]` entry |
+| Change the KV-cache precision (int8/int4/fp8/nvfp4 rows) | `blocks/attention/kv_precision/` + its `BACKEND_OPERATIONS["kv_precision"]` entry |
 | Add an atom | new file in the right `blocks/` subfolder + entry in `blocks/catalog.py` (+ `BACKEND_OPERATIONS` if the export chooses it) |
 | Change HF model → `blocks/` conversion | `export/convert.py::convert_for_export` |
 | Change the traced wrapper / example inputs | `export/wrapper.py` |
@@ -123,8 +123,11 @@ print(result.onnx_path, result.manifest_path, result.engine_path)
 ```
 
 Every backend writes `<artifact stem>.manifest.json` next to its artifact (`export/manifest.py::build_llm_manifest`):
-cache implementation, layout and dtype, per-layer key/value cache shapes (they differ per layer after pruning) and
-graph I/O names. Runners use `load_llm_manifest` and `zero_caches_from_manifest` instead of re-deriving geometry.
+cache implementation, layout and dtype, per-layer key/value cache shapes (they differ per layer after pruning), dtypes
+and graph I/O names. A precision with block scales (`kv_precision="nvfp4"`) stores each cache as two tensors: the
+layer entry then also has `key_scale`/`value_scale` (`past_key_scale_i`, ...), and the cache is the pair
+`(rows, scales)` everywhere it is passed (`build_zero_caches`, `zero_caches_from_manifest`, `write_cache_rows`).
+Runners use `load_llm_manifest` and `zero_caches_from_manifest` instead of re-deriving geometry.
 
 ## Backend Details
 
@@ -133,7 +136,7 @@ graph I/O names. Runners use `load_llm_manifest` and `zero_caches_from_manifest`
 A TensorRT engine only runs on the GPU architecture + TensorRT version it was built with, so for edge targets (Jetson Orin) the artifact is the ONNX file; the engine is built on the device (`python -m transformersurgeon.export.backends.tensorrt.exporter model.manifest.json`). Needs `pip install -e ".[onnx]"` plus the `tensorrt` Python package matching the CUDA version (e.g. `tensorrt-cu13`). CLI: `scripts/tensorrt/export_and_generate.py`. Measured at parity with NVIDIA's TensorRT Edge-LLM for decode.
 
 - **Cache:** convert with `cache_impl="io_inplace"`: BHSD `(1, kv_heads, max_cache_len, head_dim)` caches as graph I/O, written by `tsurgeon::kv_cache_update` (`blocks/attention/kv_cache/io_inplace.py`) which exports as opset-24 `TensorScatter`. TensorRT aliases each `present_*` output to its `past_*` input and updates it in place — bind both to the same buffer. `mutable` is rejected (ONNX has no state).
-- **Caller-written cache (`cache_impl="io_rows"`):** same BHSD `past_*` inputs, but the graph only reads them: `present_*` are the new rows `(1, kv_heads, seq, width)` and the runner writes them at `pos_id` (`export/manifest.py::write_cache_rows`; manifest `cache_rows: true`; `TensorRTLLMSession` does it inside the decode CUDA graph). The stored cache is decoded first and the new rows are placed in the decoded copy (`kv_cache/io_rows.py`), so stored rows never pass through a scatter or select. It is the only cache that holds `int8`/`int4`/`fp8` rows on TensorRT (see `kv_precision` below); `scripts/tensorrt/export_and_generate.py --kv-precision fp8` runs it end to end.
+- **Caller-written cache (`cache_impl="io_rows"`):** same BHSD `past_*` inputs, but the graph only reads them: `present_*` are the new rows `(1, kv_heads, seq, width)` and the runner writes them at `pos_id` (`export/manifest.py::write_cache_rows`; manifest `cache_rows: true`; `TensorRTLLMSession` does it inside the decode CUDA graph). The stored cache is decoded first and the decoded new rows are placed in the decoded copy with a gather and a select on the slot index (`kv_cache/io_rows.py`), so stored rows never pass through a scatter or select (and no FP4 dequantize feeds a scatter: TensorRT 11.4 cannot compile that for one token). It is the only cache that holds `int8`/`int4`/`fp8`/`nvfp4` rows on TensorRT (see `kv_precision` below); `scripts/tensorrt/export_and_generate.py --kv-precision fp8` (or `nvfp4`) runs it end to end.
 - **Fused decode attention (`cache_impl="io_paged"`, opt-in):** one paged K+V pool per layer `(2, ceil(max_cache_len/128), 128, kv_heads, head_dim)` (`past_kv_i`/`present_kv_i`, bind both to one buffer: the plugin writes in place without declaring the alias) and one `tsurgeon::paged_attention` op per layer (RoPE + cache write + attention over the filled slots; eager implementation in `blocks/attention/kernels/paged.py`). The TensorRT backend maps it to TensorRT Edge-LLM's `AttentionPlugin` (XQA decode kernels, NVRTC-compiled at engine build): decode cost follows the context, not `max_cache_len`, unlike the static-cache MatMul/Softmax path which reads every slot. Needs `EDGELLM_PLUGIN_PATH`, equal q/k/v head dims (head_dim 32/64/128, q:kv 1–8) and unpruned RoPE (within-head pruning keeps per-kv-group frequencies: use `io_inplace`); whole-head pruning works. Decode only (`max_input_len=1`; prompts run token by token). The plain `onnx` backend rejects it (no standard ONNX form).
 - **Prefill:** `max_input_len > 1` makes `input_ids` `(seq,)` dynamic; only `io_inplace` and `io_rows` accept `in_seq_len > 1`. The engine gets two optimization profiles: 0 = decode (seq 1), 1 = prefill.
 - **Numerics:** use `rmsnorm_upcast=True` (float32 RMSNorm, HF semantics) for fp16 GPU exports; `rmsnorm_prescale=False` alone overflows in fp16.
@@ -158,7 +161,7 @@ Tests: `test/export/test_exporter.py` (ONNX, TensorRT, graph passes), `test/bloc
 
 CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,sdpa,custom_sdpa}`. Tests: `test/blocks/test_attention.py`, gated by `test/_helpers/capabilities.py::requires_custom_sdpa` (narrower than `requires_executorch`: a minimal ExecuTorch install may lack the LLM custom-ops extension).
 
-### `kv_precision` — integer and FP8 KV cache
+### `kv_precision` — integer, FP8 and NVFP4 KV cache
 
 `convert_options={"kv_precision": "int8" | "int4"}` (default `"full"`) stores every cached key/value row (one
 token, one KV head) as `uint8`: symmetric codes (`int8`: one byte per element; `int4`: two per byte, needs an even
@@ -176,10 +179,23 @@ exported as `QuantizeLinear`/`DequantizeLinear` (an ONNX `Cast` to FP8 is refuse
 `cache_impl="io_rows"` (`KVPrecision.requires_cache`): torch has no FP8 `index_copy` and TensorRT cannot move FP8
 tensors; `resolve_convert_options` picks `io_rows` when the cache is not given.
 
+`"nvfp4"` is NVFP4 as TensorRT stores it: FP4 (E2M1) values, two per byte (`float4_e2m1fn_x2`, element 2i in the
+low nibble), and a second tensor with one FP8 (E4M3) scale per 16 elements (`KVPrecision.scale_dtype`,
+`scale_width`), 4.5 bits per element; the per-tensor (second-level) scale is 1. Block scale = max|x|/6 rounded to
+E4M3 (nearest even, saturating at 448), values x/scale rounded to E2M1 (nearest even, ±6, the sign bit kept for
+-0.0); a block below 6·2⁻¹⁰ is stored as zero. Error ≤ 17/96 of the block's max |x|. Custom ops
+`tsurgeon::kv_nvfp4_quantize` (→ `(rows, scales)`) and `kv_nvfp4_dequantize` (`kv_precision/nvfp4.py`), exported
+as a `QuantizeLinear` of the scales to FLOAT8E4M3FN, a blocked `QuantizeLinear` (block 16) of the rows to
+FLOAT4E2M1, and the two `DequantizeLinear` back; eager and TensorRT store the same bytes. Each cache is the pair
+`(rows, scales)` (see the manifest above; `MHACausal.zero_cache`, `cache_scale_dtype`); the graph has
+`past_*_scale_i`/`present_*_scale_i` next to each cache, flattened rows-then-scales per layer
+(`graph_io_names(..., scales=True)`). Needs `io_rows` and a head dim that is a multiple of 16.
+
 - **Dequantize-first**: attention never reads integer rows natively; each step decodes the whole cache, so the
   cache footprint shrinks but compute grows (decode cost can rise, which is what a cost model should see).
-- **Backends** (`BACKEND_OPERATIONS["kv_precision"]`): `xnnpack` accepts `int8`/`int4`; `onnx` and `tensorrt`
-  accept `int8`/`int4`/`fp8`; `qnn` only `"full"`. A backend entry's `requires_cache` names the cache a precision
+- **Backends** (`BACKEND_OPERATIONS["kv_precision"]`): `xnnpack` accepts `int8`/`int4`; `onnx` accepts
+  `int8`/`int4`/`fp8`; `tensorrt` accepts `int8`/`int4`/`fp8`/`nvfp4` (the NVFP4 graph is valid ONNX, but ONNX
+  Runtime 1.31 has no FLOAT4E2M1 `DequantizeLinear`); `qnn` only `"full"`. A backend entry's `requires_cache` names the cache a precision
   needs there (`operations.py::required_cache`; checked by `resolve_convert_options` and `check_components`). The
   ONNX exports (uint8 cache I/O with TensorScatter, FP8 cache I/O with `io_rows`) run in ONNX Runtime and match the
   eager wrapper (tested with onnxruntime 1.31; FP8 tensors go in as `OrtValue`s with their ONNX type).
@@ -190,26 +206,29 @@ tensors; `resolve_convert_options` picks `io_rows` when the cache is not given.
   `float_attention_core=False` (the cache is a fixed-point activation only then). HTP has no 4-bit activations, so
   no int4 cache. Written without the QNN SDK: only `test_qnn_kv_cache_bits_8_quantises_the_cache_writes_to_8_bits`
   (`requires_qnn`) exercises the lowering.
-- **TensorRT holds int8/int4/fp8 rows only with `io_rows`** (`requires_cache`; checked with TensorRT 11.4 on an
+- **TensorRT holds int8/int4/fp8/nvfp4 rows only with `io_rows`** (`requires_cache`; checked with TensorRT 11.4 on an
   RTX 4070, compute capability 8.9). The KV-cache update behind `io_inplace` takes only a Float/Half/BFloat16 cache
   ("cache has type FP8 but must have type Float, Half, or BFloat16"); `uint8` is refused inside the network ("does
   not support UINT8 types for intermediate tensors"); FP8 tensors may only be produced by a quantize layer and read
-  by a dequantize layer (not by ScatterND/Where/Cast). With `io_rows` the stored types appear only at the engine
-  boundary: TensorRT decodes the cache in one fused kernel before the attention, and `TensorRTLLMSession` writes
-  the returned rows. Prefill + CUDA-graph decode match eager for all four precisions
-  (`test_tensorrt_engine_holds_every_precision_in_a_rows_cache`). An engine that also has INT8 weights
-  (DequantizeLinear INT8) builds only on Blackwell or newer GPUs ("INT8 and FP8 mixed precision is allowed only
-  when building network with kSTRONGLY_TYPED mode on Blackwell+ platforms"); FP16 and INT4 weights build with FP8
-  on 8.9. FP8 on older GPUs (Jetson Orin, 8.7) is untested. FP4 storage also builds in TensorRT 11.4, but a usable FP4 cache needs per-block scales (NVFP4) in a
-  second tensor per cache, which the one-tensor-per-cache contract does not have yet. The Edge-LLM
-  `AttentionPlugin` (`io_paged`) has its own FP8 cache (`enable_fp8_kv_cache`), not wired (no plugin to test).
+  by a dequantize layer (not by ScatterND/Where/Cast), FP4 likewise. With `io_rows` the stored types appear only
+  at the engine boundary: TensorRT decodes the cache in one fused kernel before the attention, and
+  `TensorRTLLMSession` writes the returned rows (FP4 rows and FP8 scales as bytes). Prefill + CUDA-graph decode
+  match eager for all five precisions (`test_tensorrt_engine_holds_every_precision_in_a_rows_cache`). NVFP4 builds
+  on 8.9 with a warning that FP4 is not accelerated there (Blackwell has FP4 hardware); its block quantize is plain
+  ONNX (`TRT_FP4DynamicQuantize` accepts only 2-D/3-D inputs). An engine that also has INT8 weights
+  (DequantizeLinear INT8) and an FP8 or NVFP4 cache builds only on Blackwell or newer GPUs ("INT8 and FP8 mixed
+  precision is allowed only when building network with kSTRONGLY_TYPED mode on Blackwell+ platforms"; NVFP4's
+  scales are FP8); FP16 and INT4 weights build with them on 8.9. FP8/FP4 on older GPUs (Jetson Orin, 8.7) is
+  untested. The Edge-LLM `AttentionPlugin` (`io_paged`) has its own FP8 cache (`enable_fp8_kv_cache`), not wired
+  (no plugin to test).
 - **Accuracy is model-dependent** (Qwen2-0.5B-Instruct, fp16, teacher-forced logits vs the fp16 cache): `int8`
-  ~8 %, `fp8` ~14 %, `int4` ~50 % (greedy text breaks). Qwen2's large key outliers and attention logits amplify
-  the error: with an `fp8` cache, switching eager's attention kernel alone moves the logits by ~19 % (0.3 % with
-  fp16), so compare engines with eager by stored bytes (layer 0: only rounding-boundary flips), not by logits.
+  ~8 %, `fp8` ~14 %, `nvfp4` ~31 % (greedy text differs from the first token but stays fluent), `int4` ~50 %
+  (greedy text breaks). Qwen2's large key outliers and attention logits amplify the error: with an `fp8` (`nvfp4`)
+  cache, switching eager's attention kernel alone moves the logits by ~19 % (~10 %; 0.3 % with fp16), so compare
+  engines with eager by stored bytes (layer 0: only rounding-boundary flips), not by logits.
 - Incompatible with kernels that keep their own float cache (`custom_sdpa`, `paged`/`io_paged`): rejected at
-  construction. Encode/decode trace with `torch.export` (float element-wise ops, one reduction, casts; FP8 through
-  its two custom ops).
+  construction. Encode/decode trace with `torch.export` (float element-wise ops, one reduction, casts; FP8 and
+  NVFP4 through their custom ops).
 - XNNPACK lowering is covered only by capability-gated tests (`test/export/test_kv_precision.py`); nothing has been
   measured on a device yet.
 

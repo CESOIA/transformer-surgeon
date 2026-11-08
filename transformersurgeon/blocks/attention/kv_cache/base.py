@@ -26,8 +26,9 @@ class KVCache:
     requires_kernel = None
 
     def shape(self, attn, which):
-        """Shape of the ``which`` (``"key"``/``"value"``) cache of ``attn``. The last dim is the
-        stored row width (``attn.cache_width``: the head dim, or its packed integer form)."""
+        """Shape of the ``which`` (``"key"``/``"value"``, or their block scales ``"key_scale"``/
+        ``"value_scale"``) cache of ``attn``. The last dim is the stored row width
+        (``attn.cache_width``: the head dim, or its packed form)."""
         return (attn.max_cache_length, attn.kv_num_heads, attn.cache_width(which))
 
     def write(self, attn, k, v, write_index, key_cache, value_cache):

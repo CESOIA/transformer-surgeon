@@ -3,11 +3,13 @@ Greedy generation with a TensorRT engine built from a tsurgeon ONNX export.
 
 TensorRTLLMSession drives the graph contract recorded in the export manifest:
 
-  * KV caches are allocated once (key/value per layer, or one paged K+V pool
-    per layer for cache_impl="io_paged"); with ``cache_inplace`` each present_*
-    output is bound to its past_* input buffer (TensorRT updates it in place);
-    with ``cache_rows`` (cache_impl="io_rows") the engine only reads the caches and
-    the session writes the returned rows at the step's position (in the CUDA graph).
+  * KV caches are allocated once (key/value per layer, with their block scales
+    for kv_precision="nvfp4", or one paged K+V pool per layer for
+    cache_impl="io_paged"), each with the dtype its manifest entry records; with
+    ``cache_inplace`` each present_* output is bound to its past_* input buffer
+    (TensorRT updates it in place); with ``cache_rows`` (cache_impl="io_rows") the
+    engine only reads the caches and the session writes the returned rows at the
+    step's position (in the CUDA graph).
   * prefill() feeds the prompt through the prefill profile in chunks of up to
     max_input_len tokens (or token by token for a decode-only export).
   * decode steps replay one CUDA graph that runs the engine, takes the greedy
@@ -21,13 +23,15 @@ from typing import Iterable
 
 import torch
 
+from ....utils.devices import device_zeros
 from ...manifest import write_cache_rows
 from .edgellm_int4 import resolve_plugin_libraries
 from .engine import TensorRTEngineRunner
 from .exporter import DECODE_PROFILE, PREFILL_PROFILE
 
-_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32,
-           "uint8": torch.uint8, "float8_e4m3fn": torch.float8_e4m3fn}
+# Cache dtypes by manifest name (float4_e2m1fn_x2 only exists in recent PyTorch).
+_DTYPES = {name: getattr(torch, name) for name in
+           ("float16", "bfloat16", "float32", "uint8", "float8_e4m3fn", "float4_e2m1fn_x2") if hasattr(torch, name)}
 
 
 class TensorRTLLMSession:
@@ -49,14 +53,14 @@ class TensorRTLLMSession:
         if self.max_input_len > 1 and self.decoder.engine.num_optimization_profiles > PREFILL_PROFILE:
             self.prefiller = TensorRTEngineRunner(self.decoder, profile=PREFILL_PROFILE, device=self.device)
 
-        cache_dtype = _DTYPES[self.manifest["cache_dtype"]]
         self.cache_rows = bool(self.manifest.get("cache_rows"))
         self.caches: dict[str, torch.Tensor] = {}
-        kinds = [k for k in ("key", "value", "kv") if k in self.manifest["caches"][0]]
+        kinds = [k for k in ("key", "key_scale", "value", "value_scale", "kv") if k in self.manifest["caches"][0]]
         for layer in self.manifest["caches"]:
             for kind in kinds:
                 spec = layer[kind]
-                buf = torch.zeros(spec["shape"], dtype=cache_dtype, device=self.device)
+                cache_dtype = _DTYPES[spec.get("dtype", self.manifest["cache_dtype"])]
+                buf = device_zeros(spec["shape"], cache_dtype, self.device)
                 self.caches[spec["input"]] = buf
                 # In place: the output *is* the input buffer. Rows: room for the rows of
                 # the longest call. Otherwise the engine writes a fresh tensor that is

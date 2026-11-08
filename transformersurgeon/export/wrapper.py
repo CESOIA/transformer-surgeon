@@ -20,16 +20,15 @@ def build_zero_caches(decoder: nn.Module) -> tuple[list[torch.Tensor], list[torc
     """Zero KV caches (one per block) for a decoder whose cache is a graph input/output.
 
     Shapes come from each block's attention module, so per-layer geometry after
-    pruning is respected. Returns ``([], [])`` for an internal cache; for pages,
-    one pool per block in the first list and an empty second list.
+    pruning is respected. A cache is a ``(rows, scales)`` pair for a precision with
+    block scales (``kv_precision="nvfp4"``). Returns ``([], [])`` for an internal
+    cache; for pages, one pool per block in the first list and an empty second list.
     """
     if not _graph_io_cache(decoder):
         return [], []
     if decoder.cache_impl == "io_paged":
         return [torch.zeros(b.attn.cache_shape("kv"), dtype=b.attn.dtype) for b in decoder.blocks], []
-    key_caches = [torch.zeros(b.attn.cache_shape("key"), dtype=b.attn.cache_dtype) for b in decoder.blocks]
-    value_caches = [torch.zeros(b.attn.cache_shape("value"), dtype=b.attn.cache_dtype) for b in decoder.blocks]
-    return key_caches, value_caches
+    return [b.attn.zero_cache("key") for b in decoder.blocks], [b.attn.zero_cache("value") for b in decoder.blocks]
 
 
 class LLMWrapper(nn.Module):

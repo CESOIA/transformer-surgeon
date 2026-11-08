@@ -56,7 +56,7 @@ BACKEND_OPERATIONS = {
             "tensorrt": {"default": "io_inplace", "options": {
                 "io_inplace": "TensorScatter executed in place by TensorRT (output aliased to input).",
                 "io_rows": "Cache as a read-only engine input; the engine returns the new rows and the runner "
-                           "writes them (the only cache for int8/int4/fp8 rows).",
+                           "writes them (the only cache for int8/int4/fp8/nvfp4 rows).",
                 "io_scatter": "TensorRT ScatterND.",
                 "io_concat": "TensorRT Select.",
                 "io_paged": "Paged KV pool of the TensorRT Edge-LLM AttentionPlugin.",
@@ -66,7 +66,8 @@ BACKEND_OPERATIONS = {
     "kv_precision": {
         "description": "What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are "
                        "uint8: symmetric codes plus one 2-byte scale per row (token, KV head); FP8 rows are "
-                       "float8_e4m3fn with a unit scale. Both are decoded to float before attention; the attention "
+                       "float8_e4m3fn with a unit scale; NVFP4 rows are FP4 (E2M1) with a second tensor of FP8 "
+                       "block scales (one per 16 elements). All are decoded to float before attention; the attention "
                        "kernel never reads them natively. A backend entry may name the cache a precision needs "
                        "there (requires_cache).",
         "convert_option": "kv_precision",
@@ -86,6 +87,8 @@ BACKEND_OPERATIONS = {
                 "int4": "uint8 cache I/O with two codes per byte; encode/decode are standard ONNX operations.",
                 "fp8": "float8e4m3fn cache I/O written by QuantizeLinear and read by DequantizeLinear (unit "
                        "scale); needs cache_impl='io_rows'.",
+                # nvfp4 exports to valid ONNX (see the tensorrt entry) but ONNX Runtime 1.31 has no FLOAT4E2M1
+                # DequantizeLinear, so it is offered on tensorrt only.
             }},
             # Checked with TensorRT 11.4: the KV-cache update layer (io_inplace) takes only a Float/Half/BFloat16
             # cache; uint8 tensors are refused inside the network ("does not support UINT8 types for intermediate
@@ -99,7 +102,11 @@ BACKEND_OPERATIONS = {
                 "fp8": "FP8 cache I/O: a QuantizeLinear writes the rows, a DequantizeLinear reads the cache "
                        "(checked on compute capability 8.9; older GPUs, e.g. Jetson Orin, may refuse FP8). With "
                        "INT8 weights in the same engine it builds only on Blackwell or newer GPUs.",
-            }, "requires_cache": {"int8": "io_rows", "int4": "io_rows", "fp8": "io_rows"}},
+                "nvfp4": "NVFP4 cache I/O: FP4 rows plus an FP8 block-scale tensor per cache (unit per-tensor "
+                         "scale); QuantizeLinear writes both, a double DequantizeLinear reads them. Checked on compute "
+                         "capability 8.9, where TensorRT warns that FP4 is not accelerated (Blackwell has FP4 "
+                         "hardware). The scales are FP8, so the INT8-weights rule of fp8 applies.",
+            }, "requires_cache": {"int8": "io_rows", "int4": "io_rows", "fp8": "io_rows", "nvfp4": "io_rows"}},
         },
     },
     "kv_cache_quantization": {

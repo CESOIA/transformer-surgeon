@@ -20,6 +20,7 @@
 | `kv_precision` | `int8` | `kv_precision` | export | `blocks.attention.kv_precision.int8.Int8Precision` | uint8 rows: 8-bit symmetric codes plus one 2-byte scale per row; decoded before attention. |
 | `kv_precision` | `int4` | `kv_precision` | export | `blocks.attention.kv_precision.int4.Int4Precision` | uint8 rows: 4-bit symmetric codes, two per byte, plus one 2-byte scale per row; decoded before attention. |
 | `kv_precision` | `fp8` | `kv_precision` | export | `blocks.attention.kv_precision.fp8.FP8Precision` | float8_e4m3fn rows (unit scale, saturating at +-448); decoded before attention; needs io_rows. |
+| `kv_precision` | `nvfp4` | `kv_precision` | export | `blocks.attention.kv_precision.nvfp4.NVFP4Precision` | NVFP4 rows: float4_e2m1fn_x2 codes plus a second float8_e4m3fn tensor of block scales (one per 16 elements, unit per-tensor scale); decoded before attention; needs io_rows. |
 | `mlp` | `mlp` | `mlp` | model | `blocks.mlp.plain.MLP` | down(act(up(x))). |
 | `mlp` | `mlp_gated` | `mlp_gated` | model | `blocks.mlp.gated.MLPGated` | down(act(gate(x)) * up(x)). |
 | `norm` | `rmsnorm` | `rmsnorm` | export | `blocks.norm.rmsnorm.RMSNorm` | Plain RMS normalisation; fusable into one operation by backend compilers. |

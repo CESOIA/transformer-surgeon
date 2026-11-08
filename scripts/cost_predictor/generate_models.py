@@ -18,21 +18,22 @@ largest P instead). Artifacts: ``<exp>/models/<config>/<backend>/P<P>/``.
 
 KV-cache precision. b_KV is baked into each artifact, so every (weights, b_KV) pair is its own artifact. It is
 either the graph's ``convert_options["kv_precision"]`` (``"int8"``/``"int4"``: uint8 cache rows of codes plus one
-scale per row; ``"fp8"``: float8_e4m3fn rows; ``blocks/attention/kv_precision``) or, on QNN,
+scale per row; ``"fp8"``: float8_e4m3fn rows; ``"nvfp4"``: FP4 rows plus a second tensor of FP8 block scales, see
+the manifest's ``*_scale`` cache entries; ``blocks/attention/kv_precision``) or, on QNN,
 ``QNNExportConfig.kv_cache_bits=8`` (the QNN quantiser keeps the cache as an 8-bit fixed-point activation; QNN
 exports use quant_scope="all", whose reference cache is 16-bit, label INT16). ``BACKEND_OPERATIONS`` says what each
 backend supports; by default the KV alternatives are exactly those, and ``--kv-alts`` naming a precision the backend
 cannot export is an error.
 
-Cache implementation. Some precisions need a particular cache on a backend (``operations.required_cache``): FP8
-everywhere, and every quantised cache on TensorRT, need ``cache_impl="io_rows"`` (the graph returns the new rows and
+Cache implementation. Some precisions need a particular cache on a backend (``operations.required_cache``): FP8 and
+NVFP4 everywhere, and every quantised cache on TensorRT, need ``cache_impl="io_rows"`` (the graph returns the new rows and
 the runner writes them, see the manifest's ``cache_rows``). When a requested alternative needs one, every artifact
 of the run uses it, the reference included, so DeltaT_KV compares precisions on the same cache mechanism.
 
-FP8 on TensorRT. TensorRT builds an engine that mixes INT8 weights with an FP8 KV cache only on Blackwell or newer
-GPUs (compute capability >= 10.0); FP16/INT4 weights with FP8 build on 8.9 too. The reference weights are INT8, so
-on an older target the FP8 artifacts of E2 (and of every E4/E5 configuration with an INT8 layer) fail to build:
-there, pass ``--kv-alts INT8 INT4``.
+FP8 and NVFP4 on TensorRT. TensorRT builds an engine that mixes INT8 weights with an FP8 KV cache, or with NVFP4
+(whose block scales are FP8), only on Blackwell or newer GPUs (compute capability >= 10.0); FP16/INT4 weights with
+them build on 8.9 too. The reference weights are INT8, so on an older target the FP8/NVFP4 artifacts of E2 (and of
+every E4/E5 configuration with an INT8 layer) fail to build: there, pass ``--kv-alts INT8 INT4``.
 """
 
 import argparse
@@ -81,7 +82,7 @@ PROFILES = {
 }
 
 
-KV_OPTIONS = {"INT8": "int8", "INT4": "int4", "FP8": "fp8"}   # b_KV label -> convert_options["kv_precision"]
+KV_OPTIONS = {"INT8": "int8", "INT4": "int4", "FP8": "fp8", "NVFP4": "nvfp4"}   # b_KV label -> kv_precision
 KV_QUANTISER_BITS = {"INT8": 8}                  # b_KV label -> bits of a cache the backend's quantiser keeps
 
 
@@ -176,11 +177,14 @@ def compress(model, manager_cls, weights, profile: Profile):
 
 
 def fp8_engine_note(args):
-    """Warning for TensorRT runs with FP8 KV: engines mixing INT8 weights and FP8 build only on Blackwell+."""
-    if args.backend != "tensorrt" or "FP8" not in args.kv_alts:
+    """Warning for TensorRT runs with FP8 or NVFP4 KV: engines mixing INT8 weights and FP8 build only on
+    Blackwell+."""
+    fp8 = [label for label in ("FP8", "NVFP4") if label in args.kv_alts]
+    if args.backend != "tensorrt" or not fp8:
         return None
-    note = ("note: FP8 KV with INT8 weight layers (E2 and most FP8 configurations of E4/E5) builds a TensorRT engine "
-            "only on Blackwell or newer GPUs (compute capability >= 10.0); on older targets use --kv-alts INT8 INT4")
+    note = (f"note: {'/'.join(fp8)} KV with INT8 weight layers (E2 and most such configurations of E4/E5) builds a "
+            "TensorRT engine only on Blackwell or newer GPUs (compute capability >= 10.0); on older targets use "
+            "--kv-alts INT8 INT4")
     if args.build_engine and torch.cuda.is_available() and torch.cuda.get_device_capability() < (10, 0):
         major, minor = torch.cuda.get_device_capability()
         note += f". The local GPU (sm_{major}{minor}) cannot build them."

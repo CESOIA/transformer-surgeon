@@ -16,6 +16,9 @@ Graph contract (names are fixed; shapes/dtypes are recorded in the manifest):
   outputs  logits      (vocab,)            for the last input token
            present_key_i / present_value_i updated caches
 
+With ``kv_precision="nvfp4"`` every cache has a second tensor of block scales,
+past_key_scale_i / past_value_scale_i in and present_*_scale_i out.
+
 With ``cache_impl="io_inplace"`` the cache write is an opset-24 TensorScatter:
 consumers should bind each present_* to the same buffer as its past_* (TensorRT
 requires it -- it aliases them and updates in place).
@@ -23,7 +26,11 @@ requires it -- it aliases them and updates in place).
 With ``cache_impl="io_rows"`` the graph only reads past_*: present_* hold the new
 rows, ``(1, kv_heads, seq, width)``, which the consumer writes into its cache at
 pos_id (``export.manifest.write_cache_rows``). FP8 rows (``kv_precision="fp8"``)
-are QuantizeLinear/DequantizeLinear with a unit scale.
+are QuantizeLinear/DequantizeLinear with a unit scale; NVFP4 rows
+(``kv_precision="nvfp4"``) are FLOAT4E2M1 with FLOAT8E4M3FN block scales, written by
+a QuantizeLinear of the scales and a blocked QuantizeLinear of the rows and read by
+the two DequantizeLinear (ONNX Runtime 1.31 has no FLOAT4E2M1 DequantizeLinear;
+TensorRT runs them).
 
 With ``cache_impl="io_paged"`` each layer has one paged K+V pool instead
 (past_kv_i / present_kv_i, also updated in place) and attention is the fused
@@ -40,7 +47,7 @@ import torch
 
 from ...config import BackendExportConfig
 from ...exporter import Exporter, register_exporter
-from ...manifest import build_llm_manifest, graph_io_names
+from ...manifest import build_llm_manifest, cache_scales, graph_io_names
 from ...quant_info import extract_layer_quant_info
 from ...result import BackendExportResult, finalize_export_result
 from ...wrapper import resolve_components_and_wrapper
@@ -68,14 +75,46 @@ def _fp8_dequantize(rows):
     return op.DequantizeLinear(rows, op.Constant(value=ir.tensor(1.0)))
 
 
+def _nvfp4_quantize(x):
+    from onnxscript import ir, values
+
+    from ....blocks.attention.kv_precision.nvfp4 import E2M1_MAX, NVFP4_BLOCK
+
+    op = values.Opset("", 24)
+    one = op.Constant(value=ir.tensor(1.0))   # the per-tensor scale
+    x = op.Cast(x, to=ir.DataType.FLOAT)
+    blocked = op.Concat(op.Shape(x, end=-1), op.Constant(value=ir.tensor([-1, NVFP4_BLOCK], dtype=ir.DataType.INT64)),
+                        axis=0)
+    amax = op.ReduceMax(op.Abs(op.Reshape(x, blocked)), op.Constant(value=ir.tensor([-1], dtype=ir.DataType.INT64)),
+                        keepdims=0)
+    scales = op.QuantizeLinear(op.Div(amax, op.Constant(value=ir.tensor(E2M1_MAX))), one,
+                               output_dtype=ir.DataType.FLOAT8E4M3FN)
+    step = op.DequantizeLinear(scales, one)
+    step = op.Where(op.Greater(step, op.Constant(value=ir.tensor(0.0))), step, one)   # all-zero block
+    rows = op.QuantizeLinear(x, step, axis=-1, block_size=NVFP4_BLOCK, output_dtype=ir.DataType.FLOAT4E2M1)
+    return rows, scales
+
+
+def _nvfp4_dequantize(rows, scales):
+    from onnxscript import ir, values
+
+    from ....blocks.attention.kv_precision.nvfp4 import NVFP4_BLOCK
+
+    op = values.Opset("", 24)
+    step = op.DequantizeLinear(scales, op.Constant(value=ir.tensor(1.0)))
+    return op.DequantizeLinear(rows, step, axis=-1, block_size=NVFP4_BLOCK)
+
+
 def default_translations() -> dict[Any, Callable]:
     """ATen/custom-op -> onnxscript translations every ONNX export needs."""
     from ....blocks.attention.kv_cache import io_inplace  # noqa: F401  (registers torch.ops.tsurgeon.kv_cache_update)
-    from ....blocks.attention.kv_precision import fp8  # noqa: F401  (registers torch.ops.tsurgeon.kv_fp8_*)
+    from ....blocks.attention.kv_precision import fp8, nvfp4  # noqa: F401  (registers kv_fp8_* and kv_nvfp4_*)
 
     return {torch.ops.tsurgeon.kv_cache_update.default: _tensor_scatter,
             torch.ops.tsurgeon.kv_fp8_quantize.default: _fp8_quantize,
-            torch.ops.tsurgeon.kv_fp8_dequantize.default: _fp8_dequantize}
+            torch.ops.tsurgeon.kv_fp8_dequantize.default: _fp8_dequantize,
+            torch.ops.tsurgeon.kv_nvfp4_quantize.default: _nvfp4_quantize,
+            torch.ops.tsurgeon.kv_nvfp4_dequantize.default: _nvfp4_dequantize}
 
 
 @dataclass
@@ -149,14 +188,19 @@ def export_onnx(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
     layer_info = extract_layer_quant_info(wrapper)
 
     num_layers = len(wrapper.decoder.blocks)
-    input_names, output_names = io_names(num_layers, paged=cache_impl == "io_paged")
+    input_names, output_names = io_names(num_layers, paged=cache_impl == "io_paged",
+                                         scales=cache_scales(wrapper.decoder))
     dynamic_shapes = None
     if config.max_input_len > 1:
         # torch.export specializes size-1 dims, so trace with a 2-token prompt.
         vocab = int(getattr(model_config, "vocab_size", 100) or 100)
-        example_inputs = (torch.randint(0, vocab, (2,), dtype=torch.long), *example_inputs[1:])
+        # The caches are static. torch.onnx turns the tuples of dynamic_shapes into lists, so
+        # (rows, scales) cache pairs are traced as lists.
+        keys, values = ([list(c) if isinstance(c, tuple) else c for c in caches] for caches in example_inputs[2:])
+        example_inputs = (torch.randint(0, vocab, (2,), dtype=torch.long), example_inputs[1], keys, values)
         seq = torch.export.Dim("seq", min=1, max=config.max_input_len)
-        dynamic_shapes = ({0: seq}, None, [None] * num_layers, [None] * num_layers)
+        static = [None if isinstance(c, torch.Tensor) else [None] * len(c) for c in keys]
+        dynamic_shapes = ({0: seq}, None, static, static)
 
     with torch.no_grad():
         logits_dtype = wrapper(*example_inputs)[0].dtype

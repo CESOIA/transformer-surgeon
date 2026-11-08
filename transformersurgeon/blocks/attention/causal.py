@@ -2,6 +2,7 @@
 
 import torch
 
+from ...utils.devices import device_zeros
 from .base import MHABase
 from .kv_cache import KV_CACHES
 from .kv_precision import KV_PRECISIONS
@@ -14,7 +15,8 @@ class MHACausal(MHABase):
       stored (internal state, scatter, one-hot select, in-place operator, pages);
     - a KV-precision atom (``kv_precision``, see ``kv_precision/``): what one
       stored row holds (the model dtype, int8/int4 codes with one scale per
-      row, or FP8 numbers); the kernel always reads decoded float rows;
+      row, FP8 numbers, or NVFP4 numbers with a second tensor of block scales);
+      the kernel always reads decoded float rows;
     - an attention kernel (``attn_impl``, see ``kernels/``): how attention is
       computed (explicit, PyTorch SDPA, ExecuTorch fused kernel, paged kernel).
 
@@ -24,11 +26,12 @@ class MHACausal(MHABase):
     instead of adding a large negative penalty; ``manual`` kernel only),
     ``kv_precision`` (default ``"full"``; the others need a kernel that reads the
     cache through the KV-cache atom, not ``custom_sdpa``/``paged``, and ``"fp8"``
-    needs ``cache_impl="io_rows"``).
+    and ``"nvfp4"`` need ``cache_impl="io_rows"``).
 
     ``forward`` returns ``output`` when the cache is internal state, otherwise
     ``(output, key_cache, value_cache)`` (``(output, kv_pool, None)`` for pages; the
-    new rows only for ``io_rows``).
+    new rows only for ``io_rows``). With ``kv_precision="nvfp4"`` each key/value
+    cache, in and out, is the pair ``(rows, scales)``.
     """
 
     # Role read by exporters that treat whole atoms specially (e.g. the QNN
@@ -76,36 +79,70 @@ class MHACausal(MHABase):
         # weights are loaded. The paged pool lives outside the module.
         empty = (0,) if cache_impl == "io_paged" else None
         storage = self.kv_codec.storage_dtype(dtype)
-        self.register_buffer("key_cache", torch.zeros(empty or self.cache_shape("key"), dtype=storage),
+        self.register_buffer("key_cache", device_zeros(empty or self.cache_shape("key"), storage), persistent=False)
+        self.register_buffer("value_cache", device_zeros(empty or self.cache_shape("value"), storage),
                              persistent=False)
-        self.register_buffer("value_cache", torch.zeros(empty or self.cache_shape("value"), dtype=storage),
-                             persistent=False)
+        if self.cache_scale_dtype is not None:
+            for which in ("key", "value"):
+                self.register_buffer(f"{which}_cache_scale", device_zeros(self.cache_shape(f"{which}_scale"),
+                                                                          self.cache_scale_dtype),
+                                     persistent=False)
         self.kernel.setup(self)
 
     def _default_attn_impl(self):
         return "paged" if self.cache_impl == "io_paged" else super()._default_attn_impl()
 
     def cache_shape(self, which):
-        """Shape of the ``which`` (``"key"``, ``"value"``; ``"kv"`` for pages) cache."""
+        """Shape of the ``which`` (``"key"``, ``"value"``, their block scales ``"key_scale"``,
+        ``"value_scale"``; ``"kv"`` for pages) cache."""
         return self.kv_cache.shape(self, which)
 
     def cache_width(self, which):
-        """Stored width of one ``which`` (``"key"``/``"value"``) row: the per-head dim, or its
-        packed form for an integer ``kv_precision``."""
-        head_dim = self.key_head_dim if which == "key" else self.value_head_dim
+        """Stored width of one ``which`` row: for ``"key"``/``"value"`` the per-head dim, or its
+        packed form for a quantised ``kv_precision``; for ``"key_scale"``/``"value_scale"`` the
+        number of block scales."""
+        head_dim = self.key_head_dim if which.startswith("key") else self.value_head_dim
+        if which.endswith("_scale"):
+            return self.kv_codec.scale_width(head_dim)
         return self.kv_codec.row_width(head_dim)
 
     @property
     def cache_dtype(self):
         """dtype of the stored key/value caches (``uint8`` for an integer ``kv_precision``,
-        ``float8_e4m3fn`` for ``fp8``)."""
+        ``float8_e4m3fn`` for ``fp8``, ``float4_e2m1fn_x2`` for ``nvfp4``)."""
         return self.key_cache.dtype
+
+    @property
+    def cache_scale_dtype(self):
+        """dtype of the block scales stored next to each cache (``float8_e4m3fn`` for ``nvfp4``),
+        or ``None`` when the rows hold everything."""
+        return self.kv_codec.scale_dtype
+
+    def zero_cache(self, which):
+        """An empty ``which`` (``"key"``/``"value"``) cache in the form ``forward`` takes it: one
+        tensor, or ``(rows, scales)`` with block scales."""
+        rows = device_zeros(self.cache_shape(which), self.cache_dtype)
+        if self.cache_scale_dtype is None:
+            return rows
+        return rows, device_zeros(self.cache_shape(f"{which}_scale"), self.cache_scale_dtype)
+
+    def _cache_buffers(self):
+        """``(buffer name, cache kind)`` of the internal cache buffers."""
+        buffers = [("key_cache", "key"), ("value_cache", "value")]
+        if self.cache_scale_dtype is not None:
+            buffers += [("key_cache_scale", "key_scale"), ("value_cache_scale", "value_scale")]
+        return buffers
+
+    def _internal_cache(self, which):
+        """The internal ``which`` buffer(s) in the form ``forward`` takes."""
+        if self.cache_scale_dtype is None:
+            return getattr(self, f"{which}_cache")
+        return getattr(self, f"{which}_cache"), getattr(self, f"{which}_cache_scale")
 
     def _cache_geometry_ok(self):
         if self.cache_impl == "io_paged":
             return True
-        ok = (tuple(self.key_cache.shape) == self.cache_shape("key")
-              and tuple(self.value_cache.shape) == self.cache_shape("value"))
+        ok = all(tuple(getattr(self, name).shape) == self.cache_shape(kind) for name, kind in self._cache_buffers())
         return self.kernel.geometry_ok(self) and ok
 
     def _check_cache_geometry(self):
@@ -125,11 +162,10 @@ class MHACausal(MHABase):
         Conversion-time hook: called once after weights are loaded."""
         if self.cache_impl == "io_paged":
             return
-        for which in ("key", "value"):
-            buffer = getattr(self, f"{which}_cache")
-            if tuple(buffer.shape) != self.cache_shape(which):
-                setattr(self, f"{which}_cache",
-                        torch.zeros(self.cache_shape(which), dtype=buffer.dtype, device=buffer.device))
+        for name, kind in self._cache_buffers():
+            buffer = getattr(self, name)
+            if tuple(buffer.shape) != self.cache_shape(kind):
+                setattr(self, name, device_zeros(self.cache_shape(kind), buffer.dtype, buffer.device))
         self.kernel.finalize_geometry(self)
 
     def forward(self, x, pos_id, attn_mask, key_cache=None, value_cache=None, rope=None, paged=None):
@@ -139,7 +175,8 @@ class MHACausal(MHABase):
             pos_id: ``(1,)`` position of the first new token.
             attn_mask: additive causal mask built once per step by the decoder.
             key_cache: incoming key cache for graph-I/O caches (the internal buffer
-                is used when omitted). For pages, the pool.
+                is used when omitted; ``(rows, scales)`` with block scales). For pages,
+                the pool.
             value_cache: incoming value cache, as ``key_cache`` (unused for pages).
             rope: ``(cos, sin)`` already indexed at the new positions.
             paged: per-step inputs of the paged kernel (see ``kernels/paged.py``).
@@ -151,9 +188,9 @@ class MHACausal(MHABase):
 
         self._check_cache_geometry()
         if key_cache is None:
-            key_cache = self.key_cache
+            key_cache = self._internal_cache("key")
         if value_cache is None:
-            value_cache = self.value_cache
+            value_cache = self._internal_cache("value")
 
         # With add_batch_dim the leading size-1 dim is absorbed by the views below.
         q, k, v = self._project_qkv(x, in_seq_len)

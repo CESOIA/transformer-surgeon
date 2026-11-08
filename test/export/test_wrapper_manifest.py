@@ -157,6 +157,10 @@ def test_graph_io_names_match_the_manifest():
         ["input_ids", "pos_id", "past_key_0", "past_key_1", "past_value_0", "past_value_1"],
         ["logits", "present_key_0", "present_key_1", "present_value_0", "present_value_1"])
     assert graph_io_names(1, paged=True) == (["input_ids", "pos_id", "past_kv_0"], ["logits", "present_kv_0"])
+    # (rows, scales) caches flatten as rows then scales, layer by layer
+    assert graph_io_names(2, scales=True)[0] == [
+        "input_ids", "pos_id", "past_key_0", "past_key_scale_0", "past_key_1", "past_key_scale_1",
+        "past_value_0", "past_value_scale_0", "past_value_1", "past_value_scale_1"]
     model = _model()
     manifest = build_llm_manifest(_wrapper(model, "io_inplace"), model.config, backend="onnx", artifact="m.onnx")
     inputs, outputs = graph_io_names(2)

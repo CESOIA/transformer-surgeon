@@ -36,7 +36,7 @@ DEFAULT_CONVERT_OPTIONS = {
     "rmsnorm_prescale": True,
     "rmsnorm_upcast": False,
     "masked_softmax": False,
-    "kv_precision": "full",      # "int8"/"int4"/"fp8": stored KV-cache rows (blocks/attention/kv_precision)
+    "kv_precision": "full",      # "int8"/"int4"/"fp8"/"nvfp4": stored KV-cache rows (blocks/attention/kv_precision)
 }
 
 

@@ -36,6 +36,15 @@ def _cuda_available() -> bool:
         return False
 
 
+def _torch_has(name: str) -> bool:
+    try:
+        import torch
+
+        return hasattr(torch, name)
+    except Exception:
+        return False
+
+
 def _qnn_available() -> bool:
     """The QNN ExecuTorch backend needs the Qualcomm QNN SDK.
 
@@ -67,6 +76,8 @@ HAS_EDGELLM_PLUGIN = (
 # Narrower than HAS_EXECUTORCH: a minimal ExecuTorch install may lack the LLM
 # custom-ops extension (torch.ops.llama.custom_sdpa / update_cache).
 HAS_EXECUTORCH_CUSTOM_SDPA = _module_available("executorch.extension.llm.custom_ops.custom_ops")
+# NVFP4 KV caches store torch.float4_e2m1fn_x2 rows (recent PyTorch only).
+HAS_FLOAT4 = _torch_has("float4_e2m1fn_x2")
 
 # Network access to the Hugging Face Hub. Controlled by an env var so CI can force
 # offline runs; defaults to "assume reachable" (tests still skip on actual failure).
@@ -94,6 +105,9 @@ requires_custom_sdpa = pytest.mark.skipif(
     not HAS_EXECUTORCH_CUSTOM_SDPA,
     reason="requires ExecuTorch's llm custom_ops extension (torch.ops.llama.custom_sdpa/update_cache)",
 )
+requires_float4 = pytest.mark.skipif(
+    not HAS_FLOAT4, reason="requires a PyTorch with torch.float4_e2m1fn_x2 (kv_precision='nvfp4')"
+)
 requires_hub = pytest.mark.skipif(
     HF_OFFLINE, reason="requires Hugging Face Hub access (offline mode set)"
 )
@@ -104,5 +118,5 @@ def summary() -> str:
         f"cuda={HAS_CUDA} executorch={HAS_EXECUTORCH} "
         f"tensorrt={HAS_TENSORRT} onnx={HAS_ONNX} "
         f"edgellm_plugin={HAS_EDGELLM_PLUGIN} qnn={HAS_QNN} "
-        f"executorch_custom_sdpa={HAS_EXECUTORCH_CUSTOM_SDPA} hf_offline={HF_OFFLINE}"
+        f"executorch_custom_sdpa={HAS_EXECUTORCH_CUSTOM_SDPA} float4={HAS_FLOAT4} hf_offline={HF_OFFLINE}"
     )
