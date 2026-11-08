@@ -7,11 +7,14 @@ network I/O. This is the backbone of the parametrized ``e2e`` model-family tests
 
 Each entry in ``FAMILIES`` is a :class:`FamilySpec` describing how to build the
 model and what to compress. VL families build nested vision+text sub-configs.
+
+``kv_model`` is the one opt-in exception: with ``pytest --kv-model NAME`` the
+KV-cache export tests load that pretrained checkpoint instead of the tiny Qwen2.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import torch
 
@@ -227,3 +230,19 @@ FAMILIES: Dict[str, FamilySpec] = {
 
 ALL_FAMILY_NAMES: List[str] = list(FAMILIES)
 CAUSAL_FAMILY_NAMES: List[str] = [n for n, s in FAMILIES.items() if s.is_causal]
+
+# Pretrained Qwen2-family checkpoint of the KV-cache export tests, set by ``pytest --kv-model NAME``
+# (test/conftest.py); None: the tiny random Qwen2.
+KV_MODEL: Optional[str] = None
+
+
+def kv_model(dtype: torch.dtype = torch.float32) -> torch.nn.Module:
+    """The model of the KV-cache export tests, on the CPU in ``dtype``: the tiny random Qwen2
+    (seeded), or the pretrained ``KV_MODEL`` (downloaded from the Hugging Face Hub on first use)."""
+    if KV_MODEL is None:
+        torch.manual_seed(0)
+        model = FAMILIES["qwen2"].build().to(dtype)
+    else:
+        model = _import_ts().Qwen2ForCausalLMCompress.from_pretrained(KV_MODEL, dtype=dtype)
+    model.config.dtype = dtype  # the converted decoder allocates its cache in the config dtype
+    return model.eval()

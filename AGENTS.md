@@ -28,11 +28,19 @@ export_to_backend(model, QNNExportConfig(output_path="model.pte"))
 ```bash
 pip install -e ".[dev]"
 pytest                     # the suite in test/ (one folder per package folder), tiny random models, no downloads
+pytest test/export/test_kv_precision.py --kv-model Qwen/Qwen2.5-0.5B   # KV-cache export tests on a real model
 ```
 
 Backends are capability-gated (`test/_helpers/capabilities.py`): tests skip when ExecuTorch, the QNN SDK, ONNX,
 TensorRT or a GPU are missing. On the development machine use the conda environments `py312_tensorrt`,
 `py310-executorch-qnn`, `py312_executorch_xnnpack`.
+
+`--kv-model NAME` (`test/conftest.py`) is the one opt-in download: the KV-cache export tests then run on that
+pretrained Qwen2-family checkpoint (`test/_helpers/model_factory.py::kv_model`) instead of the tiny Qwen2, with
+relative-error bounds measured on Qwen2.5-0.5B (`ONNX_ERROR`, `ENGINE_ERROR`, `CACHE_ERROR` in the test file).
+ONNX Runtime and the eager references run on the CPU in fp32; the TensorRT test keeps one fp16 copy of the weights
+on the GPU at a time and frees it after each case. Qwen2.5-0.5B in `py312_tensorrt` on an RTX 4070 Laptop (8 GB):
+about 5 minutes for the CPU tests and 7 for the five TensorRT engines, at most 1.8 GB of GPU memory.
 
 ---
 

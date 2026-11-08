@@ -1,12 +1,18 @@
-"""KV-cache precision through the export pipeline: options, conversion, wrapper, manifest, backends."""
+"""KV-cache precision through the export pipeline: options, conversion, wrapper, manifest, backends.
+
+The model is a tiny random Qwen2, or with ``pytest --kv-model NAME`` a pretrained one (e.g.
+Qwen/Qwen2.5-0.5B): every test then runs on it, with the accuracy bounds of a deep model.
+"""
+import gc
 import json
 import os
+import shutil
 
 import pytest
 import torch
 
 from _helpers import capabilities as caps
-from _helpers.model_factory import FAMILIES
+from _helpers import model_factory
 from transformersurgeon.blocks import KV_PRECISIONS
 from transformersurgeon.export import (
     LLMWrapper, build_llm_manifest, build_zero_caches, convert_for_export, write_cache_rows,
@@ -16,13 +22,40 @@ from transformersurgeon.export.operations import check_components, options_for, 
 from transformersurgeon.utils.devices import move_to_device
 
 CACHE = 16
+PRETRAINED = model_factory.KV_MODEL is not None
+# A pretrained model is far deeper than the tiny one and compounds every rounding difference over its layers,
+# so its checks are relative logit errors (|got - expected| / |expected|) over the tests' few tokens, with margin
+# over Qwen2.5-0.5B's. A backend against the eager model with the same cache, where a value on a rounding boundary
+# can round the other way (int4 and nvfp4 codes are coarse): fp32 ONNX Runtime (Qwen2.5-0.5B: 1e-5, 7e-6, 0.02,
+# 2e-5) and fp16 TensorRT (0.01, 0.05, 0.26, 0.05, 0.25).
+ONNX_ERROR = {"full": 1e-3, "int8": 1e-3, "int4": 0.06, "fp8": 1e-3}
+ENGINE_ERROR = {"full": 0.05, "int8": 0.15, "int4": 0.5, "fp8": 0.15, "nvfp4": 0.5}
+# A quantised cache against the float cache (Qwen2.5-0.5B: int8 0.22, int4 0.69; the per-row scale follows
+# the few large key channels, so the small ones get few codes).
+CACHE_ERROR = {"int8": 0.4, "int4": 1.0} if PRETRAINED else {"int8": 0.02, "int4": 0.25}
 
 
 def _model(dtype=torch.float32):
-    torch.manual_seed(0)
-    model = FAMILIES["qwen2"].build().to(dtype).eval()
-    model.config.dtype = dtype  # the converted decoder allocates its cache in the config dtype
-    return model
+    return model_factory.kv_model(dtype)
+
+
+def _geometry(model):
+    """``(layers, kv_heads, head_dim)`` of the model's caches."""
+    config = model.config
+    return config.num_hidden_layers, config.num_key_value_heads, config.hidden_size // config.num_attention_heads
+
+
+def _relative_error(got, expected):
+    return ((got - expected).norm() / expected.norm()).item()
+
+
+def _assert_backend_matches(got, expected, atol, pretrained_error):
+    """A backend's logits reproduce the eager model's with the same cache: each within ``atol`` on the tiny
+    model, within a relative error of ``pretrained_error`` on a pretrained one."""
+    if PRETRAINED:
+        assert _relative_error(got, expected) < pretrained_error
+    else:
+        torch.testing.assert_close(got, expected, atol=atol, rtol=atol)
 
 
 def _wrapper(model, cache_impl="mutable", kv_precision="full"):
@@ -94,13 +127,13 @@ def test_conversion_builds_integer_caches_and_backends_check_them():
 
 
 @pytest.mark.parametrize("cache_impl", ["mutable", "io_inplace"])
-@pytest.mark.parametrize("name, tolerance", [("int8", 0.02), ("int4", 0.25)])
-def test_integer_cache_wrapper_tracks_the_float_wrapper(cache_impl, name, tolerance):
+@pytest.mark.parametrize("name", ["int8", "int4"])
+def test_integer_cache_wrapper_tracks_the_float_wrapper(cache_impl, name):
     model = _model()
     tokens = [3, 17, 42, 5, 99, 7]
     expected = _greedy_logits(_wrapper(model, cache_impl), tokens)
     got = _greedy_logits(_wrapper(model, cache_impl, name), tokens)
-    assert (got - expected).norm() / expected.norm() < tolerance
+    assert _relative_error(got, expected) < CACHE_ERROR[name]
 
 
 def test_manifest_records_the_precision_and_gives_uint8_caches(tmp_path):
@@ -108,8 +141,8 @@ def test_manifest_records_the_precision_and_gives_uint8_caches(tmp_path):
     wrapper = _wrapper(model, "io_inplace", "int8")
     manifest = build_llm_manifest(wrapper, model.config, backend="onnx", artifact=str(tmp_path / "model.onnx"))
     assert manifest["kv_precision"] == "int8" and manifest["cache_dtype"] == "uint8"
-    head_dim = model.config.hidden_size // model.config.num_attention_heads
-    assert manifest["caches"][0]["key"]["shape"] == [1, 2, CACHE, head_dim + 2]
+    _, kv_heads, head_dim = _geometry(model)
+    assert manifest["caches"][0]["key"]["shape"] == [1, kv_heads, CACHE, head_dim + 2]
     manifest = json.loads(json.dumps(manifest))
     for got, expected in zip(zero_caches_from_manifest(manifest), build_zero_caches(wrapper.decoder)):
         assert [(t.shape, t.dtype) for t in got] == [(t.shape, t.dtype) for t in expected]
@@ -124,8 +157,8 @@ def test_manifest_of_an_fp8_rows_cache():
     assert (manifest["kv_precision"], manifest["cache_dtype"], manifest["cache_layout"]) == \
         ("fp8", "float8_e4m3fn", "BHSD")
     assert manifest["cache_rows"] and not manifest["cache_inplace"]
-    head_dim = model.config.hidden_size // model.config.num_attention_heads
-    assert manifest["caches"][0]["key"]["shape"] == [1, 2, CACHE, head_dim]
+    _, kv_heads, head_dim = _geometry(model)
+    assert manifest["caches"][0]["key"]["shape"] == [1, kv_heads, CACHE, head_dim]
     for got, expected in zip(zero_caches_from_manifest(manifest), build_zero_caches(wrapper.decoder)):
         assert [(t.shape, t.dtype) for t in got] == [(t.shape, t.dtype) for t in expected]
 
@@ -139,12 +172,12 @@ def test_manifest_of_an_nvfp4_rows_cache():
     manifest = json.loads(json.dumps(build_llm_manifest(wrapper, model.config, backend="tensorrt", artifact="m.onnx")))
     assert (manifest["kv_precision"], manifest["cache_dtype"], manifest["cache_rows"]) == \
         ("nvfp4", "float4_e2m1fn_x2", True)
-    head_dim = model.config.hidden_size // model.config.num_attention_heads   # 16: one block per row
+    _, kv_heads, head_dim = _geometry(model)   # a multiple of 16: whole blocks per row
     layer = manifest["caches"][1]
-    assert layer["key"] == {"input": "past_key_1", "output": "present_key_1", "shape": [1, 2, CACHE, head_dim // 2],
-                            "dtype": "float4_e2m1fn_x2"}
+    assert layer["key"] == {"input": "past_key_1", "output": "present_key_1",
+                            "shape": [1, kv_heads, CACHE, head_dim // 2], "dtype": "float4_e2m1fn_x2"}
     assert layer["value_scale"] == {"input": "past_value_scale_1", "output": "present_value_scale_1",
-                                    "shape": [1, 2, CACHE, head_dim // 16], "dtype": "float8_e4m3fn"}
+                                    "shape": [1, kv_heads, CACHE, head_dim // 16], "dtype": "float8_e4m3fn"}
     for got, expected in zip(zero_caches_from_manifest(manifest), build_zero_caches(wrapper.decoder)):
         assert [[(t.shape, t.dtype) for t in pair] for pair in got] == \
             [[(t.shape, t.dtype) for t in pair] for pair in expected]
@@ -164,18 +197,20 @@ def test_onnx_graph_of_an_nvfp4_cache_has_fp4_rows_and_fp8_scales(tmp_path):
 
     cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), max_input_len=4, build_engine=False,
                                convert_options={"max_cache_len": CACHE, "kv_precision": "nvfp4"})
-    result = export_to_backend(_model(torch.float16), cfg)
+    model = _model(torch.float16)
+    layers, kv_heads, head_dim = _geometry(model)
+    result = export_to_backend(model, cfg)
     graph = onnx.load(result.onnx_path, load_external_data=False).graph
-    inputs, outputs = graph_io_names(2, scales=True)
+    inputs, outputs = graph_io_names(layers, scales=True)
     assert [i.name for i in graph.input] == inputs and [o.name for o in graph.output] == outputs
     types = {i.name: (i.type.tensor_type.elem_type, [d.dim_value for d in i.type.tensor_type.shape.dim])
              for i in graph.input}
-    assert types["past_key_0"] == (onnx.TensorProto.FLOAT4E2M1, [1, 2, CACHE, 16])
-    assert types["past_value_scale_1"] == (onnx.TensorProto.FLOAT8E4M3FN, [1, 2, CACHE, 1])
+    assert types["past_key_0"] == (onnx.TensorProto.FLOAT4E2M1, [1, kv_heads, CACHE, head_dim])
+    assert types["past_value_scale_1"] == (onnx.TensorProto.FLOAT8E4M3FN, [1, kv_heads, CACHE, head_dim // 16])
     fp4_quantize = [n for n in graph.node if n.op_type == "QuantizeLinear"
                     and onnx.helper.get_attribute_value(next(a for a in n.attribute if a.name == "output_dtype"))
                     == onnx.TensorProto.FLOAT4E2M1]
-    assert len(fp4_quantize) == 4   # keys and values of two layers
+    assert len(fp4_quantize) == 2 * layers   # keys and values of every layer
     assert all(next(a.i for a in n.attribute if a.name == "block_size") == 16 for n in fp4_quantize)
     assert json.load(open(result.manifest_path))["cache_impl"] == "io_rows"
 
@@ -224,7 +259,7 @@ def test_onnx_export_with_an_integer_cache_has_uint8_cache_io(tmp_path, name):
     logits = session.run(["logits"], feeds)[0]
     with torch.no_grad():
         expected = wrapper(torch.tensor([3]), torch.tensor([0]), keys, values)[0]
-    torch.testing.assert_close(torch.from_numpy(logits).reshape(expected.shape), expected, atol=1e-3, rtol=1e-3)
+    _assert_backend_matches(torch.from_numpy(logits).reshape(expected.shape), expected, 1e-3, ONNX_ERROR[name])
 
 
 def _run_onnx(session, manifest, tokens):
@@ -275,7 +310,7 @@ def test_chosen_kv_precision_reaches_the_exported_model(tmp_path):
     from transformersurgeon.export.backends import ONNXExportConfig
 
     model = _model()
-    head_dim = model.config.hidden_size // model.config.num_attention_heads
+    _, _, head_dim = _geometry(model)
     tokens = [3, 17, 42, 5, 99, 7]
     logits = {}
     stored_types = {"full": onnx.TensorProto.FLOAT, "int8": onnx.TensorProto.UINT8, "int4": onnx.TensorProto.UINT8,
@@ -300,53 +335,72 @@ def test_chosen_kv_precision_reaches_the_exported_model(tmp_path):
         logits[name], caches = _run_onnx(session, manifest, tokens)
         assert {c.dtype for c in caches.values()} == {KV_PRECISIONS[name].storage_dtype(torch.float32)}
         eager = _greedy_logits(_wrapper(model, manifest["cache_impl"], name), tokens)
-        torch.testing.assert_close(logits[name], eager, atol=1e-3, rtol=1e-3)
+        _assert_backend_matches(logits[name], eager, 1e-3, ONNX_ERROR[name])
+        del session
+        shutil.rmtree(tmp_path / name)   # a pretrained model's export takes gigabytes
 
     def distance(name):
-        return ((logits[name] - logits["full"]).norm() / logits["full"].norm()).item()
+        return _relative_error(logits[name], logits["full"])
 
-    assert 0 < distance("int8") < distance("int4") < 0.25
+    assert 0 < distance("int8") < distance("int4") < CACHE_ERROR["int4"]
     assert 0 < distance("fp8") < distance("int4")
+
+
+@pytest.fixture
+def release_cuda():
+    """Give the GPU memory a test held (engines, CUDA graphs, cached blocks) back afterwards, so the cases
+    of a GPU test do not add up."""
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @caps.requires_tensorrt
 @pytest.mark.parametrize("name", ["full", "int8", "int4", "fp8", pytest.param("nvfp4", marks=caps.requires_float4)])
-def test_tensorrt_engine_holds_every_precision_in_a_rows_cache(tmp_path, name):
+def test_tensorrt_engine_holds_every_precision_in_a_rows_cache(tmp_path, release_cuda, name):
     """TensorRT with cache_impl="io_rows": the engine reads the stored cache (fp8 through a dequantize
     layer, nvfp4 through two, uint8 through casts) and returns the new rows; the session writes them,
-    inside the decode CUDA graph. A prompt (prefill profile) plus greedy steps match the eager model."""
+    inside the decode CUDA graph. A prompt (prefill profile) plus decode steps match the eager model. The
+    steps are fed the eager model's greedy tokens, so the two cannot drift onto different tokens, and the
+    eager model leaves the GPU before the engine is built: one copy of the weights on the GPU at a time."""
     from transformersurgeon.export import build_wrapper, export_to_backend
     from transformersurgeon.export.backends import TensorRTExportConfig
     from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
 
     options = {"max_cache_len": CACHE, "kv_precision": name, "cache_impl": "io_rows", "rmsnorm_impl": "rmsnorm_upcast"}
-    cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), max_input_len=8, convert_options=options)
-    result = export_to_backend(_model(torch.float16), cfg)
-    session = TensorRTLLMSession(result.manifest_path)
-    assert session.cache_rows
-    assert session.caches["past_key_0"].dtype == KV_PRECISIONS[name].storage_dtype(torch.float16)
-
     prompt, steps = torch.tensor([3, 17, 42, 5, 99]), 4
-    session.prefill(prompt)
-    got = [session.logits.float().clone()]
-    for _ in range(steps):
-        session.step()
-        got.append(session.logits.float().clone())
 
     model = _model(torch.float16)
     decoder = convert_for_export(model, options=options)["text"]
     wrapper = build_wrapper({"embedding": model.get_input_embeddings(), "decoder": decoder,
                              "final_layer": model.lm_head}).cuda().eval()
     keys, values = move_to_device(build_zero_caches(wrapper.decoder), torch.device("cuda"))
-    ids, pos, expected = prompt.cuda(), torch.tensor([0]).cuda(), []
+    ids, pos, expected, tokens = prompt.cuda(), torch.tensor([0]).cuda(), [], []
     with torch.no_grad():
         for _ in range(steps + 1):
             logits, new_keys, new_values = wrapper(ids, pos, keys, values)
             for cache, rows in zip(keys + values, new_keys + new_values):
                 write_cache_rows(cache, rows, pos)
-            expected.append(logits.float())
+            expected.append(logits.float().cpu())
             pos, ids = pos + ids.numel(), logits.float().argmax(-1).view(1)
-    torch.testing.assert_close(torch.stack(got), torch.stack(expected), atol=3e-2, rtol=3e-2)
+            tokens.append(int(ids))
+    del model, decoder, wrapper, keys, values, logits, new_keys, new_values
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), max_input_len=8, convert_options=options)
+    result = export_to_backend(_model(torch.float16), cfg)
+    session = TensorRTLLMSession(result.manifest_path)
+    assert session.cache_rows
+    assert session.caches["past_key_0"].dtype == KV_PRECISIONS[name].storage_dtype(torch.float16)
+
+    session.prefill(prompt)
+    got = [session.logits.float().cpu()]
+    for token in tokens[:steps]:
+        session.input_ids.fill_(token)   # the next step consumes the eager model's token
+        session.step()
+        got.append(session.logits.float().cpu())
+    _assert_backend_matches(torch.stack(got), torch.stack(expected), 3e-2, ENGINE_ERROR[name])
 
 
 # --------------------------------------------------------------------------- #
