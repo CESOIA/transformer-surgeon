@@ -26,14 +26,22 @@ export_to_backend(model, QNNExportConfig(output_path="model.pte"))
 ## Dev Setup and Test Commands
 
 ```bash
-pip install -e ".[dev]"
+conda env create -f environment.yml   # conda environment "cesoia" with every backend (then: conda activate cesoia)
+bash scripts/executorch/qnn/install_qnn_sdk.sh   # in it: Qualcomm's QNN SDK, which backend="qnn" exports need
+pip install -e ".[dev]"    # or: the package and pytest in an environment of your own
 pytest                     # the suite in test/ (one folder per package folder), tiny random models, no downloads
 pytest test/export/test_kv_precision.py --kv-model Qwen/Qwen2.5-0.5B   # KV-cache export tests on a real model
 ```
 
 Backends are capability-gated (`test/_helpers/capabilities.py`): tests skip when ExecuTorch, the QNN SDK, ONNX,
-TensorRT or a GPU are missing. On the development machine use the conda environments `py312_tensorrt`,
-`py310-executorch-qnn`, `py312_executorch_xnnpack`.
+TensorRT or a GPU are missing. `environment.yml` (Linux x86-64, NVIDIA driver >= 580) pins the versions the suite
+passes with: torch 2.14.1 with CUDA 13.0, transformers 5.22.1, torchao 0.18, ExecuTorch 1.5.1 (XNNPACK; 1.6 needs
+torch 2.15), ONNX 1.23 with ONNX Runtime 1.31, TensorRT 11.4, plus the packages the scripts and benchmarks import.
+QNN exports also need Qualcomm's QNN SDK: `scripts/executorch/qnn/install_qnn_sdk.sh` downloads the version
+ExecuTorch was built against (2.37 for 1.5.1) and LLVM's libc++/libunwind that its x86 libraries need, and makes
+the environment set `QNN_SDK_ROOT` and `LD_LIBRARY_PATH` on activation. Running a QNN program needs a Snapdragon
+device. Older development machines keep one environment per backend (`py312_tensorrt`, `py312_executorch_xnnpack`,
+`py310-executorch-qnn` with ExecuTorch 1.3.1); the QNN exporter supports both ExecuTorch versions.
 
 `--kv-model NAME` (`test/conftest.py`) is the one opt-in download: the KV-cache export tests then run on that
 pretrained Qwen2-family checkpoint (`test/_helpers/model_factory.py::kv_model`) instead of the tiny Qwen2, with
@@ -337,6 +345,20 @@ reference: cos 0.999999, KL 7e-6; 1 partition, 0 CPU ops). HTP runs LPBQ only on
 recipes lower every linear as a 1×1 conv2d), so an LPBQ export forces ExecuTorch's `ConvertLinearToConv2d`
 and unties the embedding/lm_head weight first (that pass mishandles tied weights). The lm_head then gets its own
 copy of the matrix: a bigger file, and the same decode reads.
+
+### QNN: ExecuTorch versions and the SDK's C++ runtime
+
+- **Pass tables.** ExecuTorch 1.5 serves the default edge passes and their ordering from the HTP pass manager
+  (`get_qnn_pass_manager_cls`), 1.3 from module-level functions; `exporter.py::_default_edge_passes` takes
+  either. The sharding pass (`num_shards > 1`) is ordered as ExecuTorch's own: after `FoldQDQ`, before
+  `TagQuantIO`. Unordered, 1.5's solver ran it first and the op at each shard boundary failed HTP validation and
+  stayed on the CPU (2 shards: 2 delegates + `llama::fallback` and nothing else on the CPU once ordered).
+- **GCC's C++ runtime goes global first.** The SDK's x86 libraries link LLVM's libc++abi and libunwind, and
+  ExecuTorch opens them into the process's global symbol scope; anything built against GCC's runtime and loaded
+  afterwards (ONNX Runtime) then binds its C++ exception symbols to LLVM's and segfaults while loading. That
+  never showed while each backend had its own environment; in `cesoia` the full suite crashed at the first ONNX
+  test after the QNN ones. `QNNExporter.lower` promotes `libgcc_s` and `libstdc++` (already loaded by torch) to
+  the global scope before the SDK loads (`_keep_gcc_cxx_runtime_global`), so those symbols stay GCC's.
 
 ### Numerics caveats found on Qwen2.5-1.5B (large attention logits)
 

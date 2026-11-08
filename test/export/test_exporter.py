@@ -140,6 +140,35 @@ def test_qnn_export_writes_a_program(tmp_path):
     assert os.path.getsize(pte) > 0 and os.path.isfile(result.manifest_path)
 
 
+def _global_symbol_library(name):
+    """Path of the library that provides ``name`` in the process's global symbol scope."""
+    import ctypes
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p), ("sname", ctypes.c_char_p),
+                    ("saddr", ctypes.c_void_p)]
+
+    info = DlInfo()
+    address = ctypes.cast(getattr(ctypes.CDLL(None), name), ctypes.c_void_p)
+    ctypes.CDLL("libc.so.6").dladdr(address, ctypes.byref(info))
+    return info.fname.decode()
+
+
+@caps.requires_qnn
+def test_qnn_export_leaves_the_cxx_exception_symbols_to_gccs_runtime(tmp_path):
+    """The QNN SDK brings LLVM's libc++abi and libunwind into the global symbol scope; the exporter puts GCC's
+    runtime there first, otherwise a GCC-built library loaded afterwards (ONNX Runtime) segfaults as it loads."""
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    cfg = QNNExportConfig(output_path=str(tmp_path / "model.pte"), soc_model="SM8850", max_seq_len=CACHE,
+                          quant_scope="all",
+                          calibration_token_ids=[[(i * 37 + j * 11) % 256 for j in range(8)] for i in range(2)],
+                          run_weight_mismatch_check=False, verbose=False)
+    export_to_backend(_components(_model(quantize_mlp=True), {"max_cache_len": CACHE}), cfg)
+    assert "libstdc++" in _global_symbol_library("__cxa_throw")
+    assert "libgcc_s" in _global_symbol_library("_Unwind_Resume")
+
+
 @caps.requires_qnn
 def test_qnn_quantize_float_model_requires_quant_scope_all(tmp_path):
     from transformersurgeon.export.backends import QNNExportConfig

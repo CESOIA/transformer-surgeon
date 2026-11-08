@@ -49,5 +49,5 @@ only `calibration/`; a backend only `export/` (plus new `blocks/` atoms when an 
 pytest                                                   # test/ mirrors the package; tiny models, no downloads
 ```
 
-Use the conda environments `py312_tensorrt`, `py310-executorch-qnn`, `py312_executorch_xnnpack`; backends are
-capability-gated.
+Use the conda environment `cesoia` (`conda env create -f environment.yml`, then
+`scripts/executorch/qnn/install_qnn_sdk.sh` for QNN exports); backends are capability-gated.

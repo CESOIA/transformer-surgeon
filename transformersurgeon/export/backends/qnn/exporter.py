@@ -1,6 +1,7 @@
 """Qualcomm QNN exporter (ExecuTorch, Hexagon HTP)."""
 
 import copy
+import ctypes
 import importlib.util
 import os
 import warnings
@@ -57,7 +58,8 @@ def is_qnn_available() -> bool:
 _QNN_UNAVAILABLE_MSG = (
     "QNN backend unavailable: install the Qualcomm ExecuTorch toolchain "
     "(`pip install py-cpuinfo` plus the Qualcomm QNN SDK) and set "
-    "QNN_SDK_ROOT (or QUALCOMM_SDK_ROOT) before exporting with backend='qnn'. "
+    "QNN_SDK_ROOT (or QUALCOMM_SDK_ROOT) before exporting with backend='qnn'; "
+    "in a conda environment, scripts/executorch/qnn/install_qnn_sdk.sh does both. "
     "Use `is_qnn_available()` to check this ahead of time."
 )
 
@@ -242,6 +244,7 @@ class QNNExporter(ExecuTorchExporter):
         if config.kv_cache_bits != 16 and (config.quant_scope != "all" or config.float_attention_core):
             raise ValueError("QNNExportConfig.kv_cache_bits=8 requires quant_scope='all' and "
                              "float_attention_core=False: only then is the KV cache a fixed-point activation.")
+        _keep_gcc_cxx_runtime_global()   # before anything loads the QNN SDK
         wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
         layer_info = extract_layer_quant_info(wrapper)
 
@@ -381,17 +384,14 @@ class QNNExporter(ExecuTorchExporter):
         """Extra keyword arguments of ``to_edge_transform_and_lower_to_qnn`` (sharding, float16 fix-up)."""
         if config.num_shards <= 1 and not quantize:
             return {}
-        from executorch.backends.qualcomm._passes import LayoutTransform, TagQuantIO
-        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_capture_program_passes
-        from executorch.backends.qualcomm._passes.utils import get_passes_dependency_for_capture_program
+        from executorch.backends.qualcomm._passes import FoldQDQ, LayoutTransform, TagQuantIO
         from executorch.backends.qualcomm.utils.constants import (
             QCOM_PASS_ACTIVATE_KEY,
             QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
         )
 
         options = {}
-        passes_job = get_capture_program_passes()
-        dep_table = get_passes_dependency_for_capture_program()
+        passes_job, dep_table = _default_edge_passes()
         if config.num_shards > 1:
             # llama.fallback marks shard boundaries and must stay out of QNN partitions.
             options["skip_node_op_set"] = {"llama.fallback.default"}
@@ -402,10 +402,16 @@ class QNNExporter(ExecuTorchExporter):
                                    "(TransformerDecoder with a 'blocks' ModuleList)")
             shard_layers = list(range(0, n_layers, n_layers // config.num_shards))
             print(f"  Graph sharding: {config.num_shards} shards, layer boundaries at {shard_layers}")
-            passes_job[make_split_graph_blocks_pass(shard_layers)] = {
+            split_pass = make_split_graph_blocks_pass(shard_layers)
+            passes_job[split_pass] = {
                 QCOM_PASS_ACTIVATE_KEY: True,
                 QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY: {"shard_layers": shard_layers},
             }
+            # Ordered as ExecuTorch's own sharding: after FoldQDQ (the inserted op copies the quantisation
+            # attributes FoldQDQ leaves on its input), before TagQuantIO. Unordered, the solver may run it first
+            # and the op at a shard boundary fails HTP validation and falls back to the CPU.
+            dep_table[split_pass] = [FoldQDQ]
+            dep_table[TagQuantIO] = list(dep_table.get(TagQuantIO, [LayoutTransform])) + [split_pass]
         if quantize:
             # Mixed precision: after FoldQDQ the quantisation annotation survives on
             # activations feeding float16 linears, which makes their FC op invalid. Insert
@@ -420,6 +426,38 @@ class QNNExporter(ExecuTorchExporter):
         options["passes_job"] = passes_job
         options["dep_table"] = dep_table
         return options
+
+
+def _default_edge_passes():
+    """``(passes_job, dep_table)``: ExecuTorch's default edge passes for the HTP backend and their ordering
+    constraints. ExecuTorch 1.5 serves them from the backend's pass manager, older releases (1.3) from
+    module-level functions."""
+    try:
+        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_qnn_pass_manager_cls
+    except ImportError:
+        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_capture_program_passes
+        from executorch.backends.qualcomm._passes.utils import get_passes_dependency_for_capture_program
+        return get_capture_program_passes(), get_passes_dependency_for_capture_program()
+    from executorch.backends.qualcomm.serialization.qc_schema import QnnExecuTorchBackendType
+
+    manager = get_qnn_pass_manager_cls(QnnExecuTorchBackendType.kHtpBackend)
+    return manager.get_capture_program_passes(), manager.get_passes_dependency_for_capture_program()
+
+
+def _keep_gcc_cxx_runtime_global():
+    """Put GCC's C++ runtime (libgcc_s, libstdc++) in the process's global symbol scope before the QNN SDK loads.
+
+    The SDK's x86 libraries link LLVM's libc++abi and libunwind, and ExecuTorch opens them into the global scope:
+    a library loaded afterwards that was built against GCC's runtime (ONNX Runtime) then binds its C++ exception
+    symbols to LLVM's and crashes as it loads. The earlier entry of the global scope wins, so GCC's runtime goes
+    first (both runtimes implement the same C++ ABI, so the SDK works with it). Already loaded by torch: this only
+    promotes them.
+    """
+    for name in ("libgcc_s.so.1", "libstdc++.so.6"):
+        try:
+            ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
 
 
 __all__ = ["QNNExportConfig", "QNNExporter", "is_qnn_available"]
