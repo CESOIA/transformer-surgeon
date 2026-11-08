@@ -59,10 +59,13 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         "cache_impl": cache_impl,
         "cache_io": cache_impl != "mutable",
         "cache_inplace": cache_impl in ("io_inplace", "io_paged"),
-        "cache_layout": {"io_inplace": "BHSD", "io_paged": "PAGED"}.get(cache_impl, "SHD"),
+        # io_rows: present_* are only the new rows; the caller writes them at pos_id (write_cache_rows).
+        "cache_rows": cache_impl == "io_rows",
+        "cache_layout": {"io_inplace": "BHSD", "io_rows": "BHSD", "io_paged": "PAGED"}.get(cache_impl, "SHD"),
         # The allocated cache buffer, not config.dtype (None for configs without one).
         "cache_dtype": str(decoder.blocks[0].attn.key_cache.dtype).replace("torch.", ""),
-        # "full", or "int8"/"int4": uint8 rows of codes + a 2-byte scale (blocks/attention/kv_precision).
+        # "full", "int8"/"int4" (uint8 rows of codes + a 2-byte scale) or "fp8" (float8_e4m3fn rows),
+        # see blocks/attention/kv_precision.
         "kv_precision": getattr(decoder.blocks[0].attn, "kv_precision", "full"),
         "max_cache_len": int(decoder.max_cache_len),
         "num_layers": len(decoder.blocks),
@@ -102,5 +105,15 @@ def zero_caches_from_manifest(
     return keys, values
 
 
+def write_cache_rows(cache: torch.Tensor, rows: torch.Tensor, pos_id: torch.Tensor) -> None:
+    """``io_rows`` contract: write the rows a call returned (``present_*``, ``(1, kv_heads, seq, width)``)
+    into the caller's BHSD cache at ``pos_id``, in place. Works inside a CUDA graph (``pos_id`` may
+    live on the device); one-byte rows (uint8, FP8) are copied as bytes."""
+    positions = pos_id.view(-1)[:1] + torch.arange(rows.shape[2], device=rows.device)
+    if cache.element_size() == 1:
+        cache, rows = cache.view(torch.uint8), rows.view(torch.uint8)
+    cache.index_copy_(2, positions, rows)
+
+
 __all__ = ["MANIFEST_FORMAT", "manifest_path_for", "cache_io_name", "graph_io_names", "build_llm_manifest", "load_llm_manifest",
-           "zero_caches_from_manifest"]
+           "zero_caches_from_manifest", "write_cache_rows"]

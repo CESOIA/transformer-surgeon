@@ -17,8 +17,9 @@ Configuration c = per-layer weight precision of the 7 projection types of every 
 + one KV-cache precision. Experiments that need the same weights share one artifact (``weights_owner``).
 
 Without ``--kv-alts`` the plan is weights-only (E0, E1, E4, E5, every configuration at the reference KV precision).
-``--kv-alts INT8 INT4`` adds E2 (KV sweep) and E3 (weight-KV separability) and spreads the KV precisions over E4/E5.
-``generate_models.py`` defaults to the KV precisions the target backend can export (xnnpack, onnx: INT8, INT4).
+``--kv-alts INT8 INT4 FP8`` adds E2 (KV sweep) and E3 (weight-KV separability) and spreads the KV precisions over
+E4/E5. ``generate_models.py`` defaults to the KV precisions the target backend can export (xnnpack: INT8, INT4;
+onnx, tensorrt: INT8, INT4, FP8; qnn: INT8).
 
     python scripts/cost_predictor/experiment_plan.py --out-dir experiments/cost_predictor
     python scripts/cost_predictor/experiment_plan.py --out-dir /tmp/plan --tiny --e4-count 10 --e5-count 4
@@ -43,7 +44,8 @@ EXECUTION_ORDER = PROJECTIONS
 PRECISIONS = (16, 8, 4)
 PRECISION_NAMES = {16: "FP16", 8: "INT8", 4: "INT4"}
 REF_WEIGHT_BITS = 8
-KV_LABELS = {"F16": 16, "F32": 32, "INT16": 16, "INT8": 8, "INT4": 4}   # INT16: QNN's fixed-point cache
+KV_LABELS = {"F16": 16, "F32": 32, "INT16": 16, "INT8": 8, "INT4": 4, "FP8": 8}   # INT16: QNN's fixed-point cache
+KV_FLOAT = {"F16", "F32", "FP8"}   # floating-point caches (the others are integer codes with scales)
 GROUP_SIZE = 128   # Appendix A: per-group, g=128, FP16 scales (used for the byte estimates)
 
 # Estimated kernel family each weight precision runs on, per backend (Appendix A "kernel-family transitions").
@@ -109,7 +111,7 @@ class ConfigSpec:
     experiment: str
     description: str
     weights: list              # [num_blocks][7] weight bits (16 / 8 / 4), column order = PROJECTIONS
-    kv: str                    # "F16" | "INT8" | "INT4" (| "F32" for fp32 backends)
+    kv: str                    # "F16" | "INT8" | "INT4" | "FP8" (| "F32" for fp32 backends, "INT16" for QNN)
     tags: dict = field(default_factory=dict)
     weights_key: str = ""
     weights_owner: str = ""    # "<experiment dir>/<config_id>" holding the exported weights
@@ -318,7 +320,7 @@ def feature_columns(f, backends):
     """The numeric features f(c) of one configuration as flat columns (the residual model's input)."""
     row = {"weight_bytes": round(f["weight_bytes_total"]), "avg_weight_bits": round(f["effective_avg_weight_bits"], 3),
            "frac_w4": round(f["fraction_w4_layers"], 4), "precision_transitions": f["precision_transitions"],
-           "kv_bytes_per_token": f["kv_bytes_per_token"]}
+           "kv_bytes_per_token": f["kv_bytes_per_token"], "kv_float": int(f["kv_precision"] in KV_FLOAT)}
     for proj in PROJECTIONS:
         for b in PRECISIONS:
             row[f"n_{proj}_{PRECISION_NAMES[b]}"] = f["precision_counts_per_type"][proj][PRECISION_NAMES[b]]
@@ -382,7 +384,7 @@ def add_plan_args(parser):
                         help="alternative weight precisions b of E1 (16 = FP16)")
     parser.add_argument("--kv-ref", default="F16", choices=["F16", "F32", "INT16"],
                         help="backend default KV precision")
-    parser.add_argument("--kv-alts", nargs="*", default=[], choices=["INT8", "INT4"],
+    parser.add_argument("--kv-alts", nargs="*", default=[], choices=["INT8", "INT4", "FP8"],
                         help="alternative KV-cache precisions, adds E2/E3 (default: none, a weights-only plan; "
                              "generate_models.py defaults to what the backend can export)")
     parser.add_argument("--e4-count", type=int, default=40, help="mixed configurations to learn the residual")

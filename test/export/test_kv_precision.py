@@ -7,17 +7,21 @@ import torch
 
 from _helpers import capabilities as caps
 from _helpers.model_factory import FAMILIES
+from transformersurgeon.blocks import KV_PRECISIONS
 from transformersurgeon.export import (
-    LLMWrapper, build_llm_manifest, build_zero_caches, convert_for_export, zero_caches_from_manifest,
+    LLMWrapper, build_llm_manifest, build_zero_caches, convert_for_export, write_cache_rows,
+    zero_caches_from_manifest,
 )
 from transformersurgeon.export.operations import check_components, options_for, resolve_convert_options
 
 CACHE = 16
 
 
-def _model():
+def _model(dtype=torch.float32):
     torch.manual_seed(0)
-    return FAMILIES["qwen2"].build().float().eval()
+    model = FAMILIES["qwen2"].build().to(dtype).eval()
+    model.config.dtype = dtype  # the converted decoder allocates its cache in the config dtype
+    return model
 
 
 def _wrapper(model, cache_impl="mutable", kv_precision="full"):
@@ -27,13 +31,18 @@ def _wrapper(model, cache_impl="mutable", kv_precision="full"):
 
 
 def _greedy_logits(wrapper, tokens):
-    """Logits of every step of a token-by-token run, with the wrapper's own caches."""
+    """Logits of every step of a token-by-token run, with the wrapper's own caches (io_rows: the
+    caller writes the rows each step returns)."""
     keys, values = build_zero_caches(wrapper.decoder)
     out = []
     with torch.no_grad():
         for t, token in enumerate(tokens):
             args = (torch.tensor([token]), torch.tensor([t]))
-            if wrapper.graph_io_cache:
+            if wrapper.cache_impl == "io_rows":
+                logits, new_keys, new_values = wrapper(*args, keys, values)
+                for cache, rows in zip(keys + values, new_keys + new_values):
+                    write_cache_rows(cache, rows, args[1])
+            elif wrapper.graph_io_cache:
                 logits, keys, values = wrapper(*args, keys, values)
             else:
                 logits = wrapper(*args)
@@ -42,8 +51,8 @@ def _greedy_logits(wrapper, tokens):
 
 
 @pytest.mark.parametrize("backend, supported", [
-    ("xnnpack", {"full", "int8", "int4"}), ("onnx", {"full", "int8", "int4"}),
-    ("qnn", {"full"}), ("tensorrt", {"full"}),
+    ("xnnpack", {"full", "int8", "int4"}), ("onnx", {"full", "int8", "int4", "fp8"}),
+    ("qnn", {"full"}), ("tensorrt", {"full", "int8", "int4", "fp8"}),
 ])
 def test_backends_list_the_precisions_they_support(backend, supported):
     assert set(options_for(backend, "kv_precision")) == supported
@@ -53,6 +62,24 @@ def test_backends_list_the_precisions_they_support(backend, supported):
     if "int8" not in supported:
         with pytest.raises(ValueError, match=f"not supported by the {backend} backend"):
             resolve_convert_options(backend, {"kv_precision": "int8"})
+
+
+def test_a_precision_selects_the_cache_it_needs():
+    """fp8 rows need io_rows everywhere; on TensorRT the integer rows need it too (uint8 only at the graph
+    boundary). Without an explicit cache the resolution picks it; a conflicting cache is rejected."""
+    assert resolve_convert_options("onnx", {"kv_precision": "int8"})["cache_impl"] == "io_inplace"
+    assert resolve_convert_options("onnx", {"kv_precision": "fp8"})["cache_impl"] == "io_rows"
+    for name in ("int8", "int4", "fp8"):
+        assert resolve_convert_options("tensorrt", {"kv_precision": name})["cache_impl"] == "io_rows"
+        with pytest.raises(ValueError, match="needs cache_impl='io_rows' on the tensorrt backend"):
+            resolve_convert_options("tensorrt", {"kv_precision": name, "cache_impl": "io_inplace"})
+    with pytest.raises(ValueError, match="kv_precision implementation 'fp8' is not supported by the xnnpack"):
+        resolve_convert_options("xnnpack", {"kv_precision": "fp8"})
+    decoder = convert_for_export(_model(), options={"cache_impl": "io_inplace", "max_cache_len": CACHE,
+                                                    "kv_precision": "int8"})["text"]
+    check_components("onnx", decoder)
+    with pytest.raises(ValueError, match="needs cache_impl='io_rows'"):
+        check_components("tensorrt", decoder)
 
 
 def test_conversion_builds_integer_caches_and_backends_check_them():
@@ -85,6 +112,19 @@ def test_manifest_records_the_precision_and_gives_uint8_caches(tmp_path):
         assert [(t.shape, t.dtype) for t in got] == [(t.shape, t.dtype) for t in expected]
     assert build_llm_manifest(_wrapper(model), model.config, backend="xnnpack", artifact="m.pte")["kv_precision"] \
         == "full"
+
+
+def test_manifest_of_an_fp8_rows_cache():
+    model = _model()
+    wrapper = _wrapper(model, "io_rows", "fp8")
+    manifest = json.loads(json.dumps(build_llm_manifest(wrapper, model.config, backend="tensorrt", artifact="m.onnx")))
+    assert (manifest["kv_precision"], manifest["cache_dtype"], manifest["cache_layout"]) == \
+        ("fp8", "float8_e4m3fn", "BHSD")
+    assert manifest["cache_rows"] and not manifest["cache_inplace"]
+    head_dim = model.config.hidden_size // model.config.num_attention_heads
+    assert manifest["caches"][0]["key"]["shape"] == [1, 2, CACHE, head_dim]
+    for got, expected in zip(zero_caches_from_manifest(manifest), build_zero_caches(wrapper.decoder)):
+        assert [(t.shape, t.dtype) for t in got] == [(t.shape, t.dtype) for t in expected]
 
 
 @caps.requires_executorch
@@ -135,19 +175,34 @@ def test_onnx_export_with_an_integer_cache_has_uint8_cache_io(tmp_path, name):
 
 
 def _run_onnx(session, manifest, tokens):
-    """Decode ``tokens`` one by one in ONNX Runtime, feeding back the model's own caches."""
-    import numpy as np
+    """Decode ``tokens`` one by one in ONNX Runtime: the model's own caches are fed back, or (io_rows)
+    the rows it returns are written into the caches."""
+    import onnx
+    import onnxruntime as ort
+
+    def ort_value(t):
+        if t.dtype == torch.float8_e4m3fn:  # numpy has no FP8: hand over the bytes with their ONNX type
+            return ort.OrtValue.ortvalue_from_numpy_with_onnx_type(t.view(torch.uint8).numpy(),
+                                                                     onnx.TensorProto.FLOAT8E4M3FN)
+        return ort.OrtValue.ortvalue_from_numpy(t.numpy())
 
     keys, values = zero_caches_from_manifest(manifest)
-    caches = {f"past_key_{i}": k.numpy() for i, k in enumerate(keys)}
-    caches.update({f"past_value_{i}": v.numpy() for i, v in enumerate(values)})
+    caches = {**{f"past_key_{i}": k for i, k in enumerate(keys)}, **{f"past_value_{i}": v for i, v in enumerate(values)}}
     outputs = [o.name for o in session.get_outputs()]
     steps = []
     for t, token in enumerate(tokens):
-        feeds = {"input_ids": np.array([token], dtype=np.int64), "pos_id": np.array([t], dtype=np.int64), **caches}
-        results = dict(zip(outputs, session.run(outputs, feeds)))
-        caches = {name.replace("present_", "past_"): value for name, value in results.items() if name != "logits"}
-        steps.append(torch.from_numpy(results["logits"]).reshape(-1))
+        feeds = {"input_ids": torch.tensor([token]), "pos_id": torch.tensor([t]), **caches}
+        results = session.run_with_ort_values(outputs, {name: ort_value(v) for name, v in feeds.items()})
+        results = {name: torch.from_numpy(r.numpy()) for name, r in zip(outputs, results)}
+        for name, value in results.items():
+            if name != "logits":
+                past = name.replace("present_", "past_")
+                value = value.view(caches[past].dtype)  # FP8 comes back as its bytes
+                if manifest["cache_rows"]:
+                    write_cache_rows(caches[past], value, torch.tensor([t]))
+                else:
+                    caches[past] = value
+        steps.append(results["logits"].reshape(-1))
     return torch.stack(steps), caches
 
 
@@ -157,12 +212,12 @@ def test_chosen_kv_precision_reaches_the_exported_model(tmp_path):
 
     For each choice the ONNX graph's cache inputs have that precision's stored dtype and row width,
     the manifest records it, and ONNX Runtime decoding several tokens with its own caches reproduces
-    the eager model built with the same choice. The integer choices change the result (they are not
-    ignored) and int4 moves it further from the float cache than int8.
+    the eager model built with the same choice (fp8 selects cache_impl="io_rows": the rows the graph
+    returns are written by the caller). The quantised choices change the result (they are not
+    ignored) and int4 moves it further from the float cache than int8 or fp8.
     """
     import onnx
     ort = pytest.importorskip("onnxruntime")
-    from transformersurgeon.blocks import KV_PRECISIONS
     from transformersurgeon.export import export_to_backend
     from transformersurgeon.export.backends import ONNXExportConfig
 
@@ -170,17 +225,19 @@ def test_chosen_kv_precision_reaches_the_exported_model(tmp_path):
     head_dim = model.config.hidden_size // model.config.num_attention_heads
     tokens = [3, 17, 42, 5, 99, 7]
     logits = {}
-    for name in ("full", "int8", "int4"):
+    stored_types = {"full": onnx.TensorProto.FLOAT, "int8": onnx.TensorProto.UINT8, "int4": onnx.TensorProto.UINT8,
+                    "fp8": onnx.TensorProto.FLOAT8E4M3FN}
+    for name in ("full", "int8", "int4", "fp8"):
         cfg = ONNXExportConfig(output_path=str(tmp_path / name / "model.onnx"),
                                convert_options={"max_cache_len": CACHE, "kv_precision": name})
         result = export_to_backend(_model(), cfg)
 
         manifest = json.load(open(result.manifest_path))
         assert manifest["kv_precision"] == name
+        assert manifest["cache_impl"] == ("io_rows" if name == "fp8" else "io_inplace")
         cache_inputs = [i for i in onnx.load(result.onnx_path, load_external_data=False).graph.input
                         if i.name.startswith("past_")]
-        stored = onnx.TensorProto.FLOAT if name == "full" else onnx.TensorProto.UINT8
-        assert all(i.type.tensor_type.elem_type == stored for i in cache_inputs)
+        assert all(i.type.tensor_type.elem_type == stored_types[name] for i in cache_inputs)
         assert cache_inputs[0].type.tensor_type.shape.dim[-1].dim_value == KV_PRECISIONS[name].row_width(head_dim)
 
         try:
@@ -188,14 +245,55 @@ def test_chosen_kv_precision_reaches_the_exported_model(tmp_path):
         except Exception as exc:  # an onnxruntime without the opset-24 TensorScatter
             pytest.skip(f"onnxruntime cannot load the exported model: {exc}")
         logits[name], caches = _run_onnx(session, manifest, tokens)
-        assert {str(c.dtype) for c in caches.values()} == {"float32" if name == "full" else "uint8"}
-        eager = _greedy_logits(_wrapper(model, "io_inplace", name), tokens)
+        assert {c.dtype for c in caches.values()} == {KV_PRECISIONS[name].storage_dtype(torch.float32)}
+        eager = _greedy_logits(_wrapper(model, manifest["cache_impl"], name), tokens)
         torch.testing.assert_close(logits[name], eager, atol=1e-3, rtol=1e-3)
 
     def distance(name):
         return ((logits[name] - logits["full"]).norm() / logits["full"].norm()).item()
 
     assert 0 < distance("int8") < distance("int4") < 0.25
+    assert 0 < distance("fp8") < distance("int4")
+
+
+@caps.requires_tensorrt
+@pytest.mark.parametrize("name", ["full", "int8", "int4", "fp8"])
+def test_tensorrt_engine_holds_every_precision_in_a_rows_cache(tmp_path, name):
+    """TensorRT with cache_impl="io_rows": the engine reads the stored cache (fp8 through a dequantize
+    layer, uint8 through casts) and returns the new rows; the session writes them, inside the decode
+    CUDA graph. A prompt (prefill profile) plus greedy steps match the eager model."""
+    from transformersurgeon.export import build_wrapper, export_to_backend
+    from transformersurgeon.export.backends import TensorRTExportConfig
+    from transformersurgeon.export.backends.tensorrt.session import TensorRTLLMSession
+
+    options = {"max_cache_len": CACHE, "kv_precision": name, "cache_impl": "io_rows", "rmsnorm_impl": "rmsnorm_upcast"}
+    cfg = TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"), max_input_len=8, convert_options=options)
+    result = export_to_backend(_model(torch.float16), cfg)
+    session = TensorRTLLMSession(result.manifest_path)
+    assert session.cache_rows
+    assert session.caches["past_key_0"].dtype == KV_PRECISIONS[name].storage_dtype(torch.float16)
+
+    prompt, steps = torch.tensor([3, 17, 42, 5, 99]), 4
+    session.prefill(prompt)
+    got = [session.logits.float().clone()]
+    for _ in range(steps):
+        session.step()
+        got.append(session.logits.float().clone())
+
+    model = _model(torch.float16)
+    decoder = convert_for_export(model, options=options)["text"]
+    wrapper = build_wrapper({"embedding": model.get_input_embeddings(), "decoder": decoder,
+                             "final_layer": model.lm_head}).cuda().eval()
+    keys, values = [[c.cuda() for c in caches] for caches in build_zero_caches(wrapper.decoder)]
+    ids, pos, expected = prompt.cuda(), torch.tensor([0]).cuda(), []
+    with torch.no_grad():
+        for _ in range(steps + 1):
+            logits, new_keys, new_values = wrapper(ids, pos, keys, values)
+            for cache, rows in zip(keys + values, new_keys + new_values):
+                write_cache_rows(cache, rows, pos)
+            expected.append(logits.float())
+            pos, ids = pos + ids.numel(), logits.float().argmax(-1).view(1)
+    torch.testing.assert_close(torch.stack(got), torch.stack(expected), atol=3e-2, rtol=3e-2)
 
 
 # --------------------------------------------------------------------------- #

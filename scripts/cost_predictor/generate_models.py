@@ -18,10 +18,21 @@ largest P instead). Artifacts: ``<exp>/models/<config>/<backend>/P<P>/``.
 
 KV-cache precision. b_KV is baked into each artifact, so every (weights, b_KV) pair is its own artifact. It is
 either the graph's ``convert_options["kv_precision"]`` (``"int8"``/``"int4"``: uint8 cache rows of codes plus one
-scale per row, ``blocks/attention/kv_precision``) or, on QNN, ``QNNExportConfig.kv_cache_bits=8`` (the QNN quantiser
-keeps the cache as an 8-bit fixed-point activation; QNN exports use quant_scope="all", whose reference cache is
-16-bit, label INT16). ``BACKEND_OPERATIONS`` says what each backend supports; by default the KV alternatives are
-exactly those, and ``--kv-alts`` naming a precision the backend cannot export is an error.
+scale per row; ``"fp8"``: float8_e4m3fn rows; ``blocks/attention/kv_precision``) or, on QNN,
+``QNNExportConfig.kv_cache_bits=8`` (the QNN quantiser keeps the cache as an 8-bit fixed-point activation; QNN
+exports use quant_scope="all", whose reference cache is 16-bit, label INT16). ``BACKEND_OPERATIONS`` says what each
+backend supports; by default the KV alternatives are exactly those, and ``--kv-alts`` naming a precision the backend
+cannot export is an error.
+
+Cache implementation. Some precisions need a particular cache on a backend (``operations.required_cache``): FP8
+everywhere, and every quantised cache on TensorRT, need ``cache_impl="io_rows"`` (the graph returns the new rows and
+the runner writes them, see the manifest's ``cache_rows``). When a requested alternative needs one, every artifact
+of the run uses it, the reference included, so DeltaT_KV compares precisions on the same cache mechanism.
+
+FP8 on TensorRT. TensorRT builds an engine that mixes INT8 weights with an FP8 KV cache only on Blackwell or newer
+GPUs (compute capability >= 10.0); FP16/INT4 weights with FP8 build on 8.9 too. The reference weights are INT8, so
+on an older target the FP8 artifacts of E2 (and of every E4/E5 configuration with an INT8 layer) fail to build:
+there, pass ``--kv-alts INT8 INT4``.
 """
 
 import argparse
@@ -52,7 +63,7 @@ class Profile:
     dtype: torch.dtype
     kv_ref: str
     quant: dict                       # bits -> quantisation parameters
-    cache_impl: str | None = None
+    cache_impl: str | None = None     # unless a KV alternative needs another one (run_cache)
     quant_extra: dict = field(default_factory=dict)   # applied to every quantised layer
 
 
@@ -70,20 +81,33 @@ PROFILES = {
 }
 
 
-KV_OPTIONS = {"INT8": "int8", "INT4": "int4"}   # b_KV label -> convert_options["kv_precision"] ("full" = reference)
+KV_OPTIONS = {"INT8": "int8", "INT4": "int4", "FP8": "fp8"}   # b_KV label -> convert_options["kv_precision"]
 KV_QUANTISER_BITS = {"INT8": 8}                  # b_KV label -> bits of a cache the backend's quantiser keeps
 
 
 def supported_kv_alts(backend):
-    """b_KV labels the backend can bake into a graph besides its reference (``BACKEND_OPERATIONS``): integer
+    """b_KV labels the backend can bake into a graph besides its reference (``BACKEND_OPERATIONS``): stored
     rows of the graph (``kv_precision``) or a cache precision of the backend's quantiser (``kv_cache_bits``)."""
     if backend == "none":
         return []
     from transformersurgeon.export.operations import options_for
     rows = options_for(backend, "kv_precision")
     quantiser = options_for(backend, "kv_cache_quantization")
-    return [label for label in ("INT8", "INT4")
+    return [label for label in KV_OPTIONS
             if KV_OPTIONS[label] in rows or KV_QUANTISER_BITS.get(label) in quantiser]
+
+
+def run_cache(backend, profile: Profile, kv_alts):
+    """Cache implementation of every artifact of the run: the one a requested KV alternative needs on the
+    backend (``operations.required_cache``), else the profile's."""
+    if backend == "none":
+        return profile.cache_impl
+    from transformersurgeon.export.operations import options_for, required_cache
+    needed = {required_cache(backend, KV_OPTIONS[label]) for label in kv_alts
+              if KV_OPTIONS.get(label) in options_for(backend, "kv_precision")} - {None}
+    if len(needed) > 1:
+        raise ValueError(f"KV alternatives {kv_alts} need different caches on {backend}: {sorted(needed)}")
+    return needed.pop() if needed else profile.cache_impl
 
 
 def kv_settings(backend, kv_label, profile: Profile):
@@ -151,11 +175,23 @@ def compress(model, manager_cls, weights, profile: Profile):
     return counts
 
 
+def fp8_engine_note(args):
+    """Warning for TensorRT runs with FP8 KV: engines mixing INT8 weights and FP8 build only on Blackwell+."""
+    if args.backend != "tensorrt" or "FP8" not in args.kv_alts:
+        return None
+    note = ("note: FP8 KV with INT8 weight layers (E2 and most FP8 configurations of E4/E5) builds a TensorRT engine "
+            "only on Blackwell or newer GPUs (compute capability >= 10.0); on older targets use --kv-alts INT8 INT4")
+    if args.build_engine and torch.cuda.is_available() and torch.cuda.get_device_capability() < (10, 0):
+        major, minor = torch.cuda.get_device_capability()
+        note += f". The local GPU (sm_{major}{minor}) cannot build them."
+    return note
+
+
 def export_config(backend, out_dir: Path, cache_len, input_len, profile: Profile, args, kv_precision="full",
                   kv_cache_bits=16):
     base = {"max_cache_len": cache_len, "kv_precision": kv_precision}
-    if profile.cache_impl:
-        base["cache_impl"] = profile.cache_impl
+    if args.cache_impl:
+        base["cache_impl"] = args.cache_impl
     if backend == "xnnpack":
         from transformersurgeon.export.backends.xnnpack import XNNPACKExportConfig
         return XNNPACKExportConfig(output_path=str(out_dir / "model.pte"), max_seq_len=cache_len,
@@ -203,7 +239,8 @@ def generate_one(spec, owner_dir: Path, model_source, args, profile, classes):
         out_dir.mkdir(parents=True, exist_ok=True)
         status = {"config_id": spec["config_id"], "backend": args.backend, "graph": tag,
                   "max_input_len": input_len, "max_cache_len": cache_len, "dtype": str(profile.dtype),
-                  "b_KV": kv_label, "kv_precision": kv_precision, "kv_cache_bits": kv_cache_bits}
+                  "b_KV": kv_label, "kv_precision": kv_precision, "kv_cache_bits": kv_cache_bits,
+                  "cache_impl": args.cache_impl}
         t0 = time.time()
         try:
             model = model_cls.from_pretrained(model_source, dtype=profile.dtype).eval()
@@ -279,6 +316,7 @@ def main():
                      f"{sorted(set(args.kv_alts) - set(supported))} (supported: {supported or 'none'}; "
                      "see BACKEND_OPERATIONS['kv_precision'] and ['kv_cache_quantization'])")
     args.kv_in_graph = set(supported)
+    args.cache_impl = run_cache(args.backend, profile, args.kv_alts)
 
     out = Path(args.out_dir)
     experiments, _ = plan_mod.build_plan(args)
@@ -288,6 +326,8 @@ def main():
                      "on a backend that can export them)")
     if not args.kv_alts:
         print(f"weights-only plan: no KV-cache alternative for {args.backend} (E2/E3 left out)")
+    if fp8_engine_note(args):
+        print(fp8_engine_note(args))
 
     # One export per artifact key; the owner may live in an experiment that was not selected.
     owners = artifact_owners(experiments, args)
@@ -297,7 +337,8 @@ def main():
     if args.limit:
         todo = todo[:args.limit]
     n_graphs = len(graph_shapes(args))
-    print(f"{len(todo)} configurations x {n_graphs} graph(s) = {len(todo) * n_graphs} {args.backend} artifacts")
+    print(f"{len(todo)} configurations x {n_graphs} graph(s) = {len(todo) * n_graphs} {args.backend} artifacts "
+          f"(KV {[args.kv_ref, *args.kv_alts]}, cache_impl={args.cache_impl})")
     if args.dry_run:
         for exp, c in todo:
             print(f"  {exp.dirname}/{c.config_id}  (KV {c.kv}, {c.description})")

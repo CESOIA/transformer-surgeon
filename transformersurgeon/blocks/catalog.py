@@ -84,6 +84,11 @@ BLOCK_CATALOG = {
             "attention.kv_cache.io_inplace.InplaceCache",
             "Graph input/output in heads-major layout, updated by an in-place-capable operator; allows prefill.",
             "kv_cache", "export"),
+        "io_rows": _atom(
+            "attention.kv_cache.io_rows.RowsCache",
+            "Graph input in heads-major layout, only read; the graph returns the new rows and the caller "
+            "writes them; allows prefill.",
+            "kv_cache", "export"),
         "io_paged": _atom(
             "attention.kv_cache.io_paged.PagedCache",
             "Paged pool as graph input/output; written and read by the paged kernel.",
@@ -103,6 +108,10 @@ BLOCK_CATALOG = {
             "attention.kv_precision.int4.Int4Precision",
             "uint8 rows: 4-bit symmetric codes, two per byte, plus one 2-byte scale per row; decoded before "
             "attention.",
+            "kv_precision", "export"),
+        "fp8": _atom(
+            "attention.kv_precision.fp8.FP8Precision",
+            "float8_e4m3fn rows (unit scale, saturating at +-448); decoded before attention; needs io_rows.",
             "kv_precision", "export"),
     },
     # Feed-forward blocks. Model key: "mlp_type".

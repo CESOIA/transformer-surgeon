@@ -4,14 +4,15 @@ from .mutable import MutableCache
 from .io_scatter import ScatterCache
 from .io_concat import ConcatCache
 from .io_inplace import InplaceCache, kv_cache_update
+from .io_rows import RowsCache
 from .io_paged import PagedCache
 
 KV_CACHES = {
     cache.name: cache
-    for cache in (MutableCache(), ScatterCache(), ConcatCache(), InplaceCache(), PagedCache())
+    for cache in (MutableCache(), ScatterCache(), ConcatCache(), InplaceCache(), RowsCache(), PagedCache())
 }
 
 __all__ = [
-    "KVCache", "MutableCache", "ScatterCache", "ConcatCache", "InplaceCache", "PagedCache",
+    "KVCache", "MutableCache", "ScatterCache", "ConcatCache", "InplaceCache", "RowsCache", "PagedCache",
     "KV_CACHES", "kv_cache_update",
 ]

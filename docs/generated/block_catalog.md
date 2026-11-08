@@ -14,10 +14,12 @@
 | `kv_cache` | `io_scatter` | `kv_cache` | export | `blocks.attention.kv_cache.io_scatter.ScatterCache` | Graph input/output, updated with a functional scatter. |
 | `kv_cache` | `io_concat` | `kv_cache` | export | `blocks.attention.kv_cache.io_concat.ConcatCache` | Graph input/output, updated with a one-hot select (no scatter); one token per call. |
 | `kv_cache` | `io_inplace` | `kv_cache` | export | `blocks.attention.kv_cache.io_inplace.InplaceCache` | Graph input/output in heads-major layout, updated by an in-place-capable operator; allows prefill. |
+| `kv_cache` | `io_rows` | `kv_cache` | export | `blocks.attention.kv_cache.io_rows.RowsCache` | Graph input in heads-major layout, only read; the graph returns the new rows and the caller writes them; allows prefill. |
 | `kv_cache` | `io_paged` | `kv_cache` | export | `blocks.attention.kv_cache.io_paged.PagedCache` | Paged pool as graph input/output; written and read by the paged kernel. |
 | `kv_precision` | `full` | `kv_precision` | export | `blocks.attention.kv_precision.full.FullPrecision` | Rows kept in the model dtype. |
 | `kv_precision` | `int8` | `kv_precision` | export | `blocks.attention.kv_precision.int8.Int8Precision` | uint8 rows: 8-bit symmetric codes plus one 2-byte scale per row; decoded before attention. |
 | `kv_precision` | `int4` | `kv_precision` | export | `blocks.attention.kv_precision.int4.Int4Precision` | uint8 rows: 4-bit symmetric codes, two per byte, plus one 2-byte scale per row; decoded before attention. |
+| `kv_precision` | `fp8` | `kv_precision` | export | `blocks.attention.kv_precision.fp8.FP8Precision` | float8_e4m3fn rows (unit scale, saturating at +-448); decoded before attention; needs io_rows. |
 | `mlp` | `mlp` | `mlp` | model | `blocks.mlp.plain.MLP` | down(act(up(x))). |
 | `mlp` | `mlp_gated` | `mlp_gated` | model | `blocks.mlp.gated.MLPGated` | down(act(gate(x)) * up(x)). |
 | `norm` | `rmsnorm` | `rmsnorm` | export | `blocks.norm.rmsnorm.RMSNorm` | Plain RMS normalisation; fusable into one operation by backend compilers. |

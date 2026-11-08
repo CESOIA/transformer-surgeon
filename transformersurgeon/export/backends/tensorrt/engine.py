@@ -40,6 +40,7 @@ _TRT_TO_TORCH_DTYPE = {
     "INT64": torch.int64,
     "BOOL": torch.bool,
     "UINT8": torch.uint8,
+    "FP8": torch.float8_e4m3fn,
 }
 
 

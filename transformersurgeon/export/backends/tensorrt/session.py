@@ -5,7 +5,9 @@ TensorRTLLMSession drives the graph contract recorded in the export manifest:
 
   * KV caches are allocated once (key/value per layer, or one paged K+V pool
     per layer for cache_impl="io_paged"); with ``cache_inplace`` each present_*
-    output is bound to its past_* input buffer (TensorRT updates it in place).
+    output is bound to its past_* input buffer (TensorRT updates it in place);
+    with ``cache_rows`` (cache_impl="io_rows") the engine only reads the caches and
+    the session writes the returned rows at the step's position (in the CUDA graph).
   * prefill() feeds the prompt through the prefill profile in chunks of up to
     max_input_len tokens (or token by token for a decode-only export).
   * decode steps replay one CUDA graph that runs the engine, takes the greedy
@@ -19,11 +21,13 @@ from typing import Iterable
 
 import torch
 
+from ...manifest import write_cache_rows
 from .edgellm_int4 import resolve_plugin_libraries
 from .engine import TensorRTEngineRunner
 from .exporter import DECODE_PROFILE, PREFILL_PROFILE
 
-_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32,
+           "uint8": torch.uint8, "float8_e4m3fn": torch.float8_e4m3fn}
 
 
 class TensorRTLLMSession:
@@ -46,6 +50,7 @@ class TensorRTLLMSession:
             self.prefiller = TensorRTEngineRunner(self.decoder, profile=PREFILL_PROFILE, device=self.device)
 
         cache_dtype = _DTYPES[self.manifest["cache_dtype"]]
+        self.cache_rows = bool(self.manifest.get("cache_rows"))
         self.caches: dict[str, torch.Tensor] = {}
         kinds = [k for k in ("key", "value", "kv") if k in self.manifest["caches"][0]]
         for layer in self.manifest["caches"]:
@@ -53,9 +58,16 @@ class TensorRTLLMSession:
                 spec = layer[kind]
                 buf = torch.zeros(spec["shape"], dtype=cache_dtype, device=self.device)
                 self.caches[spec["input"]] = buf
-                # In place: the output *is* the input buffer. Otherwise the
-                # engine writes a fresh tensor that is copied back after a step.
-                self.caches[spec["output"]] = buf if self.manifest["cache_inplace"] else torch.empty_like(buf)
+                # In place: the output *is* the input buffer. Rows: room for the rows of
+                # the longest call. Otherwise the engine writes a fresh tensor that is
+                # copied back after a step.
+                if self.cache_rows:
+                    heads, width = spec["shape"][1], spec["shape"][3]
+                    out = torch.empty(1, heads, max(self.max_input_len, 1), width, dtype=cache_dtype,
+                                      device=self.device)
+                else:
+                    out = buf if self.manifest["cache_inplace"] else torch.empty_like(buf)
+                self.caches[spec["output"]] = out
         self._cache_pairs = [(l[k]["input"], l[k]["output"]) for l in self.manifest["caches"] for k in kinds]
 
         self.input_ids = torch.zeros(1, dtype=torch.int64, device=self.device)
@@ -72,8 +84,16 @@ class TensorRTLLMSession:
         self.position = 0
         self.pos_id.zero_()
 
-    def _sync_caches(self) -> None:
-        if not self.manifest["cache_inplace"]:
+    def _sync_caches(self, pos: torch.Tensor, count: int) -> None:
+        """After a call that consumed ``count`` tokens from position ``pos``: write the returned
+        rows (io_rows) or copy the returned caches into the buffers the next call reads."""
+        if self.cache_rows:
+            for src, dst in self._cache_pairs:
+                cache = self.caches[src]
+                heads, width = cache.shape[1], cache.shape[3]
+                rows = self.caches[dst].view(-1)[:heads * count * width].view(1, heads, count, width)
+                write_cache_rows(cache, rows, pos)
+        elif not self.manifest["cache_inplace"]:
             for src, dst in self._cache_pairs:
                 self.caches[src].copy_(self.caches[dst])
 
@@ -92,7 +112,7 @@ class TensorRTLLMSession:
                 self.input_ids.copy_(t.view(1))
                 self.pos_id.fill_(self.position)
                 self.decoder.run()
-                self._sync_caches()
+                self._sync_caches(self.pos_id, 1)
                 self.position += 1
         else:
             for start in range(0, token_ids.numel(), self.max_input_len):
@@ -102,7 +122,7 @@ class TensorRTLLMSession:
                 self._prefill_pos.fill_(self.position)
                 self.prefiller.bind({"input_ids": ids, "pos_id": self._prefill_pos, **self.caches, "logits": self.logits})
                 self.prefiller.run()
-                self._sync_caches()
+                self._sync_caches(self._prefill_pos, chunk.numel())
                 self.position += chunk.numel()
         self.pos_id.fill_(self.position - 1)
         self._select_token()  # input_ids <- argmax, pos_id <- position
@@ -115,7 +135,7 @@ class TensorRTLLMSession:
         # The warm-up enqueue really runs the pending step: it writes the KV
         # row at pos_id that the first replay rewrites identically, and leaves
         # input_ids/pos_id alone (token selection only runs inside the graph).
-        self.decoder.capture_graph(after=lambda: (self._sync_caches(), self._select_token()))
+        self.decoder.capture_graph(after=lambda: (self._sync_caches(self.pos_id, 1), self._select_token()))
 
     def step(self) -> None:
         """One decode step on the GPU: consume input_ids at pos_id, produce the next."""

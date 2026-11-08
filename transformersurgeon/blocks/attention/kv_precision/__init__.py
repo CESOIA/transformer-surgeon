@@ -3,13 +3,14 @@ from .base import KVPrecision, IntegerKVPrecision, SCALE_BYTES
 from .full import FullPrecision
 from .int8 import Int8Precision
 from .int4 import Int4Precision
+from .fp8 import FP8_MAX, FP8Precision, kv_fp8_quantize, kv_fp8_dequantize
 
 KV_PRECISIONS = {
     precision.name: precision
-    for precision in (FullPrecision(), Int8Precision(), Int4Precision())
+    for precision in (FullPrecision(), Int8Precision(), Int4Precision(), FP8Precision())
 }
 
 __all__ = [
     "KVPrecision", "IntegerKVPrecision", "SCALE_BYTES", "FullPrecision", "Int8Precision", "Int4Precision",
-    "KV_PRECISIONS",
+    "FP8_MAX", "FP8Precision", "kv_fp8_quantize", "kv_fp8_dequantize", "KV_PRECISIONS",
 ]

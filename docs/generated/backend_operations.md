@@ -31,17 +31,19 @@ Storage and update of past keys/values (blocks/attention/kv_cache). Chosen by: c
 | qnn | `io_scatter` | Cache as graph input/output, QNN ScatterNd. |
 | qnn | `io_concat` | Cache as graph input/output, QNN element-wise select. |
 | onnx | `io_inplace` (default) | ONNX TensorScatter (opset 24); consumers may update the buffer in place. |
+| onnx | `io_rows` | Cache as a read-only graph input; the graph returns the new rows, which the consumer writes at pos_id. |
 | onnx | `io_scatter` | ONNX ScatterND. |
 | onnx | `io_concat` | ONNX Where on a one-hot position mask. |
 | onnx | `io_paged` | Only with a custom translation of tsurgeon::paged_attention (the tensorrt backend provides one). |
 | tensorrt | `io_inplace` (default) | TensorScatter executed in place by TensorRT (output aliased to input). |
+| tensorrt | `io_rows` | Cache as a read-only engine input; the engine returns the new rows and the runner writes them (the only cache for int8/int4/fp8 rows). |
 | tensorrt | `io_scatter` | TensorRT ScatterND. |
 | tensorrt | `io_concat` | TensorRT Select. |
 | tensorrt | `io_paged` | Paged KV pool of the TensorRT Edge-LLM AttentionPlugin. |
 
 ### `kv_precision`
 
-What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are uint8: symmetric codes plus one 2-byte scale per row (token, KV head), decoded to float before attention; the attention kernel never reads them natively. Chosen by: convert option `kv_precision`.
+What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are uint8: symmetric codes plus one 2-byte scale per row (token, KV head); FP8 rows are float8_e4m3fn with a unit scale. Both are decoded to float before attention; the attention kernel never reads them natively. A backend entry may name the cache a precision needs there (requires_cache). Chosen by: convert option `kv_precision`.
 
 | Backend | Option | Device operation |
 |---|---|---|
@@ -52,7 +54,11 @@ What one stored key/value row holds (blocks/attention/kv_precision). Integer row
 | onnx | `full` (default) | Cache in the model dtype. |
 | onnx | `int8` | uint8 cache I/O; encode/decode are standard element-wise ONNX operations. |
 | onnx | `int4` | uint8 cache I/O with two codes per byte; encode/decode are standard ONNX operations. |
+| onnx | `fp8` | float8e4m3fn cache I/O written by QuantizeLinear and read by DequantizeLinear (unit scale); needs cache_impl='io_rows'. |
 | tensorrt | `full` (default) | Cache in the model dtype. |
+| tensorrt | `int8` | uint8 cache I/O; encode/decode are element-wise operations around the attention. |
+| tensorrt | `int4` | uint8 cache I/O with two codes per byte; encode/decode as for int8. |
+| tensorrt | `fp8` | FP8 cache I/O: a QuantizeLinear writes the rows, a DequantizeLinear reads the cache (checked on compute capability 8.9; older GPUs, e.g. Jetson Orin, may refuse FP8). With INT8 weights in the same engine it builds only on Blackwell or newer GPUs. |
 
 ### `kv_cache_quantization`
 

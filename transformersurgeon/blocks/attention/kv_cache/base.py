@@ -39,6 +39,19 @@ class KVCache:
         """The cache as seen by the kernel (``read_layout``)."""
         return cache
 
+    def update(self, attn, k, v, write_index, key_cache, value_cache, dtype):
+        """Store the new float rows ``k``/``v`` (``(q_len, kv_heads, head_dim)``) and return
+        ``(key, value, key_out, value_out)``: the keys/values the kernel attends to, decoded to
+        ``dtype`` in ``read_layout``, and the caches the module returns.
+
+        Default: encode the new rows, write them, then decode the whole cache.
+        """
+        codec = attn.kv_codec
+        key_cache, value_cache = self.write(attn, codec.encode(k), codec.encode(v), write_index, key_cache, value_cache)
+        key = codec.decode(self.read(key_cache), dtype)
+        value = codec.decode(self.read(value_cache), dtype)
+        return key, value, key_cache, value_cache
+
     def decoder_mask(self, decoder, pos_id, in_seq_len):
         """Additive causal mask and the positions of the new tokens.
 

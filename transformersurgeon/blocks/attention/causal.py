@@ -13,8 +13,8 @@ class MHACausal(MHABase):
     - a KV-cache atom (``cache_impl``, see ``kv_cache/``): how new keys/values are
       stored (internal state, scatter, one-hot select, in-place operator, pages);
     - a KV-precision atom (``kv_precision``, see ``kv_precision/``): what one
-      stored row holds (the model dtype, or int8/int4 codes with one scale per
-      row); the kernel always reads decoded float rows;
+      stored row holds (the model dtype, int8/int4 codes with one scale per
+      row, or FP8 numbers); the kernel always reads decoded float rows;
     - an attention kernel (``attn_impl``, see ``kernels/``): how attention is
       computed (explicit, PyTorch SDPA, ExecuTorch fused kernel, paged kernel).
 
@@ -22,11 +22,13 @@ class MHACausal(MHABase):
     ``max_cache_len`` (default 2048), ``add_batch_dim`` (accept and return a
     leading size-1 batch dimension), ``masked_softmax`` (replace masked scores
     instead of adding a large negative penalty; ``manual`` kernel only),
-    ``kv_precision`` (default ``"full"``; ``"int8"``/``"int4"`` need a kernel
-    that reads the cache through the KV-cache atom, not ``custom_sdpa``/``paged``).
+    ``kv_precision`` (default ``"full"``; the others need a kernel that reads the
+    cache through the KV-cache atom, not ``custom_sdpa``/``paged``, and ``"fp8"``
+    needs ``cache_impl="io_rows"``).
 
     ``forward`` returns ``output`` when the cache is internal state, otherwise
-    ``(output, key_cache, value_cache)`` (``(output, kv_pool, None)`` for pages).
+    ``(output, key_cache, value_cache)`` (``(output, kv_pool, None)`` for pages; the
+    new rows only for ``io_rows``).
     """
 
     # Role read by exporters that treat whole atoms specially (e.g. the QNN
@@ -53,6 +55,9 @@ class MHACausal(MHABase):
         if kv_precision != "full" and (self.kernel.owns_cache or self.kernel.fuses_projection):
             raise ValueError(f"kv_precision={kv_precision!r} needs a cache written and read through the KV-cache "
                              f"atom; attn_impl={self.attn_impl!r} keeps its own float cache.")
+        if self.kv_codec.requires_cache not in (None, cache_impl):
+            raise ValueError(f"kv_precision={kv_precision!r} needs cache_impl={self.kv_codec.requires_cache!r}: "
+                             "its rows cannot be moved by a scatter or select inside the graph.")
 
         if self.kv_cache.requires_kernel not in (None, self.attn_impl) or (
                 self.kernel.requires_cache == "io_paged" and cache_impl != "io_paged"):
@@ -92,7 +97,8 @@ class MHACausal(MHABase):
 
     @property
     def cache_dtype(self):
-        """dtype of the stored key/value caches (``uint8`` for an integer ``kv_precision``)."""
+        """dtype of the stored key/value caches (``uint8`` for an integer ``kv_precision``,
+        ``float8_e4m3fn`` for ``fp8``)."""
         return self.key_cache.dtype
 
     def _cache_geometry_ok(self):
@@ -157,10 +163,8 @@ class MHACausal(MHABase):
             attn_output = self.kernel.attend_with_own_cache(self, q, k, v, pos_id)
         else:
             write_index = torch.clamp(pos_id, 0, self.max_cache_length - 1).long()
-            key_cache, value_cache = self.kv_cache.write(self, self.kv_codec.encode(k), self.kv_codec.encode(v),
-                                                         write_index, key_cache, value_cache)
-            key = self.kv_codec.decode(self.kv_cache.read(key_cache), q.dtype)
-            value = self.kv_codec.decode(self.kv_cache.read(value_cache), q.dtype)
+            key, value, key_cache, value_cache = self.kv_cache.update(self, k, v, write_index, key_cache,
+                                                                      value_cache, q.dtype)
             attn_output = self.kernel.attend(self, q, key, value, attn_mask, kv_layout=self.kv_cache.read_layout)
 
         # Width is num_heads * value_head_dim (out_proj's input follows value pruning).

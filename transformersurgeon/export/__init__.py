@@ -18,5 +18,5 @@ from .exporter import Exporter, EXPORTERS, register_exporter, get_exporter, expo
 from .wrapper import LLMWrapper, build_wrapper, build_zero_caches, build_example_inputs
 from .quant_info import extract_layer_quant_info
 from .pt2e import calibrate_pt2e_observers, inject_scales_into_pt2e_observers
-from .manifest import build_llm_manifest, load_llm_manifest, zero_caches_from_manifest, manifest_path_for
+from .manifest import build_llm_manifest, load_llm_manifest, zero_caches_from_manifest, manifest_path_for, write_cache_rows
 from .result import BackendExportResult

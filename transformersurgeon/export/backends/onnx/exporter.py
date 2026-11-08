@@ -20,6 +20,11 @@ With ``cache_impl="io_inplace"`` the cache write is an opset-24 TensorScatter:
 consumers should bind each present_* to the same buffer as its past_* (TensorRT
 requires it -- it aliases them and updates in place).
 
+With ``cache_impl="io_rows"`` the graph only reads past_*: present_* hold the new
+rows, ``(1, kv_heads, seq, width)``, which the consumer writes into its cache at
+pos_id (``export.manifest.write_cache_rows``). FP8 rows (``kv_precision="fp8"``)
+are QuantizeLinear/DequantizeLinear with a unit scale.
+
 With ``cache_impl="io_paged"`` each layer has one paged K+V pool instead
 (past_kv_i / present_kv_i, also updated in place) and attention is the fused
 ``tsurgeon::paged_attention`` op, which has no standard ONNX form: the target
@@ -48,11 +53,29 @@ def _tensor_scatter(cache, update, write_index):
     return values.Opset("", 24).TensorScatter(cache, update, write_index, axis=2)
 
 
+def _fp8_quantize(x):
+    from onnxscript import ir, values
+
+    op = values.Opset("", 24)
+    scale = op.CastLike(op.Constant(value=ir.tensor(1.0)), x)
+    return op.QuantizeLinear(x, scale, output_dtype=ir.DataType.FLOAT8E4M3FN)
+
+
+def _fp8_dequantize(rows):
+    from onnxscript import ir, values
+
+    op = values.Opset("", 24)
+    return op.DequantizeLinear(rows, op.Constant(value=ir.tensor(1.0)))
+
+
 def default_translations() -> dict[Any, Callable]:
     """ATen/custom-op -> onnxscript translations every ONNX export needs."""
     from ....blocks.attention.kv_cache import io_inplace  # noqa: F401  (registers torch.ops.tsurgeon.kv_cache_update)
+    from ....blocks.attention.kv_precision import fp8  # noqa: F401  (registers torch.ops.tsurgeon.kv_fp8_*)
 
-    return {torch.ops.tsurgeon.kv_cache_update.default: _tensor_scatter}
+    return {torch.ops.tsurgeon.kv_cache_update.default: _tensor_scatter,
+            torch.ops.tsurgeon.kv_fp8_quantize.default: _fp8_quantize,
+            torch.ops.tsurgeon.kv_fp8_dequantize.default: _fp8_dequantize}
 
 
 @dataclass
@@ -71,7 +94,7 @@ class ONNXExportConfig(BackendExportConfig):
     output_path        - path of the .onnx file (external weights go next to it).
     max_input_len      - >1 makes the sequence dim of input_ids dynamic
                          (1..max_input_len) so a whole prompt is one call;
-                         needs cache_impl="io_inplace". 1 = decode-only graph.
+                         needs cache_impl="io_inplace" or "io_rows". 1 = decode-only graph.
     opset              - ONNX opset; 24 is required for TensorScatter.
     optimize           - run the exporter's ONNX optimizer (constant folding,
                          dead-code removal).
@@ -118,8 +141,8 @@ def export_onnx(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
     out_dir = os.path.dirname(os.path.abspath(config.output_path))
     wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
     cache_impl = wrapper.cache_impl
-    if config.max_input_len > 1 and cache_impl != "io_inplace":
-        raise ValueError("max_input_len > 1 (prompt prefill) requires cache_impl='io_inplace'.")
+    if config.max_input_len > 1 and cache_impl not in ("io_inplace", "io_rows"):
+        raise ValueError("max_input_len > 1 (prompt prefill) requires cache_impl='io_inplace' or 'io_rows'.")
 
     # Per-layer quantization metadata; hard-quantized weights are dequantized
     # in place here and re-expressed as Q/DQ after export.

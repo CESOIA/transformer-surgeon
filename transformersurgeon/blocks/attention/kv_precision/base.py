@@ -21,10 +21,12 @@ class KVPrecision:
     float keys and values.
 
     - ``bits``: stored bits per element (``None``: the model dtype, unchanged).
+    - ``requires_cache``: the only KV-cache atom that can hold these rows, or ``None``.
     """
 
     name = None
     bits = None
+    requires_cache = None
 
     def storage_dtype(self, dtype):
         """dtype of the cache buffers of a module computing in ``dtype``."""

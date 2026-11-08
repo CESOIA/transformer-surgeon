@@ -41,8 +41,8 @@ transformersurgeon/
 │   ├── positions/          rope, frequency tables, rope_pruning
 │   ├── attention/          base (MHABase), causal (MHACausal), bidirectional (MHAEncoder)
 │   │   ├── kernels/        manual, sdpa, custom_sdpa, paged
-│   │   ├── kv_cache/       mutable, io_scatter, io_concat, io_inplace, io_paged
-│   │   └── kv_precision/   full, int8, int4 (what one stored key/value row holds)
+│   │   ├── kv_cache/       mutable, io_scatter, io_concat, io_inplace, io_rows, io_paged
+│   │   └── kv_precision/   full, int8, int4, fp8 (what one stored key/value row holds)
 │   └── stacks/             decoder, encoder, config
 ├── export/         from compressed model to device artifact
 │   ├── operations.py       BACKEND_OPERATIONS: block type -> device operation per backend

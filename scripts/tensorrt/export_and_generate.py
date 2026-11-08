@@ -3,6 +3,7 @@
     python scripts/tensorrt/export_and_generate.py                       # fp16
     python scripts/tensorrt/export_and_generate.py --quant 4             # INT4 weight-only
     python scripts/tensorrt/export_and_generate.py --quant 4 --int4-backend edgellm_plugin
+    python scripts/tensorrt/export_and_generate.py --kv-precision fp8    # FP8 KV cache (io_rows)
     python scripts/tensorrt/export_and_generate.py --no-build            # ONNX only (build on the target)
     python scripts/tensorrt/export_and_generate.py --skip-export         # reuse an existing export
 
@@ -36,6 +37,9 @@ def parse_args():
     parser.add_argument("--quant", type=int, choices=[4, 8], default=None,
                         help="hard per-channel weight-only quantization of all decoder linears")
     parser.add_argument("--int4-backend", choices=["dequantize", "edgellm_plugin"], default="dequantize")
+    parser.add_argument("--kv-precision", choices=["full", "int8", "int4", "fp8"], default="full",
+                        help="stored KV-cache rows; anything but full uses cache_impl='io_rows' "
+                             "(with --quant 8, fp8 builds only on Blackwell or newer GPUs)")
     parser.add_argument("--no-build", action="store_true", help="export ONNX + manifest only")
     parser.add_argument("--skip-export", action="store_true", help="reuse out-dir/model.manifest.json")
     parser.add_argument("--prompt", default="Tell me one short fact about France.")
@@ -56,8 +60,8 @@ def export(args) -> str:
         output_path=os.path.join(args.out_dir, "model.onnx"),
         backend="tensorrt",
         max_input_len=args.max_input_len,
-        convert_options={
-            "cache_impl": "io_inplace",
+        convert_options={   # cache_impl: io_inplace, or io_rows when kv_precision needs it
+            "kv_precision": args.kv_precision,
             "max_cache_len": args.max_cache_len,
             "rmsnorm_prescale": False,
             "rmsnorm_upcast": True,
