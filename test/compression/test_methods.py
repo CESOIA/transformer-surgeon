@@ -62,6 +62,18 @@ def test_gptq_beats_round_to_nearest_on_correlated_inputs():
     assert out_err(QUANT_METHODS["gptq"], covariance=cov) < out_err(QUANT_METHODS["vanilla"])
 
 
+def test_gptq_per_group_beats_round_to_nearest():
+    torch.manual_seed(0)
+    w = torch.randn(16, 64)
+    x = torch.randn(256, 64) @ torch.randn(64, 64)
+    cov = x.T @ x / len(x)
+    def out_err(fn, **kw):
+        q, s, deq = fn(w, 3, 1e-6, "per_group", group_size=16, **kw)
+        assert q.dtype == torch.int8 and s.shape == (16, 4) and q.abs().max() <= 3
+        return torch.linalg.norm(x @ (deq(q, s) - w).T)
+    assert out_err(QUANT_METHODS["gptq"], covariance=cov) < out_err(QUANT_METHODS["vanilla"])
+
+
 def test_per_group_and_lpbq_scales():
     torch.manual_seed(0)
     w = torch.randn(4, 64)

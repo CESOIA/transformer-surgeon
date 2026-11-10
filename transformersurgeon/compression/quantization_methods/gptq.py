@@ -1,7 +1,7 @@
 import torch
 from typing import Callable, Optional, Tuple, Union
 
-from .vanilla import _dequantize_symmetric
+from .vanilla import _dequantize_symmetric, _dequantize_grouped
 
 
 def quantize_gptq(
@@ -13,6 +13,7 @@ def quantize_gptq(
     covariance: Optional[torch.Tensor] = None,
     block_size: int = 128,
     percdamp: float = 0.01,
+    group_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Callable]:
     """GPTQ weight quantization (Frantar et al., 2022).
 
@@ -24,11 +25,15 @@ def quantize_gptq(
         weight: Float weight matrix of shape [out_features, in_features].
         precision: Bit-width (integer). Binary is not supported.
         eps: Scale clamp lower bound.
-        granularity: ``"per_channel"`` (per output row) or ``"per_tensor"``.
+        granularity: ``"per_channel"`` (per output row), ``"per_group"`` (per output row and
+                     ``group_size`` input columns) or ``"per_tensor"``.
         covariance: X^T X calibration matrix of shape [in_features, in_features].
                     If None, falls back to vanilla round-to-nearest.
         block_size: Number of columns processed per Cholesky block.
         percdamp: Hessian diagonal damping as a fraction of its mean.
+        group_size: per_group only (default 128). As in the reference implementation, a
+                    group's scale is taken from the error-updated weights when the sweep
+                    reaches its first column.
 
     Returns:
         (qdata, scale, dequantize_fn) where qdata is int8, matching the
@@ -40,14 +45,28 @@ def quantize_gptq(
     W = weight.clone().float()
     out_features, in_features = W.shape
     qmax = 2 ** (precision - 1) - 1
+    per_group = granularity == "per_group"
     per_channel = granularity == "per_channel"
 
-    # Compute a fixed scale from the original weight (before Hessian corrections).
-    if per_channel:
-        scale = W.abs().amax(dim=1, keepdim=True) / qmax  # [out, 1]
+    if per_group:
+        g = group_size or 128
+        if in_features % g:
+            raise ValueError(f"per_group: in_features {in_features} not divisible by group_size {g}.")
+        if covariance is None:
+            Wg = W.reshape(out_features, in_features // g, g)
+            scale = (Wg.abs().amax(dim=2) / qmax).clamp(min=eps)  # [out, groups]
+            q = torch.clamp(torch.round(Wg / scale.unsqueeze(-1)), -qmax, qmax)
+            return q.reshape(out_features, in_features).to(torch.int8), scale, _dequantize_grouped
+        # Blocks hold whole groups, so a group's scale sees fully updated columns.
+        block_size = -(-block_size // g) * g
+        scale = torch.empty(out_features, in_features // g, device=W.device)
     else:
-        scale = W.abs().max() / qmax  # scalar
-    scale = scale.clamp(min=eps)
+        # Compute a fixed scale from the original weight (before Hessian corrections).
+        if per_channel:
+            scale = W.abs().amax(dim=1, keepdim=True) / qmax  # [out, 1]
+        else:
+            scale = W.abs().max() / qmax  # scalar
+        scale = scale.clamp(min=eps)
 
     if covariance is None:
         q = torch.clamp(torch.round(W / scale), -qmax, qmax).to(torch.int8)
@@ -79,7 +98,14 @@ def quantize_gptq(
             d = H1[j, j]          # diagonal of upper Cholesky factor at column j
 
             # Round to nearest integer, clamp, and dequantize.
-            if per_channel:
+            col = block_start + j
+            if per_group:
+                if col % g == 0:
+                    scale[:, col // g] = (W1[:, j:j + g].abs().amax(dim=1) / qmax).clamp(min=eps)
+                s_col = scale[:, col // g]
+                q = torch.clamp(torch.round(w / s_col), -qmax, qmax)
+                q_float = q * s_col
+            elif per_channel:
                 q = torch.clamp(torch.round(w / scale[:, 0]), -qmax, qmax)
                 q_float = q * scale[:, 0]
             else:
@@ -100,6 +126,9 @@ def quantize_gptq(
 
     # Re-encode Q (dequantized) back to int8. Because Q was built from exact
     # quantized values, this round-trip is lossless.
+    if per_group:
+        q_int = torch.clamp(torch.round(Q / scale.repeat_interleave(g, dim=1)), -qmax, qmax).to(torch.int8)
+        return q_int, scale, _dequantize_grouped
     q_int = torch.clamp(torch.round(Q / scale), -qmax, qmax).to(torch.int8)
     return q_int, scale, _dequantize_symmetric
 

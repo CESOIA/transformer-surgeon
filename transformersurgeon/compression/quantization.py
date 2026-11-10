@@ -146,8 +146,8 @@ class Quantizer(Compressor):
                         calibration_kwargs = {**calibration_kwargs, "covariance": V @ C @ V.T}
 
                     if granularity == "per_group":
-                        if method != "vanilla":
-                            raise NotImplementedError("per_group granularity is only implemented for method='vanilla'.")
+                        if method not in ("vanilla", "gptq", "hqq"):
+                            raise NotImplementedError(f"per_group granularity is not implemented for method={method!r}.")
                         calibration_kwargs["group_size"] = self.group_size
                         if self.group_scale_bits is not None:
                             calibration_kwargs["group_scale_bits"] = self.group_scale_bits
@@ -511,8 +511,6 @@ def _apply_hard_quantization(module, method, precision, granularity, group_size,
 
     if not (isinstance(precision, int) and 2 <= precision <= 8):
         raise ValueError(f"Hard quantization needs an int precision in [2, 8]; got {precision!r}.")
-    if method == "gptq" and granularity == "per_group":
-        raise NotImplementedError("GPTQ with per_group granularity is not implemented.")
 
     targets = [(module, "weight", calibration_kwargs)]
     V = getattr(module, "linear_V", None)
