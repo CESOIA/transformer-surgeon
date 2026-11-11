@@ -92,6 +92,9 @@ class CompressionScheme:
         self.model = model
         self.hard_applied = False # this flags the compression as non-reversible when True
         self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize with hard application
+        # Compressors already hard-applied. After a hard apply, a compression type not applied yet can still be set and
+        # hard-applied on top (staged compression, e.g. pruning -> LRD -> quantization in separate apply() calls).
+        self.applied_compressors = set()
         self.vcon_initialized = False # this flags if the VCONBlock has been initialized
         # Manager-level results of global calibration summaries (shared dict, set by the manager).
         self.global_calibration_data = {}
@@ -199,7 +202,8 @@ class CompressionScheme:
         if validator is not None:
             validator(value) # This will raise an error if the value is invalid
 
-        if self.soft_applied or self.hard_applied:
+        staged = self.hard_applied and compression_name not in self.applied_compressors
+        if (self.soft_applied or self.hard_applied) and not staged:
             raise RuntimeError(f"Cannot set {compression_property} for {compression_name} because compression has already been applied.")
 
         # Generate compressor if necessary
@@ -534,7 +538,11 @@ class CompressionScheme:
                 else:
                     print("  ! Compression already soft applied, skipping re-application.")
 
-        if self.hard_applied or (self.soft_applied and not hard):
+        pending = {n: c for n, c in self.compressors.items() if n not in self.applied_compressors}
+        staged = self.hard_applied and any(c._to_compress() for c in pending.values())
+        if staged and not hard:
+            raise RuntimeError(f"{self.path}: compression was hard-applied; a further compression must be hard too.")
+        if (self.hard_applied and not staged) or (self.soft_applied and not hard):
             return # Nothing to do
         
         # Get the module to compress
@@ -546,15 +554,17 @@ class CompressionScheme:
             self._weight_original = None
 
         # Perform compression for each compressor in the scheme
-        for cname, compressor in self.compressors.items():
+        for cname, compressor in (pending if staged else self.compressors).items():
             if verbose:
                 print(f"Applying compression '{cname}' for module {self.path}")
             compressor.set_calibration_store(self.calibration_data)
-            compressor.apply(module=module, hard=hard, soft_applied=self.soft_applied)
-                    
+            compressor.apply(module=module, hard=hard, soft_applied=self.soft_applied and not staged)
+
         # Flag as applied
         self.soft_applied = True
         self.hard_applied = hard
+        if hard:  # only the ones that compressed something (defaults stay settable)
+            self.applied_compressors.update(n for n, c in self.compressors.items() if c._to_compress())
 
     def restore(self, topology=False, verbose=False):
         """
