@@ -789,8 +789,8 @@ class CompressionSchemesManager:
         for scheme in schemes:
             required_summaries = []
 
-            for compressor in scheme.compressors.values():
-                if not compressor._to_compress():
+            for cname, compressor in scheme.compressors.items():
+                if not compressor._to_compress() or cname in scheme.applied_compressors:
                     continue
 
                 compressor.set_calibration_store(scheme.calibration_data)
