@@ -23,6 +23,7 @@ class RowsCache(InplaceCache):
     """
 
     name = "io_rows"
+    returns_rows = True
 
     def write(self, attn, k, v, write_index, key_cache, value_cache):
         raise NotImplementedError("io_rows caches are written by the caller; see RowsCache.update().")

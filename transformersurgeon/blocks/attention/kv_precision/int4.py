@@ -2,7 +2,7 @@
 
 import torch
 
-from .base import SCALE_BYTES, IntegerKVPrecision
+from .integer import SCALE_BYTES, IntegerKVPrecision
 
 
 class Int4Precision(IntegerKVPrecision):

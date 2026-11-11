@@ -11,6 +11,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from ..blocks import KV_CACHES
 from ..utils.devices import device_zeros
 
 
@@ -63,6 +64,7 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
     """
     decoder = wrapper.decoder
     cache_impl = getattr(decoder, "cache_impl", "mutable")
+    kv_cache = KV_CACHES[cache_impl]
     kinds = ("kv",) if cache_impl == "io_paged" else ("key", "value")
     if cache_scales(decoder):
         kinds += ("key_scale", "value_scale")
@@ -81,9 +83,9 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         "cache_impl": cache_impl,
         "cache_io": cache_impl != "mutable",
         "cache_inplace": cache_impl in ("io_inplace", "io_paged"),
-        # io_rows: present_* are only the new rows; the caller writes them at pos_id (write_cache_rows).
-        "cache_rows": cache_impl == "io_rows",
-        "cache_layout": {"io_inplace": "BHSD", "io_rows": "BHSD", "io_paged": "PAGED"}.get(cache_impl, "SHD"),
+        # present_* are only the new rows; the caller writes them at pos_id (write_cache_rows).
+        "cache_rows": kv_cache.returns_rows,
+        "cache_layout": kv_cache.manifest_layout,
         # The allocated cache buffer, not config.dtype (None for configs without one).
         "cache_dtype": _dtype_name(decoder.blocks[0].attn.key_cache.dtype),
         # "full", "int8"/"int4" (uint8 rows of codes + a 2-byte scale), "fp8" (float8_e4m3fn rows) or

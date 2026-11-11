@@ -75,8 +75,9 @@ Two dictionaries join the folders:
 - the model dictionary says which operations the model needs (`structure`, `attn_type`, `mlp_type`,
   `norm_type`, `rope_type`), i.e. which atoms of `BLOCK_CATALOG` build its export graph;
 - `BACKEND_OPERATIONS` says, per backend, which implementation of each operation is used by default and which
-  alternatives are supported (`cache_impl`, `attn_impl`, `rmsnorm_impl`, `masked_softmax`, `add_batch_dim`,
-  and the configuration fields `quant_path`, `quant_scope`, `int4_backend`, `convert_linear_to_conv2d`).
+  alternatives are supported (`cache_impl`, `kv_precision`, `attn_impl`, `rmsnorm_impl`, `masked_softmax`,
+  `add_batch_dim`, and the configuration fields `quant_path`, `quant_scope`, `kv_cache_bits`, `int4_backend`,
+  `convert_linear_to_conv2d`).
   `resolve_convert_options(backend, options)` fills the defaults and rejects unsupported choices.
 
 ---
@@ -152,7 +153,7 @@ Runners use `load_llm_manifest` and `zero_caches_from_manifest` instead of re-de
 A TensorRT engine only runs on the GPU architecture + TensorRT version it was built with, so for edge targets (Jetson Orin) the artifact is the ONNX file; the engine is built on the device (`python -m transformersurgeon.export.backends.tensorrt.exporter model.manifest.json`). Needs `pip install -e ".[onnx]"` plus the `tensorrt` Python package matching the CUDA version (e.g. `tensorrt-cu13`). CLI: `scripts/tensorrt/export_and_generate.py`. Measured at parity with NVIDIA's TensorRT Edge-LLM for decode.
 
 - **Cache:** convert with `cache_impl="io_inplace"`: BHSD `(1, kv_heads, max_cache_len, head_dim)` caches as graph I/O, written by `tsurgeon::kv_cache_update` (`blocks/attention/kv_cache/io_inplace.py`) which exports as opset-24 `TensorScatter`. TensorRT aliases each `present_*` output to its `past_*` input and updates it in place — bind both to the same buffer. `mutable` is rejected (ONNX has no state).
-- **Caller-written cache (`cache_impl="io_rows"`):** same BHSD `past_*` inputs, but the graph only reads them: `present_*` are the new rows `(1, kv_heads, seq, width)` and the runner writes them at `pos_id` (`export/manifest.py::write_cache_rows`; manifest `cache_rows: true`; `TensorRTLLMSession` does it inside the decode CUDA graph). The stored cache is decoded first and the decoded new rows are placed in the decoded copy with a gather and a select on the slot index (`kv_cache/io_rows.py`), so stored rows never pass through a scatter or select (and no FP4 dequantize feeds a scatter: TensorRT 11.4 cannot compile that for one token). It is the only cache that holds `int8`/`int4`/`fp8`/`nvfp4` rows on TensorRT (see `kv_precision` below); `scripts/tensorrt/export_and_generate.py --kv-precision fp8` (or `nvfp4`) runs it end to end.
+- **Caller-written cache (`cache_impl="io_rows"`):** same BHSD `past_*` inputs, but the graph only reads them: `present_*` are the new rows `(1, kv_heads, seq, width)` and the runner writes them at `pos_id` (`export/manifest.py::write_cache_rows`; manifest `cache_rows: true`, from the atom's `returns_rows`; `TensorRTLLMSession` does it inside the decode CUDA graph). The stored cache is decoded first and the decoded new rows are placed in the decoded copy with a gather and a select on the slot index (`kv_cache/io_rows.py`), so stored rows never pass through a scatter or select (and no FP4 dequantize feeds a scatter: TensorRT 11.4 cannot compile that for one token). It is the only cache that holds `int8`/`int4`/`fp8`/`nvfp4` rows on TensorRT (see `kv_precision` below); `scripts/tensorrt/export_and_generate.py --kv-precision fp8` (or `nvfp4`) runs it end to end.
 - **Fused decode attention (`cache_impl="io_paged"`, opt-in):** one paged K+V pool per layer `(2, ceil(max_cache_len/128), 128, kv_heads, head_dim)` (`past_kv_i`/`present_kv_i`, bind both to one buffer: the plugin writes in place without declaring the alias) and one `tsurgeon::paged_attention` op per layer (RoPE + cache write + attention over the filled slots; eager implementation in `blocks/attention/kernels/paged.py`). The TensorRT backend maps it to TensorRT Edge-LLM's `AttentionPlugin` (XQA decode kernels, NVRTC-compiled at engine build): decode cost follows the context, not `max_cache_len`, unlike the static-cache MatMul/Softmax path which reads every slot. Needs `EDGELLM_PLUGIN_PATH`, equal q/k/v head dims (head_dim 32/64/128, q:kv 1–8) and unpruned RoPE (within-head pruning keeps per-kv-group frequencies: use `io_inplace`); whole-head pruning works. Decode only (`max_input_len=1`; prompts run token by token). The plain `onnx` backend rejects it (no standard ONNX form).
 - **Prefill:** `max_input_len > 1` makes `input_ids` `(seq,)` dynamic; only `io_inplace` and `io_rows` accept `in_seq_len > 1`. The engine gets two optimization profiles: 0 = decode (seq 1), 1 = prefill.
 - **Numerics:** use `rmsnorm_upcast=True` (float32 RMSNorm, HF semantics) for fp16 GPU exports; `rmsnorm_prescale=False` alone overflows in fp16.
@@ -182,7 +183,8 @@ CLI: `scripts/executorch/xnnpack/exporter_function_test.py --attn-impl {manual,s
 `convert_options={"kv_precision": "int8" | "int4"}` (default `"full"`) stores every cached key/value row (one
 token, one KV head) as `uint8`: symmetric codes (`int8`: one byte per element; `int4`: two per byte, needs an even
 head dim) followed by two scale bytes, scale = `(1 + m/256) * 2**(e-128)`, rounded up from the row's max |x|/qmax so
-no code is clipped. The atom (`blocks/attention/kv_precision/`) sits between `MHACausal` and its KV-cache atom:
+no code is clipped (`kv_precision/integer.py`, the format both share). The atom
+(`blocks/attention/kv_precision/`) sits between `MHACausal` and its KV-cache atom:
 `encode` before the write, `decode` (to float) before the kernel (`KVCache.update`), so every storage atom
 (`mutable`, `io_scatter`, `io_concat`, `io_inplace`, `io_rows`) works unchanged and the cache shape/dtype
 (`cache_shape`, `cache_dtype`, manifest `cache_dtype`/`kv_precision`) follows. A fresh zero cache decodes to ~0.
@@ -219,9 +221,11 @@ FLOAT4E2M1, and the two `DequantizeLinear` back; eager and TensorRT store the sa
   `QNNExportConfig(quant_scope="all", kv_cache_bits=8)` gives the cache writes of every `MHACausal`
   (`passes.py::_kv_cache_write_predicate`: `index_copy`/`index_put` inside an `EXPORT_ROLE == "attention"` module)
   an 8a8w configuration; the graph keeps `kv_precision="full"`. Needs `quant_scope="all"` and
-  `float_attention_core=False` (the cache is a fixed-point activation only then). HTP has no 4-bit activations, so
-  no int4 cache. Written without the QNN SDK: only `test_qnn_kv_cache_bits_8_quantises_the_cache_writes_to_8_bits`
-  (`requires_qnn`) exercises the lowering.
+  `float_attention_core=False` (the cache is a fixed-point activation only then), and a cache written by an index
+  operation (`mutable`, `io_scatter`): `io_concat` writes with a select that the predicate does not match, so the
+  exporter raises instead of leaving the cache at 16 bits. HTP has no 4-bit activations, so no int4 cache. The
+  lowering is exercised on the x86 host by the `requires_qnn` tests (`test_qnn_kv_cache_bits_8_*`, QNN SDK 2.37);
+  nothing has run on a device.
 - **TensorRT holds int8/int4/fp8/nvfp4 rows only with `io_rows`** (`requires_cache`; checked with TensorRT 11.4 on an
   RTX 4070, compute capability 8.9). The KV-cache update behind `io_inplace` takes only a Float/Half/BFloat16 cache
   ("cache has type FP8 but must have type Float, Half, or BFloat16"); `uint8` is refused inside the network ("does

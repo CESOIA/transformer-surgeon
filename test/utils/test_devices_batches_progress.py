@@ -5,6 +5,7 @@ import torch
 from transformersurgeon.utils import (
     FallbackProgressBar,
     build_progress_bar,
+    device_zeros,
     infer_model_device,
     move_to_device,
     normalize_batch,
@@ -26,6 +27,19 @@ def test_move_to_device_recurses_into_containers():
     assert isinstance(moved["b"][1], tuple) and moved["b"][1][1] == 3
     assert moved["c"] == "text"
     assert torch.equal(moved["b"][0], torch.ones(1))
+
+
+def test_device_zeros_allocates_any_dtype():
+    assert device_zeros((2, 3)).dtype == torch.get_default_dtype()
+    ints = device_zeros((2, 3), torch.int64)
+    assert ints.dtype == torch.int64 and ints.shape == (2, 3) and ints.device.type == "cpu" and not ints.any()
+    # One-byte float dtypes are zeroed as bytes (torch cannot fill some of them).
+    names = [name for name in ("float8_e4m3fn", "float8_e5m2", "float4_e2m1fn_x2") if hasattr(torch, name)]
+    for name in names:
+        zeros = device_zeros((2, 4), getattr(torch, name))
+        assert zeros.dtype == getattr(torch, name) and zeros.shape == (2, 4)
+        assert not zeros.view(torch.uint8).any()
+    assert "float8_e4m3fn" in names
 
 
 @pytest.mark.parametrize("batch, expected", [

@@ -6,7 +6,9 @@ the device. It is organised by *block type*; for every backend it gives:
 
 - ``default``: the implementation used when the caller chooses nothing;
 - ``options``: every implementation known to work on that backend, each with a
-  short description of the resulting device operation.
+  short description of the resulting device operation;
+- ``requires_cache`` (optional, ``kv_precision`` only): the KV-cache atom each
+  listed precision needs on that backend (see :func:`required_cache`).
 
 Each block type also says how the choice reaches the code:
 
@@ -117,7 +119,8 @@ BACKEND_OPERATIONS = {
             "qnn": {"default": 16, "options": {
                 16: "Cache at the activation precision of the graph (16-bit with quant_scope='all').",
                 8: "The cache writes get an 8-bit activation configuration (8a8w): an 8-bit fixed-point cache. "
-                   "Needs quant_scope='all' and float_attention_core=False.",
+                   "Needs quant_scope='all', float_attention_core=False and a cache written by an index "
+                   "operation (cache_impl 'mutable' or 'io_scatter').",
             }},
             **{backend: {"default": "kv_precision", "options": {
                 "kv_precision": "Not chosen by a quantiser: the convert option kv_precision decides the cache.",

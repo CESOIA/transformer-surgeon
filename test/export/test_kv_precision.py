@@ -413,8 +413,11 @@ def _qnn_components(cache_impl="mutable"):
             "config": model.config}
 
 
-@pytest.mark.parametrize("cache_impl", ["mutable", "io_scatter"])
-def test_qnn_kv_cache_predicate_selects_the_cache_writes(cache_impl):
+@pytest.mark.parametrize("cache_impl, per_layer", [("mutable", 2), ("io_scatter", 2), ("io_concat", 0)])
+def test_qnn_kv_cache_predicate_selects_the_cache_writes(cache_impl, per_layer):
+    """One key and one value write per layer for the caches written by an index operation. io_concat
+    writes with a select, which the predicate does not match: the exporter rejects kv_cache_bits=8 with it
+    (test_qnn_kv_cache_bits_8_rejects_a_cache_it_cannot_quantise)."""
     pytest.importorskip("torchao")  # imported by the export backends
     from transformersurgeon.export.backends.qnn.passes import (
         _decompose_wrap_with_set_grad_enabled, _kv_cache_write_predicate,
@@ -430,7 +433,7 @@ def test_qnn_kv_cache_predicate_selects_the_cache_writes(cache_impl):
         pass  # an inference-mode trace has no grad-mode wrapper to inline
     predicate = _kv_cache_write_predicate()
     writes = [node for node in module.graph.nodes if predicate(node)]
-    assert len(writes) == 2 * len(wrapper.decoder.blocks)  # one key and one value write per layer
+    assert len(writes) == per_layer * len(wrapper.decoder.blocks)
 
 
 def test_qnn_kv_cache_bits_needs_a_fully_quantised_graph():
@@ -466,3 +469,18 @@ def test_qnn_kv_cache_bits_8_quantises_the_cache_writes_to_8_bits(tmp_path):
     ranges = [w.args[3].args[4] for w in writes
               if isinstance(w.args[3], torch.fx.Node) and "dequantize" in str(w.args[3].target)]
     assert writes and ranges and max(ranges) <= 255
+
+
+@caps.requires_qnn
+def test_qnn_kv_cache_bits_8_rejects_a_cache_it_cannot_quantise(tmp_path):
+    """io_concat is a QNN cache, but nothing in it matches the cache-write predicate: without the check the
+    export would succeed with a 16-bit cache."""
+    from transformersurgeon.export import export_to_backend
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    cfg = QNNExportConfig(output_path=str(tmp_path / "model.pte"), max_seq_len=CACHE, quant_scope="all",
+                          kv_cache_bits=8, run_weight_mismatch_check=False,
+                          convert_options={"max_cache_len": CACHE, "cache_impl": "io_concat"})
+    with pytest.raises(ValueError, match="found no KV-cache write to quantise"):
+        export_to_backend(_model(), cfg)
+    assert not os.path.exists(cfg.output_path)

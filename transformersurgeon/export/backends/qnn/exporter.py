@@ -119,8 +119,9 @@ class QNNExportConfig(BackendExportConfig):
     # mask, softmax, A.V) in fp16 instead of 16-bit fixed point.
     float_attention_core: bool = False
     # quant_scope="all" only (and float_attention_core=False): bits of the fixed-point
-    # KV cache. 8 gives the cache writes of every attention module an 8a8w configuration;
-    # the graph itself keeps kv_precision="full". Not yet validated on a device.
+    # KV cache. 8 gives the cache writes of every attention module an 8a8w configuration
+    # (caches written by an index operation: "mutable", "io_scatter"); the graph itself
+    # keeps kv_precision="full". Not yet validated on a device.
     kv_cache_bits: int = field(default_factory=lambda: config_default("qnn", "kv_cache_bits"))
     # Token-id sequences for PT2E activation calibration (each decoded from position 0
     # with the KV cache filling up). None = a few built-in sentences. Use real text
@@ -259,6 +260,11 @@ class QNNExporter(ExecuTorchExporter):
         module = exported.module()
         _decompose_wrap_with_set_grad_enabled(module)
         _canonicalize_pow_tensor_scalar(module)
+        if config.kv_cache_bits != 16 and not any(map(_kv_cache_write_predicate(), module.graph.nodes)):
+            raise ValueError(
+                "QNNExportConfig.kv_cache_bits=8 found no KV-cache write to quantise: the cache must be written "
+                "by index_copy or index_put (cache_impl 'mutable' or 'io_scatter'), "
+                f"got cache_impl={wrapper.cache_impl!r}.")
 
         if config.quantize_float_model and config.quant_scope != "all":
             raise ValueError("QNNExportConfig.quantize_float_model requires quant_scope='all'.")

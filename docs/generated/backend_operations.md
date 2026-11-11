@@ -69,7 +69,7 @@ Bits of a KV cache that the backend's own quantiser keeps as a fixed-point activ
 |---|---|---|
 | xnnpack | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 | qnn | `16` (default) | Cache at the activation precision of the graph (16-bit with quant_scope='all'). |
-| qnn | `8` | The cache writes get an 8-bit activation configuration (8a8w): an 8-bit fixed-point cache. Needs quant_scope='all' and float_attention_core=False. |
+| qnn | `8` | The cache writes get an 8-bit activation configuration (8a8w): an 8-bit fixed-point cache. Needs quant_scope='all', float_attention_core=False and a cache written by an index operation (cache_impl 'mutable' or 'io_scatter'). |
 | onnx | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 | tensorrt | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 

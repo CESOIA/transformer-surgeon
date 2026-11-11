@@ -16,6 +16,8 @@ class KVCache:
     - ``manifest_layout``: layout name recorded in export manifests.
     - ``multi_token``: whether one call may write several tokens (prefill).
     - ``requires_kernel``: the only attention kernel that works with this cache, or ``None``.
+    - ``returns_rows``: the graph only reads the cache and returns the new stored rows, which
+      the caller writes into its own cache (``False``: the graph returns the updated cache).
     """
 
     name = None
@@ -24,6 +26,7 @@ class KVCache:
     manifest_layout = "SHD"
     multi_token = False
     requires_kernel = None
+    returns_rows = False
 
     def shape(self, attn, which):
         """Shape of the ``which`` (``"key"``/``"value"``, or their block scales ``"key_scale"``/

@@ -8,7 +8,7 @@ elements gets the scale ``max|x| / 6`` rounded to E4M3 (nearest even, saturating
 and each element ``x / scale`` rounded to E2M1 (nearest even, saturating at +-6).
 ``torch.ops.tsurgeon.kv_nvfp4_dequantize(rows, scales)`` widens them back to float32.
 The per-tensor (second-level) scale of NVFP4 is 1. Their ONNX translations
-(``export/onnx``) are a ``QuantizeLinear`` of the block scales to FLOAT8E4M3FN followed by
+(``export/backends/onnx``) are a ``QuantizeLinear`` of the block scales to FLOAT8E4M3FN followed by
 a blocked ``QuantizeLinear`` to FLOAT4E2M1, and the two ``DequantizeLinear`` back: the
 only form in which TensorRT creates and reads FP4 tensors.
 """

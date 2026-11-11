@@ -2,7 +2,7 @@
 
 ``torch.ops.tsurgeon.kv_fp8_quantize(x)`` rounds float rows to ``float8_e4m3fn``
 (nearest even, saturating at +-448) and ``torch.ops.tsurgeon.kv_fp8_dequantize(rows)``
-widens them back to float32. Their ONNX translations (``export/onnx``) are
+widens them back to float32. Their ONNX translations (``export/backends/onnx``) are
 ``QuantizeLinear``/``DequantizeLinear`` with a unit scale: TensorRT only creates
 FP8 tensors with a quantize layer and only reads them with a dequantize layer
 (an ONNX ``Cast`` to FP8 is refused).

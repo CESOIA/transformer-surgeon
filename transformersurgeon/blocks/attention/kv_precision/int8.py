@@ -1,6 +1,6 @@
 """Keys and values stored as 8-bit codes with one scale per row."""
 
-from .base import SCALE_BYTES, IntegerKVPrecision
+from .integer import SCALE_BYTES, IntegerKVPrecision
 
 
 class Int8Precision(IntegerKVPrecision):
