@@ -26,6 +26,7 @@ from .passes import (
     _canonicalize_pow_tensor_scalar,
     _decompose_wrap_with_set_grad_enabled,
     _float_attention_nodes,
+    _kv_cache_write_kind,
     _kv_cache_write_predicate,
     _linear_block_sizes,
     _share_amin_quant_params,
@@ -121,13 +122,33 @@ class QNNExportConfig(BackendExportConfig):
     float_attention_core: bool = False
     # quant_scope="all" only (and float_attention_core=False): bits of the fixed-point
     # KV cache. 8 gives the cache writes of every attention module an 8a8w configuration
-    # (caches written by an index operation: "mutable", "io_scatter"); the graph itself
-    # keeps kv_precision="full". Not yet validated on a device.
-    kv_cache_bits: int = field(default_factory=lambda: config_default("qnn", "kv_cache_bits"))
+    # (caches written by an index operation: "mutable", "io_scatter"); a (key bits, value
+    # bits) pair sets the two caches independently: (16, 8) gives it to the value-cache
+    # writes only, (8, 16) to the key-cache writes only. The graph itself keeps
+    # kv_precision="full". Not yet validated on a device.
+    kv_cache_bits: int | tuple = field(default_factory=lambda: config_default("qnn", "kv_cache_bits"))
     # Token-id sequences for PT2E activation calibration (each decoded from position 0
     # with the KV cache filling up). None = a few built-in sentences. Use real text
     # from the target distribution: static 16-bit ranges come only from these.
     calibration_token_ids: Any = None
+
+    def __post_init__(self):
+        if isinstance(self.kv_cache_bits, list):  # e.g. read from JSON
+            self.kv_cache_bits = tuple(self.kv_cache_bits)
+        if isinstance(self.kv_cache_bits, tuple) and len(set(self.kv_cache_bits)) == 1:
+            self.kv_cache_bits = self.kv_cache_bits[0]  # (8, 8) is 8
+
+
+def _cache_bits(config: QNNExportConfig) -> tuple[int, int]:
+    """``(key bits, value bits)`` of ``config.kv_cache_bits`` (one number: both caches)."""
+    bits = config.kv_cache_bits
+    return (bits, bits) if isinstance(bits, int) else tuple(bits)
+
+
+def _eight_bit_cache_parts(config: QNNExportConfig):
+    """Caches the quantiser keeps at 8 bits: ``()``, ``None`` (both) or a 1-tuple such as ``("value",)``."""
+    eight = tuple(part for part, bits in zip(("key", "value"), _cache_bits(config)) if bits == 8)
+    return None if len(eight) == 2 else eight
 
 
 def _resolve_qcom_chipset(soc_model: Any):
@@ -243,8 +264,9 @@ class QNNExporter(ExecuTorchExporter):
             raise RuntimeError(_QNN_UNAVAILABLE_MSG)
 
     def lower(self, components, config):
-        if config.kv_cache_bits != 16 and (config.quant_scope != "all" or config.float_attention_core):
-            raise ValueError("QNNExportConfig.kv_cache_bits=8 requires quant_scope='all' and "
+        low_bit_cache = _cache_bits(config) != (16, 16)
+        if low_bit_cache and (config.quant_scope != "all" or config.float_attention_core):
+            raise ValueError(f"QNNExportConfig.kv_cache_bits={config.kv_cache_bits!r} requires quant_scope='all' and "
                              "float_attention_core=False: only then is the KV cache a fixed-point activation.")
         _keep_gcc_cxx_runtime_global()   # before anything loads the QNN SDK
         wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
@@ -261,15 +283,23 @@ class QNNExporter(ExecuTorchExporter):
         module = exported.module()
         _decompose_wrap_with_set_grad_enabled(module)
         _canonicalize_pow_tensor_scalar(module)
-        if config.kv_cache_bits != 16 and not any(map(_kv_cache_write_predicate(), module.graph.nodes)):
-            raise ValueError(
-                "QNNExportConfig.kv_cache_bits=8 found no KV-cache write to quantise: the cache must be written "
-                "by index_copy or index_put (cache_impl 'mutable' or 'io_scatter'), "
-                f"got cache_impl={wrapper.cache_impl!r}.")
+        if low_bit_cache:
+            writes = [node for node in module.graph.nodes if _kv_cache_write_predicate()(node)]
+            if not writes:
+                raise ValueError(
+                    f"QNNExportConfig.kv_cache_bits={config.kv_cache_bits!r} found no KV-cache write to quantise: the "
+                    "cache must be written by index_copy or index_put (cache_impl 'mutable' or 'io_scatter'), "
+                    f"got cache_impl={wrapper.cache_impl!r}.")
+            kinds = [_kv_cache_write_kind(node) for node in writes]
+            if _eight_bit_cache_parts(config) and (None in kinds or kinds.count("key") != kinds.count("value")):
+                raise ValueError(
+                    f"QNNExportConfig.kv_cache_bits={config.kv_cache_bits!r} cannot tell the key-cache writes from "
+                    "the value-cache writes: each must write a buffer or graph input whose name contains 'key' or "
+                    "'value'.")
 
         if config.quantize_float_model and config.quant_scope != "all":
             raise ValueError("QNNExportConfig.quantize_float_model requires quant_scope='all'.")
-        quantize = bool(layer_info) or config.quantize_float_model or config.kv_cache_bits != 16
+        quantize = bool(layer_info) or config.quantize_float_model or low_bit_cache
         model_for_edge, exported_for_mismatch = module, None
         if quantize:
             model_for_edge, exported_for_mismatch = self._quantize(module, layer_info, model_config,
@@ -367,9 +397,10 @@ class QNNExporter(ExecuTorchExporter):
              ModuleQConfig(quant_dtype=qdtype, is_linear_per_channel=True, act_observer=act_observer))
             for qdtype, layers in layers_by_qdtype.items()
         ]
-        if config.kv_cache_bits == 8:
+        eight_bit_caches = _eight_bit_cache_parts(config)
+        if eight_bit_caches != ():
             # The cache writes are not inside any linear layer, so no per-layer predicate matches them.
-            submodule_configs.append((_kv_cache_write_predicate(),
+            submodule_configs.append((_kv_cache_write_predicate(eight_bit_caches),
                                       ModuleQConfig(quant_dtype=QuantDtype.use_8a8w, act_observer=act_observer)))
         quantizer.set_submodule_qconfig_list(submodule_configs)
         # Runs after the per-operation rules: a minimum takes the scale of its input, not a range of its own.

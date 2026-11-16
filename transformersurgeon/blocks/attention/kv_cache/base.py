@@ -48,12 +48,14 @@ class KVCache:
         ``(key, value, key_out, value_out)``: the keys/values the kernel attends to, decoded to
         ``dtype`` in ``read_layout``, and the caches the module returns.
 
-        Default: encode the new rows, write them, then decode the whole cache.
+        Default: encode the new rows, write them, then decode the whole cache (each cache with its
+        own precision atom).
         """
-        codec = attn.kv_codec
-        key_cache, value_cache = self.write(attn, codec.encode(k), codec.encode(v), write_index, key_cache, value_cache)
-        key = codec.decode(self.read(key_cache), dtype)
-        value = codec.decode(self.read(value_cache), dtype)
+        key_codec, value_codec = attn.codec("key"), attn.codec("value")
+        key_cache, value_cache = self.write(attn, key_codec.encode(k), value_codec.encode(v), write_index,
+                                            key_cache, value_cache)
+        key = key_codec.decode(self.read(key_cache), dtype)
+        value = value_codec.decode(self.read(value_cache), dtype)
         return key, value, key_cache, value_cache
 
     def decoder_mask(self, decoder, pos_id, in_seq_len):

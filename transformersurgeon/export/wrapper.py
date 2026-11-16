@@ -21,7 +21,7 @@ def build_zero_caches(decoder: nn.Module) -> tuple[list[torch.Tensor], list[torc
 
     Shapes come from each block's attention module, so per-layer geometry after
     pruning is respected. A cache is a ``(rows, scales)`` pair for a precision with
-    block scales (``kv_precision="nvfp4"``). Returns ``([], [])`` for an internal
+    block scales (a cache stored as ``"nvfp4"``). Returns ``([], [])`` for an internal
     cache; for pages, one pool per block in the first list and an empty second list.
     """
     if not _graph_io_cache(decoder):

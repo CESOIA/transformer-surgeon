@@ -16,8 +16,10 @@ Graph contract (names are fixed; shapes/dtypes are recorded in the manifest):
   outputs  logits      (vocab,)            for the last input token
            present_key_i / present_value_i updated caches
 
-With ``kv_precision="nvfp4"`` every cache has a second tensor of block scales,
-past_key_scale_i / past_value_scale_i in and present_*_scale_i out.
+Keys and values may be stored differently (``kv_precision`` a ``(key, value)``
+pair): each cache input/output has its own type. Every cache stored as
+``"nvfp4"`` has a second tensor of block scales, past_key_scale_i /
+past_value_scale_i in and present_*_scale_i out.
 
 With ``cache_impl="io_inplace"`` the cache write is an opset-24 TensorScatter:
 consumers should bind each present_* to the same buffer as its past_* (TensorRT
@@ -199,8 +201,10 @@ def export_onnx(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
         keys, values = ([list(c) if isinstance(c, tuple) else c for c in caches] for caches in example_inputs[2:])
         example_inputs = (torch.randint(0, vocab, (2,), dtype=torch.long), example_inputs[1], keys, values)
         seq = torch.export.Dim("seq", min=1, max=config.max_input_len)
-        static = [None if isinstance(c, torch.Tensor) else [None] * len(c) for c in keys]
-        dynamic_shapes = ({0: seq}, None, static, static)
+        # Key and value caches may differ (only one of a (key, value) precision pair has block scales).
+        static_keys, static_values = ([None if isinstance(c, torch.Tensor) else [None] * len(c) for c in caches]
+                                      for caches in (keys, values))
+        dynamic_shapes = ({0: seq}, None, static_keys, static_values)
 
     with torch.no_grad():
         logits_dtype = wrapper(*example_inputs)[0].dtype

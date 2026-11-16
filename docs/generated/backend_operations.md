@@ -43,7 +43,7 @@ Storage and update of past keys/values (blocks/attention/kv_cache). Chosen by: c
 
 ### `kv_precision`
 
-What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are uint8: symmetric codes plus one 2-byte scale per row (token, KV head); FP8 rows are float8_e4m3fn with a unit scale; NVFP4 rows are FP4 (E2M1) with a second tensor of FP8 block scales (one per 16 elements). All are decoded to float before attention; the attention kernel never reads them natively. A backend entry may name the cache a precision needs there (requires_cache). Chosen by: convert option `kv_precision`.
+What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are uint8: symmetric codes plus one 2-byte scale per row (token, KV head); FP8 rows are float8_e4m3fn with a unit scale; NVFP4 rows are FP4 (E2M1) with a second tensor of FP8 block scales (one per 16 elements). All are decoded to float before attention; the attention kernel never reads them natively. One option for both caches, or a (key, value) pair of options to store them differently, e.g. ('int8', 'int4'). A backend entry may name the cache a precision needs there (requires_cache). Chosen by: convert option `kv_precision`.
 
 | Backend | Option | Device operation |
 |---|---|---|
@@ -59,7 +59,7 @@ What one stored key/value row holds (blocks/attention/kv_precision). Integer row
 | tensorrt | `int8` | uint8 cache I/O; encode/decode are element-wise operations around the attention. |
 | tensorrt | `int4` | uint8 cache I/O with two codes per byte; encode/decode as for int8. |
 | tensorrt | `fp8` | FP8 cache I/O: a QuantizeLinear writes the rows, a DequantizeLinear reads the cache (checked on compute capability 8.9; older GPUs, e.g. Jetson Orin, may refuse FP8). With INT8 weights in the same engine it builds only on Blackwell or newer GPUs. |
-| tensorrt | `nvfp4` | NVFP4 cache I/O: FP4 rows plus an FP8 block-scale tensor per cache (unit per-tensor scale); QuantizeLinear writes both, a double DequantizeLinear reads them. Checked on compute capability 8.9, where TensorRT warns that FP4 is not accelerated (Blackwell has FP4 hardware). The scales are FP8, so the INT8-weights rule of fp8 applies. |
+| tensorrt | `nvfp4` | NVFP4 cache I/O: FP4 rows plus an FP8 block-scale tensor per cache (unit per-tensor scale); QuantizeLinear writes both, a double DequantizeLinear reads them. Checked on compute capability 8.9, where TensorRT warns that FP4 is not accelerated (Blackwell has FP4 hardware). The scales are FP8, so the INT8-weights rule of fp8 applies. Not in a (key, value) pair with int8 or int4: TensorRT 11.4 crashes building that engine. |
 
 ### `kv_cache_quantization`
 
@@ -70,6 +70,8 @@ Bits of a KV cache that the backend's own quantiser keeps as a fixed-point activ
 | xnnpack | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 | qnn | `16` (default) | Cache at the activation precision of the graph (16-bit with quant_scope='all'). |
 | qnn | `8` | The cache writes get an 8-bit activation configuration (8a8w): an 8-bit fixed-point cache. Needs quant_scope='all', float_attention_core=False and a cache written by an index operation (cache_impl 'mutable' or 'io_scatter'). |
+| qnn | `(16, 8)` | (key bits, value bits): only the value-cache writes get the 8a8w configuration; the key cache stays at 16 bits. A few key channels with large biases set a per-tensor 8-bit key step that leaves the other channels a few codes. Same requirements as 8. |
+| qnn | `(8, 16)` | (key bits, value bits): only the key-cache writes get the 8a8w configuration; the value cache stays at 16 bits. Same requirements as 8. |
 | onnx | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 | tensorrt | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 

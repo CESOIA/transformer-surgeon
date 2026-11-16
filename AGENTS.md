@@ -141,9 +141,11 @@ print(result.onnx_path, result.manifest_path, result.engine_path)
 
 Every backend writes `<artifact stem>.manifest.json` next to its artifact (`export/manifest.py::build_llm_manifest`):
 cache implementation, layout and dtype, per-layer key/value cache shapes (they differ per layer after pruning), dtypes
-and graph I/O names. A precision with block scales (`kv_precision="nvfp4"`) stores each cache as two tensors: the
-layer entry then also has `key_scale`/`value_scale` (`past_key_scale_i`, ...), and the cache is the pair
-`(rows, scales)` everywhere it is passed (`build_zero_caches`, `zero_caches_from_manifest`, `write_cache_rows`).
+and graph I/O names. Each cache entry has its own dtype (keys and values differ with a `(key, value)`
+`kv_precision` pair; top-level `cache_dtype` is the key cache's). A cache stored with block scales (`"nvfp4"`) is two
+tensors: the layer entry then also has `key_scale` and/or `value_scale` (`past_key_scale_i`, ...;
+`manifest.py::cache_scales` names the caches that have them), and that cache is the pair `(rows, scales)` everywhere
+it is passed (`build_zero_caches`, `zero_caches_from_manifest`, `write_cache_rows`).
 Runners use `load_llm_manifest` and `zero_caches_from_manifest` instead of re-deriving geometry.
 
 ## Backend Details
@@ -190,6 +192,20 @@ no code is clipped (`kv_precision/integer.py`, the format both share). The atom
 (`cache_shape`, `cache_dtype`, manifest `cache_dtype`/`kv_precision`) follows. A fresh zero cache decodes to ~0.
 Error per element: ≤ 0.4 % (int8) / ≤ 7.2 % (int4) of the row's max |x|.
 
+**Keys and values independently:** every precision below can be given per cache as a `(key, value)` pair, e.g.
+`convert_options={"kv_precision": ("int8", "int4")}` or `("full", "nvfp4")`. `MHACausal` then holds one atom per cache
+(`kv_codecs`, `codec(which)`; `KVCache.update` and `RowsCache.update` encode/decode each cache with its own), each
+cache gets its own dtype, width and block scales (`stored_dtype(which)`; `cache_dtype`/`cache_scale_dtype` raise when
+the two differ), and `attn.kv_precision`/the manifest record the pair (`[key, value]` in JSON). The pair is
+canonical (`kv_precision_pair`, `canonical_kv_precision`): `("int8", "int8")` is `"int8"`, a list is a tuple. Each part
+must be an option of the backend and the pair takes the cache either part needs (`required_cache`); a backend entry's
+`incompatible` lists parts that cannot share one graph. Checked end to end: ONNX Runtime (`("int8", "int4")`,
+`("full", "int8")`, `("fp8", "int4")`), the XNNPACK program in ExecuTorch's runtime (`("int8", "int4")`), TensorRT
+engines (`("fp8", "int4")`, `("full", "nvfp4")`), each matching the eager model with the same pair. TensorRT 11.4
+crashes (segmentation fault in the builder) on an engine with an NVFP4 cache next to an int8/int4 one, so `tensorrt`
+rejects those pairs (`incompatible`); NVFP4 next to full or FP8 builds. Tests: `test/blocks/test_kv_precision.py`
+(`*precision_pair*`), `test/export/test_kv_precision.py`.
+
 `"fp8"` stores `float8_e4m3fn` rows (row width = head dim) with a unit scale, as FP8 KV caches run when no
 calibrated scale is given: nearest-even rounding (relative error ≤ 2⁻⁴), saturation at ±448, subnormals below
 2⁻⁶. Encode/decode are the custom ops `tsurgeon::kv_fp8_quantize`/`kv_fp8_dequantize` (`kv_precision/fp8.py`),
@@ -204,10 +220,11 @@ E4M3 (nearest even, saturating at 448), values x/scale rounded to E2M1 (nearest 
 -0.0); a block below 6·2⁻¹⁰ is stored as zero. Error ≤ 17/96 of the block's max |x|. Custom ops
 `tsurgeon::kv_nvfp4_quantize` (→ `(rows, scales)`) and `kv_nvfp4_dequantize` (`kv_precision/nvfp4.py`), exported
 as a `QuantizeLinear` of the scales to FLOAT8E4M3FN, a blocked `QuantizeLinear` (block 16) of the rows to
-FLOAT4E2M1, and the two `DequantizeLinear` back; eager and TensorRT store the same bytes. Each cache is the pair
-`(rows, scales)` (see the manifest above; `MHACausal.zero_cache`, `cache_scale_dtype`); the graph has
-`past_*_scale_i`/`present_*_scale_i` next to each cache, flattened rows-then-scales per layer
-(`graph_io_names(..., scales=True)`). Needs `io_rows` and a head dim that is a multiple of 16.
+FLOAT4E2M1, and the two `DequantizeLinear` back; eager and TensorRT store the same bytes. Each NVFP4 cache is the
+pair `(rows, scales)` (see the manifest above; `MHACausal.zero_cache`, `stored_dtype("key_scale")`); the graph has
+`past_*_scale_i`/`present_*_scale_i` next to it, flattened rows-then-scales per layer
+(`graph_io_names(..., scales=("key", "value"))`, or the one cache of a pair). Needs `io_rows` and a head dim that is a
+multiple of 16.
 
 - **Dequantize-first**: attention never reads integer rows natively; each step decodes the whole cache, so the
   cache footprint shrinks but compute grows (decode cost can rise, which is what a cost model should see).
@@ -226,6 +243,17 @@ FLOAT4E2M1, and the two `DequantizeLinear` back; eager and TensorRT store the sa
   exporter raises instead of leaving the cache at 16 bits. HTP has no 4-bit activations, so no int4 cache. The
   lowering is exercised on the x86 host by the `requires_qnn` tests (`test_qnn_kv_cache_bits_8_*`, QNN SDK 2.37);
   nothing has run on a device.
+- **QNN `kv_cache_bits=(key bits, value bits)`** sets the two caches independently: `(16, 8)` gives the 8a8w
+  configuration to the value-cache writes only, `(8, 16)` to the key-cache writes only (`(8, 8)` is `8`);
+  `passes.py::_kv_cache_write_kind` tells key from value writes by the name of the buffer or graph input they
+  write. An 8-bit key cache loses accuracy on models with large k_proj biases: the
+  cache has one range per layer, and in layers 0, 1 and 8 of Qwen2.5-0.5B a few key channels carry biases of
+  130–214, so the 8-bit step is ~1 and the median key channel uses 2–7 of the 256 codes (the value cache: 56–122
+  in every layer). Qwen2.5-0.5B with W8 MLP weights, fake-quantised model, 4 held-out WikiText-2 windows of 128
+  tokens: KL to the same model with float activations 0.117 with `kv_cache_bits=8`, 0.015 with `(16, 8)`
+  (perplexity 22.05 → 19.80; 19.54 with float activations). The `(16, 8)` program lowers to one HTP partition and,
+  on the x86 simulator, matches the float model's top-1 at 4 of 5 prompt positions (8-bit cache: 2 of 5). Test:
+  `test/export/test_kv_precision.py::test_qnn_kv_cache_bits_pair_sets_each_cache`.
 - **TensorRT holds int8/int4/fp8/nvfp4 rows only with `io_rows`** (`requires_cache`; checked with TensorRT 11.4 on an
   RTX 4070, compute capability 8.9). The KV-cache update behind `io_inplace` takes only a Float/Half/BFloat16 cache
   ("cache has type FP8 but must have type Float, Half, or BFloat16"); `uint8` is refused inside the network ("does

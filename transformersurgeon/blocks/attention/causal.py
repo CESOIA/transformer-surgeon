@@ -5,7 +5,7 @@ import torch
 from ...utils.devices import device_zeros
 from .base import MHABase
 from .kv_cache import KV_CACHES
-from .kv_precision import KV_PRECISIONS
+from .kv_precision import KV_PRECISIONS, canonical_kv_precision, kv_precision_pair
 
 
 class MHACausal(MHABase):
@@ -13,10 +13,11 @@ class MHACausal(MHABase):
 
     - a KV-cache atom (``cache_impl``, see ``kv_cache/``): how new keys/values are
       stored (internal state, scatter, one-hot select, in-place operator, pages);
-    - a KV-precision atom (``kv_precision``, see ``kv_precision/``): what one
-      stored row holds (the model dtype, int8/int4 codes with one scale per
+    - a KV-precision atom per cache (``kv_precision``, see ``kv_precision/``): what
+      one stored row holds (the model dtype, int8/int4 codes with one scale per
       row, FP8 numbers, or NVFP4 numbers with a second tensor of block scales);
-      the kernel always reads decoded float rows;
+      keys and values may use different atoms; the kernel always reads decoded
+      float rows;
     - an attention kernel (``attn_impl``, see ``kernels/``): how attention is
       computed (explicit, PyTorch SDPA, ExecuTorch fused kernel, paged kernel).
 
@@ -24,14 +25,15 @@ class MHACausal(MHABase):
     ``max_cache_len`` (default 2048), ``add_batch_dim`` (accept and return a
     leading size-1 batch dimension), ``masked_softmax`` (replace masked scores
     instead of adding a large negative penalty; ``manual`` kernel only),
-    ``kv_precision`` (default ``"full"``; the others need a kernel that reads the
-    cache through the KV-cache atom, not ``custom_sdpa``/``paged``, and ``"fp8"``
+    ``kv_precision`` (default ``"full"``: one name for both caches, or a ``(key, value)``
+    pair such as ``("int8", "int4")``; anything but ``"full"`` needs a kernel that reads
+    the cache through the KV-cache atom, not ``custom_sdpa``/``paged``, and ``"fp8"``
     and ``"nvfp4"`` need ``cache_impl="io_rows"``).
 
     ``forward`` returns ``output`` when the cache is internal state, otherwise
     ``(output, key_cache, value_cache)`` (``(output, kv_pool, None)`` for pages; the
-    new rows only for ``io_rows``). With ``kv_precision="nvfp4"`` each key/value
-    cache, in and out, is the pair ``(rows, scales)``.
+    new rows only for ``io_rows``). A cache stored as ``"nvfp4"`` is, in and out, the
+    pair ``(rows, scales)``.
     """
 
     # Role read by exporters that treat whole atoms specially (e.g. the QNN
@@ -43,24 +45,25 @@ class MHACausal(MHABase):
                  add_batch_dim=False, masked_softmax=False, kv_precision="full"):
         if cache_impl not in KV_CACHES:
             raise ValueError(f"Unsupported cache_impl {cache_impl!r}; expected one of {tuple(KV_CACHES)}")
-        if kv_precision not in KV_PRECISIONS:
-            raise ValueError(f"Unsupported kv_precision {kv_precision!r}; expected one of {tuple(KV_PRECISIONS)}")
+        names = kv_precision_pair(kv_precision)
         self.cache_impl = cache_impl
         super().__init__(embed_dim, num_heads, kv_num_heads=kv_num_heads, attn_impl=attn_impl,
                          use_sdpa=use_sdpa, linear_specs=linear_specs, dtype=dtype)
         self.kv_cache = KV_CACHES[cache_impl]
-        self.kv_precision = kv_precision
-        self.kv_codec = KV_PRECISIONS[kv_precision]
+        # The choice as given (one name, or the (key, value) pair when they differ) and one atom per cache.
+        self.kv_precision = canonical_kv_precision(kv_precision)
+        self.kv_codecs = {"key": KV_PRECISIONS[names[0]], "value": KV_PRECISIONS[names[1]]}
         self.add_batch_dim = add_batch_dim
         self.max_cache_length = max_cache_len
         self.masked_softmax = bool(masked_softmax)
 
-        if kv_precision != "full" and (self.kernel.owns_cache or self.kernel.fuses_projection):
-            raise ValueError(f"kv_precision={kv_precision!r} needs a cache written and read through the KV-cache "
-                             f"atom; attn_impl={self.attn_impl!r} keeps its own float cache.")
-        if self.kv_codec.requires_cache not in (None, cache_impl):
-            raise ValueError(f"kv_precision={kv_precision!r} needs cache_impl={self.kv_codec.requires_cache!r}: "
-                             "its rows cannot be moved by a scatter or select inside the graph.")
+        if names != ("full", "full") and (self.kernel.owns_cache or self.kernel.fuses_projection):
+            raise ValueError(f"kv_precision={self.kv_precision!r} needs a cache written and read through the "
+                             f"KV-cache atom; attn_impl={self.attn_impl!r} keeps its own float cache.")
+        for codec in self.kv_codecs.values():
+            if codec.requires_cache not in (None, cache_impl):
+                raise ValueError(f"kv_precision={codec.name!r} needs cache_impl={codec.requires_cache!r}: "
+                                 "its rows cannot be moved by a scatter or select inside the graph.")
 
         if self.kv_cache.requires_kernel not in (None, self.attn_impl) or (
                 self.kernel.requires_cache == "io_paged" and cache_impl != "io_paged"):
@@ -78,15 +81,13 @@ class MHACausal(MHABase):
         # io_* caches. They are resized once by finalize_cache_geometry() after pruned
         # weights are loaded. The paged pool lives outside the module.
         empty = (0,) if cache_impl == "io_paged" else None
-        storage = self.kv_codec.storage_dtype(dtype)
-        self.register_buffer("key_cache", device_zeros(empty or self.cache_shape("key"), storage), persistent=False)
-        self.register_buffer("value_cache", device_zeros(empty or self.cache_shape("value"), storage),
-                             persistent=False)
-        if self.cache_scale_dtype is not None:
-            for which in ("key", "value"):
+        for which in ("key", "value"):
+            codec = self.codec(which)
+            self.register_buffer(f"{which}_cache", device_zeros(empty or self.cache_shape(which),
+                                                                codec.storage_dtype(dtype)), persistent=False)
+            if codec.scale_dtype is not None:
                 self.register_buffer(f"{which}_cache_scale", device_zeros(self.cache_shape(f"{which}_scale"),
-                                                                          self.cache_scale_dtype),
-                                     persistent=False)
+                                                                          codec.scale_dtype), persistent=False)
         self.kernel.setup(self)
 
     def _default_attn_impl(self):
@@ -97,45 +98,64 @@ class MHACausal(MHABase):
         ``"value_scale"``; ``"kv"`` for pages) cache."""
         return self.kv_cache.shape(self, which)
 
+    def codec(self, which):
+        """Precision atom of the ``which`` cache (``"key"``, ``"value"``, or their ``"*_scale"``)."""
+        return self.kv_codecs[which.removesuffix("_scale")]
+
     def cache_width(self, which):
         """Stored width of one ``which`` row: for ``"key"``/``"value"`` the per-head dim, or its
-        packed form for a quantised ``kv_precision``; for ``"key_scale"``/``"value_scale"`` the
+        packed form for a quantised precision; for ``"key_scale"``/``"value_scale"`` the
         number of block scales."""
         head_dim = self.key_head_dim if which.startswith("key") else self.value_head_dim
         if which.endswith("_scale"):
-            return self.kv_codec.scale_width(head_dim)
-        return self.kv_codec.row_width(head_dim)
+            return self.codec(which).scale_width(head_dim)
+        return self.codec(which).row_width(head_dim)
+
+    def stored_dtype(self, which):
+        """dtype of the stored ``which`` cache: ``"key"``/``"value"`` rows (``uint8`` for integer
+        rows, ``float8_e4m3fn`` for ``fp8``, ``float4_e2m1fn_x2`` for ``nvfp4``), or their block
+        scales ``"key_scale"``/``"value_scale"`` (``None`` when the rows hold everything)."""
+        if which.endswith("_scale"):
+            return self.codec(which).scale_dtype
+        return getattr(self, f"{which}_cache").dtype
 
     @property
     def cache_dtype(self):
-        """dtype of the stored key/value caches (``uint8`` for an integer ``kv_precision``,
-        ``float8_e4m3fn`` for ``fp8``, ``float4_e2m1fn_x2`` for ``nvfp4``)."""
-        return self.key_cache.dtype
+        """dtype of the stored key and value caches; when a ``(key, value)`` precision pair stores
+        them differently, ask ``stored_dtype("key")``/``stored_dtype("value")``."""
+        return self._common("stored_dtype", "cache_dtype")
 
     @property
     def cache_scale_dtype(self):
         """dtype of the block scales stored next to each cache (``float8_e4m3fn`` for ``nvfp4``),
-        or ``None`` when the rows hold everything."""
-        return self.kv_codec.scale_dtype
+        or ``None`` when the rows hold everything; per cache: ``stored_dtype("key_scale")``."""
+        return self._common(lambda which: self.stored_dtype(f"{which}_scale"), "cache_scale_dtype")
+
+    def _common(self, per_cache, name):
+        per_cache = getattr(self, per_cache) if isinstance(per_cache, str) else per_cache
+        key, value = per_cache("key"), per_cache("value")
+        if key != value:
+            raise ValueError(f"{name} differs between the key and value caches (kv_precision="
+                             f"{self.kv_precision!r}): ask for one cache, e.g. stored_dtype('key').")
+        return key
 
     def zero_cache(self, which):
         """An empty ``which`` (``"key"``/``"value"``) cache in the form ``forward`` takes it: one
         tensor, or ``(rows, scales)`` with block scales."""
-        rows = device_zeros(self.cache_shape(which), self.cache_dtype)
-        if self.cache_scale_dtype is None:
+        rows = device_zeros(self.cache_shape(which), self.stored_dtype(which))
+        if self.stored_dtype(f"{which}_scale") is None:
             return rows
-        return rows, device_zeros(self.cache_shape(f"{which}_scale"), self.cache_scale_dtype)
+        return rows, device_zeros(self.cache_shape(f"{which}_scale"), self.stored_dtype(f"{which}_scale"))
 
     def _cache_buffers(self):
         """``(buffer name, cache kind)`` of the internal cache buffers."""
         buffers = [("key_cache", "key"), ("value_cache", "value")]
-        if self.cache_scale_dtype is not None:
-            buffers += [("key_cache_scale", "key_scale"), ("value_cache_scale", "value_scale")]
-        return buffers
+        return buffers + [(f"{which}_cache_scale", f"{which}_scale") for which in ("key", "value")
+                          if self.stored_dtype(f"{which}_scale") is not None]
 
     def _internal_cache(self, which):
         """The internal ``which`` buffer(s) in the form ``forward`` takes."""
-        if self.cache_scale_dtype is None:
+        if self.stored_dtype(f"{which}_scale") is None:
             return getattr(self, f"{which}_cache")
         return getattr(self, f"{which}_cache"), getattr(self, f"{which}_cache_scale")
 

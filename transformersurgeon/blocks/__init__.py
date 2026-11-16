@@ -20,5 +20,5 @@ from .norm import *
 from .mlp import *
 from .positions import *
 from .attention import (MHABase, MHACausal, MHAEncoder, ATTENTION_KERNELS, KV_CACHES, KV_PRECISIONS, CACHE_IMPLS,
-                        ATTN_IMPLS)
+                        ATTN_IMPLS, canonical_kv_precision, kv_precision_pair)
 from .stacks import *

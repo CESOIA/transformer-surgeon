@@ -30,18 +30,23 @@ def cache_io_name(kind: str, layer: int, output: bool = False) -> str:
     return f"{'present' if output else 'past'}_{kind}_{layer}"
 
 
-def cache_scales(decoder: nn.Module) -> bool:
-    """Whether each key/value cache of ``decoder`` is a ``(rows, scales)`` pair (block scales)."""
-    return any(getattr(block.attn, "cache_scale_dtype", None) is not None for block in getattr(decoder, "blocks", ()))
+def cache_scales(decoder: nn.Module) -> tuple[str, ...]:
+    """The caches of ``decoder`` (``"key"``, ``"value"``) stored as ``(rows, scales)`` pairs (block scales);
+    empty when none is."""
+    blocks = [block for block in getattr(decoder, "blocks", ()) if hasattr(block.attn, "stored_dtype")]
+    return tuple(kind for kind in ("key", "value")
+                 if any(block.attn.stored_dtype(f"{kind}_scale") is not None for block in blocks))
 
 
-def graph_io_names(num_layers: int, paged: bool = False, scales: bool = False) -> tuple[list[str], list[str]]:
+def graph_io_names(num_layers: int, paged: bool = False, scales=False) -> tuple[list[str], list[str]]:
     """``(input_names, output_names)`` of a graph-I/O cache wrapper, in flattened argument order
-    (``scales``: each key/value cache is a ``(rows, scales)`` pair)."""
+    (``scales``: the caches that are ``(rows, scales)`` pairs, ``("key", "value")`` or one of them;
+    ``True`` for both)."""
+    scales = ("key", "value") if scales is True else tuple(scales or ())
     if paged:
         groups = (("kv",),)
     else:
-        groups = tuple((kind, f"{kind}_scale") if scales else (kind,) for kind in ("key", "value"))
+        groups = tuple((kind, f"{kind}_scale") if kind in scales else (kind,) for kind in ("key", "value"))
     flat = [(kind, i) for group in groups for i in range(num_layers) for kind in group]
     inputs = ["input_ids", "pos_id"] + [cache_io_name(kind, i) for kind, i in flat]
     outputs = ["logits"] + [cache_io_name(kind, i, output=True) for kind, i in flat]
@@ -59,18 +64,18 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
     Runners use it instead of re-deriving geometry: the cache implementation,
     layout and dtype, and one entry per layer with the key/value cache shapes
     (which differ per layer after structured pruning), dtypes and graph I/O names;
-    a precision with block scales adds ``key_scale``/``value_scale`` entries, one more
-    tensor per cache. Backend-specific fields go in ``extra``.
+    a cache stored with block scales adds a ``key_scale``/``value_scale`` entry, one more
+    tensor. Keys and values may be stored differently (``kv_precision`` a ``(key, value)``
+    pair): each entry has its own dtype. Backend-specific fields go in ``extra``.
     """
     decoder = wrapper.decoder
     cache_impl = getattr(decoder, "cache_impl", "mutable")
     kv_cache = KV_CACHES[cache_impl]
     kinds = ("kv",) if cache_impl == "io_paged" else ("key", "value")
-    if cache_scales(decoder):
-        kinds += ("key_scale", "value_scale")
+    kinds += tuple(f"{kind}_scale" for kind in cache_scales(decoder))
 
     def entry(attn, kind, i):
-        dtype = attn.cache_scale_dtype if kind.endswith("_scale") else attn.key_cache.dtype
+        dtype = attn.key_cache.dtype if kind == "kv" else attn.stored_dtype(kind)
         return {"input": cache_io_name(kind, i), "output": cache_io_name(kind, i, output=True),
                 "shape": list(attn.cache_shape(kind)), "dtype": _dtype_name(dtype)}
 
@@ -86,10 +91,12 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         # present_* are only the new rows; the caller writes them at pos_id (write_cache_rows).
         "cache_rows": kv_cache.returns_rows,
         "cache_layout": kv_cache.manifest_layout,
-        # The allocated cache buffer, not config.dtype (None for configs without one).
+        # The allocated key-cache buffer, not config.dtype (None for configs without one); every entry of
+        # "caches" has its own dtype (the value cache's differs with a (key, value) precision pair).
         "cache_dtype": _dtype_name(decoder.blocks[0].attn.key_cache.dtype),
         # "full", "int8"/"int4" (uint8 rows of codes + a 2-byte scale), "fp8" (float8_e4m3fn rows) or
-        # "nvfp4" (float4_e2m1fn_x2 rows + float8_e4m3fn block scales), see blocks/attention/kv_precision.
+        # "nvfp4" (float4_e2m1fn_x2 rows + float8_e4m3fn block scales), see blocks/attention/kv_precision;
+        # a [key, value] pair when the two caches are stored differently.
         "kv_precision": getattr(decoder.blocks[0].attn, "kv_precision", "full"),
         "max_cache_len": int(decoder.max_cache_len),
         "num_layers": len(decoder.blocks),
@@ -120,7 +127,7 @@ def zero_caches_from_manifest(
     manifest: dict[str, Any], device: torch.device | str = "cpu"
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Per-layer zero (key, value) caches with the exported shapes and dtypes, ``(rows, scales)``
-    pairs with block scales (io_paged: (kv pools, []) )."""
+    pairs for a cache with block scales (io_paged: (kv pools, []) )."""
     def zeros(spec):
         return device_zeros(spec["shape"], getattr(torch, spec.get("dtype", manifest["cache_dtype"])), device)
 

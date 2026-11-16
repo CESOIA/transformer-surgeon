@@ -8,7 +8,9 @@ the device. It is organised by *block type*; for every backend it gives:
 - ``options``: every implementation known to work on that backend, each with a
   short description of the resulting device operation;
 - ``requires_cache`` (optional, ``kv_precision`` only): the KV-cache atom each
-  listed precision needs on that backend (see :func:`required_cache`).
+  listed precision needs on that backend (see :func:`required_cache`);
+- ``incompatible`` (optional, ``kv_precision`` only): precisions that cannot store
+  the two caches of a ``(key, value)`` pair together on that backend.
 
 Each block type also says how the choice reaches the code:
 
@@ -26,7 +28,7 @@ fields take the backend default from here, and a choice that is not listed for
 the backend is rejected before any tracing starts.
 """
 
-from ..blocks import ATTENTION_KERNELS, KV_CACHES, KV_PRECISIONS
+from ..blocks import ATTENTION_KERNELS, KV_CACHES, KV_PRECISIONS, canonical_kv_precision, kv_precision_pair
 
 BACKENDS = ("xnnpack", "qnn", "onnx", "tensorrt")
 
@@ -70,8 +72,9 @@ BACKEND_OPERATIONS = {
                        "uint8: symmetric codes plus one 2-byte scale per row (token, KV head); FP8 rows are "
                        "float8_e4m3fn with a unit scale; NVFP4 rows are FP4 (E2M1) with a second tensor of FP8 "
                        "block scales (one per 16 elements). All are decoded to float before attention; the attention "
-                       "kernel never reads them natively. A backend entry may name the cache a precision needs "
-                       "there (requires_cache).",
+                       "kernel never reads them natively. One option for both caches, or a (key, value) pair of "
+                       "options to store them differently, e.g. ('int8', 'int4'). A backend entry may name the "
+                       "cache a precision needs there (requires_cache).",
         "convert_option": "kv_precision",
         "backends": {
             "xnnpack": {"default": "full", "options": {
@@ -107,8 +110,12 @@ BACKEND_OPERATIONS = {
                 "nvfp4": "NVFP4 cache I/O: FP4 rows plus an FP8 block-scale tensor per cache (unit per-tensor "
                          "scale); QuantizeLinear writes both, a double DequantizeLinear reads them. Checked on compute "
                          "capability 8.9, where TensorRT warns that FP4 is not accelerated (Blackwell has FP4 "
-                         "hardware). The scales are FP8, so the INT8-weights rule of fp8 applies.",
-            }, "requires_cache": {"int8": "io_rows", "int4": "io_rows", "fp8": "io_rows", "nvfp4": "io_rows"}},
+                         "hardware). The scales are FP8, so the INT8-weights rule of fp8 applies. Not in a "
+                         "(key, value) pair with int8 or int4: TensorRT 11.4 crashes building that engine.",
+            }, "requires_cache": {"int8": "io_rows", "int4": "io_rows", "fp8": "io_rows", "nvfp4": "io_rows"},
+                # Checked with TensorRT 11.4 (RTX 4070): the builder crashes (segmentation fault) on an engine with
+                # an NVFP4 cache next to an integer (uint8) one; NVFP4 next to full or FP8 caches builds.
+                "incompatible": [("nvfp4", "int8"), ("nvfp4", "int4")]},
         },
     },
     "kv_cache_quantization": {
@@ -121,6 +128,11 @@ BACKEND_OPERATIONS = {
                 8: "The cache writes get an 8-bit activation configuration (8a8w): an 8-bit fixed-point cache. "
                    "Needs quant_scope='all', float_attention_core=False and a cache written by an index "
                    "operation (cache_impl 'mutable' or 'io_scatter').",
+                (16, 8): "(key bits, value bits): only the value-cache writes get the 8a8w configuration; the key "
+                         "cache stays at 16 bits. A few key channels with large biases set a per-tensor 8-bit key "
+                         "step that leaves the other channels a few codes. Same requirements as 8.",
+                (8, 16): "(key bits, value bits): only the key-cache writes get the 8a8w configuration; the value "
+                         "cache stays at 16 bits. Same requirements as 8.",
             }},
             **{backend: {"default": "kv_precision", "options": {
                 "kv_precision": "Not chosen by a quantiser: the convert option kv_precision decides the cache.",
@@ -299,15 +311,30 @@ def config_default(backend, field_name):
 
 
 def required_cache(backend, kv_precision):
-    """The KV-cache atom ``kv_precision`` needs on ``backend`` (``None``: any listed cache): the precision
-    atom's own requirement or the backend's (``requires_cache`` of its ``kv_precision`` entry)."""
-    atom = KV_PRECISIONS.get(kv_precision)
-    return ((atom.requires_cache if atom is not None else None)
-            or _entry("kv_precision", backend).get("requires_cache", {}).get(kv_precision))
+    """The KV-cache atom ``kv_precision`` (a name, or a ``(key, value)`` pair) needs on ``backend``
+    (``None``: any listed cache): each precision atom's own requirement or the backend's
+    (``requires_cache`` of its ``kv_precision`` entry)."""
+    needed = set()
+    for name in kv_precision_pair(kv_precision):
+        atom = KV_PRECISIONS.get(name)
+        needed.add((atom.requires_cache if atom is not None else None)
+                   or _entry("kv_precision", backend).get("requires_cache", {}).get(name))
+    needed.discard(None)
+    if len(needed) > 1:
+        raise ValueError(f"kv_precision={kv_precision!r} needs different caches on the {backend} backend: "
+                         f"{sorted(needed)}.")
+    return needed.pop() if needed else None
 
 
 def check_kv_combination(backend, cache_impl, kv_precision):
-    """Raise ``ValueError`` if ``kv_precision`` cannot be stored in ``cache_impl`` on ``backend``."""
+    """Raise ``ValueError`` if ``kv_precision`` cannot be stored in ``cache_impl`` on ``backend``, or if the
+    two precisions of a ``(key, value)`` pair cannot be stored together there."""
+    parts = set(kv_precision_pair(kv_precision))
+    for pair in _entry("kv_precision", backend).get("incompatible", ()):
+        if set(pair) == parts:
+            raise ValueError(f"kv_precision={kv_precision!r} is not supported by the {backend} backend: {pair[0]!r} "
+                             f"and {pair[1]!r} caches cannot be in one {backend} graph. "
+                             "See transformersurgeon/export/operations.py.")
     needed = required_cache(backend, kv_precision)
     if needed not in (None, cache_impl):
         raise ValueError(f"kv_precision={kv_precision!r} needs cache_impl={needed!r} on the {backend} backend "
@@ -315,14 +342,17 @@ def check_kv_combination(backend, cache_impl, kv_precision):
 
 
 def check_choice(backend, block_type, value):
-    """Raise ``ValueError`` if ``value`` is not a supported ``block_type`` implementation on ``backend``."""
+    """Raise ``ValueError`` if ``value`` is not a supported ``block_type`` implementation on ``backend``
+    (a ``(key, value)`` KV-precision pair: if either part is not)."""
     options = options_for(backend, block_type)
-    if value not in options:
-        raise ValueError(
-            f"{block_type} implementation {value!r} is not supported by the {backend} backend; "
-            f"supported: {list(options)} (default {default_for(backend, block_type)!r}). "
-            "See transformersurgeon/export/operations.py."
-        )
+    parts = kv_precision_pair(value) if block_type == "kv_precision" else (value,)
+    for part in parts:
+        if part not in options:
+            raise ValueError(
+                f"{block_type} implementation {part!r} is not supported by the {backend} backend; "
+                f"supported: {list(options)} (default {default_for(backend, block_type)!r}). "
+                "See transformersurgeon/export/operations.py."
+            )
 
 
 def check_config_choices(backend, config):
@@ -358,7 +388,8 @@ def resolve_convert_options(backend, options=None):
             if option != "attn_impl":
                 resolved[option] = default_for(backend, block_type)
 
-    if user.get("cache_impl") is None and resolved["kv_precision"] in options_for(backend, "kv_precision"):
+    precisions = options_for(backend, "kv_precision")
+    if user.get("cache_impl") is None and all(p in precisions for p in kv_precision_pair(resolved["kv_precision"])):
         resolved["cache_impl"] = required_cache(backend, resolved["kv_precision"]) or resolved["cache_impl"]
     cache = resolved["cache_impl"]
     if resolved.get("attn_impl") is None:
@@ -381,7 +412,7 @@ def check_components(backend, decoder):
     check_choice(backend, "batch_dim", bool(getattr(decoder, "add_batch_dim", False)))
     if len(decoder.blocks):
         check_choice(backend, "attention_kernel", decoder.blocks[0].attn.attn_impl)
-        precision = getattr(decoder.blocks[0].attn, "kv_precision", "full")
+        precision = canonical_kv_precision(getattr(decoder.blocks[0].attn, "kv_precision", "full"))
         check_choice(backend, "kv_precision", precision)
         check_kv_combination(backend, decoder.cache_impl, precision)
 

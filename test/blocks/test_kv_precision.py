@@ -53,6 +53,12 @@ def _write_rows(cache, rows, pos):
 def _decode(attn, xs, cache_impl):
     """Feed ``xs`` one token per step; returns the outputs and the last key cache (graph-I/O caches;
     for io_rows the caller's cache the returned rows were written into)."""
+    outputs, key_cache, _ = _decode_caches(attn, xs, cache_impl)
+    return outputs, key_cache
+
+
+def _decode_caches(attn, xs, cache_impl):
+    """As ``_decode``, returning ``(outputs, key cache, value cache)``; for the mutable cache, the module's buffers."""
     kc = vc = None
     if cache_impl == "io_rows":
         kc, vc = attn.zero_cache("key"), attn.zero_cache("value")
@@ -70,7 +76,9 @@ def _decode(attn, xs, cache_impl):
             else:
                 kc, vc = k_out, v_out
         outs.append(out)
-    return torch.cat(outs), kc
+    if kc is None:
+        kc, vc = attn._internal_cache("key"), attn._internal_cache("value")
+    return torch.cat(outs), kc, vc
 
 
 # --------------------------------------------------------------------------- #
@@ -428,3 +436,121 @@ def test_integer_cache_exports_and_matches_eager(cache_impl, name):
                 got, *program_caches = got
                 assert program_caches[0].dtype == torch.uint8
             assert torch.allclose(got, expected, atol=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# Keys and values stored differently: kv_precision=(key, value)
+# --------------------------------------------------------------------------- #
+def _bytes(cache):
+    """A stored cache, or a ``(rows, scales)`` pair, in a form ``torch.equal`` can compare (one-byte dtypes as bytes)."""
+    if isinstance(cache, tuple):
+        return tuple(_bytes(c) for c in cache)
+    return cache.view(torch.uint8) if cache.element_size() == 1 else cache
+
+
+def _same(a, b):
+    a, b = _bytes(a), _bytes(b)
+    if isinstance(a, tuple) or isinstance(b, tuple):
+        return isinstance(a, tuple) and isinstance(b, tuple) and all(torch.equal(x, y) for x, y in zip(a, b))
+    return torch.equal(a, b)
+
+
+PAIRS = [("mutable", ("int8", "int4")), ("io_scatter", ("int4", "full")), ("io_concat", ("full", "int8")),
+         ("io_inplace", ("int8", "int4")), ("io_rows", ("fp8", "int8")), ("io_rows", ("int4", "fp8")),
+         pytest.param("io_rows", ("nvfp4", "int8"), marks=caps.requires_float4),
+         pytest.param("io_rows", ("full", "nvfp4"), marks=caps.requires_float4)]
+
+
+@pytest.mark.parametrize("cache_impl, pair", PAIRS)
+def test_a_precision_pair_stores_each_cache_with_its_own_atom(cache_impl, pair):
+    """kv_precision=(key, value): after the same steps, the key cache holds exactly what an attention storing both
+    caches as the key precision holds, and the value cache what one storing both as the value precision holds."""
+    embed = 64 if "nvfp4" in pair else 32
+    mixed = _attn(cache_impl, pair, embed=embed)
+    as_key, as_value = _attn(cache_impl, pair[0], embed=embed), _attn(cache_impl, pair[1], embed=embed)
+    for attn in (as_key, as_value):
+        attn.load_state_dict(mixed.state_dict())
+    assert mixed.kv_precision == pair
+    assert (mixed.stored_dtype("key"), mixed.stored_dtype("value")) == \
+        (as_key.stored_dtype("key"), as_value.stored_dtype("value"))
+
+    xs = torch.randn(5, embed, generator=torch.Generator().manual_seed(7))
+    with torch.no_grad():
+        out, keys, values = _decode_caches(mixed, xs, cache_impl)
+        _, expected_keys, _ = _decode_caches(as_key, xs, cache_impl)
+        _, _, expected_values = _decode_caches(as_value, xs, cache_impl)
+    assert _same(keys, expected_keys) and _same(values, expected_values)
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("kv_precision, message", [
+    (("fp8", "int8"), "kv_precision='fp8' needs cache_impl='io_rows'"),
+    (("int8",), "Unsupported kv_precision"),
+    (("int8", "int3"), "Unsupported kv_precision"),
+    (8, "Unsupported kv_precision"),
+])
+def test_a_precision_pair_is_checked_for_each_cache(kv_precision, message):
+    with pytest.raises(ValueError, match=message):
+        MHACausal(32, 4, kv_num_heads=2, max_cache_len=L, kv_precision=kv_precision)
+    with pytest.raises(ValueError, match="own float cache"):
+        MHACausal(32, 4, kv_num_heads=2, max_cache_len=L, kv_precision=("full", "int8"), attn_impl="custom_sdpa")
+
+
+def test_a_precision_pair_is_kept_in_its_canonical_form():
+    assert _attn(kv_precision=("int4", "int4")).kv_precision == "int4"
+    mixed = _attn(kv_precision=["int8", "full"])   # e.g. read from JSON
+    assert mixed.kv_precision == ("int8", "full")
+    assert (mixed.stored_dtype("key"), mixed.stored_dtype("value")) == (torch.uint8, torch.float32)
+    with pytest.raises(ValueError, match="differs between the key and value caches"):
+        mixed.cache_dtype
+    assert _attn(kv_precision=("int8", "int4")).cache_dtype == torch.uint8   # both caches hold bytes
+
+
+@caps.requires_float4
+def test_only_the_cache_stored_as_nvfp4_has_block_scales():
+    attn = _attn("io_rows", ("nvfp4", "int8"), embed=64)
+    rows, scales = attn.zero_cache("key")
+    assert (rows.dtype, scales.dtype) == (torch.float4_e2m1fn_x2, torch.float8_e4m3fn)
+    assert isinstance(attn.zero_cache("value"), torch.Tensor) and attn.stored_dtype("value_scale") is None
+    assert [name for name, _ in attn._cache_buffers()] == ["key_cache", "value_cache", "key_cache_scale"]
+
+
+@pytest.mark.parametrize("cache_impl, pair", [("mutable", ("int4", "int8")), ("io_inplace", ("int8", "full")),
+                                              ("io_rows", ("fp8", "int4")),
+                                              pytest.param("io_rows", ("int8", "nvfp4"), marks=caps.requires_float4)])
+def test_a_precision_pair_exports_and_matches_eager(cache_impl, pair):
+    """torch.export of an attention storing keys and values differently: the program, run step by step, gives
+    the eager outputs and caches of each cache's own dtype."""
+    embed = 64 if "nvfp4" in pair else 32
+    traced, eager = _attn(cache_impl, pair, embed=embed), _attn(cache_impl, pair, embed=embed)
+    eager.load_state_dict(traced.state_dict())
+    graph_io = cache_impl != "mutable"
+    caches = (traced.zero_cache("key"), traced.zero_cache("value")) if graph_io else ()
+    cos, sin = ROPES[traced.key_head_dim]
+    pos = torch.tensor([0])
+    example = (torch.randn(1, embed), pos, _mask(pos, cache_impl), cos[pos], sin[pos], *caches)
+    program = torch.export.export(_Step(traced), example).module()
+
+    xs = torch.randn(4, embed, generator=torch.Generator().manual_seed(4))
+    eager_caches, program_caches = [_clone(c) for c in caches], [_clone(c) for c in caches]
+    with torch.no_grad():
+        for t in range(4):
+            pos = torch.tensor([t])
+            step = (xs[t:t + 1], pos, _mask(pos, cache_impl), cos[pos], sin[pos])
+            expected = _Step(eager)(*step, *eager_caches)
+            got = program(*step, *program_caches)
+            if graph_io:
+                expected, *eager_out = expected
+                got, *program_out = got
+                for which, out in zip(("key", "value"), program_out):
+                    first = out[0] if isinstance(out, tuple) else out
+                    assert first.dtype == traced.stored_dtype(which)
+                if cache_impl == "io_rows":
+                    for caches, rows in ((eager_caches, eager_out), (program_caches, program_out)):
+                        for cache, row in zip(caches, rows):
+                            _write_rows(cache, row, pos)
+                else:
+                    eager_caches, program_caches = eager_out, program_out
+            assert torch.allclose(got, expected, atol=1e-6)
+    if not graph_io:
+        assert _same(traced.key_cache, eager.key_cache) and _same(traced.value_cache, eager.value_cache)

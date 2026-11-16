@@ -309,15 +309,31 @@ _KV_CACHE_WRITES = {
 }
 
 
-def _kv_cache_write_predicate():
+def _kv_cache_write_kind(node: torch.fx.Node) -> str | None:
+    """``"key"`` or ``"value"``: the cache a KV-cache write updates, from the name of the buffer (``mutable``:
+    ``attn.key_cache``) or graph input (``io_scatter``: ``key_caches_<i>``) it writes into. None if the name
+    says neither."""
+    source = node.args[0] if node.args else None
+    while isinstance(source, torch.fx.Node) and source.op == "call_function" and source.args:
+        source = source.args[0]   # through the quantise/dequantise pairs of a quantised graph
+    if not isinstance(source, torch.fx.Node):
+        return None
+    name = str(source.target if source.op == "get_attr" else source.name).rsplit(".", 1)[-1]
+    return "key" if "key" in name else "value" if "value" in name else None
+
+
+def _kv_cache_write_predicate(parts=None):
     """Quantiser predicate: the KV-cache writes of every MHACausal (``EXPORT_ROLE ==
-    "attention"``). Giving these nodes an 8-bit configuration makes the cache, which they
-    produce and the attention reads, an 8-bit fixed-point tensor (QNNExportConfig.kv_cache_bits)."""
+    "attention"``), or only those of the caches in ``parts`` (``("value",)``). Giving these nodes an
+    8-bit configuration makes the cache, which they produce and the attention reads, an 8-bit
+    fixed-point tensor (QNNExportConfig.kv_cache_bits)."""
     def _pred(node: torch.fx.Node) -> bool:
         if node.op != "call_function" or node.target not in _KV_CACHE_WRITES:
             return False
         stack = node.meta.get("nn_module_stack", {}).values()
-        return any(_export_role(t[1] if isinstance(t, tuple) else t) == "attention" for t in stack)
+        if not any(_export_role(t[1] if isinstance(t, tuple) else t) == "attention" for t in stack):
+            return False
+        return parts is None or _kv_cache_write_kind(node) in parts
     return _pred
 
 
