@@ -28,6 +28,7 @@ from .passes import (
     _float_attention_nodes,
     _kv_cache_write_predicate,
     _linear_block_sizes,
+    _share_amin_quant_params,
     _split_float_linear_bias,
     _untie_shared_weights,
     make_split_graph_blocks_pass,
@@ -371,6 +372,8 @@ class QNNExporter(ExecuTorchExporter):
             submodule_configs.append((_kv_cache_write_predicate(),
                                       ModuleQConfig(quant_dtype=QuantDtype.use_8a8w, act_observer=act_observer)))
         quantizer.set_submodule_qconfig_list(submodule_configs)
+        # Runs after the per-operation rules: a minimum takes the scale of its input, not a range of its own.
+        quantizer.add_custom_quant_annotations((_share_amin_quant_params,))
         if block_layers:
             quantizer.set_block_size_map(_linear_block_sizes(module, block_layers))
         return quantizer

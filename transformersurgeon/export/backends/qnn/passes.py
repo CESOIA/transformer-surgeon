@@ -321,6 +321,31 @@ def _kv_cache_write_predicate():
     return _pred
 
 
+def _share_amin_quant_params(graph_module: torch.fx.GraphModule) -> int:
+    """Custom annotation of the QNN quantiser: the output of every quantised ``aten.amin`` (HTP ReduceMin)
+    takes the scale and zero point of its input. Returns how many it changed.
+
+    A minimum is one of its input values, so the quantisation of its input holds it exactly. The quantiser's
+    general rule observes the output on its own instead. The row minimum of masked softmax
+    (``blocks/attention/kernels/manual.py``) then gets a near-empty range in a layer whose scores are never
+    negative during calibration (empty cache slots score exactly 0, so the minimum stays 0), and HTP cannot
+    rescale the scores to it ("scale too large for requant"). A minimum the quantiser left float is skipped."""
+    from torchao.quantization.pt2e.quantizer import SharedQuantizationSpec
+    from torchao.quantization.pt2e.quantizer.utils import Q_ANNOTATION_KEY
+
+    shared = 0
+    for node in graph_module.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.amin.default:
+            continue
+        annotation = node.meta.get(Q_ANNOTATION_KEY)
+        source = node.args[0]
+        if annotation is None or annotation.output_qspec is None or annotation.input_qspec_map.get(source) is None:
+            continue
+        annotation.output_qspec = SharedQuantizationSpec((source, node))
+        shared += 1
+    return shared
+
+
 @functools.lru_cache(maxsize=None)
 def _module_class(type_name) -> type | None:
     """Class of an ``nn_module_stack`` entry (a class, or its ``"module.Class"`` name)."""

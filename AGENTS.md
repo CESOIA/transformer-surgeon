@@ -327,6 +327,16 @@ compressed config measured against it isolates the weight compression. Tests: `t
   but a 16-bit quantized score tensor no longer spans [-65504, +1e4] (a ~1.15-logit step). Measured on Qwen2.5-1.5B 16a8w
   all-op vs the same weights without activation quantization: KL 0.96 (old) -> 0.57 (decode calibration)
   -> 0.36 (+ masked softmax), top-1 61 % -> 90 %.
+- The row minimum of masked softmax takes the scale and zero point of the scores it is computed from
+  (`passes.py::_share_amin_quant_params`, a custom annotation added in `_build_quantizer`): `aten.amin` returns
+  one of its inputs, but the QNN quantiser's general rule gives its output an observer of its own. In a layer
+  whose scores are never negative during calibration the minimum stays 0 (empty cache slots score exactly 0),
+  its range becomes [0, 1e-4], and HTP logs `scale too large for requant qu16->qu16` for the rescale to it
+  (layer 0 of Qwen2.5-0.5B: score step 0.026 / 1.5e-9 = 1.7e7, logged twice). With the annotation,
+  `scripts/executorch/qnn/export_8bit_kv_cache.py` logs no error (1,674 ops on HTP, 48/48 8-bit cache writes,
+  reference vs float unchanged) and its logits on the x86 simulator are bit-identical to those of the export
+  with the error (5 tokens): the failing rescale only ever mapped 0 to 0. Nothing has run on a device. Test:
+  `test/export/test_exporter.py::test_qnn_masked_softmax_minimum_takes_the_quantisation_of_its_input`.
 - RMSNorm must reach HTP as one fused `RmsNorm` op. ExecuTorch's `RecomposeRmsNorm` matches
   `w * (x * rsqrt(mean(x*x) + eps))` (or with `pow.Tensor_Scalar`), but this exporter rewrites `pow(x, 2)`
   to `pow.Tensor_Tensor`, so the RMS normalisation atoms (`blocks/norm/`) compute `x * x` (bit-identical). Decomposed and quantized,
