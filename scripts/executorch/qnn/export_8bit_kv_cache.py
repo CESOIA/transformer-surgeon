@@ -1,8 +1,11 @@
 """Export Qwen2.5-0.5B, compressed (8-bit MLP weights), to QNN with an 8-bit KV cache, then check it on the host.
 
-Checks that every KV-cache write is 8-bit, and compares the fake-quantised model the .pte is lowered from
-(QNNExportConfig.keep_reference_module) with the original float model. About 5 minutes and 15 GiB of RAM
-(QNN SDK 2.37, ExecuTorch 1.5.1). Run in the activated cesoia environment:
+The export calibrates the fixed-point ranges (16-bit activations, 8-bit KV cache) on CALIBRATION_WINDOWS random
+windows of CACHE tokens from WikiText-2 (the `datasets` package downloads it on first use). The script then checks
+that every KV-cache write is 8-bit, and compares the fake-quantised model the .pte is lowered from
+(QNNExportConfig.keep_reference_module) with the original float model, on text that is not in the calibration data.
+About 13 minutes, most of it calibrating (fewer CALIBRATION_WINDOWS is faster), and 16 GiB of RAM (QNN SDK 2.37,
+ExecuTorch 1.5.1). Run in the activated cesoia environment:
 
     python scripts/executorch/qnn/export_8bit_kv_cache.py [output.pte]
 """
@@ -15,11 +18,13 @@ import torch
 from transformers import AutoTokenizer
 
 from transformersurgeon import Qwen2CompressionSchemesManager, Qwen2ForCausalLMCompress
+from transformersurgeon.calibration import wikitext2_loader
 from transformersurgeon.export import export_to_backend
 from transformersurgeon.export.backends import QNNExportConfig
 
 MODEL = "Qwen/Qwen2.5-0.5B"
 CACHE = 128  # KV-cache slots: the longest prompt + answer the .pte can hold
+CALIBRATION_WINDOWS = 32  # WikiText-2 windows of CACHE tokens that set the fixed-point ranges
 OUTPUT = sys.argv[1] if len(sys.argv) > 1 else "artifacts/qwen25_qnn_w8_kv8.pte"
 os.makedirs(os.path.dirname(OUTPUT) or ".", exist_ok=True)
 
@@ -34,7 +39,10 @@ for name, value in {"precision": 8, "method": "vanilla", "granularity": "per_cha
     manager.set("quantization", name, value, criteria=mlp)
 manager.apply(hard=True, criteria=mlp)
 
-# 2. Export: every activation in 16-bit fixed point (quant_scope="all"), the KV cache in 8-bit.
+# 2. Export: every activation in 16-bit fixed point (quant_scope="all"), the KV cache in 8-bit. HTP keeps static
+# ranges, measured while the exporter decodes the calibration text token by token; windows of CACHE tokens fill
+# every cache slot. Without calibration_token_ids the exporter would use a few built-in sentences.
+calibration = wikitext2_loader(tokenizer, num_samples=CALIBRATION_WINDOWS, seq_len=CACHE)
 config = QNNExportConfig(
     output_path=OUTPUT,
     soc_model="SM8850",
@@ -42,6 +50,7 @@ config = QNNExportConfig(
     quant_scope="all",
     float_attention_core=False,
     kv_cache_bits=8,
+    calibration_token_ids=[sample["input_ids"][0].tolist() for sample in calibration],
     # The 8-bit cache needs a cache written by an index operation: "mutable" (default) or "io_scatter".
     # masked_softmax keeps the 16-bit attention-score ranges tight (AGENTS.md, QNN activation calibration).
     convert_options={"max_cache_len": CACHE, "cache_impl": "mutable", "masked_softmax": True},

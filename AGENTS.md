@@ -350,6 +350,10 @@ compressed config measured against it isolates the weight compression. Tests: `t
   with the KV cache filling up (reset between sequences). It used to feed every token at position 1 with
   an empty cache, which left the attention/cache observers uncalibrated. Pass real text of the target
   distribution with `QNNExportConfig.calibration_token_ids`; the built-in sentences are only a fallback.
+  `scripts/executorch/qnn/export_8bit_kv_cache.py` passes 32 random WikiText-2 windows of `max_seq_len` (128)
+  tokens (`calibration/datasets.py::wikitext2_loader`), which fill every cache slot: 4,096 calibration tokens
+  instead of 248, and a 12-minute export instead of 3.5 (Qwen2.5-0.5B; relative logit error 0.13 against the
+  float model, same next token at 28 of 29 positions, on text outside the calibration data).
 - `convert_options={"masked_softmax": True}` (manual attention only): masked scores become `row min - 20`
   (the vendor's `enable_masked_softmax`) instead of `score + mask_penalty`. It is the same function in float,
   but a 16-bit quantized score tensor no longer spans [-65504, +1e4] (a ~1.15-logit step). Measured on Qwen2.5-1.5B 16a8w
@@ -361,7 +365,8 @@ compressed config measured against it isolates the weight compression. Tests: `t
   whose scores are never negative during calibration the minimum stays 0 (empty cache slots score exactly 0),
   its range becomes [0, 1e-4], and HTP logs `scale too large for requant qu16->qu16` for the rescale to it
   (layer 0 of Qwen2.5-0.5B: score step 0.026 / 1.5e-9 = 1.7e7, logged twice). With the annotation,
-  `scripts/executorch/qnn/export_8bit_kv_cache.py` logs no error (1,674 ops on HTP, 48/48 8-bit cache writes,
+  `scripts/executorch/qnn/export_8bit_kv_cache.py` (then calibrated on the built-in sentences; it still is
+  error-free on WikiText-2) logs no error (1,674 ops on HTP, 48/48 8-bit cache writes,
   reference vs float unchanged) and its logits on the x86 simulator are bit-identical to those of the export
   with the error (5 tokens): the failing rescale only ever mapped 0 to 0. Nothing has run on a device. Test:
   `test/export/test_exporter.py::test_qnn_masked_softmax_minimum_takes_the_quantisation_of_its_input`.
