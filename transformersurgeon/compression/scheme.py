@@ -93,6 +93,8 @@ class CompressionScheme:
         self.hard_applied = False # this flags the compression as non-reversible when True
         self.soft_applied = False # this flags the compression as already-peformed: do not overwrite/reinitialize with hard application
         self.vcon_initialized = False # this flags if the VCONBlock has been initialized
+        # Manager-level results of global calibration summaries (shared dict, set by the manager).
+        self.global_calibration_data = {}
 
         # Groups this scheme belongs to (name -> SchemeGroup). At most one for now.
         self.groups = {}
@@ -727,6 +729,23 @@ class CompressionScheme:
             for sub_chain in self._resolve_target_chains(onward_name, onward_block_id):
                 chains.append([module] + sub_chain)
         return chains
+
+    def coupled_source_modules(self):
+        """Modules of this block whose OUTPUT rows feed this layer's input columns (inverse ``output_dependence``).
+
+        Normalization layers and sentinels are skipped: only the direct producers in the same block
+        (e.g. ``gate_proj`` and ``up_proj`` for ``down_proj``).
+        """
+        dependence = self.pruning_indexing.get("output_dependence", {})
+        norms = set(self.pruning_indexing.get("norm_layers", ())) | {"preprocessing", "final_norm", "final_layer"}
+        sources = []
+        for source, targets in dependence.items():
+            if source in norms or self.name not in targets:
+                continue
+            module = self._resolve_named_module(source, self.block_id)
+            if module is not None:
+                sources.append(module)
+        return sources
 
     def coupled_target_chains(self):
         """Chains of modules whose input follows this layer's output (structured-pruning cascade).

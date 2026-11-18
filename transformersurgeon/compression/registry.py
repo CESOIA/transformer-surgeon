@@ -8,6 +8,14 @@ from .structured_pruning import (
     validate_structured_pruning_repeated_pattern,
     validate_structured_pruning_coupled_repeated_pattern,
 )
+from .channel_pruning import (
+    ChannelPruner,
+    validate_channel_pruning_ratio,
+    validate_channel_pruning_method,
+    validate_bias_compensation,
+    validate_channel_group_size,
+    validate_rank_group,
+)
 from .block_pruning import (
     BlockPruner,
     validate_block_pruning_ratio,
@@ -43,6 +51,7 @@ from .quantization import (
 
 COMPRESSOR_DICT = {
     "structured_pruning": StructuredPruner,
+    "channel_pruning": ChannelPruner,
     "block_pruning": BlockPruner,
     "unstructured_pruning": UnstructuredPruner,
     "lrd": LRDer,
@@ -54,7 +63,7 @@ COMPRESSOR_DICT = {
 # dependent layers, before anything factorizes or quantizes them), then lrd
 # (changes weight shape), then pruning (masks the result), then quantization
 # (must see the final float weights).
-APPLICATION_ORDER = ["block_pruning", "lrd", "structured_pruning", "unstructured_pruning", "quantization"]
+APPLICATION_ORDER = ["block_pruning", "lrd", "structured_pruning", "channel_pruning", "unstructured_pruning", "quantization"]
 
 # Compression properties that are group-scoped: they may be set ONLY through a
 # group name (manager.set(..., group=...)), never via plain criteria. Enabling
@@ -95,6 +104,18 @@ COMPRESSION_REGISTRY = {
         "reduce_op": dict(default=None, validator=validate_structured_pruning_reduce_op),
         # Group-only option (see GROUP_OPTIONS): settable only via a group name.
         "share_mask": dict(default=False, validator=validate_structured_pruning_share_mask),
+    },
+    # Input-channel pruning of a consumer layer scored from its own input statistics, with a baseline bias
+    # (FLAP, compression/channel_pruning.py); the keep-mask comes from a global calibration summary.
+    "channel_pruning": {
+        "ratio": dict(default=0.0, validator=validate_channel_pruning_ratio),
+        "method": dict(default="flap", validator=validate_channel_pruning_method),
+        # replace the pruned channels by their calibration mean through an added bias
+        "bias_compensation": dict(default=True, validator=validate_bias_compensation),
+        # channels pruned together in consecutive groups of this size (e.g. head_dim for attention heads)
+        "group_size": dict(default=1, validator=validate_channel_group_size),
+        # layers with the same label are ranked together (one threshold per label); the default pools all of them
+        "rank_group": dict(default="all", validator=validate_rank_group),
     },
     # Whole-block removal (e.g. attention heads), separate from structured
     # pruning; where blocks are and what they cascade to comes from the

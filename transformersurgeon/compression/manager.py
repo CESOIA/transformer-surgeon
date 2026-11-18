@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 from ..calibration import run_compression_calibration, SUPPORTED_SUMMARIES
+from ..calibration.backbone import compute_global_summaries
 from .registry import GROUP_OPTIONS, COMPRESSION_REGISTRY
 from .scheme import CompressionScheme
 from .grouping import SchemeGroup
@@ -65,6 +66,8 @@ class CompressionSchemesManager:
         """
         self.model = model
         self.calibration_data = None
+        # Results of global (cross-layer) calibration summaries, shared with every scheme.
+        self.global_calibration_data = {}
         self.calibration_loss_fn: Optional[Callable[[Any, Any], torch.Tensor]] = None
         self.calibration_mode = "standard"
         self.calibration_groups: List[List[Union[int, str, list]]] = []
@@ -605,7 +608,7 @@ class CompressionSchemesManager:
         """
         target_stages = self.collect_calibration_target_stages(criteria=criteria)
 
-        return run_compression_calibration(
+        n_calibrated = run_compression_calibration(
             model=self.model,
             calibration_data=self.calibration_data,
             target_stages=target_stages,
@@ -619,6 +622,8 @@ class CompressionSchemesManager:
             summary_dump_dir=summary_dump_dir,
             summary_dump_names=summary_dump_names,
         )
+        self._compute_global_calibration(criteria=criteria)
+        return n_calibrated
 
     def extract_summaries(
         self,
@@ -765,8 +770,28 @@ class CompressionSchemesManager:
                 summary_dump_names=summary_dump_names,
             )
 
+        self._compute_global_calibration(criteria=criteria)
+
         for scheme in self.iter_filtered(criteria=criteria):
             scheme.apply(hard=hard, verbose=verbose)
+
+    def _compute_global_calibration(self, criteria=None):
+        """Run the global summaries asked for by the compressors of the filtered schemes (if any)."""
+        requests = {}
+        schemes = list(self.iter_filtered(criteria=criteria))
+        for scheme in schemes:
+            scheme.global_calibration_data = self.global_calibration_data
+            for compressor in scheme.compressors.values():
+                if not compressor._to_compress():
+                    continue
+                for name, options in compressor.needs_global_calibration().items():
+                    if name in requests and requests[name] != options:
+                        raise ValueError(
+                            f"Conflicting options for global calibration summary '{name}': {requests[name]} vs {options}."
+                        )
+                    requests[name] = options
+        if requests:
+            compute_global_summaries(schemes, requests, self.global_calibration_data)
 
     def _collect_calibration_targets(self, criteria=None):
         stages = self.collect_calibration_target_stages(criteria=criteria)
