@@ -6,7 +6,7 @@ from .activation_range import ActivationRangeSummary, OutputActivationRangeSumma
 from .covariance import CovarianceSummary, CrossCovarianceSummary, ShiftedCovarianceSummary
 from .input_sq_mean import InputSqMeanSummary
 from .input_mean import InputMeanSummary
-from .flap_scores import FlapScoresSummary
+from .flap_scores import FlapScoresSummary, MagnitudeScoresSummary
 from .weight_grad import WeightGradSummary
 from .params import WeightSummary, BiasSummary
 from .raw_activation import InputActivationSummary, OutputActivationSummary
@@ -44,6 +44,8 @@ SUPPORTED_SUMMARIES = tuple(SUMMARY_REGISTRY.keys())
 GLOBAL_SUMMARY_REGISTRY = {
     # FLAP: standardised fluctuation scores per layer and one global threshold (keep-mask per layer).
     "flap_scores": FlapScoresSummary(),
+    # Uncalibrated structured pruning: same global cut as FLAP, scores from the weight norms only.
+    "magnitude_scores": MagnitudeScoresSummary(),
 }
 SUPPORTED_GLOBAL_SUMMARIES = tuple(GLOBAL_SUMMARY_REGISTRY.keys())
 

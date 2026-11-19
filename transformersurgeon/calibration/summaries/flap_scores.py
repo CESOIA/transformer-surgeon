@@ -26,6 +26,11 @@ class FlapScoresSummary(GlobalCalibrationSummary):
     name = "flap_scores"
     requires = ("input_mean", "input_sq_mean")
 
+    def _channel_scores(self, w, store, g):
+        mean = store["input_mean"].float().to(w.device)
+        var = (store["input_sq_mean"].float().to(w.device) - mean.pow(2)).clamp_min(0.0)
+        return (var * w.pow(2).sum(0)).reshape(-1, g).sum(1), mean
+
     def compute(self, entries, options, global_store):
         ratio = float(options["ratio"])
         scores, means, costs, groups = {}, {}, {}, {}
@@ -33,9 +38,7 @@ class FlapScoresSummary(GlobalCalibrationSummary):
             module = scheme.get_compression_module()
             w = module.weight.detach().float()
             g = int(scheme.compressors["channel_pruning"].group_size)
-            mean = store["input_mean"].float().to(w.device)
-            var = (store["input_sq_mean"].float().to(w.device) - mean.pow(2)).clamp_min(0.0)
-            s = (var * w.pow(2).sum(0)).reshape(-1, g).sum(1)  # one score per group of g consecutive channels
+            s, mean = self._channel_scores(w, store, g)  # one score per group of g consecutive channels
             scores[scheme.path] = (s - s.mean()) / s.std().clamp_min(1e-12)
             means[scheme.path] = mean
             groups[scheme.path] = g
@@ -66,3 +69,21 @@ class FlapScoresSummary(GlobalCalibrationSummary):
             ratios={p: 1.0 - keep[p].float().mean().item() for p in paths},
             threshold=threshold,
         )
+
+
+class MagnitudeScoresSummary(FlapScoresSummary):
+    """Uncalibrated counterpart of :class:`FlapScoresSummary`: same standardisation, global cut and pools, but the
+    score of a channel group is the squared norm of its weight columns (no activations, so no baseline-mean bias).
+
+    Result: ``global_store['magnitude_scores']`` with the same layout as ``flap_scores`` (``mean`` is all zeros).
+    """
+
+    name = "magnitude_scores"
+    requires = ()
+
+    def _channel_scores(self, w, store, g):
+        return w.pow(2).sum(0).reshape(-1, g).sum(1), torch.zeros(w.shape[1], device=w.device)
+
+    def compute(self, entries, options, global_store):
+        entries = [(sch, st) for sch, st in entries if sch.compressors["channel_pruning"]._to_compress()]
+        super().compute(entries, options, global_store)  # writes global_store[self.name]
