@@ -16,6 +16,11 @@ Graph contract (names are fixed; shapes/dtypes are recorded in the manifest):
   outputs  logits      (vocab,)            for the last input token
            present_key_i / present_value_i updated caches
 
+Keys and values may be stored differently (``kv_precision`` a ``(key, value)``
+pair): each cache input/output has its own type. Every cache stored as
+``"nvfp4"`` has a second tensor of block scales, past_key_scale_i /
+past_value_scale_i in and present_*_scale_i out.
+
 With ``cache_impl="io_inplace"`` the cache write is an opset-24 TensorScatter:
 consumers should bind each present_* to the same buffer as its past_* (TensorRT
 requires it -- it aliases them and updates in place).
@@ -24,6 +29,15 @@ Encoder models (``export/wrapper.py::EncoderWrapper``) have a static contract:
 
   inputs   pixel_values (1, C, H, W) model dtype   (or input_ids (1, seq) int64)
   outputs  logits       (1, num_outputs)
+
+With ``cache_impl="io_rows"`` the graph only reads past_*: present_* hold the new
+rows, ``(1, kv_heads, seq, width)``, which the consumer writes into its cache at
+pos_id (``export.manifest.write_cache_rows``). FP8 rows (``kv_precision="fp8"``)
+are QuantizeLinear/DequantizeLinear with a unit scale; NVFP4 rows
+(``kv_precision="nvfp4"``) are FLOAT4E2M1 with FLOAT8E4M3FN block scales, written by
+a QuantizeLinear of the scales and a blocked QuantizeLinear of the rows and read by
+the two DequantizeLinear (ONNX Runtime 1.31 has no FLOAT4E2M1 DequantizeLinear;
+TensorRT runs them).
 
 With ``cache_impl="io_paged"`` each layer has one paged K+V pool instead
 (past_kv_i / present_kv_i, also updated in place) and attention is the fused
@@ -40,7 +54,7 @@ import torch
 
 from ...config import BackendExportConfig
 from ...exporter import Exporter, register_exporter
-from ...manifest import build_encoder_manifest, build_llm_manifest, graph_io_names
+from ...manifest import build_encoder_manifest, build_llm_manifest, cache_scales, graph_io_names
 from ...quant_info import extract_layer_quant_info
 from ...result import BackendExportResult, finalize_export_result
 from ...wrapper import resolve_components_and_wrapper, resolve_encoder_wrapper
@@ -53,11 +67,61 @@ def _tensor_scatter(cache, update, write_index):
     return values.Opset("", 24).TensorScatter(cache, update, write_index, axis=2)
 
 
+def _fp8_quantize(x):
+    from onnxscript import ir, values
+
+    op = values.Opset("", 24)
+    scale = op.CastLike(op.Constant(value=ir.tensor(1.0)), x)
+    return op.QuantizeLinear(x, scale, output_dtype=ir.DataType.FLOAT8E4M3FN)
+
+
+def _fp8_dequantize(rows):
+    from onnxscript import ir, values
+
+    op = values.Opset("", 24)
+    return op.DequantizeLinear(rows, op.Constant(value=ir.tensor(1.0)))
+
+
+def _nvfp4_quantize(x):
+    from onnxscript import ir, values
+
+    from ....blocks.attention.kv_precision.nvfp4 import E2M1_MAX, NVFP4_BLOCK
+
+    op = values.Opset("", 24)
+    one = op.Constant(value=ir.tensor(1.0))   # the per-tensor scale
+    x = op.Cast(x, to=ir.DataType.FLOAT)
+    blocked = op.Concat(op.Shape(x, end=-1), op.Constant(value=ir.tensor([-1, NVFP4_BLOCK], dtype=ir.DataType.INT64)),
+                        axis=0)
+    amax = op.ReduceMax(op.Abs(op.Reshape(x, blocked)), op.Constant(value=ir.tensor([-1], dtype=ir.DataType.INT64)),
+                        keepdims=0)
+    scales = op.QuantizeLinear(op.Div(amax, op.Constant(value=ir.tensor(E2M1_MAX))), one,
+                               output_dtype=ir.DataType.FLOAT8E4M3FN)
+    step = op.DequantizeLinear(scales, one)
+    step = op.Where(op.Greater(step, op.Constant(value=ir.tensor(0.0))), step, one)   # all-zero block
+    rows = op.QuantizeLinear(x, step, axis=-1, block_size=NVFP4_BLOCK, output_dtype=ir.DataType.FLOAT4E2M1)
+    return rows, scales
+
+
+def _nvfp4_dequantize(rows, scales):
+    from onnxscript import ir, values
+
+    from ....blocks.attention.kv_precision.nvfp4 import NVFP4_BLOCK
+
+    op = values.Opset("", 24)
+    step = op.DequantizeLinear(scales, op.Constant(value=ir.tensor(1.0)))
+    return op.DequantizeLinear(rows, step, axis=-1, block_size=NVFP4_BLOCK)
+
+
 def default_translations() -> dict[Any, Callable]:
     """ATen/custom-op -> onnxscript translations every ONNX export needs."""
     from ....blocks.attention.kv_cache import io_inplace  # noqa: F401  (registers torch.ops.tsurgeon.kv_cache_update)
+    from ....blocks.attention.kv_precision import fp8, nvfp4  # noqa: F401  (registers kv_fp8_* and kv_nvfp4_*)
 
-    return {torch.ops.tsurgeon.kv_cache_update.default: _tensor_scatter}
+    return {torch.ops.tsurgeon.kv_cache_update.default: _tensor_scatter,
+            torch.ops.tsurgeon.kv_fp8_quantize.default: _fp8_quantize,
+            torch.ops.tsurgeon.kv_fp8_dequantize.default: _fp8_dequantize,
+            torch.ops.tsurgeon.kv_nvfp4_quantize.default: _nvfp4_quantize,
+            torch.ops.tsurgeon.kv_nvfp4_dequantize.default: _nvfp4_dequantize}
 
 
 @dataclass
@@ -76,7 +140,7 @@ class ONNXExportConfig(BackendExportConfig):
     output_path        - path of the .onnx file (external weights go next to it).
     max_input_len      - >1 makes the sequence dim of input_ids dynamic
                          (1..max_input_len) so a whole prompt is one call;
-                         needs cache_impl="io_inplace". 1 = decode-only graph.
+                         needs cache_impl="io_inplace" or "io_rows". 1 = decode-only graph.
     opset              - ONNX opset; 24 is required for TensorScatter.
     optimize           - run the exporter's ONNX optimizer (constant folding,
                          dead-code removal).
@@ -127,22 +191,29 @@ def export_onnx(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
         return export_onnx_encoder(components, config)
     wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
     cache_impl = wrapper.cache_impl
-    if config.max_input_len > 1 and cache_impl != "io_inplace":
-        raise ValueError("max_input_len > 1 (prompt prefill) requires cache_impl='io_inplace'.")
+    if config.max_input_len > 1 and cache_impl not in ("io_inplace", "io_rows"):
+        raise ValueError("max_input_len > 1 (prompt prefill) requires cache_impl='io_inplace' or 'io_rows'.")
 
     # Per-layer quantization metadata; hard-quantized weights are dequantized
     # in place here and re-expressed as Q/DQ after export.
     layer_info = extract_layer_quant_info(wrapper)
 
     num_layers = len(wrapper.decoder.blocks)
-    input_names, output_names = io_names(num_layers, paged=cache_impl == "io_paged")
+    input_names, output_names = io_names(num_layers, paged=cache_impl == "io_paged",
+                                         scales=cache_scales(wrapper.decoder))
     dynamic_shapes = None
     if config.max_input_len > 1:
         # torch.export specializes size-1 dims, so trace with a 2-token prompt.
         vocab = int(getattr(model_config, "vocab_size", 100) or 100)
-        example_inputs = (torch.randint(0, vocab, (2,), dtype=torch.long), *example_inputs[1:])
+        # The caches are static. torch.onnx turns the tuples of dynamic_shapes into lists, so
+        # (rows, scales) cache pairs are traced as lists.
+        keys, values = ([list(c) if isinstance(c, tuple) else c for c in caches] for caches in example_inputs[2:])
+        example_inputs = (torch.randint(0, vocab, (2,), dtype=torch.long), example_inputs[1], keys, values)
         seq = torch.export.Dim("seq", min=1, max=config.max_input_len)
-        dynamic_shapes = ({0: seq}, None, [None] * num_layers, [None] * num_layers)
+        # Key and value caches may differ (only one of a (key, value) precision pair has block scales).
+        static_keys, static_values = ([None if isinstance(c, torch.Tensor) else [None] * len(c) for c in caches]
+                                      for caches in (keys, values))
+        dynamic_shapes = ({0: seq}, None, static_keys, static_values)
 
     with torch.no_grad():
         logits_dtype = wrapper(*example_inputs)[0].dtype

@@ -20,7 +20,7 @@ import warnings
 import torch
 import torch.nn as nn
 
-from ..blocks import build_block, resolve_atom
+from ..blocks import build_block, canonical_kv_precision, resolve_atom
 from ..blocks.stacks.config import rmsnorm_impl_from_flags
 from ..compression.quantization import QUANT_RUNTIME_BUFFERS, copy_quant_state
 from ..utils import flatten_index_paths, get_block_config, get_parent_module, get_submodule, replace_parameter
@@ -36,6 +36,8 @@ DEFAULT_CONVERT_OPTIONS = {
     "rmsnorm_prescale": True,
     "rmsnorm_upcast": False,
     "masked_softmax": False,
+    "kv_precision": "full",      # "int8"/"int4"/"fp8"/"nvfp4": stored KV-cache rows (blocks/attention/kv_precision);
+                                 # a (key, value) pair stores the two caches differently, e.g. ("int8", "int4")
 }
 
 
@@ -45,6 +47,7 @@ def resolve_convert_options(options=None):
     if unknown:
         raise ValueError(f"Unknown convert options {sorted(unknown)}; known: {sorted(DEFAULT_CONVERT_OPTIONS)}.")
     resolved = {**DEFAULT_CONVERT_OPTIONS, **(options or {})}
+    resolved["kv_precision"] = canonical_kv_precision(resolved["kv_precision"])
     prescale = resolved.pop("rmsnorm_prescale")
     upcast = resolved.pop("rmsnorm_upcast")
     if resolved["rmsnorm_impl"] is None:

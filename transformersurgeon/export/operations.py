@@ -6,7 +6,11 @@ the device. It is organised by *block type*; for every backend it gives:
 
 - ``default``: the implementation used when the caller chooses nothing;
 - ``options``: every implementation known to work on that backend, each with a
-  short description of the resulting device operation.
+  short description of the resulting device operation;
+- ``requires_cache`` (optional, ``kv_precision`` only): the KV-cache atom each
+  listed precision needs on that backend (see :func:`required_cache`);
+- ``incompatible`` (optional, ``kv_precision`` only): precisions that cannot store
+  the two caches of a ``(key, value)`` pair together on that backend.
 
 Each block type also says how the choice reaches the code:
 
@@ -24,7 +28,7 @@ fields take the backend default from here, and a choice that is not listed for
 the backend is rejected before any tracing starts.
 """
 
-from ..blocks import ATTENTION_KERNELS, KV_CACHES
+from ..blocks import ATTENTION_KERNELS, KV_CACHES, KV_PRECISIONS, canonical_kv_precision, kv_precision_pair
 
 BACKENDS = ("xnnpack", "qnn", "onnx", "tensorrt")
 
@@ -46,6 +50,8 @@ BACKEND_OPERATIONS = {
             }},
             "onnx": {"default": "io_inplace", "options": {
                 "io_inplace": "ONNX TensorScatter (opset 24); consumers may update the buffer in place.",
+                "io_rows": "Cache as a read-only graph input; the graph returns the new rows, which the consumer "
+                           "writes at pos_id.",
                 "io_scatter": "ONNX ScatterND.",
                 "io_concat": "ONNX Where on a one-hot position mask.",
                 "io_paged": "Only with a custom translation of tsurgeon::paged_attention "
@@ -53,10 +59,84 @@ BACKEND_OPERATIONS = {
             }},
             "tensorrt": {"default": "io_inplace", "options": {
                 "io_inplace": "TensorScatter executed in place by TensorRT (output aliased to input).",
+                "io_rows": "Cache as a read-only engine input; the engine returns the new rows and the runner "
+                           "writes them (the only cache for int8/int4/fp8/nvfp4 rows).",
                 "io_scatter": "TensorRT ScatterND.",
                 "io_concat": "TensorRT Select.",
                 "io_paged": "Paged KV pool of the TensorRT Edge-LLM AttentionPlugin.",
             }},
+        },
+    },
+    "kv_precision": {
+        "description": "What one stored key/value row holds (blocks/attention/kv_precision). Integer rows are "
+                       "uint8: symmetric codes plus one 2-byte scale per row (token, KV head); FP8 rows are "
+                       "float8_e4m3fn with a unit scale; NVFP4 rows are FP4 (E2M1) with a second tensor of FP8 "
+                       "block scales (one per 16 elements). All are decoded to float before attention; the attention "
+                       "kernel never reads them natively. One option for both caches, or a (key, value) pair of "
+                       "options to store them differently, e.g. ('int8', 'int4'). A backend entry may name the "
+                       "cache a precision needs there (requires_cache).",
+        "convert_option": "kv_precision",
+        "backends": {
+            "xnnpack": {"default": "full", "options": {
+                "full": "Cache in the model dtype.",
+                "int8": "uint8 mutable cache; encode/decode are element-wise float operations, partly outside "
+                        "the XNNPACK delegate (portable ExecuTorch kernels).",
+                "int4": "uint8 mutable cache with two codes per byte; encode/decode as for int8.",
+            }},
+            # HTP keeps the cache as an activation of the graph: an 8-bit cache comes from the QNN quantiser
+            # (kv_cache_quantization / QNNExportConfig.kv_cache_bits), not from integer rows.
+            "qnn": {"default": "full", "options": {"full": "Cache in the activation precision of the graph."}},
+            "onnx": {"default": "full", "options": {
+                "full": "Cache in the model dtype.",
+                "int8": "uint8 cache I/O; encode/decode are standard element-wise ONNX operations.",
+                "int4": "uint8 cache I/O with two codes per byte; encode/decode are standard ONNX operations.",
+                "fp8": "float8e4m3fn cache I/O written by QuantizeLinear and read by DequantizeLinear (unit "
+                       "scale); needs cache_impl='io_rows'.",
+                # nvfp4 exports to valid ONNX (see the tensorrt entry) but ONNX Runtime 1.31 has no FLOAT4E2M1
+                # DequantizeLinear, so it is offered on tensorrt only.
+            }},
+            # Checked with TensorRT 11.4: the KV-cache update layer (io_inplace) takes only a Float/Half/BFloat16
+            # cache; uint8 tensors are refused inside the network ("does not support UINT8 types for intermediate
+            # tensors") and FP8 tensors may only be produced by a quantize layer and read by a dequantize layer, so
+            # a stored row can never be scattered or selected in the engine. With io_rows the engine only reads the
+            # cache and returns the new rows (uint8 or FP8 graph outputs), which the runner writes.
+            "tensorrt": {"default": "full", "options": {
+                "full": "Cache in the model dtype.",
+                "int8": "uint8 cache I/O; encode/decode are element-wise operations around the attention.",
+                "int4": "uint8 cache I/O with two codes per byte; encode/decode as for int8.",
+                "fp8": "FP8 cache I/O: a QuantizeLinear writes the rows, a DequantizeLinear reads the cache "
+                       "(checked on compute capability 8.9; older GPUs, e.g. Jetson Orin, may refuse FP8). With "
+                       "INT8 weights in the same engine it builds only on Blackwell or newer GPUs.",
+                "nvfp4": "NVFP4 cache I/O: FP4 rows plus an FP8 block-scale tensor per cache (unit per-tensor "
+                         "scale); QuantizeLinear writes both, a double DequantizeLinear reads them. Checked on compute "
+                         "capability 8.9, where TensorRT warns that FP4 is not accelerated (Blackwell has FP4 "
+                         "hardware). The scales are FP8, so the INT8-weights rule of fp8 applies. Not in a "
+                         "(key, value) pair with int8 or int4: TensorRT 11.4 crashes building that engine.",
+            }, "requires_cache": {"int8": "io_rows", "int4": "io_rows", "fp8": "io_rows", "nvfp4": "io_rows"},
+                # Checked with TensorRT 11.4 (RTX 4070): the builder crashes (segmentation fault) on an engine with
+                # an NVFP4 cache next to an integer (uint8) one; NVFP4 next to full or FP8 caches builds.
+                "incompatible": [("nvfp4", "int8"), ("nvfp4", "int4")]},
+        },
+    },
+    "kv_cache_quantization": {
+        "description": "Bits of a KV cache that the backend's own quantiser keeps as a fixed-point activation "
+                       "(the graph stores it in the model dtype, kv_precision='full').",
+        "config_field": {"qnn": "kv_cache_bits"},
+        "backends": {
+            "qnn": {"default": 16, "options": {
+                16: "Cache at the activation precision of the graph (16-bit with quant_scope='all').",
+                8: "The cache writes get an 8-bit activation configuration (8a8w): an 8-bit fixed-point cache. "
+                   "Needs quant_scope='all', float_attention_core=False and a cache written by an index "
+                   "operation (cache_impl 'mutable' or 'io_scatter').",
+                (16, 8): "(key bits, value bits): only the value-cache writes get the 8a8w configuration; the key "
+                         "cache stays at 16 bits. A few key channels with large biases set a per-tensor 8-bit key "
+                         "step that leaves the other channels a few codes. Same requirements as 8.",
+                (8, 16): "(key bits, value bits): only the key-cache writes get the 8a8w configuration; the value "
+                         "cache stays at 16 bits. Same requirements as 8.",
+            }},
+            **{backend: {"default": "kv_precision", "options": {
+                "kv_precision": "Not chosen by a quantiser: the convert option kv_precision decides the cache.",
+            }} for backend in ("xnnpack", "onnx", "tensorrt")},
         },
     },
     "attention_kernel": {
@@ -231,15 +311,49 @@ def config_default(backend, field_name):
     raise KeyError(f"{field_name!r} is not an operation choice of backend {backend!r}.")
 
 
+def required_cache(backend, kv_precision):
+    """The KV-cache atom ``kv_precision`` (a name, or a ``(key, value)`` pair) needs on ``backend``
+    (``None``: any listed cache): each precision atom's own requirement or the backend's
+    (``requires_cache`` of its ``kv_precision`` entry)."""
+    needed = set()
+    for name in kv_precision_pair(kv_precision):
+        atom = KV_PRECISIONS.get(name)
+        needed.add((atom.requires_cache if atom is not None else None)
+                   or _entry("kv_precision", backend).get("requires_cache", {}).get(name))
+    needed.discard(None)
+    if len(needed) > 1:
+        raise ValueError(f"kv_precision={kv_precision!r} needs different caches on the {backend} backend: "
+                         f"{sorted(needed)}.")
+    return needed.pop() if needed else None
+
+
+def check_kv_combination(backend, cache_impl, kv_precision):
+    """Raise ``ValueError`` if ``kv_precision`` cannot be stored in ``cache_impl`` on ``backend``, or if the
+    two precisions of a ``(key, value)`` pair cannot be stored together there."""
+    parts = set(kv_precision_pair(kv_precision))
+    for pair in _entry("kv_precision", backend).get("incompatible", ()):
+        if set(pair) == parts:
+            raise ValueError(f"kv_precision={kv_precision!r} is not supported by the {backend} backend: {pair[0]!r} "
+                             f"and {pair[1]!r} caches cannot be in one {backend} graph. "
+                             "See transformersurgeon/export/operations.py.")
+    needed = required_cache(backend, kv_precision)
+    if needed not in (None, cache_impl):
+        raise ValueError(f"kv_precision={kv_precision!r} needs cache_impl={needed!r} on the {backend} backend "
+                         f"(got {cache_impl!r}). See transformersurgeon/export/operations.py.")
+
+
 def check_choice(backend, block_type, value):
-    """Raise ``ValueError`` if ``value`` is not a supported ``block_type`` implementation on ``backend``."""
+    """Raise ``ValueError`` if ``value`` is not a supported ``block_type`` implementation on ``backend``
+    (a ``(key, value)`` KV-precision pair: if either part is not)."""
     options = options_for(backend, block_type)
-    if value not in options:
-        raise ValueError(
-            f"{block_type} implementation {value!r} is not supported by the {backend} backend; "
-            f"supported: {list(options)} (default {default_for(backend, block_type)!r}). "
-            "See transformersurgeon/export/operations.py."
-        )
+    parts = kv_precision_pair(value) if block_type == "kv_precision" else (value,)
+    for part in parts:
+        if part not in options:
+            raise ValueError(
+                f"{block_type} implementation {part!r} is not supported by the {backend} backend; "
+                f"supported: {list(options)} (default {default_for(backend, block_type)!r}). "
+                "See transformersurgeon/export/operations.py."
+            )
 
 
 def check_config_choices(backend, config):
@@ -257,7 +371,8 @@ def resolve_convert_options(backend, options=None):
     ``attn_impl="sdpa"``; ``rmsnorm_prescale``/``rmsnorm_upcast`` select an
     ``rmsnorm_impl``. When the attention kernel is not given, the backend default
     is used unless it is incompatible with the chosen cache, in which case the
-    first compatible supported kernel is taken.
+    first compatible supported kernel is taken. Likewise, when the cache is not
+    given, a ``kv_precision`` that needs a particular cache on the backend selects it.
     """
     from .convert import resolve_convert_options as resolve_generic
 
@@ -274,6 +389,9 @@ def resolve_convert_options(backend, options=None):
             if option != "attn_impl":
                 resolved[option] = default_for(backend, block_type)
 
+    precisions = options_for(backend, "kv_precision")
+    if user.get("cache_impl") is None and all(p in precisions for p in kv_precision_pair(resolved["kv_precision"])):
+        resolved["cache_impl"] = required_cache(backend, resolved["kv_precision"]) or resolved["cache_impl"]
     cache = resolved["cache_impl"]
     if resolved.get("attn_impl") is None:
         candidates = [default_for(backend, "attention_kernel")] + list(options_for(backend, "attention_kernel"))
@@ -285,6 +403,7 @@ def resolve_convert_options(backend, options=None):
 
     for option, block_type in by_option.items():
         check_choice(backend, block_type, resolved[option])
+    check_kv_combination(backend, resolved["cache_impl"], resolved["kv_precision"])
     return resolved
 
 
@@ -294,9 +413,12 @@ def check_components(backend, decoder):
     check_choice(backend, "batch_dim", bool(getattr(decoder, "add_batch_dim", False)))
     if len(decoder.blocks):
         check_choice(backend, "attention_kernel", decoder.blocks[0].attn.attn_impl)
+        precision = canonical_kv_precision(getattr(decoder.blocks[0].attn, "kv_precision", "full"))
+        check_choice(backend, "kv_precision", precision)
+        check_kv_combination(backend, decoder.cache_impl, precision)
 
 
 __all__ = [
-    "BACKENDS", "BACKEND_OPERATIONS", "default_for", "options_for", "config_default", "check_choice",
-    "check_config_choices", "resolve_convert_options", "check_components",
+    "BACKENDS", "BACKEND_OPERATIONS", "default_for", "options_for", "config_default", "required_cache",
+    "check_kv_combination", "check_choice", "check_config_choices", "resolve_convert_options", "check_components",
 ]

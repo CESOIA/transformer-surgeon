@@ -18,7 +18,7 @@ class BackendExportConfig:
         weight_mismatch_eps: Tolerance of the post-export weight check.
         run_weight_mismatch_check: Compare exported weights with the source ones.
         convert_options: Atom choices for the export-ready model (``cache_impl``,
-            ``attn_impl``, ``rmsnorm_impl``, ...). Missing entries take the
+            ``attn_impl``, ``rmsnorm_impl``, ``kv_precision``, ...). Missing entries take the
             backend default from ``export/operations.py``.
         check_ir_validity: Let ExecuTorch validate the edge program.
         verbose: Print progress and error statistics.

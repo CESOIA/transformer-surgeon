@@ -16,6 +16,8 @@ class KVCache:
     - ``manifest_layout``: layout name recorded in export manifests.
     - ``multi_token``: whether one call may write several tokens (prefill).
     - ``requires_kernel``: the only attention kernel that works with this cache, or ``None``.
+    - ``returns_rows``: the graph only reads the cache and returns the new stored rows, which
+      the caller writes into its own cache (``False``: the graph returns the updated cache).
     """
 
     name = None
@@ -24,19 +26,37 @@ class KVCache:
     manifest_layout = "SHD"
     multi_token = False
     requires_kernel = None
+    returns_rows = False
 
     def shape(self, attn, which):
-        """Shape of the ``which`` (``"key"``/``"value"``) cache of ``attn``."""
-        head_dim = attn.key_head_dim if which == "key" else attn.value_head_dim
-        return (attn.max_cache_length, attn.kv_num_heads, head_dim)
+        """Shape of the ``which`` (``"key"``/``"value"``, or their block scales ``"key_scale"``/
+        ``"value_scale"``) cache of ``attn``. The last dim is the stored row width
+        (``attn.cache_width``: the head dim, or its packed form)."""
+        return (attn.max_cache_length, attn.kv_num_heads, attn.cache_width(which))
 
     def write(self, attn, k, v, write_index, key_cache, value_cache):
-        """Return the caches updated with ``k``/``v`` (``(q_len, kv_heads, dim)``) at ``write_index``."""
+        """Return the caches updated with the stored rows ``k``/``v`` (``(q_len, kv_heads, width)``)
+        at ``write_index``."""
         raise NotImplementedError
 
     def read(self, cache):
         """The cache as seen by the kernel (``read_layout``)."""
         return cache
+
+    def update(self, attn, k, v, write_index, key_cache, value_cache, dtype):
+        """Store the new float rows ``k``/``v`` (``(q_len, kv_heads, head_dim)``) and return
+        ``(key, value, key_out, value_out)``: the keys/values the kernel attends to, decoded to
+        ``dtype`` in ``read_layout``, and the caches the module returns.
+
+        Default: encode the new rows, write them, then decode the whole cache (each cache with its
+        own precision atom).
+        """
+        key_codec, value_codec = attn.codec("key"), attn.codec("value")
+        key_cache, value_cache = self.write(attn, key_codec.encode(k), value_codec.encode(v), write_index,
+                                            key_cache, value_cache)
+        key = key_codec.decode(self.read(key_cache), dtype)
+        value = value_codec.decode(self.read(value_cache), dtype)
+        return key, value, key_cache, value_cache
 
     def decoder_mask(self, decoder, pos_id, in_seq_len):
         """Additive causal mask and the positions of the new tokens.

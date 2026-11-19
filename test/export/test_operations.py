@@ -18,8 +18,8 @@ from transformersurgeon.export.operations import (
     resolve_convert_options,
 )
 
-CATALOG_FAMILY = {"kv_cache": "kv_cache", "attention_kernel": "attention_kernel", "rmsnorm": "norm",
-                  "mlp": "mlp", "rope_frequencies": "rope_frequencies"}
+CATALOG_FAMILY = {"kv_cache": "kv_cache", "kv_precision": "kv_precision", "attention_kernel": "attention_kernel",
+                  "rmsnorm": "norm", "mlp": "mlp", "rope_frequencies": "rope_frequencies"}
 
 
 def test_every_entry_has_a_valid_default_for_every_backend():

@@ -140,6 +140,35 @@ def test_qnn_export_writes_a_program(tmp_path):
     assert os.path.getsize(pte) > 0 and os.path.isfile(result.manifest_path)
 
 
+def _global_symbol_library(name):
+    """Path of the library that provides ``name`` in the process's global symbol scope."""
+    import ctypes
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p), ("sname", ctypes.c_char_p),
+                    ("saddr", ctypes.c_void_p)]
+
+    info = DlInfo()
+    address = ctypes.cast(getattr(ctypes.CDLL(None), name), ctypes.c_void_p)
+    ctypes.CDLL("libc.so.6").dladdr(address, ctypes.byref(info))
+    return info.fname.decode()
+
+
+@caps.requires_qnn
+def test_qnn_export_leaves_the_cxx_exception_symbols_to_gccs_runtime(tmp_path):
+    """The QNN SDK brings LLVM's libc++abi and libunwind into the global symbol scope; the exporter puts GCC's
+    runtime there first, otherwise a GCC-built library loaded afterwards (ONNX Runtime) segfaults as it loads."""
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    cfg = QNNExportConfig(output_path=str(tmp_path / "model.pte"), soc_model="SM8850", max_seq_len=CACHE,
+                          quant_scope="all",
+                          calibration_token_ids=[[(i * 37 + j * 11) % 256 for j in range(8)] for i in range(2)],
+                          run_weight_mismatch_check=False, verbose=False)
+    export_to_backend(_components(_model(quantize_mlp=True), {"max_cache_len": CACHE}), cfg)
+    assert "libstdc++" in _global_symbol_library("__cxa_throw")
+    assert "libgcc_s" in _global_symbol_library("_Unwind_Resume")
+
+
 @caps.requires_qnn
 def test_qnn_quantize_float_model_requires_quant_scope_all(tmp_path):
     from transformersurgeon.export.backends import QNNExportConfig
@@ -181,6 +210,29 @@ def test_qnn_quantize_float_model_lowers_an_uncompressed_model_as_fixed_point(tm
     assert bool((fq.argmax(-1) == ref.argmax(-1)).all()) and (fq - ref).abs().max().item() < 0.1
 
 
+@caps.requires_qnn
+def test_qnn_masked_softmax_minimum_takes_the_quantisation_of_its_input(tmp_path):
+    """The row minimum of masked softmax is one of the scores, so it needs no range of its own. With one, a
+    minimum that stays 0 through calibration gets a near-empty range, and HTP cannot rescale the scores to it
+    ("scale too large for requant")."""
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    model = _model(quantize_mlp=True)
+    cfg = QNNExportConfig(output_path=str(tmp_path / "model.pte"), soc_model="SM8850", max_seq_len=CACHE,
+                          convert_options={"max_cache_len": CACHE, "masked_softmax": True}, quant_scope="all",
+                          keep_reference_module=True,
+                          calibration_token_ids=[[(i * 37 + j * 11) % 256 for j in range(CACHE)] for i in range(4)],
+                          run_weight_mismatch_check=False, verbose=False)
+    graph = export_to_backend(model, cfg).reference_module.graph
+    minima = [n for n in graph.nodes if n.op == "call_function" and n.target == torch.ops.aten.amin.default]
+    assert len(minima) == model.config.num_hidden_layers
+    for minimum in minima:
+        (dequantize,), (quantize,) = minimum.all_input_nodes, minimum.users
+        assert dequantize.target.__name__ == "dequantize_per_tensor.default"
+        assert quantize.target.__name__ == "quantize_per_tensor.default"
+        assert quantize.args[1:] == dequantize.args[1:]  # scale, zero point, integer range, dtype
+
+
 # --------------------------------------------------------------------------- #
 # Backend graph passes
 # --------------------------------------------------------------------------- #
@@ -210,6 +262,23 @@ def test_qnn_split_float_linear_bias_moves_only_float_biases_and_keeps_outputs()
             buf.zero_()
     with torch.no_grad():
         torch.testing.assert_close(gm(*inputs), before, rtol=1e-5, atol=1e-5)
+
+
+def test_qnn_share_amin_quant_params_skips_a_minimum_the_quantiser_left_float():
+    pytest.importorskip("torchao")
+    from torch.export import export as torch_export
+
+    from transformersurgeon.export.backends.qnn.passes import _share_amin_quant_params
+
+    class RowMinimum(torch.nn.Module):
+        def forward(self, scores):
+            return torch.amin(scores, dim=-1, keepdim=True) - 20
+
+    gm = torch_export(RowMinimum(), (torch.rand(2, 4),)).module()
+    assert any(node.target == torch.ops.aten.amin.default for node in gm.graph.nodes)
+    # float_attention_core=True and quant_scope="linear" leave the attention core without annotations.
+    assert _share_amin_quant_params(gm) == 0
+    assert not any("quantization_annotation" in node.meta for node in gm.graph.nodes)
 
 
 def _onnx_graph(nodes, inits, x_shape, y_shape):

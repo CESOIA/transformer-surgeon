@@ -14,8 +14,8 @@ class ConcatCache(KVCache):
     def write(self, attn, k, v, write_index, key_cache, value_cache):
         idx = torch.arange(attn.max_cache_length, device=k.device)
         sel = (idx == write_index).view(attn.max_cache_length, 1, 1)
-        k_row = k.reshape(1, attn.kv_num_heads, attn.key_head_dim)
-        v_row = v.reshape(1, attn.kv_num_heads, attn.value_head_dim)
+        k_row = k.reshape(1, attn.kv_num_heads, attn.cache_width("key"))
+        v_row = v.reshape(1, attn.kv_num_heads, attn.cache_width("value"))
         return torch.where(sel, k_row, key_cache), torch.where(sel, v_row, value_cache)
 
 
