@@ -6,7 +6,7 @@ import torch.nn as nn
 from .abstract import Compressor
 from .validators import boolean, in_range, one_of, positive_int
 
-VALID_CHANNEL_PRUNING_METHODS = ["flap"]
+VALID_CHANNEL_PRUNING_METHODS = ["flap", "magnitude"]  # magnitude: uncalibrated, scores from the weight norms (no calibration data, no bias)
 
 
 class ChannelPruner(Compressor):
@@ -41,14 +41,14 @@ class ChannelPruner(Compressor):
         self.calibration_store = calibration_data
 
     def needs_calibration(self):
-        if not self._to_compress():
+        if not self._to_compress() or self.method == "magnitude":
             return ()
         return ("input_mean", "input_sq_mean")
 
     def needs_global_calibration(self):
         if not self._to_compress():
             return {}
-        return {"flap_scores": {"ratio": self.ratio}}
+        return {f"{self.method}_scores" if self.method == "magnitude" else "flap_scores": {"ratio": self.ratio}}
 
     def _to_compress(self):
         return self.ratio > 0.0
@@ -68,10 +68,11 @@ class ChannelPruner(Compressor):
             raise NotImplementedError("channel_pruning does not support low-rank decomposed layers.")
 
         if self.MASK_BUFFER not in module._buffers:
-            result = self.scheme.global_calibration_data.get("flap_scores")
+            store_key = "magnitude_scores" if self.method == "magnitude" else "flap_scores"
+            result = self.scheme.global_calibration_data.get(store_key)
             if result is None or self.scheme.path not in result["keep"]:
                 raise RuntimeError(
-                    "channel_pruning needs the global 'flap_scores' calibration summary for this layer; "
+                    f"channel_pruning needs the global '{store_key}' calibration summary for this layer; "
                     "call manager.run_calibration()/apply() with calibration data set."
                 )
             keep = result["keep"][self.scheme.path].to(module.weight.device)
