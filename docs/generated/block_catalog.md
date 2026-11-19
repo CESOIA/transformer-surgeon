@@ -17,6 +17,11 @@
 | `kv_cache` | `io_paged` | `kv_cache` | export | `blocks.attention.kv_cache.io_paged.PagedCache` | Paged pool as graph input/output; written and read by the paged kernel. |
 | `mlp` | `mlp` | `mlp` | model | `blocks.mlp.plain.MLP` | down(act(up(x))). |
 | `mlp` | `mlp_gated` | `mlp_gated` | model | `blocks.mlp.gated.MLPGated` | down(act(gate(x)) * up(x)). |
+| `mlp` | `mlp_gated_fused` | `mlp_gated` | model | `blocks.mlp.gated_fused.MLPGatedFused` | down(act(x1) * x2) with [x1, x2] = up(x) (one fused gate/up projection). |
+| `pooling` | `cls` | `pooling` | model | `blocks.heads.pooling.ClsPooling` | First (class) token. |
+| `pooling` | `mean` | `pooling` | model | `blocks.heads.pooling.MeanPooling` | Mean over all tokens. |
+| `pooling` | `cls_patch_mean` | `pooling` | model | `blocks.heads.pooling.ClsPatchMeanPooling` | Class token concatenated with the mean of the other tokens. |
+| `pooling` | `none` | `pooling` | model | `blocks.heads.pooling.NoPooling` | Every token, unchanged. |
 | `norm` | `rmsnorm` | `rmsnorm` | export | `blocks.norm.rmsnorm.RMSNorm` | Plain RMS normalisation; fusable into one operation by backend compilers. |
 | `norm` | `rmsnorm_prescaled` | `rmsnorm` | export | `blocks.norm.rmsnorm_prescaled.RMSNormPrescaled` | Rescales rows by max \|x\| first to avoid float16 overflow. |
 | `norm` | `rmsnorm_upcast` | `rmsnorm` | export | `blocks.norm.rmsnorm_upcast.RMSNormUpcast` | Normalises in float32 and casts back (Hugging Face formulation). |

@@ -7,7 +7,8 @@ Sub-packages (one atom per file):
 - ``mlp/``       feed-forward blocks and activations;
 - ``positions/`` rotary position embeddings;
 - ``attention/`` attention modules, attention kernels and KV-cache atoms;
-- ``stacks/``    complete decoder/encoder stacks and their configurations.
+- ``stacks/``    complete decoder/encoder stacks and their configurations;
+- ``heads/``     token pooling between an encoder stack and its output head.
 
 ``catalog.py`` lists every selectable atom (``BLOCK_CATALOG``). Nothing here
 depends on a specific model family: the model dictionaries in ``models/`` name
@@ -21,3 +22,4 @@ from .mlp import *
 from .positions import *
 from .attention import MHABase, MHACausal, MHAEncoder, ATTENTION_KERNELS, KV_CACHES, CACHE_IMPLS, ATTN_IMPLS
 from .stacks import *
+from .heads import *

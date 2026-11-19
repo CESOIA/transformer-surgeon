@@ -1,8 +1,11 @@
-"""Traceable wrapper around the export components and its example inputs.
+"""Traceable wrappers around the export components and their example inputs.
 
 Every backend traces the same :class:`LLMWrapper`: input embedding, converted
 decoder stack and output head, with a fixed signature that depends only on the
 KV-cache atom of the decoder (internal state, graph input/output, or pages).
+Encoder models (ViT, DINOv2, BERT-like) are traced as an :class:`EncoderWrapper`:
+input embedding, converted encoder stack, token pooling and output head, one
+call per input.
 """
 
 from typing import Any
@@ -147,6 +150,61 @@ def resolve_components_and_wrapper(components: dict) -> tuple[nn.Module, Any | N
     return wrapper, model_config, example_inputs
 
 
+class EncoderWrapper(nn.Module):
+    """Encoder model under a single-input signature: ``forward(x) -> logits``.
+
+    ``x`` is what the embedding takes with a batch dimension of 1 (pixels
+    ``(1, C, H, W)`` or token ids ``(1, seq)``); the embedding returns
+    ``(1, seq, hidden)``, the encoder stack works on ``(seq, hidden)``, the
+    pooling atom (``blocks/heads``, named by the model dictionary's ``pooling``)
+    reduces it to ``(1, features)`` and the head gives ``(1, num_outputs)``.
+    """
+
+    def __init__(self, embedding: nn.Module, encoder: nn.Module, final_layer: nn.Module, pooling: str = "cls"):
+        super().__init__()
+        from ..blocks import build_block
+
+        self.embedding = embedding
+        self.encoder = encoder
+        self.pooling_name = pooling
+        self.pooling = build_block("pooling", pooling)
+        self.final_layer = final_layer if final_layer is not None else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = self.encoder(self.embedding(x)[0])
+        return self.final_layer(self.pooling(hidden))
+
+
+def build_encoder_example_inputs(model_config: Any | None, embedding: nn.Module, *,
+                                 input_shape: tuple[int, ...] | None = None) -> tuple[torch.Tensor]:
+    """One example input for an :class:`EncoderWrapper`.
+
+    Image models (configuration with ``num_channels``): pixels of shape
+    ``input_shape`` (default ``(1, num_channels, image_size, image_size)``) in
+    the embedding's parameter dtype. Other encoders: token ids of shape
+    ``input_shape`` (default ``(1, 128)``).
+    """
+    if model_config is not None and hasattr(model_config, "num_channels"):
+        if input_shape is None:
+            size = getattr(model_config, "image_size", 224)
+            size = size if isinstance(size, (tuple, list)) else (size, size)
+            input_shape = (1, int(model_config.num_channels), *map(int, size))
+        dtype = next((p.dtype for p in embedding.parameters() if p.is_floating_point()), torch.float32)
+        return (torch.randn(*input_shape, dtype=dtype),)
+    vocab_size = int(getattr(model_config, "vocab_size", 100)) if model_config is not None else 100
+    return (torch.randint(0, vocab_size, tuple(input_shape or (1, 128)), dtype=torch.long),)
+
+
+def resolve_encoder_wrapper(components: dict, *, input_shape: tuple[int, ...] | None = None):
+    """``(wrapper, model_config, example_inputs)`` for resolved encoder components."""
+    wrapper = EncoderWrapper(components["embedding"], components["encoder"], components["final_layer"],
+                             components.get("pooling", "cls")).eval()
+    model_config = components.get("config")
+    return wrapper, model_config, build_encoder_example_inputs(model_config, wrapper.embedding,
+                                                               input_shape=input_shape)
+
+
 __all__ = [
     "build_zero_caches", "LLMWrapper", "build_wrapper", "build_example_inputs", "resolve_components_and_wrapper",
+    "EncoderWrapper", "build_encoder_example_inputs", "resolve_encoder_wrapper",
 ]

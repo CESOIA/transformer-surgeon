@@ -121,6 +121,16 @@ result = export_to_backend(model, config)   # full HF model, or {embedding, deco
 print(result.onnx_path, result.manifest_path, result.engine_path)
 ```
 
+**Encoder models** (a dictionary component with `structure="transformer_encoder"` and no decoder: ViT, DINOv2,
+BERT-like) take a separate path: `resolve_encoder_components` returns `{embedding, encoder, final_layer, pooling,
+config}` (embedding = the component's `preprocessing` module, pooling = its `pooling` key, an atom of
+`BLOCK_CATALOG["pooling"]`), traced as `export/wrapper.py::EncoderWrapper` (`forward(x) -> logits`, static shapes).
+Only exporters with `supports_encoder = True` (`onnx`, `tensorrt`) accept it; graph I/O is `pixel_values`
+`(1, C, H, W)` in the model dtype (or `input_ids (1, seq)`) → `logits (1, num_outputs)`, shape from
+`ONNXExportConfig.input_shape` (default the configuration's `image_size`), manifest `tsurgeon-encoder/1`
+(`build_encoder_manifest`), no TensorRT optimisation profile. Weight Q/DQ and static INT8 activations (W8A8) work as for
+decoders; `fp32_attention_scores` also matches unmasked scores and casts back to the model dtype (fp16 or bf16).
+
 Every backend writes `<artifact stem>.manifest.json` next to its artifact (`export/manifest.py::build_llm_manifest`):
 cache implementation, layout and dtype, per-layer key/value cache shapes (they differ per layer after pruning) and
 graph I/O names. Runners use `load_llm_manifest` and `zero_caches_from_manifest` instead of re-deriving geometry.
