@@ -154,6 +154,37 @@ BACKEND_OPERATIONS = {
             }} for backend in ("xnnpack", "onnx", "tensorrt")},
         },
     },
+    "kv_cache_8bit_scheme": {
+        "description": "How an 8-bit QNN KV cache (kv_cache_bits=8) is expressed to the QNN quantiser.",
+        "config_field": {"qnn": "kv_cache_8bit_scheme"},
+        "backends": {
+            "qnn": {"default": "cache_writes", "options": {
+                "cache_writes": "The cache writes get an 8a8w configuration (any 8-bit part of kv_cache_bits, "
+                                "pairs included).",
+                "attention_matmuls": "ExecuTorch's annotate_kv_8bit, adapted to the index_copy cache: q.K^T and P.V "
+                                     "16a8w, the cache and its view chain one 8-bit symmetric tensor. Both caches "
+                                     "only (kv_cache_bits=8), mutable cache.",
+            }, "requires": {"config": {"quant_scope": "all", "float_attention_core": False, "kv_cache_bits": 8},
+                            "cache_impl": ["mutable"]}},
+            **{backend: {"default": "cache_writes", "options": {
+                "cache_writes": "Not chosen by a quantiser (no 8-bit quantiser cache on this backend).",
+            }} for backend in ("xnnpack", "onnx", "tensorrt")},
+        },
+    },
+    "kv_cache_io": {
+        "description": "Dtype of a mutable KV cache at the delegate boundary of a quantised QNN graph.",
+        "config_field": {"qnn": "quantized_kv_io"},
+        "backends": {
+            "qnn": {"default": False, "options": {
+                False: "The cache buffer keeps the traced dtype: HTP dequantises the whole cache at the output and "
+                       "requantises it at the input of every step.",
+                True: "The cache stays fixed-point (uint16, uint8 for an 8-bit cache) across the delegate boundary "
+                      "(TagQuantIO + BuildQuantIo). Needs a quantised quant_scope='all' graph and the mutable cache.",
+            }, "requires": {"config": {"quant_scope": "all"}, "cache_impl": ["mutable"]}},
+            **{backend: {"default": False, "options": {False: "Not applicable (no delegate-boundary cache)."}}
+               for backend in ("xnnpack", "onnx", "tensorrt")},
+        },
+    },
     "attention_kernel": {
         "description": "How attention scores and the weighted sum are computed (blocks/attention/kernels).",
         "convert_option": "attn_impl",
@@ -163,6 +194,8 @@ BACKEND_OPERATIONS = {
                 "sdpa": "aten.scaled_dot_product_attention, decomposed at lowering.",
                 "custom_sdpa": "ExecuTorch llama::custom_sdpa + llama::update_cache CPU kernels "
                                "(scans only the filled cache; needs the mutable cache).",
+                "custom_quantized_sdpa": "ExecuTorch llama::custom_quantized_sdpa over the kernel's own int8 cache "
+                                         "(per token and kv head scale + zero point; needs the mutable cache).",
             }},
             "qnn": {"default": "manual", "options": {
                 "manual": "HTP MatMul/Softmax/MatMul with grouped heads broadcast (no cache copy).",
@@ -190,6 +223,34 @@ BACKEND_OPERATIONS = {
             }} for backend in BACKENDS
         },
     },
+    "key_centering": {
+        "description": "Attend over k - k_0 (k_0 = the cached key of position 0) instead of k "
+                       "(blocks/attention/causal.py). Softmax cancels q.k_0, so attention is unchanged; the score "
+                       "matmul works on |q.(k - k_0)| instead of |q.k|, which a 16-bit score matmul resolves when "
+                       "|q.k| is large (float16 step 16 at 2e4). Kernels that keep their own cache cannot use it.",
+        "convert_option": "center_keys",
+        "backends": {
+            backend: {"default": False, "options": {
+                False: "Scores q.k.",
+                True: "Scores q.(k - k_0): one subtraction over the key cache per layer and step.",
+            }} for backend in BACKENDS
+        },
+    },
+    "paged_rope": {
+        "description": "io_paged + within-head pruned attention: the fused paged kernel applies one RoPE table to "
+                       "every head, which cannot express per-kv-group rotary frequencies. True substitutes a "
+                       "standard RoPE table of the pruned head dim (TransformerDecoder.finalize_paged_rope): same "
+                       "shapes, cache size and work per token, DIFFERENT OUTPUT. A benchmarking device for latency "
+                       "only; it warns at conversion.",
+        "convert_option": "force_uniform_rope_latency_only",
+        "backends": {
+            backend: {"default": False, "options": {
+                False: "Within-head pruned attention with io_paged is refused (exact alternative: io_inplace).",
+                **({True: "LATENCY ONLY: standard RoPE of the pruned head dim; the output is not the model's."}
+                   if backend in ("onnx", "tensorrt") else {}),
+            }} for backend in BACKENDS
+        },
+    },
     # -------------------------------------------------------------- normalisation
     "rmsnorm": {
         "description": "Implementation of RMS normalisation (blocks/norm).",
@@ -200,6 +261,12 @@ BACKEND_OPERATIONS = {
                 "rmsnorm": "Plain RMS normalisation"
                            + (" (fused into one HTP RmsNorm operation)." if backend == "qnn" else "."),
                 "rmsnorm_upcast": "Normalisation computed in float32, cast back.",
+                "rmsnorm_threshold": "Rescale only rows with max |x| > rmsnorm_threshold; eps enters unscaled"
+                                     + (" (still fused into one HTP RmsNorm operation)." if backend == "qnn" else "."),
+                "rmsnorm_threshold_safe_sum": "rmsnorm_threshold with the variance as a sum of pre-scaled squares "
+                                              "(float16 accumulation stays in range; not fused).",
+                "rmsnorm_prescaled_exact_eps": "Max-abs rescale with eps/max**2: the unscaled norm exactly, with a "
+                                               "float16-safe reduction.",
             }} for backend in BACKENDS
         },
     },

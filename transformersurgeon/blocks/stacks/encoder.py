@@ -10,7 +10,7 @@ from .config import CustomEncoderConfigCompress
 def _norm(config):
     name = norm_atom_name(config.norm_type, getattr(config, "rmsnorm_impl", "rmsnorm_prescaled"))
     eps = getattr(config, "rms_norm_eps", None) or getattr(config, "layer_norm_eps", None) or 1e-5
-    return build_block("norm", name, config.hidden_size, eps=eps)
+    return build_block("norm", name, config.hidden_size, eps=eps, config=config)
 
 
 class TransformerEncoderBlock(torch.nn.Module):

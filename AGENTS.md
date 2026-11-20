@@ -460,6 +460,26 @@ was always 2048 slots regardless of `--max-sequence-length`.
 
 ---
 
+### Options ported from the compression-benchmark branch (2026-11-20)
+
+From `bench-d78-fp16` (frozen as tag `bench-frozen-2026-11`, the version behind the published benchmark numbers),
+re-expressed as atoms and `BACKEND_OPERATIONS` entries. All off by default. Tests: `test/blocks/test_bench_options.py`,
+`test/export/test_bench_exports.py`.
+
+| Option | Where | What |
+|---|---|---|
+| `rmsnorm_impl="rmsnorm_threshold"` (+ `rmsnorm_threshold`, default 128) | `blocks/norm/rmsnorm_threshold.py` | rescale only rows with max\|x\| above the threshold: eps enters unscaled, fp16-safe, still fused on QNN. Old flag `rmsnorm_prescale_threshold=128` |
+| `rmsnorm_impl="rmsnorm_threshold_safe_sum"` | `blocks/norm/rmsnorm_threshold_safe_sum.py` | threshold + variance as `sum((x/sqrt(n))**2)` (fp16 accumulation safe; not fused). Old `rmsnorm_safe_sum` |
+| `rmsnorm_impl="rmsnorm_prescaled_exact_eps"` | `blocks/norm/rmsnorm_prescaled_exact_eps.py` | max prescale with eps/max**2: the unscaled norm exactly. Old `rmsnorm_prescale_exact_eps` |
+| `center_keys=True` | `blocks/attention/causal.py`, entry `key_centering` | attend over k - k_0 (softmax cancels q.k_0); not with kernels that keep their own cache |
+| `attn_impl="custom_quantized_sdpa"` | `blocks/attention/kernels/custom_quantized_sdpa.py` | XNNPACK: ExecuTorch fused attention over its own int8 cache. Old `kv_cache_quant="int8"` |
+| `force_uniform_rope_latency_only=True` | `TransformerDecoder.finalize_paged_rope`, entry `paged_rope` | io_paged + within-head pruning: standard RoPE of the pruned head dim. LATENCY ONLY, changes the output, warns |
+| `QNNExportConfig.quantized_kv_io=True` | entry `kv_cache_io` | mutable cache stays fixed-point at the delegate boundary (TagQuantIO + BuildQuantIo) |
+| `QNNExportConfig.kv_cache_8bit_scheme="attention_matmuls"` | entry `kv_cache_8bit_scheme` | the benchmark's `kv_cache_bits=8`: q.K^T and P.V 16a8w, cache 8-bit (ExecuTorch's annotate_kv_8bit). Default `"cache_writes"` is the KV-precision work's 8a8w cache writes |
+
+Also: XNNPACK torchao path stores channelwise int8 weight scales as fp32 (XNNPACK refuses fp16 ones); manifests and
+the TensorRT session accept decoders with no blocks (embedding + lm_head only).
+
 ## Compression Parameter Reference
 
 All parameters are set via `manager.set(compression_type, param, value, criteria=...)`.

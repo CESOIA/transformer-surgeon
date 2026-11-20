@@ -93,11 +93,11 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         "cache_layout": kv_cache.manifest_layout,
         # The allocated key-cache buffer, not config.dtype (None for configs without one); every entry of
         # "caches" has its own dtype (the value cache's differs with a (key, value) precision pair).
-        "cache_dtype": _dtype_name(decoder.blocks[0].attn.key_cache.dtype),
+        "cache_dtype": _dtype_name(decoder.blocks[0].attn.key_cache.dtype) if len(decoder.blocks) else None,
         # "full", "int8"/"int4" (uint8 rows of codes + a 2-byte scale), "fp8" (float8_e4m3fn rows) or
         # "nvfp4" (float4_e2m1fn_x2 rows + float8_e4m3fn block scales), see blocks/attention/kv_precision;
         # a [key, value] pair when the two caches are stored differently.
-        "kv_precision": getattr(decoder.blocks[0].attn, "kv_precision", "full"),
+        "kv_precision": getattr(decoder.blocks[0].attn, "kv_precision", "full") if len(decoder.blocks) else "full",
         "max_cache_len": int(decoder.max_cache_len),
         "num_layers": len(decoder.blocks),
         "add_batch_dim": bool(getattr(wrapper, "add_batch_dim", False)),

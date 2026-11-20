@@ -25,6 +25,7 @@ class MHACausal(MHABase):
     ``max_cache_len`` (default 2048), ``add_batch_dim`` (accept and return a
     leading size-1 batch dimension), ``masked_softmax`` (replace masked scores
     instead of adding a large negative penalty; ``manual`` kernel only),
+    ``center_keys`` (attend over ``k - k_0``, see ``export/operations.py``, ``key_centering``),
     ``kv_precision`` (default ``"full"``: one name for both caches, or a ``(key, value)``
     pair such as ``("int8", "int4")``; anything but ``"full"`` needs a kernel that reads
     the cache through the KV-cache atom, not ``custom_sdpa``/``paged``, and ``"fp8"``
@@ -45,7 +46,7 @@ class MHACausal(MHABase):
 
     def __init__(self, embed_dim, num_heads, kv_num_heads=None, attn_impl=None, use_sdpa=False,
                  linear_specs=None, dtype=None, cache_impl="mutable", max_cache_len=2048,
-                 add_batch_dim=False, masked_softmax=False, kv_precision="full"):
+                 add_batch_dim=False, masked_softmax=False, kv_precision="full", center_keys=False):
         if cache_impl not in KV_CACHES:
             raise ValueError(f"Unsupported cache_impl {cache_impl!r}; expected one of {tuple(KV_CACHES)}")
         names = kv_precision_pair(kv_precision)
@@ -59,6 +60,9 @@ class MHACausal(MHABase):
         self.add_batch_dim = add_batch_dim
         self.max_cache_length = max_cache_len
         self.masked_softmax = bool(masked_softmax)
+        # center_keys: attend over k - k_0, k_0 = the cached key of position 0. q.k_0 is the same for every key
+        # of a query, so softmax cancels it; the cache keeps the raw keys (no extra graph state).
+        self.center_keys = bool(center_keys)
 
         if names != ("full", "full") and (self.kernel.owns_cache or self.kernel.fuses_projection):
             raise ValueError(f"kv_precision={self.kv_precision!r} needs a cache written and read through the "
@@ -71,6 +75,9 @@ class MHACausal(MHABase):
         if self.kv_cache.requires_kernel not in (None, self.attn_impl) or (
                 self.kernel.requires_cache == "io_paged" and cache_impl != "io_paged"):
             raise ValueError("attn_impl='paged' and cache_impl='io_paged' go together.")
+        if self.center_keys and (self.kernel.owns_cache or self.kernel.fuses_projection):
+            raise ValueError(f"center_keys=True needs a kernel that reads the cache through the KV-cache atom; "
+                             f"attn_impl={self.attn_impl!r} keeps its own cache.")
         if self.masked_softmax and not self.kernel.supports_masked_softmax:
             raise ValueError("masked_softmax=True needs attn_impl='manual'.")
         if self.kernel.requires_cache not in (None, cache_impl):
@@ -225,6 +232,9 @@ class MHACausal(MHABase):
             write_index = torch.clamp(pos_id, 0, self.max_cache_length - 1).long()
             key, value, key_cache, value_cache = self.kv_cache.update(self, k, v, write_index, key_cache,
                                                                       value_cache, q.dtype)
+            if self.center_keys:  # position 0 is always written before it is attended to
+                seq_axis = self.kv_cache.read_layout.index("s")
+                key = key - key.narrow(seq_axis, 0, 1)
             attn_output = self.kernel.attend(self, q, key, value, attn_mask, kv_layout=self.kv_cache.read_layout)
 
         # Width is num_heads * value_head_dim (out_proj's input follows value pruning).

@@ -58,6 +58,9 @@ class MHABase(torch.nn.Module):
 
         # RoPE-pruning geometry: frozen by finalize_rope_pruning() at conversion time.
         self.rope_pruned = False
+        # io_paged + force_uniform_rope_latency_only: set by TransformerDecoder.finalize_paged_rope (conversion time).
+        self.paged_uniform_rope = False
+        self.paged_rope_table = None
         self.register_buffer("rope_freq_proj", None, persistent=False)
 
     def _default_attn_impl(self):

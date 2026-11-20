@@ -26,6 +26,9 @@ from .passes import (
     _canonicalize_pow_tensor_scalar,
     _decompose_wrap_with_set_grad_enabled,
     _float_attention_nodes,
+    _KV_CACHE_WRITES,
+    _annotate_kv_cache_8bit_matmuls,
+    _kv_cache_buffer_kind,
     _kv_cache_write_kind,
     _kv_cache_write_predicate,
     _linear_block_sizes,
@@ -127,6 +130,14 @@ class QNNExportConfig(BackendExportConfig):
     # writes only, (8, 16) to the key-cache writes only. The graph itself keeps
     # kv_precision="full". Not yet validated on a device.
     kv_cache_bits: int | tuple = field(default_factory=lambda: config_default("qnn", "kv_cache_bits"))
+    # How kv_cache_bits=8 reaches the graph (export/operations.py, "kv_cache_8bit_scheme"): "cache_writes" gives the
+    # cache writes an 8a8w configuration; "attention_matmuls" (ExecuTorch's annotate_kv_8bit, adapted to the
+    # index_copy cache) makes q.K^T and P.V 16a8w and the cache and its view chain one 8-bit symmetric tensor.
+    kv_cache_8bit_scheme: str = field(default_factory=lambda: config_default("qnn", "kv_cache_8bit_scheme"))
+    # quant_scope="all" only: keep the mutable KV cache quantised at the delegate boundary (uint16, or uint8 for an
+    # 8-bit cache). Without it the cache buffer stays in the traced dtype: HTP dequantises the whole cache at the
+    # output and requantises it at the input of every step (export/operations.py, "kv_cache_io").
+    quantized_kv_io: bool = field(default_factory=lambda: config_default("qnn", "quantized_kv_io"))
     # Token-id sequences for PT2E activation calibration (each decoded from position 0
     # with the KV cache filling up). None = a few built-in sentences. Use real text
     # from the target distribution: static 16-bit ranges come only from these.
@@ -299,6 +310,9 @@ class QNNExporter(ExecuTorchExporter):
         if config.quantize_float_model and config.quant_scope != "all":
             raise ValueError("QNNExportConfig.quantize_float_model requires quant_scope='all'.")
         quantize = bool(layer_info) or config.quantize_float_model or low_bit_cache
+        if config.quantized_kv_io and not quantize:
+            raise ValueError("QNNExportConfig.quantized_kv_io needs a quantised graph (compressed fixed-point weights, "
+                             "quantize_float_model=True or an 8-bit cache); this export has none.")
         model_for_edge, exported_for_mismatch = module, None
         if quantize:
             model_for_edge, exported_for_mismatch = self._quantize(module, layer_info, model_config,
@@ -329,7 +343,11 @@ class QNNExporter(ExecuTorchExporter):
             convert_linear_to_conv2d=lpbq or _resolve_linear_to_conv2d(wrapper, config),
             **self._edge_pass_options(wrapper, config, quantize),
         )
-        self.write_program(edge, config, alloc_graph_input=True, alloc_graph_output=True)
+        passes = []
+        if config.quantized_kv_io:
+            from executorch.backends.qualcomm._passes.build_quant_io import BuildQuantIo
+            passes.append(BuildQuantIo())
+        self.write_program(edge, config, alloc_graph_input=True, alloc_graph_output=True, passes=passes)
         result = self.finalize(config, precision="mixed" if quantize else "full", wrapper=wrapper,
                                example_inputs=example_inputs, model_config=model_config,
                                exported_for_mismatch=exported_for_mismatch)
@@ -397,7 +415,9 @@ class QNNExporter(ExecuTorchExporter):
             for qdtype, layers in layers_by_qdtype.items()
         ]
         eight_bit_caches = _eight_bit_cache_parts(config)
-        if eight_bit_caches != ():
+        if eight_bit_caches != () and config.kv_cache_8bit_scheme == "attention_matmuls":
+            quantizer.add_custom_quant_annotations((_annotate_kv_cache_8bit_matmuls,))
+        elif eight_bit_caches != ():
             # The cache writes are not inside any linear layer, so no per-layer predicate matches them.
             submodule_configs.append((_kv_cache_write_predicate(eight_bit_caches),
                                       ModuleQConfig(quant_dtype=QuantDtype.use_8a8w, act_observer=act_observer)))
@@ -462,9 +482,38 @@ class QNNExporter(ExecuTorchExporter):
             dep_table[_BreakQuantAttrsBeforeFp16Linear] = [LayoutTransform]
             dep_table[TagQuantIO] = list(dep_table.get(TagQuantIO, [LayoutTransform])) + [
                 _BreakQuantAttrsBeforeFp16Linear]
+        if config.quantized_kv_io:
+            # The cache buffer (lifted placeholder) and the write feeding its mutation output keep the cache's
+            # fixed-point dtype at the delegate boundary (TagQuantIO here, BuildQuantIo in write_program).
+            passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
+            passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY]["get_quant_io_dtype_fn"] = (
+                _kv_cache_io_dtype_fn(config))
         options["passes_job"] = passes_job
         options["dep_table"] = dep_table
         return options
+
+
+def _kv_cache_io_dtype_fn(config):
+    """``get_quant_io_dtype_fn`` of TagQuantIO for ``quantized_kv_io``: the fixed-point dtype of the KV-cache
+    buffers and of the cache writes that feed their mutation outputs (uint8 for an 8-bit cache, else uint16)."""
+    dtypes = {kind: torch.uint8 if bits == 8 else torch.uint16 for kind, bits in zip(("key", "value"), _cache_bits(config))}
+
+    def dtype_of(node):
+        if node.op == "placeholder":
+            kind = _kv_cache_buffer_kind(node.name)
+            return dtypes[kind] if kind else None
+        if node.op == "call_function" and any(user.op == "output" for user in node.users):
+            current = node   # output <- [dequantize <- quantize <-] cache write
+            for _ in range(3):
+                if current.target in _KV_CACHE_WRITES or "index_copy" in str(current.target) \
+                        or "index_put" in str(current.target):
+                    kind = _kv_cache_write_kind(current)
+                    return dtypes[kind] if kind else None
+                if not (current.args and isinstance(current.args[0], torch.fx.Node) and "quantize" in str(current.target)):
+                    return None
+                current = current.args[0]
+        return None
+    return dtype_of
 
 
 def _default_edge_passes():

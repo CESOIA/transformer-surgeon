@@ -55,7 +55,8 @@ class TensorRTLLMSession:
 
         self.cache_rows = bool(self.manifest.get("cache_rows"))
         self.caches: dict[str, torch.Tensor] = {}
-        kinds = [k for k in ("key", "key_scale", "value", "value_scale", "kv") if k in self.manifest["caches"][0]]
+        caches = self.manifest["caches"]  # empty for a decoder with no blocks (embedding + lm_head only)
+        kinds = [k for k in ("key", "key_scale", "value", "value_scale", "kv") if k in caches[0]] if caches else []
         for layer in self.manifest["caches"]:
             for kind in kinds:
                 spec = layer[kind]

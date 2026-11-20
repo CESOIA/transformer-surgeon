@@ -330,9 +330,66 @@ def _kv_cache_write_kind(node: torch.fx.Node) -> str | None:
         leaf = str(source.target).rsplit(".", 1)[-1]
         return next((kind for kind, name in MHACausal.CACHE_BUFFERS.items() if leaf == name), None)
     if source.op == "placeholder":
-        return next((kind for kind, name in LLMWrapper.CACHE_INPUTS.items()
-                     if re.fullmatch(rf"{re.escape(name)}_\d+", source.name)), None)
+        return _kv_cache_buffer_kind(source.name) or next(
+            (kind for kind, name in LLMWrapper.CACHE_INPUTS.items()
+             if re.fullmatch(rf"{re.escape(name)}_\d+", source.name)), None)
     return None
+
+
+def _kv_cache_buffer_kind(name: str) -> str | None:
+    """``"key"``/``"value"`` for a lifted KV-cache buffer placeholder (torch.export names a buffer ``b_<path>`` with
+    the dots of its path as underscores, ending in ``_`` + a name of ``MHACausal.CACHE_BUFFERS``), else None."""
+    from ....blocks.attention.causal import MHACausal
+
+    return next((kind for kind, buffer in MHACausal.CACHE_BUFFERS.items()
+                 if name.startswith("b_") and name.endswith("_" + buffer)), None)
+
+
+def _annotate_kv_cache_8bit_matmuls(gm: torch.fx.GraphModule) -> int:
+    """``kv_cache_8bit_scheme="attention_matmuls"``: q.K^T and P.V become 16a8w; walking back from each matmul's
+    second input through the layout ops (shared quantisation parameters) to the cache write (``index_copy`` on the
+    mutable buffer), the cache and its view chain get one 8-bit symmetric per-tensor spec, taken at the new rows.
+    Adapted from ExecuTorch's ``annotate_kv_8bit`` (static-LLM recipes), which expects a concatenated cache.
+    Structural: a matmul is a cache read when its second input leads to a cache write. Returns the matmul count."""
+    from executorch.backends.qualcomm.quantizer.qconfig import get_16a8w_qnn_ptq_config, get_8a8w_qnn_ptq_config
+    from torchao.quantization.pt2e import MinMaxObserver
+    from torchao.quantization.pt2e.quantizer import QuantizationAnnotation, SharedQuantizationSpec
+    from torchao.quantization.pt2e.quantizer.utils import Q_ANNOTATION_KEY
+
+    cfg16a8w = get_16a8w_qnn_ptq_config(act_observer=MinMaxObserver)
+    act8 = get_8a8w_qnn_ptq_config(act_symmetric=True, act_observer=MinMaxObserver).input_activation
+    layout_ops = {torch.ops.aten.permute.default, torch.ops.aten.transpose.int, torch.ops.aten.unsqueeze.default,
+                  torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten.expand.default}
+    cache_writes = {torch.ops.aten.index_copy_.default, torch.ops.aten.index_copy.default}
+
+    def share(node, src):
+        node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={src: act8}, output_qspec=SharedQuantizationSpec((src, node)), _annotated=True)
+
+    n_matmul = 0
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.matmul.default:
+            continue
+        chain, cur = [], node.args[1]
+        while isinstance(cur, torch.fx.Node) and cur.op == "call_function" and cur.target in layout_ops:
+            chain.append(cur)
+            cur = cur.args[0]
+        if not (isinstance(cur, torch.fx.Node) and cur.target in cache_writes):
+            continue  # not a K/V cache read
+        node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={node.args[0]: cfg16a8w.input_activation, node.args[1]: cfg16a8w.weight},
+            output_qspec=cfg16a8w.output_activation, _annotated=True)
+        value = cur.args[3]  # index_copy_(cache, dim, index, new_rows): the mutable buffer itself stays unannotated
+        cur.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={value: act8}, output_qspec=SharedQuantizationSpec((value, cur)), _annotated=True)
+        for v in reversed(chain):
+            share(v, v.args[0])
+        n_matmul += 1
+    if n_matmul == 0:
+        raise RuntimeError("kv_cache_8bit_scheme='attention_matmuls': no attention matmul reads a mutable KV cache "
+                           "(cache_impl='mutable').")
+    print(f"  QNN: 8-bit KV cache on {n_matmul} attention matmuls")
+    return n_matmul
 
 
 def _kv_cache_write_predicate(parts=None):

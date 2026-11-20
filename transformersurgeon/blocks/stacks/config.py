@@ -126,6 +126,9 @@ class CustomDecoderConfigCompress(_ConvertedStackConfig):
         "add_batch_dim": False,
         "masked_softmax": False,
         "kv_precision": "full",
+        "center_keys": False,
+        "rmsnorm_threshold": 128.0,
+        "force_uniform_rope_latency_only": False,
     }
 
     def __init__(self, **kwargs):
@@ -144,7 +147,7 @@ class CustomEncoderConfigCompress(_ConvertedStackConfig):
     model_type = "transformersurgeon-custom-encoder"
     _model_keys = {"attn_type": "mha_encoder", "mlp_type": "mlp", "norm_type": "layernorm",
                    "norm_position": "pre", "use_final_norm": True, "layer_scale": False}
-    _defaults = dict(_model_keys)
+    _defaults = {**_model_keys, "rmsnorm_threshold": 128.0}
 
     def __init__(self, **kwargs):
         # transformers generates a constructor for config subclasses without their own.

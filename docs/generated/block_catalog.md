@@ -9,6 +9,7 @@
 | `attention_kernel` | `manual` | `attention_kernel` | export | `blocks.attention.kernels.manual.ManualKernel` | Explicit matrix products and softmax; portable; supports masked softmax. |
 | `attention_kernel` | `sdpa` | `attention_kernel` | export | `blocks.attention.kernels.sdpa.SdpaKernel` | torch.nn.functional.scaled_dot_product_attention. |
 | `attention_kernel` | `custom_sdpa` | `attention_kernel` | export | `blocks.attention.kernels.custom_sdpa.CustomSdpaKernel` | ExecuTorch fused CPU kernel that scans only the filled cache; needs the mutable cache. |
+| `attention_kernel` | `custom_quantized_sdpa` | `attention_kernel` | export | `blocks.attention.kernels.custom_quantized_sdpa.CustomQuantizedSdpaKernel` | custom_sdpa over its own int8 cache (per token and kv head scale + zero point); needs the mutable cache. |
 | `attention_kernel` | `paged` | `attention_kernel` | export | `blocks.attention.kernels.paged.PagedKernel` | Fused rotary embedding + paged cache write + attention; needs the io_paged cache. |
 | `kv_cache` | `mutable` | `kv_cache` | export | `blocks.attention.kv_cache.mutable.MutableCache` | Internal module state written in place (not a graph input/output). |
 | `kv_cache` | `io_scatter` | `kv_cache` | export | `blocks.attention.kv_cache.io_scatter.ScatterCache` | Graph input/output, updated with a functional scatter. |
@@ -31,6 +32,9 @@
 | `norm` | `rmsnorm` | `rmsnorm` | export | `blocks.norm.rmsnorm.RMSNorm` | Plain RMS normalisation; fusable into one operation by backend compilers. |
 | `norm` | `rmsnorm_prescaled` | `rmsnorm` | export | `blocks.norm.rmsnorm_prescaled.RMSNormPrescaled` | Rescales rows by max \|x\| first to avoid float16 overflow. |
 | `norm` | `rmsnorm_upcast` | `rmsnorm` | export | `blocks.norm.rmsnorm_upcast.RMSNormUpcast` | Normalises in float32 and casts back (Hugging Face formulation). |
+| `norm` | `rmsnorm_threshold` | `rmsnorm` | export | `blocks.norm.rmsnorm_threshold.RMSNormThreshold` | Rescales only rows with max \|x\| above rmsnorm_threshold (default 128), so eps enters unscaled; float16-safe and still fusable. |
+| `norm` | `rmsnorm_threshold_safe_sum` | `rmsnorm` | export | `blocks.norm.rmsnorm_threshold_safe_sum.RMSNormThresholdSafeSum` | rmsnorm_threshold with the variance as a sum of pre-scaled squares (safe with float16 accumulation; not fusable). |
+| `norm` | `rmsnorm_prescaled_exact_eps` | `rmsnorm` | export | `blocks.norm.rmsnorm_prescaled_exact_eps.RMSNormPrescaledExactEps` | Max-abs rescale with eps / max**2 added: exactly the unscaled norm, float16-safe reduction. |
 | `norm` | `layernorm` | `layernorm` | model | `blocks.norm.layernorm.LayerNorm` | Layer normalisation. |
 | `rope_frequencies` | `default` | `rope_frequencies` | model | `blocks.positions.frequencies_default.inv_freq_default` | Plain rotary frequencies. |
 | `rope_frequencies` | `llama3` | `rope_frequencies` | model | `blocks.positions.frequencies_band_scaled.inv_freq_band_scaled` | Band-wise scaled frequencies for long contexts (HF rope_type 'llama3'). |

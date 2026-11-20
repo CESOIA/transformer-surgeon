@@ -61,6 +61,11 @@ BLOCK_CATALOG = {
             "attention.kernels.custom_sdpa.CustomSdpaKernel",
             "ExecuTorch fused CPU kernel that scans only the filled cache; needs the mutable cache.",
             "attention_kernel", "export"),
+        "custom_quantized_sdpa": _atom(
+            "attention.kernels.custom_quantized_sdpa.CustomQuantizedSdpaKernel",
+            "custom_sdpa over its own int8 cache (per token and kv head scale + zero point); needs the mutable "
+            "cache.",
+            "attention_kernel", "export"),
         "paged": _atom(
             "attention.kernels.paged.PagedKernel",
             "Fused rotary embedding + paged cache write + attention; needs the io_paged cache.",
@@ -150,6 +155,20 @@ BLOCK_CATALOG = {
             "norm.rmsnorm_upcast.RMSNormUpcast",
             "Normalises in float32 and casts back (Hugging Face formulation).",
             "rmsnorm", "export"),
+        "rmsnorm_threshold": _atom(
+            "norm.rmsnorm_threshold.RMSNormThreshold",
+            "Rescales only rows with max |x| above rmsnorm_threshold (default 128), so eps enters unscaled; "
+            "float16-safe and still fusable.",
+            "rmsnorm", "export"),
+        "rmsnorm_threshold_safe_sum": _atom(
+            "norm.rmsnorm_threshold_safe_sum.RMSNormThresholdSafeSum",
+            "rmsnorm_threshold with the variance as a sum of pre-scaled squares (safe with float16 accumulation; "
+            "not fusable).",
+            "rmsnorm", "export"),
+        "rmsnorm_prescaled_exact_eps": _atom(
+            "norm.rmsnorm_prescaled_exact_eps.RMSNormPrescaledExactEps",
+            "Max-abs rescale with eps / max**2 added: exactly the unscaled norm, float16-safe reduction.",
+            "rmsnorm", "export"),
         "layernorm": _atom("norm.layernorm.LayerNorm", "Layer normalisation.", "layernorm", "model"),
     },
     # Rotary-embedding frequency tables. Model key: "rope_type" ("auto" = from the HF configuration).
@@ -174,9 +193,16 @@ def resolve_atom(family, name):
     return getattr(import_module(f"{__package__}.{module_path}"), attr)
 
 
-def build_block(family, name, *args, **kwargs):
-    """Instantiate the atom ``BLOCK_CATALOG[family][name]`` with the given arguments."""
-    return resolve_atom(family, name)(*args, **kwargs)
+def build_block(family, name, *args, config=None, **kwargs):
+    """Instantiate the atom ``BLOCK_CATALOG[family][name]`` with the given arguments.
+
+    An atom with a ``CONFIG_OPTIONS`` class attribute (``{constructor argument: configuration attribute}``)
+    also receives those arguments from ``config`` (a stack configuration), when it has the attribute."""
+    atom = resolve_atom(family, name)
+    for argument, attribute in getattr(atom, "CONFIG_OPTIONS", {}).items():
+        if config is not None and argument not in kwargs and getattr(config, attribute, None) is not None:
+            kwargs[argument] = getattr(config, attribute)
+    return atom(*args, **kwargs)
 
 
 def implementations_of(operation, family=None):

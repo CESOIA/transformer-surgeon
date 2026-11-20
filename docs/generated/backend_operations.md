@@ -7,8 +7,12 @@ Defaults per backend (— = chosen by the model dictionary):
 | `kv_cache` | convert option `cache_impl` | `mutable` | `mutable` | `io_inplace` | `io_inplace` |
 | `kv_precision` | convert option `kv_precision` | `full` | `full` | `full` | `full` |
 | `kv_cache_quantization` | config field `qnn.kv_cache_bits` | `kv_precision` | `16` | `kv_precision` | `kv_precision` |
+| `kv_cache_8bit_scheme` | config field `qnn.kv_cache_8bit_scheme` | `cache_writes` | `cache_writes` | `cache_writes` | `cache_writes` |
+| `kv_cache_io` | config field `qnn.quantized_kv_io` | `False` | `False` | `False` | `False` |
 | `attention_kernel` | convert option `attn_impl` | `manual` | `manual` | `manual` | `manual` |
 | `masked_softmax` | convert option `masked_softmax` | `False` | `False` | `False` | `False` |
+| `key_centering` | convert option `center_keys` | `False` | `False` | `False` | `False` |
+| `paged_rope` | convert option `force_uniform_rope_latency_only` | `False` | `False` | `False` | `False` |
 | `rmsnorm` | convert option `rmsnorm_impl` | `rmsnorm_prescaled` | `rmsnorm_prescaled` | `rmsnorm_prescaled` | `rmsnorm_prescaled` |
 | `batch_dim` | convert option `add_batch_dim` | `False` | `False` | `False` | `False` |
 | `linear_quantization` | config field `xnnpack.quant_path`, `qnn.quant_scope`, `tensorrt.int4_backend` | `pt2e` | `linear` | `qdq` | `dequantize` |
@@ -75,6 +79,30 @@ Bits of a KV cache that the backend's own quantiser keeps as a fixed-point activ
 | onnx | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 | tensorrt | `kv_precision` (default) | Not chosen by a quantiser: the convert option kv_precision decides the cache. |
 
+### `kv_cache_8bit_scheme`
+
+How an 8-bit QNN KV cache (kv_cache_bits=8) is expressed to the QNN quantiser. Chosen by: config field `qnn.kv_cache_8bit_scheme`.
+
+| Backend | Option | Device operation |
+|---|---|---|
+| xnnpack | `cache_writes` (default) | Not chosen by a quantiser (no 8-bit quantiser cache on this backend). |
+| qnn | `cache_writes` (default) | The cache writes get an 8a8w configuration (any 8-bit part of kv_cache_bits, pairs included). |
+| qnn | `attention_matmuls` | ExecuTorch's annotate_kv_8bit, adapted to the index_copy cache: q.K^T and P.V 16a8w, the cache and its view chain one 8-bit symmetric tensor. Both caches only (kv_cache_bits=8), mutable cache. |
+| onnx | `cache_writes` (default) | Not chosen by a quantiser (no 8-bit quantiser cache on this backend). |
+| tensorrt | `cache_writes` (default) | Not chosen by a quantiser (no 8-bit quantiser cache on this backend). |
+
+### `kv_cache_io`
+
+Dtype of a mutable KV cache at the delegate boundary of a quantised QNN graph. Chosen by: config field `qnn.quantized_kv_io`.
+
+| Backend | Option | Device operation |
+|---|---|---|
+| xnnpack | `False` (default) | Not applicable (no delegate-boundary cache). |
+| qnn | `False` (default) | The cache buffer keeps the traced dtype: HTP dequantises the whole cache at the output and requantises it at the input of every step. |
+| qnn | `True` | The cache stays fixed-point (uint16, uint8 for an 8-bit cache) across the delegate boundary (TagQuantIO + BuildQuantIo). Needs a quantised quant_scope='all' graph and the mutable cache. |
+| onnx | `False` (default) | Not applicable (no delegate-boundary cache). |
+| tensorrt | `False` (default) | Not applicable (no delegate-boundary cache). |
+
 ### `attention_kernel`
 
 How attention scores and the weighted sum are computed (blocks/attention/kernels). Chosen by: convert option `attn_impl`.
@@ -84,6 +112,7 @@ How attention scores and the weighted sum are computed (blocks/attention/kernels
 | xnnpack | `manual` (default) | MatMul + Softmax + MatMul, delegated to XNNPACK. |
 | xnnpack | `sdpa` | aten.scaled_dot_product_attention, decomposed at lowering. |
 | xnnpack | `custom_sdpa` | ExecuTorch llama::custom_sdpa + llama::update_cache CPU kernels (scans only the filled cache; needs the mutable cache). |
+| xnnpack | `custom_quantized_sdpa` | ExecuTorch llama::custom_quantized_sdpa over the kernel's own int8 cache (per token and kv head scale + zero point; needs the mutable cache). |
 | qnn | `manual` (default) | HTP MatMul/Softmax/MatMul with grouped heads broadcast (no cache copy). |
 | qnn | `sdpa` | aten.scaled_dot_product_attention, decomposed at lowering. |
 | onnx | `manual` (default) | ONNX MatMul/Softmax/MatMul. |
@@ -108,6 +137,34 @@ Masking by replacing masked scores instead of adding a penalty (manual kernel on
 | tensorrt | `False` (default) | Additive mask (-65504 on masked positions). |
 | tensorrt | `True` | Masked scores replaced by (row minimum - 20); keeps quantised score ranges tight. |
 
+### `key_centering`
+
+Attend over k - k_0 (k_0 = the cached key of position 0) instead of k (blocks/attention/causal.py). Softmax cancels q.k_0, so attention is unchanged; the score matmul works on \|q.(k - k_0)\| instead of \|q.k\|, which a 16-bit score matmul resolves when \|q.k\| is large (float16 step 16 at 2e4). Kernels that keep their own cache cannot use it. Chosen by: convert option `center_keys`.
+
+| Backend | Option | Device operation |
+|---|---|---|
+| xnnpack | `False` (default) | Scores q.k. |
+| xnnpack | `True` | Scores q.(k - k_0): one subtraction over the key cache per layer and step. |
+| qnn | `False` (default) | Scores q.k. |
+| qnn | `True` | Scores q.(k - k_0): one subtraction over the key cache per layer and step. |
+| onnx | `False` (default) | Scores q.k. |
+| onnx | `True` | Scores q.(k - k_0): one subtraction over the key cache per layer and step. |
+| tensorrt | `False` (default) | Scores q.k. |
+| tensorrt | `True` | Scores q.(k - k_0): one subtraction over the key cache per layer and step. |
+
+### `paged_rope`
+
+io_paged + within-head pruned attention: the fused paged kernel applies one RoPE table to every head, which cannot express per-kv-group rotary frequencies. True substitutes a standard RoPE table of the pruned head dim (TransformerDecoder.finalize_paged_rope): same shapes, cache size and work per token, DIFFERENT OUTPUT. A benchmarking device for latency only; it warns at conversion. Chosen by: convert option `force_uniform_rope_latency_only`.
+
+| Backend | Option | Device operation |
+|---|---|---|
+| xnnpack | `False` (default) | Within-head pruned attention with io_paged is refused (exact alternative: io_inplace). |
+| qnn | `False` (default) | Within-head pruned attention with io_paged is refused (exact alternative: io_inplace). |
+| onnx | `False` (default) | Within-head pruned attention with io_paged is refused (exact alternative: io_inplace). |
+| onnx | `True` | LATENCY ONLY: standard RoPE of the pruned head dim; the output is not the model's. |
+| tensorrt | `False` (default) | Within-head pruned attention with io_paged is refused (exact alternative: io_inplace). |
+| tensorrt | `True` | LATENCY ONLY: standard RoPE of the pruned head dim; the output is not the model's. |
+
 ### `rmsnorm`
 
 Implementation of RMS normalisation (blocks/norm). Chosen by: convert option `rmsnorm_impl`.
@@ -117,15 +174,27 @@ Implementation of RMS normalisation (blocks/norm). Chosen by: convert option `rm
 | xnnpack | `rmsnorm_prescaled` (default) | Max-abs rescale then RMS normalisation (float16-overflow safe). |
 | xnnpack | `rmsnorm` | Plain RMS normalisation. |
 | xnnpack | `rmsnorm_upcast` | Normalisation computed in float32, cast back. |
+| xnnpack | `rmsnorm_threshold` | Rescale only rows with max \|x\| > rmsnorm_threshold; eps enters unscaled. |
+| xnnpack | `rmsnorm_threshold_safe_sum` | rmsnorm_threshold with the variance as a sum of pre-scaled squares (float16 accumulation stays in range; not fused). |
+| xnnpack | `rmsnorm_prescaled_exact_eps` | Max-abs rescale with eps/max**2: the unscaled norm exactly, with a float16-safe reduction. |
 | qnn | `rmsnorm_prescaled` (default) | Max-abs rescale then RMS normalisation (float16-overflow safe). |
 | qnn | `rmsnorm` | Plain RMS normalisation (fused into one HTP RmsNorm operation). |
 | qnn | `rmsnorm_upcast` | Normalisation computed in float32, cast back. |
+| qnn | `rmsnorm_threshold` | Rescale only rows with max \|x\| > rmsnorm_threshold; eps enters unscaled (still fused into one HTP RmsNorm operation). |
+| qnn | `rmsnorm_threshold_safe_sum` | rmsnorm_threshold with the variance as a sum of pre-scaled squares (float16 accumulation stays in range; not fused). |
+| qnn | `rmsnorm_prescaled_exact_eps` | Max-abs rescale with eps/max**2: the unscaled norm exactly, with a float16-safe reduction. |
 | onnx | `rmsnorm_prescaled` (default) | Max-abs rescale then RMS normalisation (float16-overflow safe). |
 | onnx | `rmsnorm` | Plain RMS normalisation. |
 | onnx | `rmsnorm_upcast` | Normalisation computed in float32, cast back. |
+| onnx | `rmsnorm_threshold` | Rescale only rows with max \|x\| > rmsnorm_threshold; eps enters unscaled. |
+| onnx | `rmsnorm_threshold_safe_sum` | rmsnorm_threshold with the variance as a sum of pre-scaled squares (float16 accumulation stays in range; not fused). |
+| onnx | `rmsnorm_prescaled_exact_eps` | Max-abs rescale with eps/max**2: the unscaled norm exactly, with a float16-safe reduction. |
 | tensorrt | `rmsnorm_prescaled` (default) | Max-abs rescale then RMS normalisation (float16-overflow safe). |
 | tensorrt | `rmsnorm` | Plain RMS normalisation. |
 | tensorrt | `rmsnorm_upcast` | Normalisation computed in float32, cast back. |
+| tensorrt | `rmsnorm_threshold` | Rescale only rows with max \|x\| > rmsnorm_threshold; eps enters unscaled. |
+| tensorrt | `rmsnorm_threshold_safe_sum` | rmsnorm_threshold with the variance as a sum of pre-scaled squares (float16 accumulation stays in range; not fused). |
+| tensorrt | `rmsnorm_prescaled_exact_eps` | Max-abs rescale with eps/max**2: the unscaled norm exactly, with a float16-safe reduction. |
 
 ### `batch_dim`
 

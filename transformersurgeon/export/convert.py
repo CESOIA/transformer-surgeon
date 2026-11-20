@@ -36,6 +36,9 @@ DEFAULT_CONVERT_OPTIONS = {
     "rmsnorm_prescale": True,
     "rmsnorm_upcast": False,
     "masked_softmax": False,
+    "center_keys": False,        # attend over k - k_0 (blocks/attention/causal.py)
+    "rmsnorm_threshold": 128.0,  # threshold of the rmsnorm_threshold* atoms (blocks/norm/)
+    "force_uniform_rope_latency_only": False,  # io_paged + within-head pruning: LATENCY ONLY, changes the output
     "kv_precision": "full",      # "int8"/"int4"/"fp8"/"nvfp4": stored KV-cache rows (blocks/attention/kv_precision);
                                  # a (key, value) pair stores the two caches differently, e.g. ("int8", "int4")
 }
@@ -244,6 +247,10 @@ def convert_for_export(model, options=None, verbose=False):
             for hook in ("finalize_head_pruning", "finalize_rope_pruning", "finalize_cache_geometry"):
                 if hasattr(attn, hook):
                     getattr(attn, hook)()
+        # Stack-level geometry that needs every block's (paged RoPE tables of within-head pruned blocks).
+        for hook in ("finalize_paged_rope",):
+            if hasattr(new_model, hook):
+                getattr(new_model, hook)()
 
         extra = indexing.get("extra_layers", [])
         extra_targets = indexing.get("extra_layers_matching") or [path.split(".")[-1] for path in extra]

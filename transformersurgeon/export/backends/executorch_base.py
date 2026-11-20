@@ -77,7 +77,7 @@ def _get_method_names(program: Any) -> list[str]:
 class ExecuTorchExporter(Exporter):
     """Base of the ExecuTorch exporters: writes the program and runs the shared final checks."""
 
-    def write_program(self, edge, config, *, alloc_graph_input, alloc_graph_output=True):
+    def write_program(self, edge, config, *, alloc_graph_input, alloc_graph_output=True, passes=None):
         """Lower the edge program to an ExecuTorch program and write it to ``config.output_path``.
 
         ``alloc_graph_input=False`` keeps graph inputs caller-owned (zero copy);
@@ -87,7 +87,8 @@ class ExecuTorchExporter(Exporter):
         from executorch.exir.passes import MemoryPlanningPass
 
         planning = MemoryPlanningPass(alloc_graph_input=alloc_graph_input, alloc_graph_output=alloc_graph_output)
-        program = edge.to_executorch(config=ExecutorchBackendConfig(memory_planning_pass=planning))
+        program = edge.to_executorch(config=ExecutorchBackendConfig(passes=list(passes or []),
+                                                                    memory_planning_pass=planning))
         with open(config.output_path, "wb") as f:
             f.write(program.buffer)
 

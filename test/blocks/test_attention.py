@@ -37,8 +37,10 @@ def test_manual_attention_matches_naive_grouped_attention():
 
 
 def test_kernel_registry_describes_requirements():
-    assert set(ATTENTION_KERNELS) == {"manual", "sdpa", "custom_sdpa", "paged"}
+    assert set(ATTENTION_KERNELS) == {"manual", "sdpa", "custom_sdpa", "custom_quantized_sdpa", "paged"}
     assert ATTENTION_KERNELS["custom_sdpa"].requires_cache == "mutable"
+    assert ATTENTION_KERNELS["custom_quantized_sdpa"].requires_cache == "mutable"
+    assert ATTENTION_KERNELS["custom_quantized_sdpa"].owns_cache
     assert ATTENTION_KERNELS["paged"].requires_cache == "io_paged"
     assert ATTENTION_KERNELS["paged"].fuses_projection
     assert ATTENTION_KERNELS["manual"].supports_masked_softmax
