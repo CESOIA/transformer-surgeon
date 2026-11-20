@@ -1,7 +1,6 @@
 """Qualcomm QNN exporter (ExecuTorch, Hexagon HTP)."""
 
 import copy
-import ctypes
 import importlib.util
 import os
 import warnings
@@ -19,6 +18,7 @@ from ...exporter import register_exporter
 from ...operations import config_default
 from ...pt2e import calibrate_pt2e_observers, inject_scales_into_pt2e_observers
 from ...quant_info import extract_layer_quant_info
+from ....utils.native_libs import load_into_global_scope
 from ...wrapper import resolve_components_and_wrapper
 from ..executorch_base import ExecuTorchExporter
 from .passes import (
@@ -260,15 +260,14 @@ class QNNExporter(ExecuTorchExporter):
     config_class = QNNExportConfig
 
     def check_available(self):
+        _keep_gcc_cxx_runtime_global()   # before anything loads the QNN SDK
         if not is_qnn_available():
             raise RuntimeError(_QNN_UNAVAILABLE_MSG)
 
     def lower(self, components, config):
+        # kv_cache_bits needs quant_scope='all', float_attention_core=False and an index-written cache: declared in
+        # export/operations.py ("requires") and checked by Exporter.export before tracing (check_config_requirements).
         low_bit_cache = _cache_bits(config) != (16, 16)
-        if low_bit_cache and (config.quant_scope != "all" or config.float_attention_core):
-            raise ValueError(f"QNNExportConfig.kv_cache_bits={config.kv_cache_bits!r} requires quant_scope='all' and "
-                             "float_attention_core=False: only then is the KV cache a fixed-point activation.")
-        _keep_gcc_cxx_runtime_global()   # before anything loads the QNN SDK
         wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
         layer_info = extract_layer_quant_info(wrapper)
 
@@ -294,8 +293,8 @@ class QNNExporter(ExecuTorchExporter):
             if _eight_bit_cache_parts(config) and (None in kinds or kinds.count("key") != kinds.count("value")):
                 raise ValueError(
                     f"QNNExportConfig.kv_cache_bits={config.kv_cache_bits!r} cannot tell the key-cache writes from "
-                    "the value-cache writes: each must write a buffer or graph input whose name contains 'key' or "
-                    "'value'.")
+                    "the value-cache writes: each must write a buffer named as in MHACausal.CACHE_BUFFERS or a graph "
+                    "input named after LLMWrapper.CACHE_INPUTS.")
 
         if config.quantize_float_model and config.quant_scope != "all":
             raise ValueError("QNNExportConfig.quantize_float_model requires quant_scope='all'.")
@@ -485,7 +484,9 @@ def _default_edge_passes():
 
 
 def _keep_gcc_cxx_runtime_global():
-    """Put GCC's C++ runtime (libgcc_s, libstdc++) in the process's global symbol scope before the QNN SDK loads.
+    """Put GCC's C++ runtime (libgcc_s, libstdc++) in the process's global symbol scope before the QNN SDK loads
+    (called by ``QNNExporter.check_available``, i.e. before every QNN export; the generic mechanism is
+    ``utils/native_libs.py``).
 
     The SDK's x86 libraries link LLVM's libc++abi and libunwind, and ExecuTorch opens them into the global scope:
     a library loaded afterwards that was built against GCC's runtime (ONNX Runtime) then binds its C++ exception
@@ -493,11 +494,7 @@ def _keep_gcc_cxx_runtime_global():
     first (both runtimes implement the same C++ ABI, so the SDK works with it). Already loaded by torch: this only
     promotes them.
     """
-    for name in ("libgcc_s.so.1", "libstdc++.so.6"):
-        try:
-            ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
-        except OSError:
-            pass
+    load_into_global_scope("libgcc_s.so.1", "libstdc++.so.6")
 
 
 __all__ = ["QNNExportConfig", "QNNExporter", "is_qnn_available"]

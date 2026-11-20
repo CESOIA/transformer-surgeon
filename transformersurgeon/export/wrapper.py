@@ -45,7 +45,13 @@ class LLMWrapper(nn.Module):
         ``(logits, new_key_caches, new_value_caches)`` (KV cache is graph I/O).
       - ``io_paged``: ``forward(input_ids, pos_id, kv_pools)`` ->
         ``(logits, new_kv_pools)`` (one paged K+V pool per layer).
+
+    ``CACHE_INPUTS``: the ``forward`` arguments that carry the graph-I/O key/value caches. torch.export
+    names the per-layer graph inputs ``<argument>_<layer>`` (``key_caches_0``); exporters that must tell
+    key-cache writes from value-cache writes match these exactly.
     """
+
+    CACHE_INPUTS = {"key": "key_caches", "value": "value_caches"}
 
     def __init__(self, embedding: nn.Module, decoder: nn.Module, final_layer: nn.Module):
         super().__init__()

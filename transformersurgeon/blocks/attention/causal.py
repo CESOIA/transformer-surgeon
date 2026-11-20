@@ -39,6 +39,9 @@ class MHACausal(MHABase):
     # Role read by exporters that treat whole atoms specially (e.g. the QNN
     # exporter keeps the attention core in fp16 under quant_scope="all").
     EXPORT_ROLE = "attention"
+    # Names of the internal key/value cache buffers. Exporters that must tell a key-cache write from a
+    # value-cache write in a traced graph (QNN kv_cache_bits) match these exactly, never a substring.
+    CACHE_BUFFERS = {"key": "key_cache", "value": "value_cache"}
 
     def __init__(self, embed_dim, num_heads, kv_num_heads=None, attn_impl=None, use_sdpa=False,
                  linear_specs=None, dtype=None, cache_impl="mutable", max_cache_len=2048,
@@ -83,7 +86,7 @@ class MHACausal(MHABase):
         empty = (0,) if cache_impl == "io_paged" else None
         for which in ("key", "value"):
             codec = self.codec(which)
-            self.register_buffer(f"{which}_cache", device_zeros(empty or self.cache_shape(which),
+            self.register_buffer(self.CACHE_BUFFERS[which], device_zeros(empty or self.cache_shape(which),
                                                                 codec.storage_dtype(dtype)), persistent=False)
             if codec.scale_dtype is not None:
                 self.register_buffer(f"{which}_cache_scale", device_zeros(self.cache_shape(f"{which}_scale"),

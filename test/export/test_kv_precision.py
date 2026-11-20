@@ -608,8 +608,7 @@ def test_qnn_kv_cache_predicate_selects_the_cache_writes(cache_impl, per_layer):
 def test_qnn_kv_cache_bits_needs_a_fully_quantised_graph():
     pytest.importorskip("torchao")
     from transformersurgeon.export.backends import QNNExportConfig
-    from transformersurgeon.export.backends.qnn.exporter import QNNExporter
-    from transformersurgeon.export.operations import check_config_choices
+    from transformersurgeon.export.operations import check_config_choices, check_config_requirements
 
     assert QNNExportConfig(output_path="x").kv_cache_bits == 16
     assert QNNExportConfig(output_path="x", kv_cache_bits=[16, 8]).kv_cache_bits == (16, 8)  # as read from JSON
@@ -625,7 +624,36 @@ def test_qnn_kv_cache_bits_needs_a_fully_quantised_graph():
         for bad in ({"quant_scope": "linear"}, {"quant_scope": "all", "float_attention_core": True}):
             config = QNNExportConfig(output_path="x", kv_cache_bits=bits, **bad)
             with pytest.raises(ValueError, match=re.escape(f"kv_cache_bits={bits!r} requires quant_scope='all'")):
-                QNNExporter().lower(_qnn_components(), config)
+                check_config_requirements("qnn", config)
+        # the requirements are declared in BACKEND_OPERATIONS, not in the exporter: the cache must be index-written
+        good = QNNExportConfig(output_path="x", kv_cache_bits=bits, quant_scope="all")
+        check_config_requirements("qnn", good, {"cache_impl": "io_scatter"})
+        with pytest.raises(ValueError, match=re.escape("requires cache_impl in ['mutable', 'io_scatter']")):
+            check_config_requirements("qnn", good, {"cache_impl": "io_concat"})
+    check_config_requirements("qnn", QNNExportConfig(output_path="x"), {"cache_impl": "io_concat"})  # default: free
+
+
+def test_cache_names_the_qnn_pass_matches_are_the_declared_ones():
+    """_kv_cache_write_kind matches MHACausal.CACHE_BUFFERS / LLMWrapper.CACHE_INPUTS exactly: they must be the
+    real buffer and argument names, and a look-alike (a block-scale buffer) must not count as a cache."""
+    import inspect
+
+    pytest.importorskip("torchao")
+    from transformersurgeon.blocks.attention.causal import MHACausal
+    from transformersurgeon.export.backends.qnn.passes import _kv_cache_write_kind
+    from transformersurgeon.export.wrapper import LLMWrapper
+
+    attn = _qnn_components()["decoder"].blocks[0].attn
+    assert all(hasattr(attn, name) for name in MHACausal.CACHE_BUFFERS.values())
+    assert set(LLMWrapper.CACHE_INPUTS.values()) <= set(inspect.signature(LLMWrapper.forward).parameters)
+    graph = torch.fx.Graph()
+    for target, kind in (("decoder.blocks.0.attn.key_cache", "key"), ("decoder.blocks.3.attn.value_cache", "value"),
+                         ("decoder.blocks.0.attn.key_cache_scale", None)):
+        write = graph.call_function(torch.ops.aten.index_copy_.default, (graph.get_attr(target), 0, None, None))
+        assert _kv_cache_write_kind(write) == kind
+    for name, kind in (("key_caches_0", "key"), ("value_caches_12", "value"), ("past_key_scale_0", None)):
+        write = graph.call_function(torch.ops.aten.index_put.default, (graph.placeholder(name), None, None))
+        assert _kv_cache_write_kind(write) == kind
 
 
 @caps.requires_qnn
@@ -683,6 +711,6 @@ def test_qnn_kv_cache_bits_8_rejects_a_cache_it_cannot_quantise(tmp_path):
     cfg = QNNExportConfig(output_path=str(tmp_path / "model.pte"), max_seq_len=CACHE, quant_scope="all",
                           kv_cache_bits=8, run_weight_mismatch_check=False,
                           convert_options={"max_cache_len": CACHE, "cache_impl": "io_concat"})
-    with pytest.raises(ValueError, match="found no KV-cache write to quantise"):
+    with pytest.raises(ValueError, match=re.escape("requires cache_impl in ['mutable', 'io_scatter']")):
         export_to_backend(_model(), cfg)
     assert not os.path.exists(cfg.output_path)

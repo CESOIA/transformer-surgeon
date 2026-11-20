@@ -10,7 +10,13 @@ the device. It is organised by *block type*; for every backend it gives:
 - ``requires_cache`` (optional, ``kv_precision`` only): the KV-cache atom each
   listed precision needs on that backend (see :func:`required_cache`);
 - ``incompatible`` (optional, ``kv_precision`` only): precisions that cannot store
-  the two caches of a ``(key, value)`` pair together on that backend.
+  the two caches of a ``(key, value)`` pair together on that backend;
+- ``requires`` (optional): what every non-default option of a ``config_field``
+  choice needs, ``{"config": {field: value}, "cache_impl": [...]}``, checked by
+  :func:`check_config_requirements` before any tracing.
+
+A block type with ``"per_cache": True`` takes one option for both caches or a
+``(key, value)`` pair of options (each part must be listed).
 
 Each block type also says how the choice reaches the code:
 
@@ -76,6 +82,7 @@ BACKEND_OPERATIONS = {
                        "options to store them differently, e.g. ('int8', 'int4'). A backend entry may name the "
                        "cache a precision needs there (requires_cache).",
         "convert_option": "kv_precision",
+        "per_cache": True,
         "backends": {
             "xnnpack": {"default": "full", "options": {
                 "full": "Cache in the model dtype.",
@@ -133,7 +140,8 @@ BACKEND_OPERATIONS = {
                          "step that leaves the other channels a few codes. Same requirements as 8.",
                 (8, 16): "(key bits, value bits): only the key-cache writes get the 8a8w configuration; the value "
                          "cache stays at 16 bits. Same requirements as 8.",
-            }},
+            }, "requires": {"config": {"quant_scope": "all", "float_attention_core": False},
+                            "cache_impl": ["mutable", "io_scatter"]}},
             **{backend: {"default": "kv_precision", "options": {
                 "kv_precision": "Not chosen by a quantiser: the convert option kv_precision decides the cache.",
             }} for backend in ("xnnpack", "onnx", "tensorrt")},
@@ -342,11 +350,18 @@ def check_kv_combination(backend, cache_impl, kv_precision):
                          f"(got {cache_impl!r}). See transformersurgeon/export/operations.py.")
 
 
+def _per_cache_parts(value):
+    """The options of a ``per_cache`` choice: one option (both caches) or a ``(key, value)`` pair."""
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        return tuple(value)
+    return (value,)
+
+
 def check_choice(backend, block_type, value):
     """Raise ``ValueError`` if ``value`` is not a supported ``block_type`` implementation on ``backend``
     (a ``(key, value)`` KV-precision pair: if either part is not)."""
     options = options_for(backend, block_type)
-    parts = kv_precision_pair(value) if block_type == "kv_precision" else (value,)
+    parts = _per_cache_parts(value) if BACKEND_OPERATIONS[block_type].get("per_cache") else (value,)
     for part in parts:
         if part not in options:
             raise ValueError(
@@ -362,6 +377,28 @@ def check_config_choices(backend, config):
         field_name = spec.get("config_field", {}).get(backend)
         if field_name is not None and hasattr(config, field_name):
             check_choice(backend, block_type, getattr(config, field_name))
+
+
+def check_config_requirements(backend, config, convert_options=None):
+    """Raise ``ValueError`` if a non-default ``config_field`` choice lacks what its backend entry
+    ``requires``: other configuration values, and (with ``convert_options``, resolved) a cache atom."""
+    for block_type, spec in BACKEND_OPERATIONS.items():
+        field_name = spec.get("config_field", {}).get(backend)
+        if field_name is None or not hasattr(config, field_name):
+            continue
+        entry = _entry(block_type, backend)
+        value, requires = getattr(config, field_name), entry.get("requires")
+        if not requires or value == entry["default"]:
+            continue
+        what = f"{type(config).__name__}.{field_name}={value!r}"
+        needed = requires.get("config", {})
+        if any(getattr(config, name, None) != want for name, want in needed.items()):
+            raise ValueError(f"{what} requires " + " and ".join(f"{n}={w!r}" for n, w in needed.items())
+                             + ". See transformersurgeon/export/operations.py.")
+        caches = requires.get("cache_impl")
+        if caches and convert_options is not None and convert_options.get("cache_impl") not in caches:
+            raise ValueError(f"{what} requires cache_impl in {caches} (got {convert_options.get('cache_impl')!r}). "
+                             "See transformersurgeon/export/operations.py.")
 
 
 def resolve_convert_options(backend, options=None):
@@ -420,5 +457,5 @@ def check_components(backend, decoder):
 
 __all__ = [
     "BACKENDS", "BACKEND_OPERATIONS", "default_for", "options_for", "config_default", "required_cache",
-    "check_kv_combination", "check_choice", "check_config_choices", "resolve_convert_options", "check_components",
+    "check_kv_combination", "check_choice", "check_config_choices", "check_config_requirements", "resolve_convert_options", "check_components",
 ]

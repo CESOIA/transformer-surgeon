@@ -249,14 +249,17 @@ multiple of 16.
   (`passes.py::_kv_cache_write_predicate`: `index_copy`/`index_put` inside an `EXPORT_ROLE == "attention"` module)
   an 8a8w configuration; the graph keeps `kv_precision="full"`. Needs `quant_scope="all"` and
   `float_attention_core=False` (the cache is a fixed-point activation only then), and a cache written by an index
-  operation (`mutable`, `io_scatter`): `io_concat` writes with a select that the predicate does not match, so the
-  exporter raises instead of leaving the cache at 16 bits. HTP has no 4-bit activations, so no int4 cache. The
+  operation (`mutable`, `io_scatter`): `io_concat` writes with a select that the predicate does not match. These
+  requirements are declared in the table (`"requires"` of the QNN `kv_cache_quantization` entry) and checked by
+  `operations.py::check_config_requirements` in `Exporter.export`, before tracing; `lower()` keeps only the
+  graph-level safety net ("found no KV-cache write to quantise"), so the cache is never silently left at 16 bits. HTP has no 4-bit activations, so no int4 cache. The
   lowering is exercised on the x86 host by the `requires_qnn` tests (`test_qnn_kv_cache_bits_8_*`, QNN SDK 2.37);
   nothing has run on a device.
 - **QNN `kv_cache_bits=(key bits, value bits)`** sets the two caches independently: `(16, 8)` gives the 8a8w
   configuration to the value-cache writes only, `(8, 16)` to the key-cache writes only (`(8, 8)` is `8`);
-  `passes.py::_kv_cache_write_kind` tells key from value writes by the name of the buffer or graph input they
-  write. An 8-bit key cache loses accuracy on models with large k_proj biases: the
+  `passes.py::_kv_cache_write_kind` tells key from value writes by what they write, matched exactly against the
+  declared names `MHACausal.CACHE_BUFFERS` (internal buffers) and `LLMWrapper.CACHE_INPUTS` (graph inputs
+  `<argument>_<layer>`); never by a substring of the name (see Coding Invariant 12). An 8-bit key cache loses accuracy on models with large k_proj biases: the
   cache has one range per layer, and in layers 0, 1 and 8 of Qwen2.5-0.5B a few key channels carry biases of
   130–214, so the 8-bit step is ~1 and the median key channel uses 2–7 of the 256 codes (the value cache: 56–122
   in every layer). Qwen2.5-0.5B with W8 MLP weights, fake-quantised model, 4 held-out WikiText-2 windows of 128
@@ -414,8 +417,9 @@ copy of the matrix: a bigger file, and the same decode reads.
   ExecuTorch opens them into the process's global symbol scope; anything built against GCC's runtime and loaded
   afterwards (ONNX Runtime) then binds its C++ exception symbols to LLVM's and segfaults while loading. That
   never showed while each backend had its own environment; in `cesoia` the full suite crashed at the first ONNX
-  test after the QNN ones. `QNNExporter.lower` promotes `libgcc_s` and `libstdc++` (already loaded by torch) to
-  the global scope before the SDK loads (`_keep_gcc_cxx_runtime_global`), so those symbols stay GCC's.
+  test after the QNN ones. `QNNExporter.check_available` (run first by every export) promotes `libgcc_s` and
+  `libstdc++` (already loaded by torch) to the global scope before the SDK loads (`_keep_gcc_cxx_runtime_global`,
+  built on the generic `utils/native_libs.py::load_into_global_scope`), so those symbols stay GCC's.
 
 ### Numerics caveats found on Qwen2.5-1.5B (large attention logits)
 
@@ -669,6 +673,16 @@ Passed to `manager.set()`, `manager.apply()`, `manager.restore()`, etc.:
    `export_to_hf` applies and prepares for you). Never call it before a backend export: it upcasts and dequantises.
 10. **`path_template` is a format string** with `{block_index}` and `{path}`.
 11. **`attn_impl="custom_sdpa"` requires `cache_impl="mutable"` and `q_head_dim == value_head_dim`** (validated).
+12. **Tell graph nodes apart by declared names, matched exactly.** When an exporter pass must know which cache a
+    traced node writes, it matches the names the library declares (`MHACausal.CACHE_BUFFERS`,
+    `LLMWrapper.CACHE_INPUTS`) exactly, never a substring (`"key" in name` also matches `key_cache_scale`).
+    New per-node roles get a declared name the same way. (`torch.fx.traceback.annotate` tags do not survive
+    `torch.export` in torch 2.12/2.13, so they cannot be used for this yet.)
+13. **Requirements of a backend choice are data in `BACKEND_OPERATIONS`, checked by generic functions.** A
+    configuration field that needs other settings declares `"requires": {"config": {...}, "cache_impl": [...]}`
+    (checked by `check_config_requirements`); a choice that may differ per cache declares `"per_cache": True`
+    (one option or a `(key, value)` pair, checked by `check_choice`). Functions in `operations.py` never branch on a
+    block-type name, and `lower()` never re-checks what the table declares.
 
 ---
 
@@ -680,9 +694,33 @@ Passed to `manager.set()`, `manager.apply()`, `manager.restore()`, etc.:
 - **Don't put model-specific logic outside `models/`** (not even in comments: describe the feature, e.g. "a
   composite embedding module", not the model).
 - **Don't hard-code an implementation choice in an exporter**: add it to `BACKEND_OPERATIONS`.
+- **Don't validate a backend option inside `lower()` or with `if block_type == "..."`** in `operations.py`: declare
+  it in the entry (`requires`, `per_cache`) — Coding Invariant 13.
+- **Don't identify a node by a substring of its name** — Coding Invariant 12.
+- **Don't put process-wide environment workarounds in exporter logic**: generic mechanism in `utils/`, called
+  from the exporter's `check_available`.
 - **Don't use `"standard"` calibration mode with `"aa-svd"`** (needs `manager.set_calibration_mode("cascade")`), and
   don't use `"cascade"` with a family whose dictionary sets `'no_cascade_calibration': True` (`bert_c`, `modernbert_c`).
 - **Don't call `reapply_masks()` before `manager.apply()`.**
+
+---
+
+## Review fixes applied to the KV-precision work (2026-11-20)
+
+Applied while merging `draft-babisant88` into `draft-prolucio` (merge branch `trial/merge-babisant88`); behaviour
+and defaults unchanged, all tests pass (TensorRT env 366 passed; QNN env: every QNN test passes). For the author's
+agent: keep these patterns in new code (Coding Invariants 12–13, Anti-Patterns).
+
+| # | Before | After |
+|---|---|---|
+| 1 | `qnn/passes.py::_kv_cache_write_kind` found key vs value writes by `"key" in name` | exact match on `MHACausal.CACHE_BUFFERS` / `LLMWrapper.CACHE_INPUTS` (`<argument>_<layer>`); test `test_cache_names_the_qnn_pass_matches_are_the_declared_ones` |
+| 2 | `operations.py::check_choice` had `if block_type == "kv_precision"` | `"per_cache": True` on the `kv_precision` entry; generic `_per_cache_parts` |
+| 3 | `QNNExporter.lower` checked that `kv_cache_bits` needs `quant_scope="all"`, `float_attention_core=False` | declared as `"requires"` on the QNN `kv_cache_quantization` entry (also `cache_impl in [mutable, io_scatter]`), checked by `check_config_requirements` in `Exporter.export` before tracing; error messages say `... requires quant_scope='all' and float_attention_core=False` / `requires cache_impl in [...]` |
+| 4 | `_keep_gcc_cxx_runtime_global` (ctypes) ran inside `QNNExporter.lower` | generic `utils/native_libs.py::load_into_global_scope`, called from `QNNExporter.check_available` |
+
+Not changed (pre-existing, noted for later): `backends/onnx/exporter.py` lists the prefill-capable caches by name
+(`cache_impl in ("io_inplace", "io_rows")`); the cache atoms' `multi_token` attribute could replace it, but
+`io_paged` is also `multi_token` and has no plain-ONNX translation, so it needs a per-backend entry first.
 
 ---
 

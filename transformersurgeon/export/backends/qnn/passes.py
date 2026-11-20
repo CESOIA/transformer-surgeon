@@ -310,16 +310,29 @@ _KV_CACHE_WRITES = {
 
 
 def _kv_cache_write_kind(node: torch.fx.Node) -> str | None:
-    """``"key"`` or ``"value"``: the cache a KV-cache write updates, from the name of the buffer (``mutable``:
-    ``attn.key_cache``) or graph input (``io_scatter``: ``key_caches_<i>``) it writes into. None if the name
-    says neither."""
+    """``"key"`` or ``"value"``: the cache a KV-cache write updates, or None if it is neither.
+
+    Found from what the write updates, matched EXACTLY against the names the library declares:
+    an internal buffer (``mutable``) named as in ``MHACausal.CACHE_BUFFERS``, or a graph input
+    (``io_scatter``) named ``<argument>_<layer>`` after ``LLMWrapper.CACHE_INPUTS``. A substring test
+    ("key" in the name) would also match e.g. ``key_cache_scale`` or a renamed argument. torch's node
+    annotations (``torch.fx.traceback.annotate``) would be cleaner but do not survive ``torch.export``
+    (checked with torch 2.12 and 2.13)."""
+    from ....blocks.attention.causal import MHACausal
+    from ...wrapper import LLMWrapper
+
     source = node.args[0] if node.args else None
     while isinstance(source, torch.fx.Node) and source.op == "call_function" and source.args:
         source = source.args[0]   # through the quantise/dequantise pairs of a quantised graph
     if not isinstance(source, torch.fx.Node):
         return None
-    name = str(source.target if source.op == "get_attr" else source.name).rsplit(".", 1)[-1]
-    return "key" if "key" in name else "value" if "value" in name else None
+    if source.op == "get_attr":
+        leaf = str(source.target).rsplit(".", 1)[-1]
+        return next((kind for kind, name in MHACausal.CACHE_BUFFERS.items() if leaf == name), None)
+    if source.op == "placeholder":
+        return next((kind for kind, name in LLMWrapper.CACHE_INPUTS.items()
+                     if re.fullmatch(rf"{re.escape(name)}_\d+", source.name)), None)
+    return None
 
 
 def _kv_cache_write_predicate(parts=None):
