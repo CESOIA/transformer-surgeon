@@ -56,3 +56,28 @@ def test_mlp_takes_pruned_geometry_from_specs():
     assert gated.up_proj.out_features == 10 and gated.up_proj.bias is not None
     assert gated.down_proj.in_features == 10 and gated.down_proj.rank == 3
     assert gated(torch.randn(2, 8)).shape == (2, 8)
+
+
+def test_mlp_gated_fused_splits_the_input_projection_gate_first():
+    from transformersurgeon.blocks import MLPGatedFused
+
+    torch.manual_seed(0)
+    mlp = MLPGatedFused(8, 6, activation="silu")
+    assert (mlp.up_proj.out_features, mlp.down_proj.in_features) == (12, 6)
+    x = torch.randn(3, 8)
+    linear = torch.nn.functional.linear
+    gate, up = linear(x, mlp.up_proj.weight, mlp.up_proj.bias).chunk(2, dim=-1)
+    want = linear(torch.nn.functional.silu(gate) * up, mlp.down_proj.weight, mlp.down_proj.bias)
+    torch.testing.assert_close(mlp(x), want)
+
+
+def test_pooling_atoms_return_rank_two():
+    from transformersurgeon.blocks import build_block
+
+    x = torch.randn(5, 4)
+    assert torch.equal(build_block("pooling", "cls")(x), x[:1])
+    torch.testing.assert_close(build_block("pooling", "mean")(x), x.mean(0, keepdim=True))
+    both = build_block("pooling", "cls_patch_mean")(x)
+    assert both.shape == (1, 8)
+    torch.testing.assert_close(both[:, 4:], x[1:].mean(0, keepdim=True))
+    assert build_block("pooling", "none")(x) is x

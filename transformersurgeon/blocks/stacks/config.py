@@ -13,7 +13,9 @@ A converted stack is described by a Hugging-Face-style configuration holding:
   (``{"blocks.0.attn.q_proj": {"in_features", "out_features", "rank", "bias"}}``).
   ``mlp_hidden_dim_attr`` may be omitted when the source configuration has no
   such attribute (e.g. DINOv2's ``mlp_ratio``): the MLP width then comes from
-  these specifications alone.
+  these specifications alone. ``mlp_activation`` (a literal activation name) overrides
+  ``mlp_activation_attr`` when the source configuration names a different activation
+  than the one the block computes (e.g. DINOv2-giant's SwiGLU under ``hidden_act="gelu"``).
 """
 
 from transformers import PretrainedConfig
@@ -96,6 +98,8 @@ class _ConvertedStackConfig(PretrainedConfig):
         if "kv_num_heads_attr" in indexing:
             values["num_key_value_heads"] = read("kv_num_heads_attr")
             consumed.add(indexing["kv_num_heads_attr"])
+        if "mlp_activation" in indexing:
+            values["hidden_act"] = indexing["mlp_activation"]
         for key, default in cls._model_keys.items():
             values[key] = indexing.get(key, default)
         reserved = consumed | set(values) | set(options) | {"compression_config", "layer_specs"}
@@ -121,6 +125,10 @@ class CustomDecoderConfigCompress(_ConvertedStackConfig):
         "max_cache_len": 2048,
         "add_batch_dim": False,
         "masked_softmax": False,
+        "kv_precision": "full",
+        "center_keys": False,
+        "rmsnorm_threshold": 128.0,
+        "force_uniform_rope_latency_only": False,
     }
 
     def __init__(self, **kwargs):
@@ -139,7 +147,7 @@ class CustomEncoderConfigCompress(_ConvertedStackConfig):
     model_type = "transformersurgeon-custom-encoder"
     _model_keys = {"attn_type": "mha_encoder", "mlp_type": "mlp", "norm_type": "layernorm",
                    "norm_position": "pre", "use_final_norm": True, "layer_scale": False}
-    _defaults = dict(_model_keys)
+    _defaults = {**_model_keys, "rmsnorm_threshold": 128.0}
 
     def __init__(self, **kwargs):
         # transformers generates a constructor for config subclasses without their own.

@@ -62,6 +62,18 @@ def test_gptq_beats_round_to_nearest_on_correlated_inputs():
     assert out_err(QUANT_METHODS["gptq"], covariance=cov) < out_err(QUANT_METHODS["vanilla"])
 
 
+def test_gptq_per_group_beats_round_to_nearest():
+    torch.manual_seed(0)
+    w = torch.randn(16, 64)
+    x = torch.randn(256, 64) @ torch.randn(64, 64)
+    cov = x.T @ x / len(x)
+    def out_err(fn, **kw):
+        q, s, deq = fn(w, 3, 1e-6, "per_group", group_size=16, **kw)
+        assert q.dtype == torch.int8 and s.shape == (16, 4) and q.abs().max() <= 3
+        return torch.linalg.norm(x @ (deq(q, s) - w).T)
+    assert out_err(QUANT_METHODS["gptq"], covariance=cov) < out_err(QUANT_METHODS["vanilla"])
+
+
 def test_per_group_and_lpbq_scales():
     torch.manual_seed(0)
     w = torch.randn(4, 64)
@@ -98,6 +110,16 @@ def test_unstructured_masks_hit_the_requested_sparsity(method):
     assert mask.dtype == torch.bool and (~mask).sum() == 16
 
 
+def test_wanda_scores_weights_by_input_channel_norm():
+    w = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    uniform = UNSTRUCTURED["wanda"](w, torch.ones(4), pruning_ratio=0.5, granularity="neuron")
+    assert uniform.tolist() == [[False, False, True, True]]  # equal norms: same mask as magnitude
+    skewed = UNSTRUCTURED["wanda"](w, torch.tensor([100.0, 100.0, 1e-4, 1e-4]), pruning_ratio=0.5, granularity="neuron")
+    assert skewed.tolist() == [[True, True, False, False]]  # large-activation channels kept despite small weights
+    with pytest.raises(ValueError):
+        UNSTRUCTURED["wanda"](w, None, pruning_ratio=0.5)
+
+
 def test_coupled_pruner_removes_and_restores_input_columns():
     lin = torch.nn.Linear(6, 2)
     original = lin.weight.detach().clone()
@@ -107,3 +129,20 @@ def test_coupled_pruner_removes_and_restores_input_columns():
     assert lin.in_features == 4 and torch.equal(lin.weight, original[:, keep])
     pruner.revert(lin)
     assert lin.in_features == 6 and torch.equal(lin.weight, original)
+
+
+def test_gptq_binarize_beats_plain_binarization_on_correlated_inputs():
+    from transformersurgeon.compression.quantization_methods import gptq_binarize
+    torch.manual_seed(0)
+    X = torch.randn(2048, 64) @ torch.randn(64, 64)  # correlated inputs
+    W = torch.randn(32, 64)
+    cov = X.T @ X / X.shape[0]
+    latent, scale = gptq_binarize(W, cov)
+    plain = scale * torch.where(W >= 0, 1.0, -1.0)
+    calibrated = scale * torch.where(latent >= 0, 1.0, -1.0)
+    err = lambda Q: ((X @ (W - Q).T) ** 2).mean()
+    assert err(calibrated) < err(plain)
+    assert scale.shape == (32, 1)
+    # without covariance it is plain binarisation of the original weight
+    lat0, _ = gptq_binarize(W, None)
+    torch.testing.assert_close(lat0, W)

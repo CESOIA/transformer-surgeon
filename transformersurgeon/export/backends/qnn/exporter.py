@@ -18,6 +18,7 @@ from ...exporter import register_exporter
 from ...operations import config_default
 from ...pt2e import calibrate_pt2e_observers, inject_scales_into_pt2e_observers
 from ...quant_info import extract_layer_quant_info
+from ....utils.native_libs import load_into_global_scope
 from ...wrapper import resolve_components_and_wrapper
 from ..executorch_base import ExecuTorchExporter
 from .passes import (
@@ -25,7 +26,13 @@ from .passes import (
     _canonicalize_pow_tensor_scalar,
     _decompose_wrap_with_set_grad_enabled,
     _float_attention_nodes,
+    _KV_CACHE_WRITES,
+    _annotate_kv_cache_8bit_matmuls,
+    _kv_cache_buffer_kind,
+    _kv_cache_write_kind,
+    _kv_cache_write_predicate,
     _linear_block_sizes,
+    _share_amin_quant_params,
     _split_float_linear_bias,
     _untie_shared_weights,
     make_split_graph_blocks_pass,
@@ -56,7 +63,8 @@ def is_qnn_available() -> bool:
 _QNN_UNAVAILABLE_MSG = (
     "QNN backend unavailable: install the Qualcomm ExecuTorch toolchain "
     "(`pip install py-cpuinfo` plus the Qualcomm QNN SDK) and set "
-    "QNN_SDK_ROOT (or QUALCOMM_SDK_ROOT) before exporting with backend='qnn'. "
+    "QNN_SDK_ROOT (or QUALCOMM_SDK_ROOT) before exporting with backend='qnn'; "
+    "in a conda environment, scripts/executorch/qnn/install_qnn_sdk.sh does both. "
     "Use `is_qnn_available()` to check this ahead of time."
 )
 
@@ -115,10 +123,43 @@ class QNNExportConfig(BackendExportConfig):
     # quant_scope="all" only: keep the attention core (RoPE, KV cache, scores,
     # mask, softmax, A.V) in fp16 instead of 16-bit fixed point.
     float_attention_core: bool = False
+    # quant_scope="all" only (and float_attention_core=False): bits of the fixed-point
+    # KV cache. 8 gives the cache writes of every attention module an 8a8w configuration
+    # (caches written by an index operation: "mutable", "io_scatter"); a (key bits, value
+    # bits) pair sets the two caches independently: (16, 8) gives it to the value-cache
+    # writes only, (8, 16) to the key-cache writes only. The graph itself keeps
+    # kv_precision="full". Not yet validated on a device.
+    kv_cache_bits: int | tuple = field(default_factory=lambda: config_default("qnn", "kv_cache_bits"))
+    # How kv_cache_bits=8 reaches the graph (export/operations.py, "kv_cache_8bit_scheme"): "cache_writes" gives the
+    # cache writes an 8a8w configuration; "attention_matmuls" (ExecuTorch's annotate_kv_8bit, adapted to the
+    # index_copy cache) makes q.K^T and P.V 16a8w and the cache and its view chain one 8-bit symmetric tensor.
+    kv_cache_8bit_scheme: str = field(default_factory=lambda: config_default("qnn", "kv_cache_8bit_scheme"))
+    # quant_scope="all" only: keep the mutable KV cache quantised at the delegate boundary (uint16, or uint8 for an
+    # 8-bit cache). Without it the cache buffer stays in the traced dtype: HTP dequantises the whole cache at the
+    # output and requantises it at the input of every step (export/operations.py, "kv_cache_io").
+    quantized_kv_io: bool = field(default_factory=lambda: config_default("qnn", "quantized_kv_io"))
     # Token-id sequences for PT2E activation calibration (each decoded from position 0
     # with the KV cache filling up). None = a few built-in sentences. Use real text
     # from the target distribution: static 16-bit ranges come only from these.
     calibration_token_ids: Any = None
+
+    def __post_init__(self):
+        if isinstance(self.kv_cache_bits, list):  # e.g. read from JSON
+            self.kv_cache_bits = tuple(self.kv_cache_bits)
+        if isinstance(self.kv_cache_bits, tuple) and len(set(self.kv_cache_bits)) == 1:
+            self.kv_cache_bits = self.kv_cache_bits[0]  # (8, 8) is 8
+
+
+def _cache_bits(config: QNNExportConfig) -> tuple[int, int]:
+    """``(key bits, value bits)`` of ``config.kv_cache_bits`` (one number: both caches)."""
+    bits = config.kv_cache_bits
+    return (bits, bits) if isinstance(bits, int) else tuple(bits)
+
+
+def _eight_bit_cache_parts(config: QNNExportConfig):
+    """Caches the quantiser keeps at 8 bits: ``()``, ``None`` (both) or a 1-tuple such as ``("value",)``."""
+    eight = tuple(part for part, bits in zip(("key", "value"), _cache_bits(config)) if bits == 8)
+    return None if len(eight) == 2 else eight
 
 
 def _resolve_qcom_chipset(soc_model: Any):
@@ -230,10 +271,14 @@ class QNNExporter(ExecuTorchExporter):
     config_class = QNNExportConfig
 
     def check_available(self):
+        _keep_gcc_cxx_runtime_global()   # before anything loads the QNN SDK
         if not is_qnn_available():
             raise RuntimeError(_QNN_UNAVAILABLE_MSG)
 
     def lower(self, components, config):
+        # kv_cache_bits needs quant_scope='all', float_attention_core=False and an index-written cache: declared in
+        # export/operations.py ("requires") and checked by Exporter.export before tracing (check_config_requirements).
+        low_bit_cache = _cache_bits(config) != (16, 16)
         wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
         layer_info = extract_layer_quant_info(wrapper)
 
@@ -248,10 +293,26 @@ class QNNExporter(ExecuTorchExporter):
         module = exported.module()
         _decompose_wrap_with_set_grad_enabled(module)
         _canonicalize_pow_tensor_scalar(module)
+        if low_bit_cache:
+            writes = [node for node in module.graph.nodes if _kv_cache_write_predicate()(node)]
+            if not writes:
+                raise ValueError(
+                    f"QNNExportConfig.kv_cache_bits={config.kv_cache_bits!r} found no KV-cache write to quantise: the "
+                    "cache must be written by index_copy or index_put (cache_impl 'mutable' or 'io_scatter'), "
+                    f"got cache_impl={wrapper.cache_impl!r}.")
+            kinds = [_kv_cache_write_kind(node) for node in writes]
+            if _eight_bit_cache_parts(config) and (None in kinds or kinds.count("key") != kinds.count("value")):
+                raise ValueError(
+                    f"QNNExportConfig.kv_cache_bits={config.kv_cache_bits!r} cannot tell the key-cache writes from "
+                    "the value-cache writes: each must write a buffer named as in MHACausal.CACHE_BUFFERS or a graph "
+                    "input named after LLMWrapper.CACHE_INPUTS.")
 
         if config.quantize_float_model and config.quant_scope != "all":
             raise ValueError("QNNExportConfig.quantize_float_model requires quant_scope='all'.")
-        quantize = bool(layer_info) or config.quantize_float_model
+        quantize = bool(layer_info) or config.quantize_float_model or low_bit_cache
+        if config.quantized_kv_io and not quantize:
+            raise ValueError("QNNExportConfig.quantized_kv_io needs a quantised graph (compressed fixed-point weights, "
+                             "quantize_float_model=True or an 8-bit cache); this export has none.")
         model_for_edge, exported_for_mismatch = module, None
         if quantize:
             model_for_edge, exported_for_mismatch = self._quantize(module, layer_info, model_config,
@@ -282,7 +343,11 @@ class QNNExporter(ExecuTorchExporter):
             convert_linear_to_conv2d=lpbq or _resolve_linear_to_conv2d(wrapper, config),
             **self._edge_pass_options(wrapper, config, quantize),
         )
-        self.write_program(edge, config, alloc_graph_input=True, alloc_graph_output=True)
+        passes = []
+        if config.quantized_kv_io:
+            from executorch.backends.qualcomm._passes.build_quant_io import BuildQuantIo
+            passes.append(BuildQuantIo())
+        self.write_program(edge, config, alloc_graph_input=True, alloc_graph_output=True, passes=passes)
         result = self.finalize(config, precision="mixed" if quantize else "full", wrapper=wrapper,
                                example_inputs=example_inputs, model_config=model_config,
                                exported_for_mismatch=exported_for_mismatch)
@@ -344,11 +409,21 @@ class QNNExporter(ExecuTorchExporter):
             quantizer.default_quant_config = float_config
 
         # Same order as the vendor recipe: default config first, then per-layer configs.
-        quantizer.set_submodule_qconfig_list([
+        submodule_configs = [
             (_layer_predicate(frozenset(layers)),
              ModuleQConfig(quant_dtype=qdtype, is_linear_per_channel=True, act_observer=act_observer))
             for qdtype, layers in layers_by_qdtype.items()
-        ])
+        ]
+        eight_bit_caches = _eight_bit_cache_parts(config)
+        if eight_bit_caches != () and config.kv_cache_8bit_scheme == "attention_matmuls":
+            quantizer.add_custom_quant_annotations((_annotate_kv_cache_8bit_matmuls,))
+        elif eight_bit_caches != ():
+            # The cache writes are not inside any linear layer, so no per-layer predicate matches them.
+            submodule_configs.append((_kv_cache_write_predicate(eight_bit_caches),
+                                      ModuleQConfig(quant_dtype=QuantDtype.use_8a8w, act_observer=act_observer)))
+        quantizer.set_submodule_qconfig_list(submodule_configs)
+        # Runs after the per-operation rules: a minimum takes the scale of its input, not a range of its own.
+        quantizer.add_custom_quant_annotations((_share_amin_quant_params,))
         if block_layers:
             quantizer.set_block_size_map(_linear_block_sizes(module, block_layers))
         return quantizer
@@ -368,17 +443,14 @@ class QNNExporter(ExecuTorchExporter):
         """Extra keyword arguments of ``to_edge_transform_and_lower_to_qnn`` (sharding, float16 fix-up)."""
         if config.num_shards <= 1 and not quantize:
             return {}
-        from executorch.backends.qualcomm._passes import LayoutTransform, TagQuantIO
-        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_capture_program_passes
-        from executorch.backends.qualcomm._passes.utils import get_passes_dependency_for_capture_program
+        from executorch.backends.qualcomm._passes import FoldQDQ, LayoutTransform, TagQuantIO
         from executorch.backends.qualcomm.utils.constants import (
             QCOM_PASS_ACTIVATE_KEY,
             QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
         )
 
         options = {}
-        passes_job = get_capture_program_passes()
-        dep_table = get_passes_dependency_for_capture_program()
+        passes_job, dep_table = _default_edge_passes()
         if config.num_shards > 1:
             # llama.fallback marks shard boundaries and must stay out of QNN partitions.
             options["skip_node_op_set"] = {"llama.fallback.default"}
@@ -389,10 +461,16 @@ class QNNExporter(ExecuTorchExporter):
                                    "(TransformerDecoder with a 'blocks' ModuleList)")
             shard_layers = list(range(0, n_layers, n_layers // config.num_shards))
             print(f"  Graph sharding: {config.num_shards} shards, layer boundaries at {shard_layers}")
-            passes_job[make_split_graph_blocks_pass(shard_layers)] = {
+            split_pass = make_split_graph_blocks_pass(shard_layers)
+            passes_job[split_pass] = {
                 QCOM_PASS_ACTIVATE_KEY: True,
                 QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY: {"shard_layers": shard_layers},
             }
+            # Ordered as ExecuTorch's own sharding: after FoldQDQ (the inserted op copies the quantisation
+            # attributes FoldQDQ leaves on its input), before TagQuantIO. Unordered, the solver may run it first
+            # and the op at a shard boundary fails HTP validation and falls back to the CPU.
+            dep_table[split_pass] = [FoldQDQ]
+            dep_table[TagQuantIO] = list(dep_table.get(TagQuantIO, [LayoutTransform])) + [split_pass]
         if quantize:
             # Mixed precision: after FoldQDQ the quantisation annotation survives on
             # activations feeding float16 linears, which makes their FC op invalid. Insert
@@ -404,9 +482,68 @@ class QNNExporter(ExecuTorchExporter):
             dep_table[_BreakQuantAttrsBeforeFp16Linear] = [LayoutTransform]
             dep_table[TagQuantIO] = list(dep_table.get(TagQuantIO, [LayoutTransform])) + [
                 _BreakQuantAttrsBeforeFp16Linear]
+        if config.quantized_kv_io:
+            # The cache buffer (lifted placeholder) and the write feeding its mutation output keep the cache's
+            # fixed-point dtype at the delegate boundary (TagQuantIO here, BuildQuantIo in write_program).
+            passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
+            passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY]["get_quant_io_dtype_fn"] = (
+                _kv_cache_io_dtype_fn(config))
         options["passes_job"] = passes_job
         options["dep_table"] = dep_table
         return options
+
+
+def _kv_cache_io_dtype_fn(config):
+    """``get_quant_io_dtype_fn`` of TagQuantIO for ``quantized_kv_io``: the fixed-point dtype of the KV-cache
+    buffers and of the cache writes that feed their mutation outputs (uint8 for an 8-bit cache, else uint16)."""
+    dtypes = {kind: torch.uint8 if bits == 8 else torch.uint16 for kind, bits in zip(("key", "value"), _cache_bits(config))}
+
+    def dtype_of(node):
+        if node.op == "placeholder":
+            kind = _kv_cache_buffer_kind(node.name)
+            return dtypes[kind] if kind else None
+        if node.op == "call_function" and any(user.op == "output" for user in node.users):
+            current = node   # output <- [dequantize <- quantize <-] cache write
+            for _ in range(3):
+                if current.target in _KV_CACHE_WRITES or "index_copy" in str(current.target) \
+                        or "index_put" in str(current.target):
+                    kind = _kv_cache_write_kind(current)
+                    return dtypes[kind] if kind else None
+                if not (current.args and isinstance(current.args[0], torch.fx.Node) and "quantize" in str(current.target)):
+                    return None
+                current = current.args[0]
+        return None
+    return dtype_of
+
+
+def _default_edge_passes():
+    """``(passes_job, dep_table)``: ExecuTorch's default edge passes for the HTP backend and their ordering
+    constraints. ExecuTorch 1.5 serves them from the backend's pass manager, older releases (1.3) from
+    module-level functions."""
+    try:
+        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_qnn_pass_manager_cls
+    except ImportError:
+        from executorch.backends.qualcomm._passes.qnn_pass_manager import get_capture_program_passes
+        from executorch.backends.qualcomm._passes.utils import get_passes_dependency_for_capture_program
+        return get_capture_program_passes(), get_passes_dependency_for_capture_program()
+    from executorch.backends.qualcomm.serialization.qc_schema import QnnExecuTorchBackendType
+
+    manager = get_qnn_pass_manager_cls(QnnExecuTorchBackendType.kHtpBackend)
+    return manager.get_capture_program_passes(), manager.get_passes_dependency_for_capture_program()
+
+
+def _keep_gcc_cxx_runtime_global():
+    """Put GCC's C++ runtime (libgcc_s, libstdc++) in the process's global symbol scope before the QNN SDK loads
+    (called by ``QNNExporter.check_available``, i.e. before every QNN export; the generic mechanism is
+    ``utils/native_libs.py``).
+
+    The SDK's x86 libraries link LLVM's libc++abi and libunwind, and ExecuTorch opens them into the global scope:
+    a library loaded afterwards that was built against GCC's runtime (ONNX Runtime) then binds its C++ exception
+    symbols to LLVM's and crashes as it loads. The earlier entry of the global scope wins, so GCC's runtime goes
+    first (both runtimes implement the same C++ ABI, so the SDK works with it). Already loaded by torch: this only
+    promotes them.
+    """
+    load_into_global_scope("libgcc_s.so.1", "libstdc++.so.6")
 
 
 __all__ = ["QNNExportConfig", "QNNExporter", "is_qnn_available"]

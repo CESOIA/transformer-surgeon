@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 VALID_METHODS = list(METHOD_FUNCTIONS)  # unstructured_pruning_methods/ is the single list
 CALIBRATED_METHOD_DICT = {
     "gradient": ("weight_grad",),
+    "wanda": ("input_sq_mean",),
 }
 
 
@@ -66,6 +67,14 @@ class UnstructuredPruner(Compressor):
                     granularity=granularity,
                 )
 
+            elif method == "wanda":
+                mask = METHOD_FUNCTIONS[method](
+                    module.weight,
+                    self.calibration_store["input_sq_mean"],
+                    pruning_ratio=ratio,
+                    granularity=granularity,
+                )
+
             elif method == "random":
                 mask = METHOD_FUNCTIONS[method](
                     module.weight,
@@ -111,6 +120,8 @@ class UnstructuredPruner(Compressor):
         Call after optimizer.step() in STE fine-tuning loops to prevent mask
         drift.
         """
+        if not self._to_compress():
+            return  # the mask on the module may belong to another pruner (e.g. structured)
         mask = module._buffers.get('weight_mask')
         if mask is None:
             return

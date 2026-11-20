@@ -8,7 +8,7 @@ type or the export.
 | `modules.py` | `get_submodule`, `set_submodule`, `get_parent_module` (dotted paths such as `model.layers.3.mlp`), `replace_parameter` |
 | `indexing.py` | generic readers of a model dictionary: `flatten_index_paths`, `get_block_config`, `num_blocks` |
 | `batches.py` | `normalize_batch`, `pack_batch`: calibration batches as `(args, kwargs)` |
-| `devices.py` | device helpers |
+| `devices.py` | device helpers: `infer_model_device`, `move_to_device`, `device_zeros` (zeros of any dtype, FP4 included) |
 | `progress.py` | progress bars |
 
 ```python

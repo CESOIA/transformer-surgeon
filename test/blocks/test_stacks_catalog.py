@@ -121,7 +121,9 @@ def test_catalog_entries_all_resolve_and_are_documented():
 
 
 def test_catalog_helpers():
-    assert set(implementations_of("rmsnorm", "norm")) == {"rmsnorm", "rmsnorm_prescaled", "rmsnorm_upcast"}
+    assert set(implementations_of("rmsnorm", "norm")) == {"rmsnorm", "rmsnorm_prescaled", "rmsnorm_upcast",
+                                                          "rmsnorm_threshold", "rmsnorm_threshold_safe_sum",
+                                                          "rmsnorm_prescaled_exact_eps"}
     assert norm_atom_name("rmsnorm", "rmsnorm_upcast") == "rmsnorm_upcast"
     assert norm_atom_name("layernorm", "rmsnorm_upcast") == "layernorm"
     with pytest.raises(ValueError):

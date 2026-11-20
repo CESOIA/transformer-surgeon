@@ -301,6 +301,137 @@ def _float_attention_nodes(graph_module) -> list[str]:
     return names
 
 
+# Operations that write the KV cache of an attention module: index_copy for the mutable
+# cache, index_put for io_scatter (functional or in place, before/after functionalisation).
+_KV_CACHE_WRITES = {
+    torch.ops.aten.index_copy.default, torch.ops.aten.index_copy_.default,
+    torch.ops.aten.index_put.default, torch.ops.aten.index_put_.default,
+}
+
+
+def _kv_cache_write_kind(node: torch.fx.Node) -> str | None:
+    """``"key"`` or ``"value"``: the cache a KV-cache write updates, or None if it is neither.
+
+    Found from what the write updates, matched EXACTLY against the names the library declares:
+    an internal buffer (``mutable``) named as in ``MHACausal.CACHE_BUFFERS``, or a graph input
+    (``io_scatter``) named ``<argument>_<layer>`` after ``LLMWrapper.CACHE_INPUTS``. A substring test
+    ("key" in the name) would also match e.g. ``key_cache_scale`` or a renamed argument. torch's node
+    annotations (``torch.fx.traceback.annotate``) would be cleaner but do not survive ``torch.export``
+    (checked with torch 2.12 and 2.13)."""
+    from ....blocks.attention.causal import MHACausal
+    from ...wrapper import LLMWrapper
+
+    source = node.args[0] if node.args else None
+    while isinstance(source, torch.fx.Node) and source.op == "call_function" and source.args:
+        source = source.args[0]   # through the quantise/dequantise pairs of a quantised graph
+    if not isinstance(source, torch.fx.Node):
+        return None
+    if source.op == "get_attr":
+        leaf = str(source.target).rsplit(".", 1)[-1]
+        return next((kind for kind, name in MHACausal.CACHE_BUFFERS.items() if leaf == name), None)
+    if source.op == "placeholder":
+        return _kv_cache_buffer_kind(source.name) or next(
+            (kind for kind, name in LLMWrapper.CACHE_INPUTS.items()
+             if re.fullmatch(rf"{re.escape(name)}_\d+", source.name)), None)
+    return None
+
+
+def _kv_cache_buffer_kind(name: str) -> str | None:
+    """``"key"``/``"value"`` for a lifted KV-cache buffer placeholder (torch.export names a buffer ``b_<path>`` with
+    the dots of its path as underscores, ending in ``_`` + a name of ``MHACausal.CACHE_BUFFERS``), else None."""
+    from ....blocks.attention.causal import MHACausal
+
+    return next((kind for kind, buffer in MHACausal.CACHE_BUFFERS.items()
+                 if name.startswith("b_") and name.endswith("_" + buffer)), None)
+
+
+def _annotate_kv_cache_8bit_matmuls(gm: torch.fx.GraphModule) -> int:
+    """``kv_cache_8bit_scheme="attention_matmuls"``: q.K^T and P.V become 16a8w; walking back from each matmul's
+    second input through the layout ops (shared quantisation parameters) to the cache write (``index_copy`` on the
+    mutable buffer), the cache and its view chain get one 8-bit symmetric per-tensor spec, taken at the new rows.
+    Adapted from ExecuTorch's ``annotate_kv_8bit`` (static-LLM recipes), which expects a concatenated cache.
+    Structural: a matmul is a cache read when its second input leads to a cache write. Returns the matmul count."""
+    from executorch.backends.qualcomm.quantizer.qconfig import get_16a8w_qnn_ptq_config, get_8a8w_qnn_ptq_config
+    from torchao.quantization.pt2e import MinMaxObserver
+    from torchao.quantization.pt2e.quantizer import QuantizationAnnotation, SharedQuantizationSpec
+    from torchao.quantization.pt2e.quantizer.utils import Q_ANNOTATION_KEY
+
+    cfg16a8w = get_16a8w_qnn_ptq_config(act_observer=MinMaxObserver)
+    act8 = get_8a8w_qnn_ptq_config(act_symmetric=True, act_observer=MinMaxObserver).input_activation
+    layout_ops = {torch.ops.aten.permute.default, torch.ops.aten.transpose.int, torch.ops.aten.unsqueeze.default,
+                  torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten.expand.default}
+    cache_writes = {torch.ops.aten.index_copy_.default, torch.ops.aten.index_copy.default}
+
+    def share(node, src):
+        node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={src: act8}, output_qspec=SharedQuantizationSpec((src, node)), _annotated=True)
+
+    n_matmul = 0
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.matmul.default:
+            continue
+        chain, cur = [], node.args[1]
+        while isinstance(cur, torch.fx.Node) and cur.op == "call_function" and cur.target in layout_ops:
+            chain.append(cur)
+            cur = cur.args[0]
+        if not (isinstance(cur, torch.fx.Node) and cur.target in cache_writes):
+            continue  # not a K/V cache read
+        node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={node.args[0]: cfg16a8w.input_activation, node.args[1]: cfg16a8w.weight},
+            output_qspec=cfg16a8w.output_activation, _annotated=True)
+        value = cur.args[3]  # index_copy_(cache, dim, index, new_rows): the mutable buffer itself stays unannotated
+        cur.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+            input_qspec_map={value: act8}, output_qspec=SharedQuantizationSpec((value, cur)), _annotated=True)
+        for v in reversed(chain):
+            share(v, v.args[0])
+        n_matmul += 1
+    if n_matmul == 0:
+        raise RuntimeError("kv_cache_8bit_scheme='attention_matmuls': no attention matmul reads a mutable KV cache "
+                           "(cache_impl='mutable').")
+    print(f"  QNN: 8-bit KV cache on {n_matmul} attention matmuls")
+    return n_matmul
+
+
+def _kv_cache_write_predicate(parts=None):
+    """Quantiser predicate: the KV-cache writes of every MHACausal (``EXPORT_ROLE ==
+    "attention"``), or only those of the caches in ``parts`` (``("value",)``). Giving these nodes an
+    8-bit configuration makes the cache, which they produce and the attention reads, an 8-bit
+    fixed-point tensor (QNNExportConfig.kv_cache_bits)."""
+    def _pred(node: torch.fx.Node) -> bool:
+        if node.op != "call_function" or node.target not in _KV_CACHE_WRITES:
+            return False
+        stack = node.meta.get("nn_module_stack", {}).values()
+        if not any(_export_role(t[1] if isinstance(t, tuple) else t) == "attention" for t in stack):
+            return False
+        return parts is None or _kv_cache_write_kind(node) in parts
+    return _pred
+
+
+def _share_amin_quant_params(graph_module: torch.fx.GraphModule) -> int:
+    """Custom annotation of the QNN quantiser: the output of every quantised ``aten.amin`` (HTP ReduceMin)
+    takes the scale and zero point of its input. Returns how many it changed.
+
+    A minimum is one of its input values, so the quantisation of its input holds it exactly. The quantiser's
+    general rule observes the output on its own instead. The row minimum of masked softmax
+    (``blocks/attention/kernels/manual.py``) then gets a near-empty range in a layer whose scores are never
+    negative during calibration (empty cache slots score exactly 0, so the minimum stays 0), and HTP cannot
+    rescale the scores to it ("scale too large for requant"). A minimum the quantiser left float is skipped."""
+    from torchao.quantization.pt2e.quantizer import SharedQuantizationSpec
+    from torchao.quantization.pt2e.quantizer.utils import Q_ANNOTATION_KEY
+
+    shared = 0
+    for node in graph_module.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.amin.default:
+            continue
+        annotation = node.meta.get(Q_ANNOTATION_KEY)
+        source = node.args[0]
+        if annotation is None or annotation.output_qspec is None or annotation.input_qspec_map.get(source) is None:
+            continue
+        annotation.output_qspec = SharedQuantizationSpec((source, node))
+        shared += 1
+    return shared
+
+
 @functools.lru_cache(maxsize=None)
 def _module_class(type_name) -> type | None:
     """Class of an ``nn_module_stack`` entry (a class, or its ``"module.Class"`` name)."""

@@ -47,6 +47,17 @@ def test_calibrated_lrd_uses_the_covariance_summary():
     assert model.model.layers[1].mlp.down_proj.rank == 8
 
 
+def test_wanda_pruning_uses_the_input_norm_summary():
+    model, mgr = _model()
+    mgr.set("unstructured_pruning", "method", "wanda", criteria="mlp.down_proj")
+    mgr.set("unstructured_pruning", "ratio", 0.5, criteria="mlp.down_proj")
+    mgr.set("unstructured_pruning", "granularity", "neuron", criteria="mlp.down_proj")
+    mgr.set_calibration_data(_loader())
+    mgr.apply(hard=False, show_progress=False)
+    weight = model.model.layers[0].mlp.down_proj.weight
+    assert ((weight == 0).sum(1) == weight.shape[1] // 2).all()  # half of every output row
+
+
 def test_structured_pruning_soft_zeroes_and_hard_removes_rows():
     model, mgr = _model()
     for name, paths in mgr.auto_groups().items():
@@ -113,3 +124,118 @@ def test_static_activation_quantisation_installs_and_strips_hooks():
     _logits(model)
     mgr.prepare_for_save()
     assert not hasattr(layer, "_act_quant_hook_handle") and not hasattr(layer, "_act_quant_scale")
+
+
+def test_binary_qat_trains_latent_weight_and_channel_scale():
+    model, mgr = _model()
+    mgr.set("quantization", "precision", "binary", criteria="mlp.down_proj")
+    mgr.set("quantization", "granularity", "per_channel", criteria="mlp.down_proj")
+    mgr.set("quantization", "qat", True, criteria="mlp.down_proj")
+    layer = model.model.layers[0].mlp.down_proj
+    latent = layer.weight.detach().clone()
+    mgr.apply(hard=False)
+    assert layer.bin_scale.shape == (layer.out_features, 1) and layer.bin_scale.requires_grad
+    torch.testing.assert_close(layer.weight, latent)  # latent weight untouched
+    torch.testing.assert_close(layer.bin_scale.detach(), latent.abs().mean(dim=1, keepdim=True))
+    model.train()
+    model(input_ids=IDS).logits.sum().backward()
+    assert layer.weight.grad is not None and layer.weight.grad.abs().sum() > 0  # STE passes the gradient
+    assert layer.bin_scale.grad is not None and layer.bin_scale.grad.abs().sum() > 0
+    x = torch.randn(3, layer.in_features)
+    expected = x @ (layer.bin_scale.detach() * torch.where(latent >= 0, 1.0, -1.0)).T + layer.bias.detach() if layer.bias is not None else x @ (layer.bin_scale.detach() * torch.where(latent >= 0, 1.0, -1.0)).T
+    torch.testing.assert_close(layer(x), expected)
+    mgr.restore()
+    assert layer.bin_scale is None
+
+
+def test_binary_qat_requires_binary_precision():
+    model, mgr = _model()
+    mgr.set("quantization", "precision", 8, criteria="mlp.down_proj")
+    mgr.set("quantization", "qat", True, criteria="mlp.down_proj")
+    with pytest.raises(NotImplementedError):
+        mgr.apply(hard=False)
+
+
+def test_gptq_binary_qat_uses_the_covariance_summary():
+    model, mgr = _model()
+    crit = "mlp.down_proj"
+    mgr.set("quantization", "method", "gptq", criteria=crit)
+    mgr.set("quantization", "precision", "binary", criteria=crit)
+    mgr.set("quantization", "granularity", "per_channel", criteria=crit)
+    mgr.set("quantization", "qat", True, criteria=crit)
+    mgr.set_calibration_data(_loader())
+    layer = model.model.layers[0].mlp.down_proj
+    latent = layer.weight.detach().clone()
+    mgr.apply(hard=False, show_progress=False)
+    assert layer.bin_scale is not None
+    assert not torch.allclose(layer.weight, latent)  # Hessian compensation moved the latent weight
+    torch.testing.assert_close(layer.bin_scale.detach(), latent.abs().mean(dim=1, keepdim=True))
+
+
+def _flap_setup(ratio=0.5, bias_compensation=True):
+    model, mgr = _model()
+    mgr.set("channel_pruning", "ratio", ratio, criteria="mlp.down_proj")
+    mgr.set("channel_pruning", "bias_compensation", bias_compensation, criteria="mlp.down_proj")
+    mgr.set_calibration_data(_loader(4))
+    return model, mgr
+
+
+def test_flap_prunes_the_requested_fraction_globally_and_adds_the_baseline_bias():
+    model, mgr = _flap_setup(0.5)
+    dense = _logits(model)
+    mgr.apply(hard=False, show_progress=False)
+    layers = [blk.mlp.down_proj for blk in model.model.layers]
+    kept = sum(int(l.input_mask.sum()) for l in layers)
+    total = sum(l.in_features for l in layers)
+    assert abs(kept / total - 0.5) < 0.02
+    for l in layers:
+        assert (l.weight[:, ~l.input_mask] == 0).all()
+        assert l.bias is not None
+    assert not torch.allclose(_logits(model), dense)
+    mgr.restore()
+    assert all(blk.mlp.down_proj.bias is None for blk in model.model.layers)
+    torch.testing.assert_close(_logits(model), dense)
+
+
+def test_flap_bias_compensation_improves_over_plain_zeroing():
+    errs = {}
+    for comp in (True, False):
+        model, mgr = _flap_setup(0.5, comp)
+        dense = _logits(model)
+        mgr.apply(hard=False, show_progress=False)
+        errs[comp] = (_logits(model) - dense).pow(2).mean().item()
+    assert errs[True] <= errs[False]
+
+
+def test_flap_hard_matches_soft_and_shrinks_the_mlp():
+    model, mgr = _flap_setup(0.5)
+    mgr.apply(hard=False, show_progress=False)
+    soft = _logits(model)
+    mgr.apply(hard=True, show_progress=False)
+    layer = model.model.layers[0].mlp
+    assert layer.down_proj.in_features == layer.gate_proj.out_features == layer.up_proj.out_features
+    assert layer.down_proj.in_features < 128
+    torch.testing.assert_close(_logits(model), soft, rtol=1e-4, atol=1e-4)
+
+
+def test_flap_groups_prune_whole_heads_across_attention_and_mlp():
+    model, mgr = _model()
+    head_dim = model.config.hidden_size // model.config.num_attention_heads
+    mgr.set("channel_pruning", "ratio", 0.4, criteria=["mlp.down_proj", "self_attn.o_proj"])
+    mgr.set("channel_pruning", "group_size", head_dim, criteria="self_attn.o_proj")
+    mgr.set("channel_pruning", "rank_group", "attn", criteria="self_attn.o_proj")
+    mgr.set("channel_pruning", "rank_group", "mlp", criteria="mlp.down_proj")
+    mgr.set_calibration_data(_loader(4))
+    dense = _logits(model)
+    mgr.apply(hard=False, show_progress=False)
+    for blk in model.model.layers:
+        m = blk.self_attn.o_proj.input_mask.view(-1, head_dim)
+        assert (m.all(1) | (~m).all(1)).all()  # a head is kept or dropped as a whole
+    cost = lambda l: l.in_features * l.out_features
+    pruned = sum(int((~b.mlp.down_proj.input_mask).sum()) * b.mlp.down_proj.out_features + int((~b.self_attn.o_proj.input_mask).sum()) * b.self_attn.o_proj.out_features for b in model.model.layers)
+    total = sum(cost(b.mlp.down_proj) + cost(b.self_attn.o_proj) for b in model.model.layers)
+    assert abs(pruned / total - 0.4) < 0.05
+    attn = [b.self_attn.o_proj for b in model.model.layers]
+    frac = sum(int((~l.input_mask).sum()) for l in attn) / sum(l.in_features for l in attn)
+    assert abs(frac - 0.4) < 0.15  # each pool has its own threshold for the same ratio
+    assert not torch.allclose(_logits(model), dense)

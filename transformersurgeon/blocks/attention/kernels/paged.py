@@ -119,11 +119,15 @@ class PagedKernel(AttentionKernel):
     def forward_fused(self, attn, x, in_seq_len, kv_pool, paged):
         """``paged`` = (context_lengths, rope_cos_sin, kvcache_start_index, kv_page_table)."""
         head_dim = attn.value_head_dim
-        if (attn.rope_pruned or attn.key_head_dim != head_dim
-                or attn.q_proj.out_features != attn.num_heads * head_dim):
+        if attn.rope_pruned and not attn.paged_uniform_rope:
             raise NotImplementedError(
-                "cache_impl='io_paged' needs equal q/k/v head dims and unpruned RoPE (one cos/sin table "
-                "for every head); use 'io_inplace' for within-head pruned attention.")
+                "cache_impl='io_paged' cannot run within-head pruned attention: the kernel applies one RoPE table to "
+                "every head, while pruning kept different rotary frequencies per kv group. Use cache_impl='io_inplace' "
+                "(exact), or force_uniform_rope_latency_only=True (LATENCY ONLY, changes the output; see "
+                "TransformerDecoder.finalize_paged_rope).")
+        if attn.key_head_dim != head_dim or attn.q_proj.out_features != attn.num_heads * head_dim:
+            raise NotImplementedError("cache_impl='io_paged' needs equal q/k/v head dims; use 'io_inplace' for this "
+                                      "attention.")
         qkv = torch.cat([attn.q_proj(x), attn.k_proj(x), attn.v_proj(x)], dim=-1)
         qkv = qkv.reshape(1, in_seq_len, qkv.shape[-1])
         context_lengths, rope_cos_sin, start_index, page_table = paged

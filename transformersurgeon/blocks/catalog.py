@@ -61,6 +61,11 @@ BLOCK_CATALOG = {
             "attention.kernels.custom_sdpa.CustomSdpaKernel",
             "ExecuTorch fused CPU kernel that scans only the filled cache; needs the mutable cache.",
             "attention_kernel", "export"),
+        "custom_quantized_sdpa": _atom(
+            "attention.kernels.custom_quantized_sdpa.CustomQuantizedSdpaKernel",
+            "custom_sdpa over its own int8 cache (per token and kv head scale + zero point); needs the mutable "
+            "cache.",
+            "attention_kernel", "export"),
         "paged": _atom(
             "attention.kernels.paged.PagedKernel",
             "Fused rotary embedding + paged cache write + attention; needs the io_paged cache.",
@@ -84,15 +89,56 @@ BLOCK_CATALOG = {
             "attention.kv_cache.io_inplace.InplaceCache",
             "Graph input/output in heads-major layout, updated by an in-place-capable operator; allows prefill.",
             "kv_cache", "export"),
+        "io_rows": _atom(
+            "attention.kv_cache.io_rows.RowsCache",
+            "Graph input in heads-major layout, only read; the graph returns the new rows and the caller "
+            "writes them; allows prefill.",
+            "kv_cache", "export"),
         "io_paged": _atom(
             "attention.kv_cache.io_paged.PagedCache",
             "Paged pool as graph input/output; written and read by the paged kernel.",
             "kv_cache", "export"),
     },
+    # What one stored key/value row holds. Export option: "kv_precision".
+    "kv_precision": {
+        "full": _atom(
+            "attention.kv_precision.full.FullPrecision",
+            "Rows kept in the model dtype.",
+            "kv_precision", "export"),
+        "int8": _atom(
+            "attention.kv_precision.int8.Int8Precision",
+            "uint8 rows: 8-bit symmetric codes plus one 2-byte scale per row; decoded before attention.",
+            "kv_precision", "export"),
+        "int4": _atom(
+            "attention.kv_precision.int4.Int4Precision",
+            "uint8 rows: 4-bit symmetric codes, two per byte, plus one 2-byte scale per row; decoded before "
+            "attention.",
+            "kv_precision", "export"),
+        "fp8": _atom(
+            "attention.kv_precision.fp8.FP8Precision",
+            "float8_e4m3fn rows (unit scale, saturating at +-448); decoded before attention; needs io_rows.",
+            "kv_precision", "export"),
+        "nvfp4": _atom(
+            "attention.kv_precision.nvfp4.NVFP4Precision",
+            "NVFP4 rows: float4_e2m1fn_x2 codes plus a second float8_e4m3fn tensor of block scales (one per 16 "
+            "elements, unit per-tensor scale); decoded before attention; needs io_rows.",
+            "kv_precision", "export"),
+    },
     # Feed-forward blocks. Model key: "mlp_type".
     "mlp": {
         "mlp": _atom("mlp.plain.MLP", "down(act(up(x))).", "mlp", "model"),
         "mlp_gated": _atom("mlp.gated.MLPGated", "down(act(gate(x)) * up(x)).", "mlp_gated", "model"),
+        "mlp_gated_fused": _atom("mlp.gated_fused.MLPGatedFused",
+                                 "down(act(x1) * x2) with [x1, x2] = up(x) (one fused gate/up projection).",
+                                 "mlp_gated", "model"),
+    },
+    # Reduction of an encoder's tokens before its output head. Model key: "pooling".
+    "pooling": {
+        "cls": _atom("heads.pooling.ClsPooling", "First (class) token.", "pooling", "model"),
+        "mean": _atom("heads.pooling.MeanPooling", "Mean over all tokens.", "pooling", "model"),
+        "cls_patch_mean": _atom("heads.pooling.ClsPatchMeanPooling",
+                                "Class token concatenated with the mean of the other tokens.", "pooling", "model"),
+        "none": _atom("heads.pooling.NoPooling", "Every token, unchanged.", "pooling", "model"),
     },
     # Normalisations. Model key: "norm_type" names the operation; for RMS
     # normalisation the export option "rmsnorm_impl" picks the implementation.
@@ -108,6 +154,20 @@ BLOCK_CATALOG = {
         "rmsnorm_upcast": _atom(
             "norm.rmsnorm_upcast.RMSNormUpcast",
             "Normalises in float32 and casts back (Hugging Face formulation).",
+            "rmsnorm", "export"),
+        "rmsnorm_threshold": _atom(
+            "norm.rmsnorm_threshold.RMSNormThreshold",
+            "Rescales only rows with max |x| above rmsnorm_threshold (default 128), so eps enters unscaled; "
+            "float16-safe and still fusable.",
+            "rmsnorm", "export"),
+        "rmsnorm_threshold_safe_sum": _atom(
+            "norm.rmsnorm_threshold_safe_sum.RMSNormThresholdSafeSum",
+            "rmsnorm_threshold with the variance as a sum of pre-scaled squares (safe with float16 accumulation; "
+            "not fusable).",
+            "rmsnorm", "export"),
+        "rmsnorm_prescaled_exact_eps": _atom(
+            "norm.rmsnorm_prescaled_exact_eps.RMSNormPrescaledExactEps",
+            "Max-abs rescale with eps / max**2 added: exactly the unscaled norm, float16-safe reduction.",
             "rmsnorm", "export"),
         "layernorm": _atom("norm.layernorm.LayerNorm", "Layer normalisation.", "layernorm", "model"),
     },
@@ -133,9 +193,16 @@ def resolve_atom(family, name):
     return getattr(import_module(f"{__package__}.{module_path}"), attr)
 
 
-def build_block(family, name, *args, **kwargs):
-    """Instantiate the atom ``BLOCK_CATALOG[family][name]`` with the given arguments."""
-    return resolve_atom(family, name)(*args, **kwargs)
+def build_block(family, name, *args, config=None, **kwargs):
+    """Instantiate the atom ``BLOCK_CATALOG[family][name]`` with the given arguments.
+
+    An atom with a ``CONFIG_OPTIONS`` class attribute (``{constructor argument: configuration attribute}``)
+    also receives those arguments from ``config`` (a stack configuration), when it has the attribute."""
+    atom = resolve_atom(family, name)
+    for argument, attribute in getattr(atom, "CONFIG_OPTIONS", {}).items():
+        if config is not None and argument not in kwargs and getattr(config, attribute, None) is not None:
+            kwargs[argument] = getattr(config, attribute)
+    return atom(*args, **kwargs)
 
 
 def implementations_of(operation, family=None):

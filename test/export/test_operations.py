@@ -18,8 +18,8 @@ from transformersurgeon.export.operations import (
     resolve_convert_options,
 )
 
-CATALOG_FAMILY = {"kv_cache": "kv_cache", "attention_kernel": "attention_kernel", "rmsnorm": "norm",
-                  "mlp": "mlp", "rope_frequencies": "rope_frequencies"}
+CATALOG_FAMILY = {"kv_cache": "kv_cache", "kv_precision": "kv_precision", "attention_kernel": "attention_kernel",
+                  "rmsnorm": "norm", "mlp": "mlp", "rope_frequencies": "rope_frequencies"}
 
 
 def test_every_entry_has_a_valid_default_for_every_backend():
@@ -79,3 +79,28 @@ def test_resolve_convert_options_honours_aliases_and_compatibility():
         resolve_convert_options("qnn", {"cache": "mutable"})
     with pytest.raises(ValueError):
         check_choice("onnx", "batch_dim", True)
+
+
+def test_prefill_caches_are_declared_per_backend():
+    """Whole-prompt export (max_input_len > 1): the allowed caches come from the table, every listed cache can
+    write several tokens per call, and a multi-token cache the exporter cannot trace that way (the paged pool)
+    is refused before conversion, with a clear message."""
+    from types import SimpleNamespace
+
+    from transformersurgeon.blocks import KV_CACHES
+    from transformersurgeon.export.operations import BACKEND_OPERATIONS, check_prefill
+
+    for backend, entry in BACKEND_OPERATIONS["kv_cache"]["backends"].items():
+        for cache in entry.get("prefill", []):
+            assert cache in entry["options"] and KV_CACHES[cache].multi_token, (backend, cache)
+    prompt, decode = SimpleNamespace(max_input_len=128), SimpleNamespace(max_input_len=1)
+    for backend in ("onnx", "tensorrt"):
+        for cache in ("io_inplace", "io_rows"):
+            check_prefill(backend, prompt, {"cache_impl": cache})
+        for cache in ("io_paged", "io_scatter", "io_concat"):
+            check_prefill(backend, decode, {"cache_impl": cache})  # decode-only: any cache
+            with pytest.raises(ValueError, match="requires cache_impl in"):
+                check_prefill(backend, prompt, {"cache_impl": cache})
+    assert KV_CACHES["io_paged"].multi_token  # why the flag alone is not enough
+    with pytest.raises(ValueError, match="on the xnnpack backend"):
+        check_prefill("xnnpack", prompt, {"cache_impl": "mutable"})

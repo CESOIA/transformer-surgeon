@@ -1,0 +1,32 @@
+# Conda environment for the CESOIA project (transformer-surgeon) on a Linux x86-64 machine with an NVIDIA GPU:
+# the package with its ONNX / ONNX Runtime, TensorRT (CUDA 13) and ExecuTorch (XNNPACK, QNN) backends, the test
+# suite and the packages the scripts, examples and benchmarks import.
+#
+#     conda env create -f environment.yml      # from the repository root
+#     conda activate cesoia
+#     bash scripts/executorch/qnn/install_qnn_sdk.sh   # QNN exports: Qualcomm's QNN SDK (a separate download)
+#
+# Versions are the ones the test suite passes with; torch 2.14 with CUDA 13.0 needs an NVIDIA driver >= 580.
+name: cesoia
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.14.1+cu130
+      - torchao==0.18.0
+      - transformers==5.22.1
+      - executorch==1.5.1               # XNNPACK; 1.6 requires torch 2.15
+      - onnx==1.23.2
+      - onnxscript==0.7.2
+      - onnxruntime==1.31.1
+      - ml_dtypes==0.6.0
+      - tensorrt-cu13==11.4.0.106
+      - datasets                        # calibration data (transformersurgeon/calibration)
+      - scikit-learn                    # scripts/cost_predictor/fit_predictor.py
+      - pandas                          # benchmarks/
+      - matplotlib                      # benchmarks/
+      - -e .[onnx,executorch,dev]

@@ -15,6 +15,16 @@ cd transformer-surgeon
 pip install -e ".[test]"   # add [test] to also get pytest for running the test suite
 ```
 
+Or create the project's conda environment, `cesoia`, with the ONNX Runtime, TensorRT and ExecuTorch (XNNPACK, QNN)
+backends and the test suite (Linux x86-64 with an NVIDIA driver >= 580); QNN exports also need Qualcomm's QNN SDK,
+which the last line installs into the environment:
+
+```bash
+conda env create -f environment.yml
+conda activate cesoia
+bash scripts/executorch/qnn/install_qnn_sdk.sh
+```
+
 ## 🗂️ What's Included
 
 **Compression methods**
@@ -49,7 +59,7 @@ pip install -e ".[test]"   # add [test] to also get pytest for running the test 
 | ModernBERT | Encoder | `ModernBertForSequenceClassificationCompress` |
 | DistilBERT | Encoder | `DistilBertForSequenceClassificationCompress` |
 | ViT | Vision encoder | `ViTForImageClassificationCompress` |
-| DINOv2 | Vision encoder | `Dinov2ForImageClassificationCompress` |
+| DINOv2 | Vision encoder | `Dinov2ForImageClassificationCompress` (giant: `Dinov2SwiGLUForImageClassificationCompress`) |
 
 All follow the same three-class pattern: a compressed config, a compressed model, and a compression manager — all HuggingFace-compatible.
 

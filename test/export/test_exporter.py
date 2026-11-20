@@ -12,7 +12,7 @@ from transformersurgeon.export import (
     EXPORTERS, BackendExportConfig, build_wrapper, build_zero_caches, convert_for_export, export_to_backend,
     extract_layer_quant_info, get_exporter,
 )
-from transformersurgeon.export.exporter import resolve_components
+from transformersurgeon.export.exporter import resolve_components, resolve_encoder_components
 
 CACHE = 16
 IO_INPLACE = {"cache_impl": "io_inplace", "max_cache_len": CACHE}
@@ -140,6 +140,35 @@ def test_qnn_export_writes_a_program(tmp_path):
     assert os.path.getsize(pte) > 0 and os.path.isfile(result.manifest_path)
 
 
+def _global_symbol_library(name):
+    """Path of the library that provides ``name`` in the process's global symbol scope."""
+    import ctypes
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p), ("sname", ctypes.c_char_p),
+                    ("saddr", ctypes.c_void_p)]
+
+    info = DlInfo()
+    address = ctypes.cast(getattr(ctypes.CDLL(None), name), ctypes.c_void_p)
+    ctypes.CDLL("libc.so.6").dladdr(address, ctypes.byref(info))
+    return info.fname.decode()
+
+
+@caps.requires_qnn
+def test_qnn_export_leaves_the_cxx_exception_symbols_to_gccs_runtime(tmp_path):
+    """The QNN SDK brings LLVM's libc++abi and libunwind into the global symbol scope; the exporter puts GCC's
+    runtime there first, otherwise a GCC-built library loaded afterwards (ONNX Runtime) segfaults as it loads."""
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    cfg = QNNExportConfig(output_path=str(tmp_path / "model.pte"), soc_model="SM8850", max_seq_len=CACHE,
+                          quant_scope="all",
+                          calibration_token_ids=[[(i * 37 + j * 11) % 256 for j in range(8)] for i in range(2)],
+                          run_weight_mismatch_check=False, verbose=False)
+    export_to_backend(_components(_model(quantize_mlp=True), {"max_cache_len": CACHE}), cfg)
+    assert "libstdc++" in _global_symbol_library("__cxa_throw")
+    assert "libgcc_s" in _global_symbol_library("_Unwind_Resume")
+
+
 @caps.requires_qnn
 def test_qnn_quantize_float_model_requires_quant_scope_all(tmp_path):
     from transformersurgeon.export.backends import QNNExportConfig
@@ -181,6 +210,29 @@ def test_qnn_quantize_float_model_lowers_an_uncompressed_model_as_fixed_point(tm
     assert bool((fq.argmax(-1) == ref.argmax(-1)).all()) and (fq - ref).abs().max().item() < 0.1
 
 
+@caps.requires_qnn
+def test_qnn_masked_softmax_minimum_takes_the_quantisation_of_its_input(tmp_path):
+    """The row minimum of masked softmax is one of the scores, so it needs no range of its own. With one, a
+    minimum that stays 0 through calibration gets a near-empty range, and HTP cannot rescale the scores to it
+    ("scale too large for requant")."""
+    from transformersurgeon.export.backends import QNNExportConfig
+
+    model = _model(quantize_mlp=True)
+    cfg = QNNExportConfig(output_path=str(tmp_path / "model.pte"), soc_model="SM8850", max_seq_len=CACHE,
+                          convert_options={"max_cache_len": CACHE, "masked_softmax": True}, quant_scope="all",
+                          keep_reference_module=True,
+                          calibration_token_ids=[[(i * 37 + j * 11) % 256 for j in range(CACHE)] for i in range(4)],
+                          run_weight_mismatch_check=False, verbose=False)
+    graph = export_to_backend(model, cfg).reference_module.graph
+    minima = [n for n in graph.nodes if n.op == "call_function" and n.target == torch.ops.aten.amin.default]
+    assert len(minima) == model.config.num_hidden_layers
+    for minimum in minima:
+        (dequantize,), (quantize,) = minimum.all_input_nodes, minimum.users
+        assert dequantize.target.__name__ == "dequantize_per_tensor.default"
+        assert quantize.target.__name__ == "quantize_per_tensor.default"
+        assert quantize.args[1:] == dequantize.args[1:]  # scale, zero point, integer range, dtype
+
+
 # --------------------------------------------------------------------------- #
 # Backend graph passes
 # --------------------------------------------------------------------------- #
@@ -210,6 +262,23 @@ def test_qnn_split_float_linear_bias_moves_only_float_biases_and_keeps_outputs()
             buf.zero_()
     with torch.no_grad():
         torch.testing.assert_close(gm(*inputs), before, rtol=1e-5, atol=1e-5)
+
+
+def test_qnn_share_amin_quant_params_skips_a_minimum_the_quantiser_left_float():
+    pytest.importorskip("torchao")
+    from torch.export import export as torch_export
+
+    from transformersurgeon.export.backends.qnn.passes import _share_amin_quant_params
+
+    class RowMinimum(torch.nn.Module):
+        def forward(self, scores):
+            return torch.amin(scores, dim=-1, keepdim=True) - 20
+
+    gm = torch_export(RowMinimum(), (torch.rand(2, 4),)).module()
+    assert any(node.target == torch.ops.aten.amin.default for node in gm.graph.nodes)
+    # float_attention_core=True and quant_scope="linear" leave the attention core without annotations.
+    assert _share_amin_quant_params(gm) == 0
+    assert not any("quantization_annotation" in node.meta for node in gm.graph.nodes)
 
 
 def _onnx_graph(nodes, inits, x_shape, y_shape):
@@ -261,3 +330,101 @@ def test_fp32_attention_scores_wraps_the_score_path_in_casts():
     onnx.checker.check_model(model)
     with pytest.raises(RuntimeError, match="no MatMul"):
         fp32_attention_scores(_onnx_graph([helper.make_node("Relu", ["x"], ["y"])], [], [4], [4]))
+
+
+@caps.requires_onnx
+def test_fp32_attention_scores_handles_unmasked_scores_and_bfloat16():
+    import onnx
+    from onnx import TensorProto, helper
+
+    from transformersurgeon.export.backends.tensorrt.attention_passes import fp32_attention_scores
+
+    def graph(elem):
+        x = helper.make_tensor_value_info("x", elem, [4, 4])
+        y = helper.make_tensor_value_info("y", elem, [4, 4])
+        w = helper.make_tensor("w", elem, [1], [1.0])  # the weight dtype is the model dtype
+        nodes = [helper.make_node("MatMul", ["x", "x"], ["s"], name="mm"),
+                 helper.make_node("Softmax", ["s"], ["y"], name="sm")]
+        return helper.make_model(helper.make_graph(nodes, "g", [x], [y], [w]),
+                                 opset_imports=[helper.make_opsetid("", 21)])
+
+    for elem in (TensorProto.FLOAT16, TensorProto.BFLOAT16):
+        model = graph(elem)
+        fp32_attention_scores(model)
+        casts = [helper.get_attribute_value(n.attribute[0]) for n in model.graph.node if n.op_type == "Cast"]
+        assert casts.count(TensorProto.FLOAT) == 2 and casts.count(elem) == 1
+        onnx.checker.check_model(model)
+    model = graph(TensorProto.FLOAT)
+    fp32_attention_scores(model)  # a float32 model is left unchanged
+    assert not any(n.op_type == "Cast" for n in model.graph.node)
+
+
+# --------------------------------------------------------------------------- #
+# Encoder models (EncoderWrapper)
+
+def _encoder_model(quantize=False):
+    torch.manual_seed(0)
+    spec = FAMILIES["dinov2"]
+    model = spec.build().float().eval()
+    if quantize:
+        mgr = spec.manager(model)
+        mgr.set("quantization", "precision", 8, criteria="mlp")
+        mgr.set("quantization", "granularity", "per_channel", criteria="mlp")
+        mgr.apply(hard=True, show_progress=False)
+    return model
+
+
+def test_encoder_wrapper_matches_the_hf_classifier():
+    from transformersurgeon.export import EncoderWrapper
+
+    model = _encoder_model()
+    components = resolve_encoder_components(model)
+    assert components["pooling"] == "cls_patch_mean"
+    wrapper = EncoderWrapper(components["embedding"], components["encoder"], components["final_layer"],
+                             components["pooling"]).eval()
+    x = torch.randn(1, 3, 32, 32)
+    with torch.no_grad():
+        torch.testing.assert_close(wrapper(x), model(x).logits, rtol=1e-4, atol=1e-4)
+    assert resolve_encoder_components(_model()) is None  # decoders keep the LLM path
+
+
+def test_backends_without_encoder_support_reject_encoders(tmp_path):
+    components = resolve_encoder_components(_encoder_model())
+    with pytest.raises(NotImplementedError, match="encoder"):
+        get_exporter("qnn")._export_encoder(components, BackendExportConfig(backend="qnn", output_path=str(tmp_path / "m.pte")))
+
+
+@caps.requires_onnx
+def test_onnx_encoder_export_is_static_and_quantizes_the_listed_layers(tmp_path):
+    import onnx
+    from transformersurgeon.export.backends import ONNXExportConfig
+
+    result = export_to_backend(_encoder_model(quantize=True), ONNXExportConfig(output_path=str(tmp_path / "model.onnx")))
+    graph = onnx.load(result.onnx_path, load_external_data=False).graph
+    assert [i.name for i in graph.input] == ["pixel_values"] and [o.name for o in graph.output] == ["logits"]
+    assert [d.dim_value for d in graph.input[0].type.tensor_type.shape.dim] == [1, 3, 32, 32]
+    manifest = json.load(open(result.manifest_path))
+    assert manifest["format"] == "tsurgeon-encoder/1" and manifest["outputs"]["logits"]["shape"] == [1, 10]
+    assert sorted(manifest["quantized_layers"]) == [f"encoder.blocks.{i}.mlp.{p}" for i in range(2)
+                                                    for p in ("down_proj", "up_proj")]
+    assert sum(n.op_type == "DequantizeLinear" for n in graph.node) == 4
+
+
+@caps.requires_tensorrt
+def test_tensorrt_encoder_engine_matches_the_eager_wrapper(tmp_path):
+    from transformersurgeon.export import EncoderWrapper
+    from transformersurgeon.export.backends import TensorRTExportConfig
+    from transformersurgeon.export.backends.tensorrt.engine import TensorRTEngineRunner
+
+    model = _encoder_model()
+    x = torch.randn(1, 3, 32, 32)
+    with torch.no_grad():
+        want = model(x).logits
+    result = export_to_backend(model, TensorRTExportConfig(output_path=str(tmp_path / "model.onnx"),
+                                                           float_type=torch.float16))
+    runner = TensorRTEngineRunner(result.engine_path)
+    runner.bind({"pixel_values": x.half().cuda()})
+    out = runner.allocate_outputs()["logits"]
+    runner.run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float().cpu(), want, rtol=2e-2, atol=2e-2)

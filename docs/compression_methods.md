@@ -134,7 +134,7 @@ during fine-tuning, or as a stepping stone to a sparse kernel/format later.
 | param | default | valid values | what it means |
 |---|---|---|---|
 | `ratio` | `0.0` | `float` in `[0, 1)` | Fraction of weight *elements* to zero out. |
-| `method` | `"magnitude"` | `"magnitude"`, `"gradient"`, `"random"` | Same scoring idea as structured pruning, but applied per-element instead of per-row. See below. |
+| `method` | `"magnitude"` | `"magnitude"`, `"gradient"`, `"wanda"`, `"random"` | Same scoring idea as structured pruning, but applied per-element instead of per-row. See below. |
 | `granularity` | `"layer"` | `"layer"`, `"neuron"`, or a positive `int` | `"layer"` pools all elements of the weight together and prunes the lowest-scoring `ratio` fraction globally. `"neuron"` prunes independently within each output row. An `int` chunks the flattened weight and prunes within each chunk. |
 
 ### Methods (importance scoring)
@@ -143,6 +143,7 @@ during fine-tuning, or as a stepping stone to a sparse kernel/format later.
 |---|---|---|
 | `magnitude` | none | Scores each weight element by `abs(weight)` — smallest-magnitude elements pruned first. |
 | `gradient` | `"weight_grad"` (needs `manager.set_calibration_loss(...)`) | Scores each element by `abs(weight * weight_grad)` — a per-element loss-sensitivity estimate. |
+| `wanda` | `"input_sq_mean"` (needs `manager.set_calibration_data(...)`) | Scores each element by `abs(weight) * ||x_j||` with `x_j` the input channel of the element (Wanda). No weight update; use `granularity="neuron"` for the per-output-row comparison of the original method. |
 | `random` | none | Random per-element scores — ablation baseline. |
 
 Masks are registered as a `weight_mask` buffer and survive `restore()`

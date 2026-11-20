@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from .activation_range import ActivationRangeSummary, OutputActivationRangeSummary
 from .covariance import CovarianceSummary, CrossCovarianceSummary, ShiftedCovarianceSummary
+from .input_sq_mean import InputSqMeanSummary
+from .input_mean import InputMeanSummary
+from .flap_scores import FlapScoresSummary, MagnitudeScoresSummary
 from .weight_grad import WeightGradSummary
 from .params import WeightSummary, BiasSummary
 from .raw_activation import InputActivationSummary, OutputActivationSummary
@@ -16,6 +19,10 @@ SUMMARY_REGISTRY = {
     "shifted_covariance": ShiftedCovarianceSummary(),
     # Running cross covariance between base and shifted activations.
     "cross_covariance": CrossCovarianceSummary(),
+    # Running per-input-channel mean of x^2, used by activation-aware pruning (wanda).
+    "input_sq_mean": InputSqMeanSummary(),
+    # Running per-input-channel mean of x (the baseline value of FLAP's bias compensation).
+    "input_mean": InputMeanSummary(),
     # Running weight-gradient average, used by gradient-based pruning methods.
     "weight_grad": WeightGradSummary(),
     # Running min/max of input activations, used by static activation fake-quant.
@@ -32,6 +39,24 @@ SUMMARY_REGISTRY = {
     "output_activation": OutputActivationSummary(),
 }
 SUPPORTED_SUMMARIES = tuple(SUMMARY_REGISTRY.keys())
+
+# Global summaries: computed once across schemes after the calibration pass (see global_base.py).
+GLOBAL_SUMMARY_REGISTRY = {
+    # FLAP: standardised fluctuation scores per layer and one global threshold (keep-mask per layer).
+    "flap_scores": FlapScoresSummary(),
+    # Uncalibrated structured pruning: same global cut as FLAP, scores from the weight norms only.
+    "magnitude_scores": MagnitudeScoresSummary(),
+}
+SUPPORTED_GLOBAL_SUMMARIES = tuple(GLOBAL_SUMMARY_REGISTRY.keys())
+
+
+def get_global_summary(name: str):
+    try:
+        return GLOBAL_SUMMARY_REGISTRY[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported global calibration summary '{name}'. Supported: {SUPPORTED_GLOBAL_SUMMARIES}."
+        ) from exc
 
 
 def get_summary(summary_name: str):

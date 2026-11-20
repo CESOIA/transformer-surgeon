@@ -1,4 +1,4 @@
-"""Device helpers: find where a model lives and move nested values there."""
+"""Device helpers: find where a model lives, move nested values there, allocate zeros of any dtype."""
 
 from collections.abc import Mapping
 
@@ -50,4 +50,12 @@ def move_to_device(value, target_device: torch.device):
     return value
 
 
-__all__ = ["infer_model_device", "move_to_device"]
+def device_zeros(shape, dtype: torch.dtype | None = None, device="cpu") -> torch.Tensor:
+    """``torch.zeros`` for any dtype (``None``: the default dtype): one-byte float dtypes are zeroed
+    as bytes, since torch cannot fill some of them (``float4_e2m1fn_x2`` on CUDA)."""
+    if dtype is not None and dtype.is_floating_point and dtype.itemsize == 1:
+        return torch.zeros(shape, dtype=torch.uint8, device=device).view(dtype)
+    return torch.zeros(shape, dtype=dtype, device=device)
+
+
+__all__ = ["infer_model_device", "move_to_device", "device_zeros"]

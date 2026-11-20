@@ -37,19 +37,24 @@ def test_manual_attention_matches_naive_grouped_attention():
 
 
 def test_kernel_registry_describes_requirements():
-    assert set(ATTENTION_KERNELS) == {"manual", "sdpa", "custom_sdpa", "paged"}
+    assert set(ATTENTION_KERNELS) == {"manual", "sdpa", "custom_sdpa", "custom_quantized_sdpa", "paged"}
     assert ATTENTION_KERNELS["custom_sdpa"].requires_cache == "mutable"
+    assert ATTENTION_KERNELS["custom_quantized_sdpa"].requires_cache == "mutable"
+    assert ATTENTION_KERNELS["custom_quantized_sdpa"].owns_cache
     assert ATTENTION_KERNELS["paged"].requires_cache == "io_paged"
     assert ATTENTION_KERNELS["paged"].fuses_projection
     assert ATTENTION_KERNELS["manual"].supports_masked_softmax
 
 
 def test_kv_cache_registry_and_shapes():
-    assert set(KV_CACHES) == {"mutable", "io_scatter", "io_concat", "io_inplace", "io_paged"}
+    assert set(KV_CACHES) == {"mutable", "io_scatter", "io_concat", "io_inplace", "io_rows", "io_paged"}
     attn = MHACausal(32, 4, kv_num_heads=2, max_cache_len=L, cache_impl="io_inplace")
     assert attn.cache_shape("key") == (1, 2, L, 8)
     assert MHACausal(32, 4, kv_num_heads=2, max_cache_len=L).cache_shape("value") == (L, 2, 8)
     assert not KV_CACHES["mutable"].graph_io and KV_CACHES["io_inplace"].multi_token
+    assert MHACausal(32, 4, kv_num_heads=2, max_cache_len=L, cache_impl="io_rows").cache_shape("key") == (1, 2, L, 8)
+    assert KV_CACHES["io_rows"].multi_token and KV_CACHES["io_rows"].read_layout == "hsd"
+    assert [name for name, cache in KV_CACHES.items() if cache.returns_rows] == ["io_rows"]
 
 
 def test_kv_cache_update_op_is_functional():

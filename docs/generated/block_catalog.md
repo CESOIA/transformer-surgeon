@@ -9,17 +9,32 @@
 | `attention_kernel` | `manual` | `attention_kernel` | export | `blocks.attention.kernels.manual.ManualKernel` | Explicit matrix products and softmax; portable; supports masked softmax. |
 | `attention_kernel` | `sdpa` | `attention_kernel` | export | `blocks.attention.kernels.sdpa.SdpaKernel` | torch.nn.functional.scaled_dot_product_attention. |
 | `attention_kernel` | `custom_sdpa` | `attention_kernel` | export | `blocks.attention.kernels.custom_sdpa.CustomSdpaKernel` | ExecuTorch fused CPU kernel that scans only the filled cache; needs the mutable cache. |
+| `attention_kernel` | `custom_quantized_sdpa` | `attention_kernel` | export | `blocks.attention.kernels.custom_quantized_sdpa.CustomQuantizedSdpaKernel` | custom_sdpa over its own int8 cache (per token and kv head scale + zero point); needs the mutable cache. |
 | `attention_kernel` | `paged` | `attention_kernel` | export | `blocks.attention.kernels.paged.PagedKernel` | Fused rotary embedding + paged cache write + attention; needs the io_paged cache. |
 | `kv_cache` | `mutable` | `kv_cache` | export | `blocks.attention.kv_cache.mutable.MutableCache` | Internal module state written in place (not a graph input/output). |
 | `kv_cache` | `io_scatter` | `kv_cache` | export | `blocks.attention.kv_cache.io_scatter.ScatterCache` | Graph input/output, updated with a functional scatter. |
 | `kv_cache` | `io_concat` | `kv_cache` | export | `blocks.attention.kv_cache.io_concat.ConcatCache` | Graph input/output, updated with a one-hot select (no scatter); one token per call. |
 | `kv_cache` | `io_inplace` | `kv_cache` | export | `blocks.attention.kv_cache.io_inplace.InplaceCache` | Graph input/output in heads-major layout, updated by an in-place-capable operator; allows prefill. |
+| `kv_cache` | `io_rows` | `kv_cache` | export | `blocks.attention.kv_cache.io_rows.RowsCache` | Graph input in heads-major layout, only read; the graph returns the new rows and the caller writes them; allows prefill. |
 | `kv_cache` | `io_paged` | `kv_cache` | export | `blocks.attention.kv_cache.io_paged.PagedCache` | Paged pool as graph input/output; written and read by the paged kernel. |
+| `kv_precision` | `full` | `kv_precision` | export | `blocks.attention.kv_precision.full.FullPrecision` | Rows kept in the model dtype. |
+| `kv_precision` | `int8` | `kv_precision` | export | `blocks.attention.kv_precision.int8.Int8Precision` | uint8 rows: 8-bit symmetric codes plus one 2-byte scale per row; decoded before attention. |
+| `kv_precision` | `int4` | `kv_precision` | export | `blocks.attention.kv_precision.int4.Int4Precision` | uint8 rows: 4-bit symmetric codes, two per byte, plus one 2-byte scale per row; decoded before attention. |
+| `kv_precision` | `fp8` | `kv_precision` | export | `blocks.attention.kv_precision.fp8.FP8Precision` | float8_e4m3fn rows (unit scale, saturating at +-448); decoded before attention; needs io_rows. |
+| `kv_precision` | `nvfp4` | `kv_precision` | export | `blocks.attention.kv_precision.nvfp4.NVFP4Precision` | NVFP4 rows: float4_e2m1fn_x2 codes plus a second float8_e4m3fn tensor of block scales (one per 16 elements, unit per-tensor scale); decoded before attention; needs io_rows. |
 | `mlp` | `mlp` | `mlp` | model | `blocks.mlp.plain.MLP` | down(act(up(x))). |
 | `mlp` | `mlp_gated` | `mlp_gated` | model | `blocks.mlp.gated.MLPGated` | down(act(gate(x)) * up(x)). |
+| `mlp` | `mlp_gated_fused` | `mlp_gated` | model | `blocks.mlp.gated_fused.MLPGatedFused` | down(act(x1) * x2) with [x1, x2] = up(x) (one fused gate/up projection). |
+| `pooling` | `cls` | `pooling` | model | `blocks.heads.pooling.ClsPooling` | First (class) token. |
+| `pooling` | `mean` | `pooling` | model | `blocks.heads.pooling.MeanPooling` | Mean over all tokens. |
+| `pooling` | `cls_patch_mean` | `pooling` | model | `blocks.heads.pooling.ClsPatchMeanPooling` | Class token concatenated with the mean of the other tokens. |
+| `pooling` | `none` | `pooling` | model | `blocks.heads.pooling.NoPooling` | Every token, unchanged. |
 | `norm` | `rmsnorm` | `rmsnorm` | export | `blocks.norm.rmsnorm.RMSNorm` | Plain RMS normalisation; fusable into one operation by backend compilers. |
 | `norm` | `rmsnorm_prescaled` | `rmsnorm` | export | `blocks.norm.rmsnorm_prescaled.RMSNormPrescaled` | Rescales rows by max \|x\| first to avoid float16 overflow. |
 | `norm` | `rmsnorm_upcast` | `rmsnorm` | export | `blocks.norm.rmsnorm_upcast.RMSNormUpcast` | Normalises in float32 and casts back (Hugging Face formulation). |
+| `norm` | `rmsnorm_threshold` | `rmsnorm` | export | `blocks.norm.rmsnorm_threshold.RMSNormThreshold` | Rescales only rows with max \|x\| above rmsnorm_threshold (default 128), so eps enters unscaled; float16-safe and still fusable. |
+| `norm` | `rmsnorm_threshold_safe_sum` | `rmsnorm` | export | `blocks.norm.rmsnorm_threshold_safe_sum.RMSNormThresholdSafeSum` | rmsnorm_threshold with the variance as a sum of pre-scaled squares (safe with float16 accumulation; not fusable). |
+| `norm` | `rmsnorm_prescaled_exact_eps` | `rmsnorm` | export | `blocks.norm.rmsnorm_prescaled_exact_eps.RMSNormPrescaledExactEps` | Max-abs rescale with eps / max**2 added: exactly the unscaled norm, float16-safe reduction. |
 | `norm` | `layernorm` | `layernorm` | model | `blocks.norm.layernorm.LayerNorm` | Layer normalisation. |
 | `rope_frequencies` | `default` | `rope_frequencies` | model | `blocks.positions.frequencies_default.inv_freq_default` | Plain rotary frequencies. |
 | `rope_frequencies` | `llama3` | `rope_frequencies` | model | `blocks.positions.frequencies_band_scaled.inv_freq_band_scaled` | Band-wise scaled frequencies for long contexts (HF rope_type 'llama3'). |

@@ -11,6 +11,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from ..blocks import KV_CACHES
+from ..utils.devices import device_zeros
+
 
 MANIFEST_FORMAT = "tsurgeon-llm/1"
 
@@ -22,16 +25,36 @@ def manifest_path_for(artifact_path: str) -> str:
 
 def cache_io_name(kind: str, layer: int, output: bool = False) -> str:
     """Graph I/O name of one layer's cache: ``past_<kind>_<i>`` in, ``present_<kind>_<i>`` out
-    (``kind`` is ``key``, ``value`` or ``kv`` for a paged pool)."""
+    (``kind`` is ``key``, ``value``, their block scales ``key_scale``/``value_scale``, or ``kv``
+    for a paged pool)."""
     return f"{'present' if output else 'past'}_{kind}_{layer}"
 
 
-def graph_io_names(num_layers: int, paged: bool = False) -> tuple[list[str], list[str]]:
-    """``(input_names, output_names)`` of a graph-I/O cache wrapper, in flattened argument order."""
-    kinds = ("kv",) if paged else ("key", "value")
-    inputs = ["input_ids", "pos_id"] + [cache_io_name(k, i) for k in kinds for i in range(num_layers)]
-    outputs = ["logits"] + [cache_io_name(k, i, output=True) for k in kinds for i in range(num_layers)]
+def cache_scales(decoder: nn.Module) -> tuple[str, ...]:
+    """The caches of ``decoder`` (``"key"``, ``"value"``) stored as ``(rows, scales)`` pairs (block scales);
+    empty when none is."""
+    blocks = [block for block in getattr(decoder, "blocks", ()) if hasattr(block.attn, "stored_dtype")]
+    return tuple(kind for kind in ("key", "value")
+                 if any(block.attn.stored_dtype(f"{kind}_scale") is not None for block in blocks))
+
+
+def graph_io_names(num_layers: int, paged: bool = False, scales=False) -> tuple[list[str], list[str]]:
+    """``(input_names, output_names)`` of a graph-I/O cache wrapper, in flattened argument order
+    (``scales``: the caches that are ``(rows, scales)`` pairs, ``("key", "value")`` or one of them;
+    ``True`` for both)."""
+    scales = ("key", "value") if scales is True else tuple(scales or ())
+    if paged:
+        groups = (("kv",),)
+    else:
+        groups = tuple((kind, f"{kind}_scale") if kind in scales else (kind,) for kind in ("key", "value"))
+    flat = [(kind, i) for group in groups for i in range(num_layers) for kind in group]
+    inputs = ["input_ids", "pos_id"] + [cache_io_name(kind, i) for kind, i in flat]
+    outputs = ["logits"] + [cache_io_name(kind, i, output=True) for kind, i in flat]
     return inputs, outputs
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).replace("torch.", "")
 
 
 def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend: str,
@@ -40,17 +63,23 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
 
     Runners use it instead of re-deriving geometry: the cache implementation,
     layout and dtype, and one entry per layer with the key/value cache shapes
-    (which differ per layer after structured pruning) and their graph I/O names.
-    Backend-specific fields go in ``extra``.
+    (which differ per layer after structured pruning), dtypes and graph I/O names;
+    a cache stored with block scales adds a ``key_scale``/``value_scale`` entry, one more
+    tensor. Keys and values may be stored differently (``kv_precision`` a ``(key, value)``
+    pair): each entry has its own dtype. Backend-specific fields go in ``extra``.
     """
     decoder = wrapper.decoder
     cache_impl = getattr(decoder, "cache_impl", "mutable")
+    kv_cache = KV_CACHES[cache_impl]
     kinds = ("kv",) if cache_impl == "io_paged" else ("key", "value")
-    caches = [
-        {"layer": i, **{k: {"input": cache_io_name(k, i), "output": cache_io_name(k, i, output=True),
-                            "shape": list(block.attn.cache_shape(k))} for k in kinds}}
-        for i, block in enumerate(decoder.blocks)
-    ]
+    kinds += tuple(f"{kind}_scale" for kind in cache_scales(decoder))
+
+    def entry(attn, kind, i):
+        dtype = attn.key_cache.dtype if kind == "kv" else attn.stored_dtype(kind)
+        return {"input": cache_io_name(kind, i), "output": cache_io_name(kind, i, output=True),
+                "shape": list(attn.cache_shape(kind)), "dtype": _dtype_name(dtype)}
+
+    caches = [{"layer": i, **{k: entry(block.attn, k, i) for k in kinds}} for i, block in enumerate(decoder.blocks)]
     eos = getattr(model_config, "eos_token_id", None) if model_config is not None else None
     return {
         "format": MANIFEST_FORMAT,
@@ -59,9 +88,16 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         "cache_impl": cache_impl,
         "cache_io": cache_impl != "mutable",
         "cache_inplace": cache_impl in ("io_inplace", "io_paged"),
-        "cache_layout": {"io_inplace": "BHSD", "io_paged": "PAGED"}.get(cache_impl, "SHD"),
-        # The allocated cache buffer, not config.dtype (None for configs without one).
-        "cache_dtype": str(decoder.blocks[0].attn.key_cache.dtype).replace("torch.", ""),
+        # present_* are only the new rows; the caller writes them at pos_id (write_cache_rows).
+        "cache_rows": kv_cache.returns_rows,
+        "cache_layout": kv_cache.manifest_layout,
+        # The allocated key-cache buffer, not config.dtype (None for configs without one); every entry of
+        # "caches" has its own dtype (the value cache's differs with a (key, value) precision pair).
+        "cache_dtype": _dtype_name(decoder.blocks[0].attn.key_cache.dtype) if len(decoder.blocks) else None,
+        # "full", "int8"/"int4" (uint8 rows of codes + a 2-byte scale), "fp8" (float8_e4m3fn rows) or
+        # "nvfp4" (float4_e2m1fn_x2 rows + float8_e4m3fn block scales), see blocks/attention/kv_precision;
+        # a [key, value] pair when the two caches are stored differently.
+        "kv_precision": getattr(decoder.blocks[0].attn, "kv_precision", "full") if len(decoder.blocks) else "full",
         "max_cache_len": int(decoder.max_cache_len),
         "num_layers": len(decoder.blocks),
         "add_batch_dim": bool(getattr(wrapper, "add_batch_dim", False)),
@@ -71,6 +107,32 @@ def build_llm_manifest(wrapper: nn.Module, model_config: Any | None, *, backend:
         "vocab_size": int(getattr(model_config, "vocab_size", 0) or 0) if model_config is not None else 0,
         "eos_token_id": eos if isinstance(eos, list) else ([eos] if eos is not None else []),
         "caches": caches,
+        **extra,
+    }
+
+
+ENCODER_MANIFEST_FORMAT = "tsurgeon-encoder/1"
+
+
+def build_encoder_manifest(wrapper: nn.Module, model_config: Any | None, *, backend: str, artifact: str,
+                           input_name: str, input_shape: list[int], input_dtype: str,
+                           output_shape: list[int], output_dtype: str, **extra: Any) -> dict[str, Any]:
+    """Describe an exported encoder's runtime contract: one static input, one output (``logits``)."""
+    encoder = wrapper.encoder
+    labels = getattr(model_config, "id2label", None) if model_config is not None else None
+    return {
+        "format": ENCODER_MANIFEST_FORMAT,
+        "backend": backend,
+        "artifact": os.path.basename(artifact),
+        "structure": "transformer_encoder",
+        "num_layers": len(encoder.blocks),
+        "hidden_size": int(encoder.embed_dim),
+        "attn_impl": getattr(encoder.blocks[0].attn, "attn_impl", None) if len(encoder.blocks) else None,
+        "pooling": wrapper.pooling_name,
+        "inputs": {input_name: {"shape": list(input_shape), "dtype": input_dtype}},
+        "outputs": {"logits": {"shape": list(output_shape), "dtype": output_dtype}},
+        "num_labels": int(output_shape[-1]),
+        "id2label": {str(k): v for k, v in labels.items()} if isinstance(labels, dict) else None,
         **extra,
     }
 
@@ -90,15 +152,35 @@ def load_llm_manifest(artifact_path: str) -> dict[str, Any]:
 def zero_caches_from_manifest(
     manifest: dict[str, Any], device: torch.device | str = "cpu"
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Per-layer zero (key, value) caches with the exported shapes and dtype
-    (io_paged: (kv pools, []) )."""
-    dtype = getattr(torch, manifest["cache_dtype"])
+    """Per-layer zero (key, value) caches with the exported shapes and dtypes, ``(rows, scales)``
+    pairs for a cache with block scales (io_paged: (kv pools, []) )."""
+    def zeros(spec):
+        return device_zeros(spec["shape"], getattr(torch, spec.get("dtype", manifest["cache_dtype"])), device)
+
+    def cache(layer, kind):
+        return (zeros(layer[kind]), zeros(layer[f"{kind}_scale"])) if f"{kind}_scale" in layer else zeros(layer[kind])
+
     if manifest.get("cache_layout") == "PAGED":
-        return [torch.zeros(layer["kv"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]], []
-    keys = [torch.zeros(layer["key"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]]
-    values = [torch.zeros(layer["value"]["shape"], dtype=dtype, device=device) for layer in manifest["caches"]]
-    return keys, values
+        return [zeros(layer["kv"]) for layer in manifest["caches"]], []
+    layers = manifest["caches"]
+    return [cache(layer, "key") for layer in layers], [cache(layer, "value") for layer in layers]
 
 
-__all__ = ["MANIFEST_FORMAT", "manifest_path_for", "cache_io_name", "graph_io_names", "build_llm_manifest", "load_llm_manifest",
-           "zero_caches_from_manifest"]
+def write_cache_rows(cache: torch.Tensor, rows: torch.Tensor, pos_id: torch.Tensor) -> None:
+    """``io_rows`` contract: write the rows a call returned (``present_*``, ``(1, kv_heads, seq, width)``)
+    into the caller's BHSD cache at ``pos_id``, in place. Works inside a CUDA graph (``pos_id`` may
+    live on the device); one-byte rows (uint8, FP8, FP4 pairs) are copied as bytes. A
+    ``(rows, scales)`` cache takes the ``(rows, scales)`` a call returned."""
+    if isinstance(cache, (tuple, list)):
+        for part, part_rows in zip(cache, rows):
+            write_cache_rows(part, part_rows, pos_id)
+        return
+    positions = pos_id.view(-1)[:1] + torch.arange(rows.shape[2], device=rows.device)
+    if cache.element_size() == 1:
+        cache, rows = cache.view(torch.uint8), rows.view(torch.uint8)
+    cache.index_copy_(2, positions, rows)
+
+
+__all__ = ["MANIFEST_FORMAT", "ENCODER_MANIFEST_FORMAT", "build_encoder_manifest", "manifest_path_for", "cache_io_name",
+           "cache_scales", "graph_io_names", "build_llm_manifest", "load_llm_manifest", "zero_caches_from_manifest",
+           "write_cache_rows"]

@@ -40,7 +40,10 @@ _TRT_TO_TORCH_DTYPE = {
     "INT64": torch.int64,
     "BOOL": torch.bool,
     "UINT8": torch.uint8,
+    "FP8": torch.float8_e4m3fn,
 }
+if hasattr(torch, "float4_e2m1fn_x2"):   # recent PyTorch only
+    _TRT_TO_TORCH_DTYPE["FP4"] = torch.float4_e2m1fn_x2   # two values per element: a TensorRT FP4 shape counts values
 
 
 def _logger(verbose: bool):
