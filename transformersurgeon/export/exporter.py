@@ -28,7 +28,7 @@ from ..utils import get_submodule
 from .config import BackendExportConfig
 from .convert import convert_for_export
 from .operations import (check_choice, check_components, check_config_choices, check_config_requirements,
-                         resolve_convert_options)
+                         check_prefill, resolve_convert_options)
 from .wrapper import _normalize_component_devices
 
 EXPORTERS: dict[str, type] = {}
@@ -153,6 +153,7 @@ class Exporter:
             options["max_cache_len"] = config.max_seq_len
         options = resolve_convert_options(self.backend, options)
         check_config_requirements(self.backend, config, options)
+        check_prefill(self.backend, config, options)
 
         encoder = resolve_encoder_components(model_or_graph, convert_options=options, verbose=config.verbose)
         if encoder is not None:

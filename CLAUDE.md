@@ -39,7 +39,7 @@ only `calibration/`; a backend only `export/` (plus new `blocks/` atoms when an 
 - Compressors receive resolved module chains (`CompressionScheme.coupled_target_chains`), never paths.
 - Only `compression/quantization.py` reads the private quantisation state (`export_quant_info`, `copy_quant_state`).
 - Export implementation choices live in `BACKEND_OPERATIONS`, not in exporter code. So do their requirements
-  (`"requires"`, `"per_cache"`), checked by generic functions: never in `lower()`, never `if block_type == ...`.
+  (`"requires"`, `"per_cache"`, `"prefill"`), checked by generic functions: never in `lower()`, never `if block_type == ...`.
 - Tell traced nodes apart by declared names matched exactly (`MHACausal.CACHE_BUFFERS`,
   `LLMWrapper.CACHE_INPUTS`), never by substring. Process-wide workarounds: generic helper in `utils/`.
   (Review fixes of 2026-11-20 to the KV-precision work: AGENTS.md, "Review fixes applied ...".)

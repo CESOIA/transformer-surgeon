@@ -191,8 +191,8 @@ def export_onnx(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
         return export_onnx_encoder(components, config)
     wrapper, model_config, example_inputs = resolve_components_and_wrapper(components)
     cache_impl = wrapper.cache_impl
-    if config.max_input_len > 1 and cache_impl not in ("io_inplace", "io_rows"):
-        raise ValueError("max_input_len > 1 (prompt prefill) requires cache_impl='io_inplace' or 'io_rows'.")
+    # Which caches allow max_input_len > 1 is declared per backend ("prefill" of the kv_cache entry in
+    # export/operations.py) and checked by Exporter.export (check_prefill) before conversion.
 
     # Per-layer quantization metadata; hard-quantized weights are dequantized
     # in place here and re-expressed as Q/DQ after export.

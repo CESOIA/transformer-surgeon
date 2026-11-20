@@ -167,7 +167,7 @@ A TensorRT engine only runs on the GPU architecture + TensorRT version it was bu
 - **Cache:** convert with `cache_impl="io_inplace"`: BHSD `(1, kv_heads, max_cache_len, head_dim)` caches as graph I/O, written by `tsurgeon::kv_cache_update` (`blocks/attention/kv_cache/io_inplace.py`) which exports as opset-24 `TensorScatter`. TensorRT aliases each `present_*` output to its `past_*` input and updates it in place — bind both to the same buffer. `mutable` is rejected (ONNX has no state).
 - **Caller-written cache (`cache_impl="io_rows"`):** same BHSD `past_*` inputs, but the graph only reads them: `present_*` are the new rows `(1, kv_heads, seq, width)` and the runner writes them at `pos_id` (`export/manifest.py::write_cache_rows`; manifest `cache_rows: true`, from the atom's `returns_rows`; `TensorRTLLMSession` does it inside the decode CUDA graph). The stored cache is decoded first and the decoded new rows are placed in the decoded copy with a gather and a select on the slot index (`kv_cache/io_rows.py`), so stored rows never pass through a scatter or select (and no FP4 dequantize feeds a scatter: TensorRT 11.4 cannot compile that for one token). It is the only cache that holds `int8`/`int4`/`fp8`/`nvfp4` rows on TensorRT (see `kv_precision` below); `scripts/tensorrt/export_and_generate.py --kv-precision fp8` (or `nvfp4`) runs it end to end.
 - **Fused decode attention (`cache_impl="io_paged"`, opt-in):** one paged K+V pool per layer `(2, ceil(max_cache_len/128), 128, kv_heads, head_dim)` (`past_kv_i`/`present_kv_i`, bind both to one buffer: the plugin writes in place without declaring the alias) and one `tsurgeon::paged_attention` op per layer (RoPE + cache write + attention over the filled slots; eager implementation in `blocks/attention/kernels/paged.py`). The TensorRT backend maps it to TensorRT Edge-LLM's `AttentionPlugin` (XQA decode kernels, NVRTC-compiled at engine build): decode cost follows the context, not `max_cache_len`, unlike the static-cache MatMul/Softmax path which reads every slot. Needs `EDGELLM_PLUGIN_PATH`, equal q/k/v head dims (head_dim 32/64/128, q:kv 1–8) and unpruned RoPE (within-head pruning keeps per-kv-group frequencies: use `io_inplace`); whole-head pruning works. Decode only (`max_input_len=1`; prompts run token by token). The plain `onnx` backend rejects it (no standard ONNX form).
-- **Prefill:** `max_input_len > 1` makes `input_ids` `(seq,)` dynamic; only `io_inplace` and `io_rows` accept `in_seq_len > 1`. The engine gets two optimization profiles: 0 = decode (seq 1), 1 = prefill.
+- **Prefill:** `max_input_len > 1` makes `input_ids` `(seq,)` dynamic; the caches allowed are declared in `BACKEND_OPERATIONS` (`"prefill"` of the `kv_cache` entry: `io_inplace`, `io_rows`) and checked by `check_prefill`. The engine gets two optimization profiles: 0 = decode (seq 1), 1 = prefill.
 - **Numerics:** use `rmsnorm_upcast=True` (float32 RMSNorm, HF semantics) for fp16 GPU exports; `rmsnorm_prescale=False` alone overflows in fp16.
 - **Quantization:** weight-only. INT4 → blocked `DequantizeLinear` (per-channel scales tiled over 128/64/32 blocks, exact). Plain TensorRT 10.16 has no fast single-token INT4 GEMV, so INT4 decode runs at fp16 speed unless `int4_backend="edgellm_plugin"` (opt-in): eligible layers become TensorRT Edge-LLM's `Int4GroupwiseGemmPluginV2`, and the engine then needs `libNvInfer_edgellm_plugin.so` (`EDGELLM_PLUGIN_PATH`; recorded in the manifest under `plugins`). INT8 weight-only gives no speedup on TensorRT (it folds to fp16). **W8A8 (native INT8 GEMMs):** quantize the layer with `precision_activation=8, method_activation="maxmin", scheme_activation="symmetric", quantize_output_activation=False` and calibration data; the exporter (`apply_activation_quantization`) puts a per-tensor INT8 QuantizeLinear/DequantizeLinear on the GEMM's activation input (an LRD layer: on its V factor's input), recorded as `act_precision` in the manifest's `quantized_layers`. Only symmetric INT8 per-tensor input scales are exportable; output-activation quantization raises.
   Models with massive activations (Qwen2.5 down_proj input amax ~5e3) need **SmoothQuant** first: `manager.set_calibration_data(...)`, then `manager.smooth_activations(alpha=0.5, criteria=...)` *before* `manager.apply` of the quantization (groups from `indexing['smoothing']`: norm→q/k/v, norm→gate/up, up→down; float result unchanged; refuses already-quantized weights). Qwen2.5-1.5B W8A8 all linears: KL vs fp16 1.71 → 0.18 (alpha 0.5).
@@ -681,7 +681,9 @@ Passed to `manager.set()`, `manager.apply()`, `manager.restore()`, etc.:
 13. **Requirements of a backend choice are data in `BACKEND_OPERATIONS`, checked by generic functions.** A
     configuration field that needs other settings declares `"requires": {"config": {...}, "cache_impl": [...]}`
     (checked by `check_config_requirements`); a choice that may differ per cache declares `"per_cache": True`
-    (one option or a `(key, value)` pair, checked by `check_choice`). Functions in `operations.py` never branch on a
+    (one option or a `(key, value)` pair, checked by `check_choice`); the caches an exporter can export as a
+    whole-prompt graph are a per-backend `"prefill"` list on the `kv_cache` entry (checked by `check_prefill`).
+    Functions in `operations.py` never branch on a
     block-type name, and `lower()` never re-checks what the table declares.
 
 ---
@@ -708,7 +710,7 @@ Passed to `manager.set()`, `manager.apply()`, `manager.restore()`, etc.:
 ## Review fixes applied to the KV-precision work (2026-11-20)
 
 Applied while merging `draft-babisant88` into `draft-prolucio` (merge branch `trial/merge-babisant88`); behaviour
-and defaults unchanged, all tests pass (TensorRT env 366 passed; QNN env: every QNN test passes). For the author's
+and defaults unchanged (fix 5: the same caches are accepted as before), all tests pass (TensorRT env 366 passed; QNN env: every QNN test passes). For the author's
 agent: keep these patterns in new code (Coding Invariants 12–13, Anti-Patterns).
 
 | # | Before | After |
@@ -717,10 +719,13 @@ agent: keep these patterns in new code (Coding Invariants 12–13, Anti-Patterns
 | 2 | `operations.py::check_choice` had `if block_type == "kv_precision"` | `"per_cache": True` on the `kv_precision` entry; generic `_per_cache_parts` |
 | 3 | `QNNExporter.lower` checked that `kv_cache_bits` needs `quant_scope="all"`, `float_attention_core=False` | declared as `"requires"` on the QNN `kv_cache_quantization` entry (also `cache_impl in [mutable, io_scatter]`), checked by `check_config_requirements` in `Exporter.export` before tracing; error messages say `... requires quant_scope='all' and float_attention_core=False` / `requires cache_impl in [...]` |
 | 4 | `_keep_gcc_cxx_runtime_global` (ctypes) ran inside `QNNExporter.lower` | generic `utils/native_libs.py::load_into_global_scope`, called from `QNNExporter.check_available` |
+| 5 | `backends/onnx/exporter.py` listed by name the caches allowed for a whole-prompt graph (`max_input_len > 1`; pre-existing, extended with `io_rows`) | `"prefill": [...]` on the `onnx`/`tensorrt` `kv_cache` entries, checked by `operations.py::check_prefill` in `Exporter.export` before conversion; test `test_prefill_caches_are_declared_per_backend` |
 
-Not changed (pre-existing, noted for later): `backends/onnx/exporter.py` lists the prefill-capable caches by name
-(`cache_impl in ("io_inplace", "io_rows")`); the cache atoms' `multi_token` attribute could replace it, but
-`io_paged` is also `multi_token` and has no plain-ONNX translation, so it needs a per-backend entry first.
+
+Why a list and not the caches' `multi_token` flag: `multi_token` says a cache *can* write several tokens per call;
+`prefill` says the backend's exporter *can export* it that way. They differ for `io_paged` (multi-token, but the
+ONNX lowering traces a whole-prompt graph only with separate key/value caches), which with the flag alone would
+pass the check and then fail inside tracing. Every cache listed in `prefill` must be `multi_token` (tested).
 
 ---
 

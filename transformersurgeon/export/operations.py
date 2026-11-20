@@ -11,6 +11,11 @@ the device. It is organised by *block type*; for every backend it gives:
   listed precision needs on that backend (see :func:`required_cache`);
 - ``incompatible`` (optional, ``kv_precision`` only): precisions that cannot store
   the two caches of a ``(key, value)`` pair together on that backend;
+- ``prefill`` (optional, ``kv_cache`` only): the caches with which that backend's
+  exporter can export a whole-prompt graph (``max_input_len > 1``). Each listed cache
+  must be able to write several tokens per call (``multi_token``), but not every such
+  cache is exportable that way (the paged pool is not), so the list is per backend.
+  A backend without the key exports no whole-prompt graph. Checked by :func:`check_prefill`;
 - ``requires`` (optional): what every non-default option of a ``config_field``
   choice needs, ``{"config": {field: value}, "cache_impl": [...]}``, checked by
   :func:`check_config_requirements` before any tracing.
@@ -62,7 +67,7 @@ BACKEND_OPERATIONS = {
                 "io_concat": "ONNX Where on a one-hot position mask.",
                 "io_paged": "Only with a custom translation of tsurgeon::paged_attention "
                             "(the tensorrt backend provides one).",
-            }},
+            }, "prefill": ["io_inplace", "io_rows"]},
             "tensorrt": {"default": "io_inplace", "options": {
                 "io_inplace": "TensorScatter executed in place by TensorRT (output aliased to input).",
                 "io_rows": "Cache as a read-only engine input; the engine returns the new rows and the runner "
@@ -70,7 +75,9 @@ BACKEND_OPERATIONS = {
                 "io_scatter": "TensorRT ScatterND.",
                 "io_concat": "TensorRT Select.",
                 "io_paged": "Paged KV pool of the TensorRT Edge-LLM AttentionPlugin.",
-            }},
+            # io_paged writes several tokens per call (multi_token), but the ONNX lowering shared with onnx traces
+            # the whole-prompt graph only with separate key/value caches, not with one paged pool per layer.
+            }, "prefill": ["io_inplace", "io_rows"]},
         },
     },
     "kv_precision": {
@@ -379,6 +386,18 @@ def check_config_choices(backend, config):
             check_choice(backend, block_type, getattr(config, field_name))
 
 
+def check_prefill(backend, config, convert_options):
+    """Raise ``ValueError`` if ``config`` asks for a whole-prompt graph (``max_input_len > 1``) with a cache that
+    the backend's exporter cannot export that way (``prefill`` of its ``kv_cache`` entry)."""
+    if int(getattr(config, "max_input_len", 1) or 1) <= 1:
+        return
+    allowed = _entry("kv_cache", backend).get("prefill", [])
+    cache = convert_options.get("cache_impl")
+    if cache not in allowed:
+        raise ValueError(f"max_input_len > 1 (prompt prefill) on the {backend} backend requires cache_impl in "
+                         f"{allowed} (got {cache!r}). See transformersurgeon/export/operations.py.")
+
+
 def check_config_requirements(backend, config, convert_options=None):
     """Raise ``ValueError`` if a non-default ``config_field`` choice lacks what its backend entry
     ``requires``: other configuration values, and (with ``convert_options``, resolved) a cache atom."""
@@ -457,5 +476,5 @@ def check_components(backend, decoder):
 
 __all__ = [
     "BACKENDS", "BACKEND_OPERATIONS", "default_for", "options_for", "config_default", "required_cache",
-    "check_kv_combination", "check_choice", "check_config_choices", "check_config_requirements", "resolve_convert_options", "check_components",
+    "check_kv_combination", "check_choice", "check_config_choices", "check_config_requirements", "check_prefill", "resolve_convert_options", "check_components",
 ]
