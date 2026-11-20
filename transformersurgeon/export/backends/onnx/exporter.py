@@ -28,6 +28,8 @@ requires it -- it aliases them and updates in place).
 Encoder models (``export/wrapper.py::EncoderWrapper``) have a static contract:
 
   inputs   pixel_values (1, C, H, W) model dtype   (or input_ids (1, seq) int64)
+           rank_<group> (r,) int32                 one per runtime rank group (export/runtime_ranks.py):
+                                                   its length r is the group's active rank
   outputs  logits       (1, num_outputs)
 
 With ``cache_impl="io_rows"`` the graph only reads past_*: present_* hold the new
@@ -57,6 +59,7 @@ from ...exporter import Exporter, register_exporter
 from ...manifest import build_encoder_manifest, build_llm_manifest, cache_scales, graph_io_names
 from ...quant_info import extract_layer_quant_info
 from ...result import BackendExportResult, finalize_export_result
+from ...runtime_ranks import RANK_INPUT_DTYPE, resolve_runtime_ranks, runtime_rank_dynamic_shapes
 from ...wrapper import resolve_components_and_wrapper, resolve_encoder_wrapper
 from .quantization import apply_activation_quantization, apply_weight_quantization
 
@@ -153,6 +156,11 @@ class ONNXExportConfig(BackendExportConfig):
     input_shape        - encoder models only: shape of the (static) graph
                          input; default (1, num_channels, image_size,
                          image_size) for image models, (1, 128) otherwise.
+    runtime_ranks      - encoder models only: {group: (min, opt, max)} of the
+                         runtime rank groups exposed as graph inputs
+                         (rank_<group>, export/runtime_ranks.py); a None range
+                         is (1, stored, stored). None (default) exposes every
+                         group the model has, {} none (stored ranks).
     int4_block_size    - INT4 weight DQ block size along in_features. None
                          keeps tsurgeon's per-channel scales exactly; a block
                          size (e.g. 128, what INT4 GEMM kernels expect)
@@ -165,6 +173,7 @@ class ONNXExportConfig(BackendExportConfig):
     optimize: bool = True
     int4_block_size: int | None = None
     input_shape: tuple[int, ...] | None = None
+    runtime_ranks: dict[str, tuple[int, int, int] | None] | None = None
     custom_translations: dict[Any, Callable] = field(default_factory=dict)
     graph_passes: list[Callable] = field(default_factory=list)
 
@@ -286,10 +295,15 @@ def _save_and_finalize(model, manifest, wrapper, model_config, config, quantized
 
 def export_onnx_encoder(components: dict, config: ONNXExportConfig) -> ONNXExportResult:
     """ONNX lowering of encoder components (static single-input graph, see the module docstring)."""
-    wrapper, model_config, example_inputs = resolve_encoder_wrapper(components, input_shape=config.input_shape)
+    modules = torch.nn.ModuleDict({k: components[k] for k in ("embedding", "encoder", "final_layer")
+                                   if components.get(k) is not None})
+    runtime_ranks = resolve_runtime_ranks(modules, config.runtime_ranks)
+    wrapper, model_config, example_inputs = resolve_encoder_wrapper(components, input_shape=config.input_shape,
+                                                                    runtime_ranks=runtime_ranks)
     layer_info = extract_layer_quant_info(wrapper)
     x = example_inputs[0]
     input_name = "input_ids" if x.dtype == torch.long else "pixel_values"
+    rank_inputs = [spec["input"] for spec in runtime_ranks.values()]
     with torch.no_grad():
         logits = wrapper(*example_inputs)
 
@@ -298,8 +312,10 @@ def export_onnx_encoder(components: dict, config: ONNXExportConfig) -> ONNXExpor
         example_inputs,
         dynamo=True,
         opset_version=config.opset,
-        input_names=[input_name],
+        input_names=[input_name, *rank_inputs],
         output_names=["logits"],
+        # forward(x, *ranks): torch.export sees the rank inputs as one tuple argument.
+        dynamic_shapes=(None, runtime_rank_dynamic_shapes(runtime_ranks)) if runtime_ranks else None,
         custom_translation_table={**default_translations(), **config.custom_translations},
         optimize=config.optimize,
         verbose=config.verbose,
@@ -313,6 +329,8 @@ def export_onnx_encoder(components: dict, config: ONNXExportConfig) -> ONNXExpor
         wrapper, model_config, backend=config.backend, artifact=config.output_path,
         input_name=input_name, input_shape=list(x.shape), input_dtype=str(x.dtype).replace("torch.", ""),
         output_shape=list(logits.shape), output_dtype=str(logits.dtype).replace("torch.", ""),
+        runtime_ranks=runtime_ranks,
+        rank_input_dtype=str(RANK_INPUT_DTYPE).replace("torch.", ""),
         precision="mixed" if quantized else "full",
         onnx_file=os.path.basename(config.output_path),
         opset=config.opset,

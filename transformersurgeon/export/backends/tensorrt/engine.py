@@ -250,10 +250,12 @@ class TensorRTEngineRunner:
     def output_shape(self, name: str) -> tuple[int, ...]:
         return tuple(self.context.get_tensor_shape(name))
 
-    def bind(self, tensors: Mapping[str, torch.Tensor]) -> None:
+    def bind(self, tensors: Mapping[str, torch.Tensor], *, keep_graphs: bool = False) -> None:
         """Record tensor addresses (and dynamic input shapes) on the context.
 
-        Invalidates captured graphs: they hold the previous addresses.
+        Invalidates captured graphs (they hold the previous addresses) unless
+        ``keep_graphs``: for a caller that only changes input *shapes* over the
+        same buffers (prefixes of one allocation) and keys one graph per shape.
         """
         for name, tensor in tensors.items():
             if not tensor.is_contiguous():
@@ -268,7 +270,8 @@ class TensorRTEngineRunner:
                 self.context.set_input_shape(name, tuple(tensor.shape))
             self.context.set_tensor_address(name, tensor.data_ptr())
             self._bound[name] = tensor
-        self._graphs.clear()
+        if not keep_graphs:
+            self._graphs.clear()
 
     def allocate_outputs(self, skip: Iterable[str] = ()) -> dict[str, torch.Tensor]:
         """Allocate (and bind) device buffers for every output not in ``skip``."""

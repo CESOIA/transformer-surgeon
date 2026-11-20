@@ -18,7 +18,18 @@ Static activation quantization (apply_activation_quantization): a layer whose
 input activation was calibrated by tsurgeon (``act_scale``; INT8 symmetric,
 per-tensor) gets QuantizeLinear -> DequantizeLinear on the activation input of
 its GEMM. TensorRT fuses Q/DQ(x) + DQ(W) into a native INT8 GEMM (W8A8) with a
-float output. For an LRD layer the calibrated input is the one of its V factor.
+float output. For an LRD layer the calibrated input is the one of its V factor;
+a calibrated inner activation (``act_hidden_scale``, h = V x) gets the same Q/DQ
+on the input of the U factor's GEMM, so both factors are INT8 GEMMs.
+
+Runtime-rank layers (``export/runtime_ranks.py``) read their factors through a
+``Slice`` sized by a graph input. Weights are followed through Slice/Transpose/
+Cast to their GEMMs. An INT8 per-channel weight whose *rows* (output channels)
+are sliced -- the V factor -- cannot keep a per-channel DequantizeLinear in front
+of the Slice (TensorRT then runs the GEMM in fp16) nor slice its scales (TensorRT
+needs constant DQ scales). It is written instead as a per-tensor DequantizeLinear
+at the largest channel scale, and the GEMM output is multiplied by the sliced
+ratios ``scale / max(scale)``: the same numbers, and a native INT8 GEMM.
 """
 
 import warnings
@@ -50,6 +61,74 @@ def _find_initializer(model, name: str):
         if init.name == name:
             return init
     return None
+
+
+# Operations a weight may pass through between its initializer and the GEMM that reads it.
+_WEIGHT_PATH_OPS = ("DequantizeLinear", "Slice", "Transpose", "Cast", "Identity")
+
+
+def _weight_gemms(model, tensor_name: str) -> list[tuple[Any, list]]:
+    """``(gemm, path)`` for every Gemm/MatMul reading ``tensor_name`` as its B input, directly or through
+    ``_WEIGHT_PATH_OPS`` (``path``: those nodes, in order)."""
+    consumers: dict[str, list] = {}
+    for node in model.graph.node:
+        for name in node.input:
+            consumers.setdefault(name, []).append(node)
+    found, stack = [], [(tensor_name, [])]
+    while stack:
+        name, path = stack.pop()
+        for node in consumers.get(name, []):
+            if node.op_type in ("Gemm", "MatMul") and len(node.input) > 1 and node.input[1] == name:
+                found.append((node, path))
+            elif node.op_type in _WEIGHT_PATH_OPS and node.input[0] == name:
+                stack.append((node.output[0], path + [node]))
+    return found
+
+
+def _const_ints(model, name: str):
+    """Values of a constant int tensor (initializer or Constant node output), or None."""
+    from onnx import numpy_helper
+
+    init = _find_initializer(model, name)
+    if init is not None:
+        return [int(v) for v in numpy_helper.to_array(init).reshape(-1)]
+    for node in model.graph.node:
+        if node.op_type == "Constant" and node.output[0] == name:
+            for attr in node.attribute:
+                if attr.name == "value":
+                    return [int(v) for v in numpy_helper.to_array(attr.t).reshape(-1)]
+                if attr.name in ("value_int", "value_ints"):
+                    return list(attr.ints) if attr.name == "value_ints" else [int(attr.i)]
+    return None
+
+
+def _row_slices(model, weight_name: str):
+    """Slice nodes cutting the rows (axis 0) of a 2-D weight, or None if a row slice cannot be rewritten
+    (not a plain bias-free ``Gemm(transB=1)`` behind it, or non-constant axes)."""
+    from onnx import helper
+
+    slices = []
+    for gemm, path in _weight_gemms(model, weight_name):
+        sliced = any(n.op_type == "Slice" for n in path)
+        if sliced and any(n.op_type == "Transpose" for n in path):
+            return None   # which axis the slice cuts is not traced through transposes
+        cuts = []
+        for node in path:
+            if node.op_type != "Slice":
+                continue
+            axes = _const_ints(model, node.input[3]) if len(node.input) > 3 and node.input[3] else [0, 1]
+            if axes is None:
+                return None
+            if any(a in (0, -2) for a in axes):
+                cuts.append(node)
+        if not cuts:
+            continue
+        attrs = {a.name: helper.get_attribute_value(a) for a in gemm.attribute}
+        if (len(cuts) != 1 or gemm.op_type != "Gemm" or attrs.get("transB", 0) != 1 or attrs.get("transA", 0)
+                or (len(gemm.input) > 2 and gemm.input[2])):
+            return None
+        slices.append((cuts[0], gemm))
+    return slices
 
 
 def apply_weight_quantization(model, layer_info: dict[str, dict[str, Any]], *, int4_block_size: int | None = None) -> dict[str, dict[str, Any]]:
@@ -108,10 +187,39 @@ def apply_weight_quantization(model, layer_info: dict[str, dict[str, Any]], *, i
         elif precision == 8:
             q = np.clip(np.rint(w / scale[:, None]), qmin, qmax).astype(np.int8)
             q_init = numpy_helper.from_array(q, weight_name + "_q")
-            scale_init = numpy_helper.from_array(scale.astype(float_dtype), weight_name + "_scale")
-            dq = helper.make_node("DequantizeLinear", [q_init.name, scale_init.name], [weight_name + "_dq"],
-                                  axis=0, name=weight_name + "_DequantizeLinear")
-            granularity = "per_channel"
+            row_slices = _row_slices(model, weight_name)
+            if row_slices is None:
+                warnings.warn(f"ONNX export: {layer_name} has sliced rows behind a pattern the INT8 rewrite does "
+                              "not handle; kept a per-channel DequantizeLinear (TensorRT may run it in fp16).",
+                              stacklevel=2)
+                row_slices = []
+            if row_slices:
+                # Per-tensor DQ at the largest scale; the per-row ratios scale the GEMM output (module docstring).
+                peak = float(scale.max())
+                scale_init = numpy_helper.from_array(np.array(peak, dtype=float_dtype), weight_name + "_scale")
+                ratio = numpy_helper.from_array((scale / peak).astype(float_dtype), weight_name + "_row_ratio")
+                axis0 = numpy_helper.from_array(np.array([0], np.int64), weight_name + "_row_axis")
+                model.graph.initializer.extend([ratio, axis0])
+                dq = helper.make_node("DequantizeLinear", [q_init.name, scale_init.name], [weight_name + "_dq"],
+                                      name=weight_name + "_DequantizeLinear")
+                for k, (cut, gemm) in enumerate(row_slices):
+                    steps = [cut.input[4]] if len(cut.input) > 4 and cut.input[4] else []
+                    ratio_k = f"{weight_name}_row_ratio_{k}"
+                    raw = f"{gemm.output[0]}_unscaled"
+                    out = gemm.output[0]
+                    gemm.output[0] = raw
+                    at = list(model.graph.node).index(gemm) + 1
+                    model.graph.node.insert(at, helper.make_node(
+                        "Slice", [ratio.name, cut.input[1], cut.input[2], axis0.name, *steps], [ratio_k],
+                        name=ratio_k + "_Slice"))
+                    model.graph.node.insert(at + 1, helper.make_node("Mul", [raw, ratio_k], [out],
+                                                                     name=f"{weight_name}_row_scale_{k}"))
+                granularity = "per_channel_row_sliced"
+            else:
+                scale_init = numpy_helper.from_array(scale.astype(float_dtype), weight_name + "_scale")
+                dq = helper.make_node("DequantizeLinear", [q_init.name, scale_init.name], [weight_name + "_dq"],
+                                      axis=0, name=weight_name + "_DequantizeLinear")
+                granularity = "per_channel"
         else:
             if int4_block_size is None:
                 # Per-channel INT4, expressed as blocks that all repeat the
@@ -152,20 +260,68 @@ def apply_weight_quantization(model, layer_info: dict[str, dict[str, Any]], *, i
 
 
 def _gemm_consumers(model, weight_name: str) -> list:
-    """GEMM nodes reading ``weight_name`` (or its weight DequantizeLinear output) as their B input."""
-    names = {weight_name, weight_name + "_dq"}
-    return [n for n in model.graph.node
-            if n.op_type in ("Gemm", "MatMul") and len(n.input) > 1 and n.input[1] in names]
+    """GEMM nodes reading ``weight_name`` (float, or after its Q/DQ rewrite) as their B input."""
+    root = weight_name if _find_initializer(model, weight_name) is not None else weight_name + "_q"
+    gemms = []
+    for gemm, _ in _weight_gemms(model, root):
+        if gemm not in gemms:
+            gemms.append(gemm)
+    return gemms
+
+
+def _static_int8_scale(layer_name: str, what: str, scale, zero_point, precision, scheme) -> float:
+    """The per-tensor scale of a static INT8 symmetric activation, or raise if it is not one."""
+    zp = zero_point.detach().reshape(-1)
+    if int(precision) != 8 or scheme != "symmetric" or bool((zp != 0).any()):
+        raise NotImplementedError(
+            f"ONNX/TensorRT export: {layer_name} {what} is {precision}-bit {scheme}; only INT8 "
+            "symmetric (zero point 0) is supported.")
+    scale = scale.detach().float().reshape(-1)
+    if scale.numel() != 1:
+        raise NotImplementedError(f"ONNX/TensorRT export: {layer_name} {what} scale is not per-tensor.")
+    return scale.item()
+
+
+def _insert_input_qdq(model, consumers: list, scale: float, prefix: str, float_dtype) -> None:
+    """QuantizeLinear -> DequantizeLinear on input 0 of every node in ``consumers`` (one shared scale)."""
+    from onnx import helper, numpy_helper
+
+    s_init = numpy_helper.from_array(np.array(scale, dtype=float_dtype), prefix + "_scale")
+    z_init = numpy_helper.from_array(np.array(0, dtype=np.int8), prefix + "_zero_point")
+    model.graph.initializer.extend([s_init, z_init])
+    new_nodes = []
+    for k, node in enumerate(consumers):
+        x = node.input[0]
+        q_out, dq_out = f"{prefix}{k}_q", f"{prefix}{k}_dq"
+        new_nodes.append(helper.make_node("QuantizeLinear", [x, s_init.name, z_init.name], [q_out],
+                                          name=f"{prefix}{k}_QuantizeLinear"))
+        new_nodes.append(helper.make_node("DequantizeLinear", [q_out, s_init.name, z_init.name], [dq_out],
+                                          name=f"{prefix}{k}_DequantizeLinear"))
+        node.input[0] = dq_out
+    # Keep the graph topologically sorted: Q/DQ go right before their first consumer.
+    first = min(list(model.graph.node).index(n) for n in consumers)
+    for j, n in enumerate(new_nodes):
+        model.graph.node.insert(first + j, n)
+
+
+def _float_dtype(model, target: str):
+    from onnx import numpy_helper
+
+    w = _find_initializer(model, target + "_scale")
+    if w is None:
+        w = _find_initializer(model, target)
+    float_dtype = numpy_helper.to_array(w).dtype
+    if float_dtype not in (np.float16, np.float32):
+        raise RuntimeError(f"ONNX export: unexpected float dtype {float_dtype} for {target}.")
+    return float_dtype
 
 
 def apply_activation_quantization(model, layer_info: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Insert static INT8 Q/DQ on the activation input of calibrated linears (in place).
 
-    Returns {layer_name: {"act_precision", "act_granularity"}} for the layers rewritten.
-    Only symmetric INT8 per-tensor scales are expressible for TensorRT (zero point 0).
+    Returns {layer_name: {"act_precision", "act_granularity"[, "act_hidden_precision"]}} for the layers
+    rewritten. Only symmetric INT8 per-tensor scales are expressible for TensorRT (zero point 0).
     """
-    from onnx import helper, numpy_helper
-
     done: dict[str, dict[str, Any]] = {}
     for layer_name, info in layer_info.items():
         if info.get("act_scale") is None:
@@ -174,15 +330,8 @@ def apply_activation_quantization(model, layer_info: dict[str, dict[str, Any]]) 
             raise NotImplementedError(
                 f"ONNX/TensorRT export: {layer_name} has output-activation quantization; TensorRT INT8 "
                 "GEMMs write float outputs (quantize the input only: quantize_output_activation=False).")
-        precision, scheme = int(info["act_precision"]), info["act_scheme"]
-        zp = info["act_zero_point"].detach().reshape(-1)
-        if precision != 8 or scheme != "symmetric" or bool((zp != 0).any()):
-            raise NotImplementedError(
-                f"ONNX/TensorRT export: {layer_name} activation is {precision}-bit {scheme}; only INT8 "
-                "symmetric (zero point 0) is supported.")
-        scale = info["act_scale"].detach().float().reshape(-1)
-        if scale.numel() != 1:
-            raise NotImplementedError(f"ONNX/TensorRT export: {layer_name} activation scale is not per-tensor.")
+        scale = _static_int8_scale(layer_name, "activation", info["act_scale"], info["act_zero_point"],
+                                   info["act_precision"], info["act_scheme"])
         # The module input feeds the V factor of an LRD layer.
         target = f"{layer_name}.linear_V.weight"
         if _find_initializer(model, target) is None and _find_initializer(model, target + "_q") is None:
@@ -190,30 +339,20 @@ def apply_activation_quantization(model, layer_info: dict[str, dict[str, Any]]) 
         consumers = _gemm_consumers(model, target)
         if not consumers:
             raise RuntimeError(f"ONNX export: no GEMM reads '{target}'; cannot place {layer_name}'s activation Q/DQ.")
-        w = _find_initializer(model, target + "_scale")
-        if w is None:
-            w = _find_initializer(model, target)
-        float_dtype = numpy_helper.to_array(w).dtype
-        if float_dtype not in (np.float16, np.float32):
-            raise RuntimeError(f"ONNX export: unexpected float dtype {float_dtype} for {target}.")
-        prefix = f"{layer_name}.act"
-        s_init = numpy_helper.from_array(np.array(scale.item(), dtype=float_dtype), prefix + "_scale")
-        z_init = numpy_helper.from_array(np.array(0, dtype=np.int8), prefix + "_zero_point")
-        model.graph.initializer.extend([s_init, z_init])
-        new_nodes = []
-        for k, node in enumerate(consumers):
-            x = node.input[0]
-            q_out, dq_out = f"{prefix}{k}_q", f"{prefix}{k}_dq"
-            new_nodes.append(helper.make_node("QuantizeLinear", [x, s_init.name, z_init.name], [q_out],
-                                              name=f"{prefix}{k}_QuantizeLinear"))
-            new_nodes.append(helper.make_node("DequantizeLinear", [q_out, s_init.name, z_init.name], [dq_out],
-                                              name=f"{prefix}{k}_DequantizeLinear"))
-            node.input[0] = dq_out
-        # Keep the graph topologically sorted: Q/DQ go right before their first consumer.
-        first = min(list(model.graph.node).index(n) for n in consumers)
-        for j, n in enumerate(new_nodes):
-            model.graph.node.insert(first + j, n)
+        _insert_input_qdq(model, consumers, scale, f"{layer_name}.act", _float_dtype(model, target))
         done[layer_name] = {"act_precision": 8, "act_granularity": "per_tensor"}
+
+        if info.get("act_hidden_scale") is not None:
+            # Inner activation h = V x: the input of the U factor's GEMM.
+            hidden = _static_int8_scale(layer_name, "inner activation", info["act_hidden_scale"],
+                                        info["act_hidden_zero_point"], info["act_hidden_precision"],
+                                        info["act_hidden_scheme"])
+            u = f"{layer_name}.weight"
+            u_consumers = _gemm_consumers(model, u)
+            if not u_consumers:
+                raise RuntimeError(f"ONNX export: no GEMM reads '{u}'; cannot place {layer_name}'s inner Q/DQ.")
+            _insert_input_qdq(model, u_consumers, hidden, f"{layer_name}.act_hidden", _float_dtype(model, u))
+            done[layer_name]["act_hidden_precision"] = 8
     return done
 
 

@@ -116,10 +116,15 @@ ENCODER_MANIFEST_FORMAT = "tsurgeon-encoder/1"
 
 def build_encoder_manifest(wrapper: nn.Module, model_config: Any | None, *, backend: str, artifact: str,
                            input_name: str, input_shape: list[int], input_dtype: str,
-                           output_shape: list[int], output_dtype: str, **extra: Any) -> dict[str, Any]:
-    """Describe an exported encoder's runtime contract: one static input, one output (``logits``)."""
+                           output_shape: list[int], output_dtype: str, runtime_ranks: dict | None = None,
+                           rank_input_dtype: str = "int32", **extra: Any) -> dict[str, Any]:
+    """Describe an exported encoder's runtime contract: one static input, one output (``logits``),
+    plus one ``rank_<group>`` input per runtime rank group (``runtime_ranks``: its range and layers)."""
     encoder = wrapper.encoder
     labels = getattr(model_config, "id2label", None) if model_config is not None else None
+    inputs = {input_name: {"shape": list(input_shape), "dtype": input_dtype}}
+    for group, spec in (runtime_ranks or {}).items():
+        inputs[spec["input"]] = {"shape": [spec["input"]], "dtype": rank_input_dtype, "runtime_rank_group": group}
     return {
         "format": ENCODER_MANIFEST_FORMAT,
         "backend": backend,
@@ -129,7 +134,8 @@ def build_encoder_manifest(wrapper: nn.Module, model_config: Any | None, *, back
         "hidden_size": int(encoder.embed_dim),
         "attn_impl": getattr(encoder.blocks[0].attn, "attn_impl", None) if len(encoder.blocks) else None,
         "pooling": wrapper.pooling_name,
-        "inputs": {input_name: {"shape": list(input_shape), "dtype": input_dtype}},
+        "inputs": inputs,
+        "runtime_ranks": dict(runtime_ranks or {}),
         "outputs": {"logits": {"shape": list(output_shape), "dtype": output_dtype}},
         "num_labels": int(output_shape[-1]),
         "id2label": {str(k): v for k, v in labels.items()} if isinstance(labels, dict) else None,

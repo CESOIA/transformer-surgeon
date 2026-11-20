@@ -7,3 +7,4 @@ from .exporter import (
     engine_profiles,
     export_tensorrt,
 )
+from .encoder_session import TensorRTEncoderSession

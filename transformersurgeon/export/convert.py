@@ -188,6 +188,7 @@ def _layer_spec(module):
         "out_features": module.out_features,
         "rank": getattr(module, "rank", "full"),
         "bias": getattr(module, "bias", None) is not None,
+        "runtime_rank_group": getattr(module, "runtime_rank_group", None),
     }
 
 

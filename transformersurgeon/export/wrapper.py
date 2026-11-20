@@ -8,10 +8,14 @@ input embedding, converted encoder stack, token pooling and output head, one
 call per input.
 """
 
-from typing import Any
+from contextlib import nullcontext
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
+
+from ..blocks.layers import active_ranks
+from .runtime_ranks import runtime_rank_example_inputs
 
 
 def _graph_io_cache(decoder):
@@ -163,9 +167,13 @@ class EncoderWrapper(nn.Module):
     ``(1, seq, hidden)``, the encoder stack works on ``(seq, hidden)``, the
     pooling atom (``blocks/heads``, named by the model dictionary's ``pooling``)
     reduces it to ``(1, features)`` and the head gives ``(1, num_outputs)``.
+
+    ``rank_groups`` names the runtime rank groups (``export/runtime_ranks.py``) taken as extra inputs,
+    in order: ``forward(x, *ranks)``, each rank a 1-D tensor whose length is the group's active rank.
     """
 
-    def __init__(self, embedding: nn.Module, encoder: nn.Module, final_layer: nn.Module, pooling: str = "cls"):
+    def __init__(self, embedding: nn.Module, encoder: nn.Module, final_layer: nn.Module, pooling: str = "cls",
+                 rank_groups: tuple[str, ...] = ()):
         super().__init__()
         from ..blocks import build_block
 
@@ -174,10 +182,15 @@ class EncoderWrapper(nn.Module):
         self.pooling_name = pooling
         self.pooling = build_block("pooling", pooling)
         self.final_layer = final_layer if final_layer is not None else nn.Identity()
+        self.rank_groups = tuple(rank_groups)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden = self.encoder(self.embedding(x)[0])
-        return self.final_layer(self.pooling(hidden))
+    def forward(self, x: torch.Tensor, *ranks: torch.Tensor) -> torch.Tensor:
+        if len(ranks) != len(self.rank_groups):
+            raise TypeError(f"EncoderWrapper takes {len(self.rank_groups)} rank inputs {self.rank_groups}, "
+                            f"got {len(ranks)}.")
+        with active_ranks(dict(zip(self.rank_groups, ranks))) if ranks else nullcontext():
+            hidden = self.encoder(self.embedding(x)[0])
+            return self.final_layer(self.pooling(hidden))
 
 
 def build_encoder_example_inputs(model_config: Any | None, embedding: nn.Module, *,
@@ -200,13 +213,18 @@ def build_encoder_example_inputs(model_config: Any | None, embedding: nn.Module,
     return (torch.randint(0, vocab_size, tuple(input_shape or (1, 128)), dtype=torch.long),)
 
 
-def resolve_encoder_wrapper(components: dict, *, input_shape: tuple[int, ...] | None = None):
-    """``(wrapper, model_config, example_inputs)`` for resolved encoder components."""
+def resolve_encoder_wrapper(components: dict, *, input_shape: tuple[int, ...] | None = None,
+                            runtime_ranks: Mapping[str, dict] | None = None):
+    """``(wrapper, model_config, example_inputs)`` for resolved encoder components.
+
+    ``runtime_ranks`` (from ``resolve_runtime_ranks``) adds one rank input per group after the model input.
+    """
+    runtime_ranks = runtime_ranks or {}
     wrapper = EncoderWrapper(components["embedding"], components["encoder"], components["final_layer"],
-                             components.get("pooling", "cls")).eval()
+                             components.get("pooling", "cls"), rank_groups=tuple(runtime_ranks)).eval()
     model_config = components.get("config")
-    return wrapper, model_config, build_encoder_example_inputs(model_config, wrapper.embedding,
-                                                               input_shape=input_shape)
+    inputs = build_encoder_example_inputs(model_config, wrapper.embedding, input_shape=input_shape)
+    return wrapper, model_config, inputs + runtime_rank_example_inputs(runtime_ranks)
 
 
 __all__ = [

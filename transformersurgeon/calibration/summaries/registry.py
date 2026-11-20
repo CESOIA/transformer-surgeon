@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .activation_range import ActivationRangeSummary, OutputActivationRangeSummary
+from .activation_range import ActivationRangeSummary, LowRankHiddenRangeSummary, OutputActivationRangeSummary
 from .covariance import CovarianceSummary, CrossCovarianceSummary, ShiftedCovarianceSummary
 from .input_sq_mean import InputSqMeanSummary
 from .input_mean import InputMeanSummary
@@ -29,6 +29,8 @@ SUMMARY_REGISTRY = {
     "activation_range": ActivationRangeSummary(),
     # Running min/max of output activations, used by output-side static fake-quant.
     "output_activation_range": OutputActivationRangeSummary(),
+    # Running min/max of the inner activation h = V x of low-rank layers (static quantisation of U's input).
+    "lrd_hidden_activation_range": LowRankHiddenRangeSummary(),
     # Raw module weight parameter, captured via the generic calibration forward-hook pipeline.
     "weight": WeightSummary(),
     # Raw module bias parameter, captured via the generic calibration forward-hook pipeline.

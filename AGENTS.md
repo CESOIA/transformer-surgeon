@@ -176,6 +176,34 @@ A TensorRT engine only runs on the GPU architecture + TensorRT version it was bu
 
 Tests: `test/export/test_exporter.py` (ONNX, TensorRT, graph passes), `test/blocks/test_attention.py` (cache and kernel atoms), gated by `requires_onnx` / `requires_tensorrt` / `requires_edgellm_plugin`. Benchmark workspace with the Edge-LLM vendor baseline: `../trt-models/`.
 
+### LRD encoders on TensorRT: quantized factors and runtime rank (2026-11-20)
+
+Branch `draft-prolucio-lrd-export` (study: `../ambra-benchmark/`, ViT-B/16 CIFAR-100, L4). Tests:
+`test/blocks/test_runtime_rank.py`, `test/compression/test_lrd_export_options.py`, `test/export/test_runtime_rank_export.py`.
+
+- **W8A8 of LRD layers.** Activation Q/DQ on the V input (as before) and, with `quantize_lrd_hidden_activation`,
+  on the U input (`act_hidden_*` in `export_quant_info`, `apply_activation_quantization`). Both factors become
+  `i8i32` GEMMs.
+- **Run-time SmoothQuant.** `indexing['runtime_smoothing']` lists consumers whose input has no foldable producer
+  (ViT `mlp.fc2` after GELU). `smooth_activations(runtime_alpha=...)` gives them `LinearCompressed.set_input_scale(1/s)`,
+  a first forward pre-hook (calibration and fake-quant see the scaled input) exported as a `Mul`, and multiplies
+  the input columns (V for LRD) by `s`. ViT now has `smoothing` (LN→qkv, LN→fc1, v→o) and `runtime_smoothing`.
+- **Runtime rank.** LRD option `runtime_rank_group` + `blocks/layers/runtime_rank.py` (`active_ranks`, a context:
+  no atom signature changes). `ONNXExportConfig.runtime_ranks={group: (min, opt, max)}` (default: every group)
+  adds `rank_<group>` inputs (`export/runtime_ranks.py`, int32, the *length* is the rank; `EncoderWrapper.forward(x, *ranks)`),
+  manifest `runtime_ranks`. The factors are read through `Slice`. Measured on TensorRT 10.16: one dynamic profile
+  slices (copies) the weights on every run, about 2x slower than a static engine; `TensorRTExportConfig.rank_profiles`
+  adds fixed-rank profiles (TensorRT folds the slices: static speed, but each profile stores its sliced weights),
+  recorded in the manifest. `TensorRTEncoderSession` (`export/backends/tensorrt/encoder_session.py`) picks the
+  profile, keeps one CUDA graph per rank setting (same buffers, so switching is free) and `set_ranks` at run time.
+- **Slice-aware Q/DQ.** Weights are followed through Slice/Transpose/Cast to their GEMMs. A row-sliced INT8
+  per-channel weight (V) becomes a per-tensor DQ at the max scale plus a `Mul` of the GEMM output by the sliced
+  ratios (a per-channel DQ before the Slice runs fp16; TensorRT rejects sliced DQ scales).
+- `fp32_accumulate_lrd` (default True) targets M=1 GEMVs; on encoders (M=197) it only slows the engine
+  (LRD r=512 ViT: 2.03 vs 1.71 ms on L4): pass `False`.
+- Not done: Conv Q/DQ (patch embedding stays fp16), runtime ranks in decoder exports (`LLMWrapper` has no
+  rank inputs: layers run at their stored rank), Edge-LLM INT4 plugin with sliced weights (falls back to DQ).
+
 ### XNNPACK: `attn_impl` — optimized causal attention
 
 `MHACausal` (`blocks/attention/causal.py`) supports three attention-kernel atoms (`blocks/attention/kernels/`) via `attn_impl` in `convert_options`, orthogonal to `cache_impl`:
@@ -493,6 +521,7 @@ method/parameter actually does, see [docs/compression_methods.md](docs/compressi
 | `rank` | `"full"` | `int` (1 to `in_features`), or `"full"` |
 | `method` | `"svd"` | `"svd"`, `"svd-llm-v2"`, `"aa-svd"` |
 | `eps` | `1e-6` | `float > 0` |
+| `runtime_rank_group` | `None` | `None` or a label: the layer keeps its factors at `rank` and runs with its first `r` components inside `blocks.layers.active_ranks({label: r})`; an encoder export gets one `rank_<label>` input per label. Only `ORDERED_METHODS` (`svd`, `svd-llm-v2`: a prefix of the components is the rank-`r` solution) |
 
 Calibration requirements by method:
 
@@ -630,6 +659,8 @@ Pruning masks survive `restore()` for STE fine-tuning. Call `manager.remove_mask
 | `method_activation` | `"maxmin"` | `"maxmin"` (static, calibrated hooks), `"dynamic_per_token"` (int8 asym per-token at run time; hard only, no calibration) |
 | `scheme_activation` | `"asymmetric"` | `"symmetric"`, `"asymmetric"` |
 | `quantize_output_activation` | `True` | `False` = static quantization of the input only (TensorRT W8A8) |
+| `lrd_factor_calibration` | `"independent"` | LRD layers (V quantized first): `"independent"` (U with `V C Vᵀ`, float V), `"sequential"` (U with `Vq C Vqᵀ`), `"refit"` (U least-squares refitted to the float layer through `Vq`, then quantized; best for W4). The last two need `"covariance"` whatever the method |
+| `quantize_lrd_hidden_activation` | `False` | LRD layers only (set it with criteria selecting them): also quantize the inner activation `h = V x` (hook point `lrd_hidden`, summary `lrd_hidden_activation_range`), so both factors are INT8 GEMMs on TensorRT |
 | `eps` | `1e-6` | `float > 0` |
 
 **Hard apply is computed by tsurgeon, not torchao** (`_apply_hard_quantization`).

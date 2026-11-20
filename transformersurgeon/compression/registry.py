@@ -33,6 +33,7 @@ from .lrd import (
     validate_lrd_rank,
     validate_lrd_method,
     validate_lrd_eps,
+    validate_lrd_runtime_rank_group,
 )
 from .quantization import (
     Quantizer,
@@ -47,6 +48,8 @@ from .quantization import (
     validate_qat,
     validate_quantization_group_scale_bits,
     validate_activation_scheme,
+    validate_lrd_factor_calibration,
+    validate_quantize_lrd_hidden_activation,
 )
 
 COMPRESSOR_DICT = {
@@ -138,6 +141,10 @@ COMPRESSION_REGISTRY = {
         "rank": dict(default="full", validator=validate_lrd_rank),
         "method": dict(default="svd", validator=validate_lrd_method),
         "eps": dict(default=1e-6, validator=validate_lrd_eps),
+        # runtime_rank_group: label of a runtime rank knob. The layer keeps its factors at `rank` and, inside
+        # blocks.layers.active_ranks({label: r}), runs with its first r components (an exported graph gets one
+        # rank input per label). Only for methods whose components are sorted by importance (lrd_methods.ORDERED_METHODS).
+        "runtime_rank_group": dict(default=None, validator=validate_lrd_runtime_rank_group),
     },
     "quantization": {
         "method": dict(default="vanilla", validator=validate_quantization_method),
@@ -160,6 +167,11 @@ COMPRESSION_REGISTRY = {
         "quantize_output_activation": dict(default=True, validator=validate_quantize_output_activation),
         # Binary QAT: keep the latent float weight and train a per-channel scale through an STE (precision="binary").
         "qat": dict(default=False, validator=validate_qat),
+        # LRD layers: how U is calibrated once V is quantized ("independent", "sequential", "refit"; see quantization.py).
+        "lrd_factor_calibration": dict(default="independent", validator=validate_lrd_factor_calibration),
+        # LRD layers only: also quantize the inner activation h = V x (the U factor's input), like the input
+        # activation; set it with criteria selecting the factorised layers (it needs their calibration).
+        "quantize_lrd_hidden_activation": dict(default=False, validator=validate_quantize_lrd_hidden_activation),
     }
 }
 

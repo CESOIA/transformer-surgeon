@@ -35,7 +35,8 @@ transformersurgeon/
 │   └── datasets.py         token-window calibration loaders (WikiText-2)
 ├── blocks/         export-ready transformer, split into selectable atoms
 │   ├── catalog.py          BLOCK_CATALOG: family -> atom -> {object, summary, implements, selected_by}
-│   ├── layers/             LinearCompressed, EmbeddingCompressed, Conv2d/3dCompressed, LowRankMixin, VCONBlock, AtomicSum, LayerScale
+│   ├── layers/             LinearCompressed, EmbeddingCompressed, Conv2d/3dCompressed, LowRankMixin, VCONBlock, AtomicSum, LayerScale,
+│   │                       runtime_rank (active_ranks: runtime-selectable LRD rank)
 │   ├── norm/               rmsnorm, rmsnorm_prescaled, rmsnorm_upcast, layernorm
 │   ├── mlp/                plain, gated, activations
 │   ├── positions/          rope, frequency tables, rope_pruning
@@ -47,6 +48,7 @@ transformersurgeon/
 ├── export/         from compressed model to device artifact
 │   ├── operations.py       BACKEND_OPERATIONS: block type -> device operation per backend
 │   ├── convert.py          convert_for_export: HF model -> blocks/ stacks
+│   ├── runtime_ranks.py    rank_<group> graph inputs of runtime-rank LRD layers
 │   ├── exporter.py         Exporter, register_exporter, export_to_backend
 │   ├── wrapper.py, quant_info.py, pt2e.py, pt2e_linear_quantizer.py, checks.py, manifest.py, result.py
 │   └── backends/           executorch_base.py, xnnpack.py, qnn/, onnx/, tensorrt/

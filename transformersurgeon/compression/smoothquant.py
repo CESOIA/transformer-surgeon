@@ -15,6 +15,13 @@ indexing under ``'smoothing'`` (producer path -> consumer paths). A producer mus
 reach its consumers through operations that commute with a per-channel scale:
 a norm directly, or ``up_proj`` through ``act(gate) * up``.
 
+A consumer whose input has no such producer (its input comes out of a non-linearity,
+e.g. the down projection of a GELU MLP) is declared under ``'runtime_smoothing'``
+(a list of consumer paths): its scale cannot be folded into a weight, so the layer
+divides its input by ``s`` at run time (``LinearCompressed.set_input_scale(1/s)``,
+a per-channel ``Mul`` that backends fuse into the preceding element-wise kernel)
+and its input columns are multiplied by ``s``. The float result is unchanged too.
+
 This is a weight transform applied once on the HF ``*_c`` model, before
 quantization (whose activation calibration then sees the smoothed ranges). It
 leaves weights in place and float, so every later step (quantization, convert,
@@ -44,26 +51,37 @@ def _check_float(t: torch.Tensor, what: str) -> None:
         raise RuntimeError(f"SmoothQuant: {what} is already quantized; smooth before quantization.")
 
 
-def resolve_smoothing_groups(model: nn.Module, indexing: dict, consumers_filter=None) -> list[dict]:
-    """[{block, producer, producer_path, consumers: [(path, module)]}] for every block.
+def resolve_smoothing_groups(model: nn.Module, indexing: dict, consumers_filter=None,
+                             runtime: bool = False) -> list[dict]:
+    """[{block, producer, producer_path, consumers: [(path, module)], runtime}] for every block.
 
     ``consumers_filter(module_path) -> bool`` keeps a group only if it accepts
     *all* its consumers (a producer scale must be compensated in every reader).
+    With ``runtime`` the ``'runtime_smoothing'`` consumers are added too, one
+    group each with no producer (``runtime=True``).
     """
     groups = []
     for block_indexing in indexing.values():
-        spec = block_indexing.get("smoothing")
-        if not spec:
+        spec = block_indexing.get("smoothing") or {}
+        runtime_spec = block_indexing.get("runtime_smoothing", []) if runtime else []
+        if not spec and not runtime_spec:
             continue
         num_blocks = getattr(get_block_config(model.config, block_indexing), block_indexing["num_blocks_attr"])
         template = block_indexing["path_template"]
         for i in range(num_blocks):
+            for consumer in runtime_spec:
+                full = template.format(block_index=i, path=consumer)
+                if consumers_filter is not None and not consumers_filter(full):
+                    continue
+                groups.append({"block": i, "producer_path": None, "producer": None, "runtime": True,
+                               "consumers": [(consumer, get_submodule(model, full))]})
             for producer, consumers in spec.items():
                 full = [template.format(block_index=i, path=c) for c in consumers]
                 if consumers_filter is not None and not all(consumers_filter(f) for f in full):
                     continue
                 groups.append({
                     "block": i,
+                    "runtime": False,
                     "producer_path": producer,
                     "producer": get_submodule(model, template.format(block_index=i, path=producer)),
                     "consumers": [(c, get_submodule(model, template.format(block_index=i, path=c))) for c in consumers],
@@ -74,22 +92,30 @@ def resolve_smoothing_groups(model: nn.Module, indexing: dict, consumers_filter=
 @torch.no_grad()
 def apply_smoothquant(model: nn.Module, indexing: dict, calibration_data, alpha: float = 0.5,
                       consumers_filter=None, max_batches: Optional[int] = None,
-                      min_scale: float = 1e-5) -> dict:
+                      min_scale: float = 1e-5, runtime: bool = True,
+                      runtime_alpha: Optional[float] = None) -> dict:
     """Smooth every indexing-declared (producer -> consumers) group in place.
 
-    Returns a summary {"alpha", "groups": n, "max_input_absmax_before"/"_after" per
-    consumer path} for logging. Raises if a weight is already quantized.
+    ``runtime`` also smooths the ``'runtime_smoothing'`` consumers (run-time input
+    scale, see the module docstring) with ``runtime_alpha`` (default ``alpha``).
+    Returns a summary {"alpha", "runtime_alpha", "groups": n, "runtime_groups": n,
+    "max_input_absmax_before"/"_after" per consumer path} for logging. Raises if a
+    weight is already quantized.
     """
-    if not 0.0 <= alpha <= 1.0:
-        raise ValueError(f"SmoothQuant alpha must be in [0, 1], got {alpha}.")
-    groups = resolve_smoothing_groups(model, indexing, consumers_filter)
+    runtime_alpha = alpha if runtime_alpha is None else runtime_alpha
+    for a in (alpha, runtime_alpha):
+        if not 0.0 <= a <= 1.0:
+            raise ValueError(f"SmoothQuant alpha must be in [0, 1], got {a}.")
+    groups = resolve_smoothing_groups(model, indexing, consumers_filter, runtime=runtime)
     if not groups:
-        return {"alpha": alpha, "groups": 0}
+        return {"alpha": alpha, "runtime_alpha": runtime_alpha, "groups": 0, "runtime_groups": 0}
     # One representative reader per group: all consumers read the same tensor.
     readers = [g["consumers"][0][1] for g in groups]
     absmax = collect_input_absmax(model, readers, calibration_data, max_batches=max_batches)
 
-    summary = {"alpha": alpha, "groups": len(groups), "max_input_absmax_before": {}, "max_input_absmax_after": {}}
+    summary = {"alpha": alpha, "runtime_alpha": runtime_alpha, "groups": sum(not g["runtime"] for g in groups),
+               "runtime_groups": sum(g["runtime"] for g in groups),
+               "max_input_absmax_before": {}, "max_input_absmax_after": {}}
     for g in groups:
         x_max = absmax[g["consumers"][0][1]]
         weights = [_input_weight(m) for _, m in g["consumers"]]
@@ -99,11 +125,21 @@ def apply_smoothquant(model: nn.Module, indexing: dict, calibration_data, alpha:
                 raise RuntimeError(f"SmoothQuant: block {g['block']} {path} reads {w.shape[1]} channels, "
                                    f"calibrated input has {x_max.numel()}.")
         w_max = torch.stack([w.detach().float().abs().amax(0).cpu() for w in weights]).amax(0)
-        s = (x_max.clamp_min(min_scale) ** alpha / w_max.clamp_min(min_scale) ** (1 - alpha)).clamp_min(min_scale)
+        a = runtime_alpha if g["runtime"] else alpha
+        s = (x_max.clamp_min(min_scale) ** a / w_max.clamp_min(min_scale) ** (1 - a)).clamp_min(min_scale)
         s = torch.where((x_max > 0) & (w_max > 0), s, torch.ones_like(s))  # dead channels: leave alone
 
         prod = g["producer"]
-        if isinstance(prod, nn.Linear) or hasattr(prod, "linear_V"):
+        if g["runtime"]:
+            # No producer to fold into: the consumer divides its input by s at run time
+            # (composed with an input scale it may already have).
+            path, consumer = g["consumers"][0]
+            if not hasattr(consumer, "set_input_scale"):
+                raise RuntimeError(f"SmoothQuant: block {g['block']} {path} cannot scale its input at run time.")
+            previous = getattr(consumer, "input_scale", None)
+            previous = previous.detach().float().cpu() if previous is not None else torch.ones_like(s)
+            consumer.set_input_scale(previous / s)
+        elif isinstance(prod, nn.Linear) or hasattr(prod, "linear_V"):
             # Output rows of the producer (U factor for LRD); bias follows its rows.
             _check_float(prod.weight, f"block {g['block']} {g['producer_path']}")
             if prod.weight.shape[0] != s.numel():

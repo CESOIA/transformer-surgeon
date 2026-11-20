@@ -32,10 +32,11 @@ def _lrd_layer_prefixes(model: onnx.ModelProto) -> set[str]:
 
 
 def _weight_source(node, producers) -> str:
-    """Name of a GEMM's weight tensor, looking through a DequantizeLinear/Cast/Transpose."""
+    """Name of a GEMM's weight tensor, looking through a DequantizeLinear/Cast/Transpose/Slice
+    (a runtime-rank layer slices its factors)."""
     w = node.input[1]
     seen = 0
-    while w in producers and producers[w].op_type in ("DequantizeLinear", "Cast", "Transpose") and seen < 3:
+    while w in producers and producers[w].op_type in ("DequantizeLinear", "Cast", "Transpose", "Slice") and seen < 4:
         w = producers[w].input[0]
         seen += 1
     return w

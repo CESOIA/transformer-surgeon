@@ -21,6 +21,14 @@ VALID_GRANULARITIES = ["per_tensor", "per_channel", "per_group"]
 CALIBRATED_METHOD_DICT = {
     "gptq": ("covariance",),
 }
+# How the two factors of a low-rank (LRD) layer y = U (V x) are calibrated (both are quantized, V first):
+#   "independent" each factor on the float model: V with the input covariance C, U with V C V^T (float V);
+#   "sequential"  U with the covariance of the input it really sees, Vq C Vq^T (Vq = the quantized V);
+#   "refit"       "sequential" plus a least-squares refit of U to the float layer before quantizing it,
+#                 U' = U (V C Vq^T) (Vq C Vq^T + damp)^-1, so U absorbs the error of the quantized V.
+# The last two need the input covariance whatever the method (the refit also applies to RTN).
+VALID_LRD_FACTOR_CALIBRATIONS = ["independent", "sequential", "refit"]
+_LRD_REFIT_DAMP = 0.01  # diagonal damping of the refit, as a fraction of the mean diagonal (GPTQ's percdamp)
 
 
 
@@ -31,6 +39,7 @@ CALIBRATED_METHOD_DICT = {
 QUANT_RUNTIME_BUFFERS = (
     "_act_quant_scale", "_act_quant_zero_point",
     "_act_out_quant_scale", "_act_out_quant_zero_point",
+    "_act_hidden_quant_scale", "_act_hidden_quant_zero_point",
     "_torchao_scale",
 )
 QUANT_RUNTIME_ATTRS = (
@@ -39,6 +48,7 @@ QUANT_RUNTIME_ATTRS = (
     "_soft_quant_precision",
     "_act_quant_precision", "_act_quant_method", "_act_quant_scheme",
     "_act_out_quant_precision", "_act_out_quant_method", "_act_out_quant_scheme",
+    "_act_hidden_quant_precision", "_act_hidden_quant_method", "_act_hidden_quant_scheme",
 )
 
 
@@ -61,6 +71,10 @@ class Quantizer(Compressor):
         self.quantize_output_activation = self.config.get("quantize_output_activation", True)
         # qat: keep the latent float weight trainable and fake-quantise in forward (binary precision only).
         self.qat = self.config.get("qat", False)
+        self.lrd_factor_calibration = self.config.get("lrd_factor_calibration", "independent")
+        # Static quantization of the inner activation h = V x of an LRD layer (its U factor's input),
+        # with the same precision/method/scheme as the input activation.
+        self.quantize_lrd_hidden_activation = self.config.get("quantize_lrd_hidden_activation", False)
         self.calibration_store = None
 
     def set_calibration_store(self, calibration_data):
@@ -68,11 +82,15 @@ class Quantizer(Compressor):
 
     def needs_calibration(self):
         summaries = list(CALIBRATED_METHOD_DICT.get(self.method, ()))
+        if self._to_compress() and self.lrd_factor_calibration != "independent" and "covariance" not in summaries:
+            summaries.append("covariance")
         if self.precision_activation != "full" and self.method_activation != "dynamic_per_token":
             if "activation_range" not in summaries:
                 summaries.append("activation_range")
             if self.quantize_output_activation and "output_activation_range" not in summaries:
                 summaries.append("output_activation_range")
+            if self.quantize_lrd_hidden_activation:
+                summaries.append("lrd_hidden_activation_range")
         return tuple(summaries)
 
     def apply(self, module, hard=False, soft_applied=False):
@@ -101,6 +119,8 @@ class Quantizer(Compressor):
             validate_quantization_eps(eps)
             validate_quantization_granularity(granularity)
             validate_quantization_group_scale_bits(self.group_scale_bits)
+            validate_lrd_factor_calibration(self.lrd_factor_calibration)
+            self.config["lrd_factor_calibration"] = self.lrd_factor_calibration
             if self.group_scale_bits is not None and (granularity != "per_group" or method != "vanilla"):
                 raise NotImplementedError("group_scale_bits (LPBQ-style group scales) needs "
                                           "granularity='per_group' and method='vanilla'.")
@@ -121,34 +141,18 @@ class Quantizer(Compressor):
                     group_scale_bits=self.group_scale_bits,
                     dynamic_activation=(precision_activation != "full"
                                         and method_activation == "dynamic_per_token"),
+                    lrd_factor_calibration=self.lrd_factor_calibration,
+                    covariance=self._store("covariance"),
                 )
             elif self.qat and not soft_applied:
                 self._apply_binary_qat(module, method, precision, granularity, eps)
             elif not soft_applied:
                 # Soft-path: fake-quant via dequantize.
-                for name, param in module.named_parameters():
-                    if name not in ["weight", "linear_V.weight"]:
-                        continue
-
-                    calibration_kwargs = {}
-                    if method in CALIBRATED_METHOD_DICT and self.calibration_store:
-                        for key in CALIBRATED_METHOD_DICT[method]:
-                            if key in self.calibration_store:
-                                calibration_kwargs[key] = self.calibration_store[key]
-
-                    # When quantizing the U factor (weight) of an LRD-decomposed layer,
-                    # the effective input to U is h = V·x, not x itself.
-                    # The correct Hessian is C_U = V @ E[x^Tx] @ V^T, derived from
-                    # the single calibration pass covariance and the already-computed V.
-                    if (
-                        name == "weight"
-                        and isinstance(getattr(module, "rank", "full"), int)
-                        and "covariance" in calibration_kwargs
-                    ):
-                        V = module.linear_V.weight.data.float()
-                        C = calibration_kwargs["covariance"].float()
-                        calibration_kwargs = {**calibration_kwargs, "covariance": V @ C @ V.T}
-
+                for owner, attr, calibration_kwargs, source in _factor_targets(
+                        module, self._calibration_kwargs(method), self.lrd_factor_calibration,
+                        self._store("covariance")):
+                    param = getattr(owner, attr)
+                    calibration_kwargs = dict(calibration_kwargs)
                     if granularity == "per_group":
                         if method not in ("vanilla", "gptq", "hqq"):
                             raise NotImplementedError(f"per_group granularity is not implemented for method={method!r}.")
@@ -156,7 +160,7 @@ class Quantizer(Compressor):
                         if self.group_scale_bits is not None:
                             calibration_kwargs["group_scale_bits"] = self.group_scale_bits
                     qdata, scale, dequantize_fn = METHOD_FUNCTIONS[method](
-                        param.data, precision, eps, granularity, **calibration_kwargs
+                        source.to(param.dtype), precision, eps, granularity, **calibration_kwargs
                     )
 
                     qweight = dequantize_fn(qdata, scale)
@@ -198,8 +202,10 @@ class Quantizer(Compressor):
                 act_min, act_max, precision_activation, scheme_activation
             )
 
-            module.register_buffer("_act_quant_scale", scale)
-            module.register_buffer("_act_quant_zero_point", zero_point)
+            # Calibration statistics may live on the CPU (offload_to_cpu); the buffers follow the layer.
+            device = _layer_device(module)
+            module.register_buffer("_act_quant_scale", scale.to(device))
+            module.register_buffer("_act_quant_zero_point", zero_point.to(device))
             module._act_quant_precision = precision_activation
             module._act_quant_method = method_activation
             module._act_quant_scheme = scheme_activation
@@ -210,6 +216,30 @@ class Quantizer(Compressor):
 
             module._act_quant_hook_handle = module.register_forward_pre_hook(
                 _make_fake_quant_hook("_act_quant", precision_activation, scheme_activation)
+            )
+
+        # Inner activation h = V x of an LRD layer: fake-quant on the layer's lrd_hidden hook point.
+        validate_quantize_lrd_hidden_activation(self.quantize_lrd_hidden_activation)
+        self.config["quantize_lrd_hidden_activation"] = self.quantize_lrd_hidden_activation
+        if (precision_activation != "full" and self.quantize_lrd_hidden_activation
+                and isinstance(getattr(module, "rank", "full"), int)):
+            if self.calibration_store is None or "lrd_hidden_activation_range" not in self.calibration_store:
+                raise RuntimeError(
+                    "Quantizing the inner LRD activation requires calibration data on the factorised layer "
+                    "(apply the LRD first, then calibrate and apply the quantization).")
+            hidden_range = self.calibration_store["lrd_hidden_activation_range"]
+            h_scale, h_zero_point = ACT_METHOD_FUNCTIONS[method_activation](
+                hidden_range["min"].float(), hidden_range["max"].float(), precision_activation, scheme_activation)
+            point = module.lrd_hidden
+            point.register_buffer("_act_hidden_quant_scale", h_scale.to(_layer_device(module)))
+            point.register_buffer("_act_hidden_quant_zero_point", h_zero_point.to(_layer_device(module)))
+            module._act_hidden_quant_precision = precision_activation
+            module._act_hidden_quant_method = method_activation
+            module._act_hidden_quant_scheme = scheme_activation
+            if hasattr(point, "_act_hidden_quant_hook_handle"):
+                point._act_hidden_quant_hook_handle.remove()
+            point._act_hidden_quant_hook_handle = point.register_forward_hook(
+                _make_fake_quant_hook("_act_hidden_quant", precision_activation, scheme_activation, output=True)
             )
 
         # Output activation fake-quant emulation via forward post-hook.
@@ -229,8 +259,8 @@ class Quantizer(Compressor):
                 out_min, out_max, precision_activation, scheme_activation
             )
 
-            module.register_buffer("_act_out_quant_scale", out_scale)
-            module.register_buffer("_act_out_quant_zero_point", out_zero_point)
+            module.register_buffer("_act_out_quant_scale", out_scale.to(_layer_device(module)))
+            module.register_buffer("_act_out_quant_zero_point", out_zero_point.to(_layer_device(module)))
             module._act_out_quant_precision = precision_activation
             module._act_out_quant_method = method_activation
             module._act_out_quant_scheme = scheme_activation
@@ -270,6 +300,9 @@ class Quantizer(Compressor):
         module._soft_quant_precision = precision
         self.config["qat"] = True
 
+    def _store(self, key):
+        return self.calibration_store.get(key) if self.calibration_store else None
+
     def _calibration_kwargs(self, method):
         kw = {}
         if method in CALIBRATED_METHOD_DICT and self.calibration_store:
@@ -293,6 +326,8 @@ class Quantizer(Compressor):
         self.config["method_activation"] = "maxmin"
         self.config["scheme_activation"] = "asymmetric"
         self.config["quantize_output_activation"] = True
+        self.config["lrd_factor_calibration"] = "independent"
+        self.config["quantize_lrd_hidden_activation"] = False
         self.strip_runtime_state(module)
 
     def strip_runtime_state(self, module):
@@ -309,9 +344,15 @@ class Quantizer(Compressor):
         if hasattr(module, "_act_out_quant_hook_handle"):
             module._act_out_quant_hook_handle.remove()
             del module._act_out_quant_hook_handle
-        for attr in QUANT_RUNTIME_BUFFERS + QUANT_RUNTIME_ATTRS:
-            if hasattr(module, attr):
-                delattr(module, attr)
+        for owner in (module, getattr(module, "lrd_hidden", None)):
+            if owner is None:
+                continue
+            if hasattr(owner, "_act_hidden_quant_hook_handle"):
+                owner._act_hidden_quant_hook_handle.remove()
+                del owner._act_hidden_quant_hook_handle
+            for attr in QUANT_RUNTIME_BUFFERS + QUANT_RUNTIME_ATTRS:
+                if hasattr(owner, attr):
+                    delattr(owner, attr)
 
     def prepare_for_save(self, module):
         self.strip_runtime_state(module)
@@ -326,6 +367,67 @@ class Quantizer(Compressor):
             f"method_activation='{self.method_activation}', precision_activation={self.precision_activation}, "
             f"scheme_activation='{self.scheme_activation}')"
         )
+
+
+def _layer_device(module) -> torch.device:
+    weight = getattr(module, "weight", None)
+    return weight.device if isinstance(weight, torch.Tensor) else torch.device("cpu")
+
+
+def _dequantized(weight: torch.Tensor) -> torch.Tensor:
+    """Float values of a (possibly torchao-quantized) weight."""
+    if type(weight) is not torch.Tensor and type(weight) is not nn.Parameter and hasattr(weight, "dequantize"):
+        return weight.dequantize()
+    data = weight.data
+    if type(data) is not torch.Tensor and hasattr(data, "dequantize"):
+        return data.dequantize()
+    return data
+
+
+def _lrd_u_calibration(U, V, Vq, kwargs, mode, covariance):
+    """(weight to quantize, method kwargs) for the U factor of an LRD layer, given its float V and quantized Vq.
+
+    ``covariance`` is the layer-input covariance C (``None``: nothing to project, U is quantized as is).
+    See ``VALID_LRD_FACTOR_CALIBRATIONS``.
+    """
+    if covariance is None:
+        if mode != "independent":
+            raise RuntimeError(f"lrd_factor_calibration={mode!r} needs the input covariance (calibration data).")
+        return U, kwargs
+    C = covariance.float().to(V.device)
+    V = V.float()
+    if mode == "independent":
+        H, target = V @ C @ V.T, U
+    else:
+        Vq = Vq.float().to(V.device)
+        H = Vq @ C @ Vq.T
+        target = U
+        if mode == "refit":
+            A = H.clone()
+            A.diagonal().add_(_LRD_REFIT_DAMP * A.diagonal().mean())
+            L = torch.linalg.cholesky(A)
+            target = torch.cholesky_solve((U.float() @ (V @ C @ Vq.T)).T, L).T
+    kwargs = dict(kwargs)
+    if "covariance" in kwargs:      # only methods that use it receive it
+        kwargs["covariance"] = H
+    return target, kwargs
+
+
+def _factor_targets(module, kwargs, mode, covariance):
+    """Yield ``(owner, attribute, method kwargs, float source)`` for every weight of ``module`` to quantize.
+
+    A dense layer yields its weight. An LRD layer yields V (with the layer-input calibration), then U
+    (``_lrd_u_calibration``); the caller quantizes each target before asking for the next one, so U is
+    computed from the already quantized V.
+    """
+    V = getattr(module, "linear_V", None)
+    if V is None or not isinstance(getattr(module, "rank", "full"), int):
+        yield module, "weight", kwargs, module.weight.data
+        return
+    v_float = V.weight.data.float().clone()
+    yield V, "weight", kwargs, V.weight.data
+    u, kw_u = _lrd_u_calibration(module.weight.data, v_float, _dequantized(V.weight), kwargs, mode, covariance)
+    yield module, "weight", kw_u, u
 
 
 def _make_fake_quant_hook(prefix: str, precision: int, scheme: str, output: bool = False):
@@ -509,6 +611,19 @@ def _extract_act_quant_info(module: nn.Linear, info: dict) -> None:
     else:
         info["act_out_scale"] = None
 
+    # Inner activation h = V x of an LRD layer (the input of its U factor).
+    point = getattr(module, "lrd_hidden", None)
+    if point is not None and hasattr(point, "_act_hidden_quant_scale"):
+        info["act_hidden_scale"]      = point._act_hidden_quant_scale.detach().clone()
+        info["act_hidden_zero_point"] = point._act_hidden_quant_zero_point.detach().clone()
+        info["act_hidden_precision"]  = module._act_hidden_quant_precision
+        info["act_hidden_scheme"]     = module._act_hidden_quant_scheme
+        if hasattr(point, "_act_hidden_quant_hook_handle"):
+            point._act_hidden_quant_hook_handle.remove()
+            del point._act_hidden_quant_hook_handle
+    else:
+        info["act_hidden_scale"] = None
+
 
 
 def extract_torchao_scale(w: torch.Tensor) -> torch.Tensor | None:
@@ -526,15 +641,16 @@ def extract_torchao_scale(w: torch.Tensor) -> torch.Tensor | None:
 
 
 def _apply_hard_quantization(module, method, precision, granularity, group_size, eps,
-                             calibration_kwargs, dynamic_activation=False, group_scale_bits=None) -> None:
+                             calibration_kwargs, dynamic_activation=False, group_scale_bits=None,
+                             lrd_factor_calibration="independent", covariance=None) -> None:
     """Hard quantization computed by tsurgeon's own method functions.
 
     The integer weights and scales come from METHOD_FUNCTIONS[method] (vanilla
     RTN, GPTQ, HQQ); torchao is only the *container*: each weight becomes an
     ``IntxUnpackedToInt8Tensor`` holding exactly those integers/scales (scale
     stored in the weight dtype), so the eager model and every exporter see the
-    same numbers. For an LRD layer both factors are quantized (the U factor
-    with the covariance projected through V, as in the soft path).
+    same numbers. For an LRD layer both factors are quantized, V first, U as
+    ``lrd_factor_calibration`` says (as in the soft path; see ``_factor_targets``).
     ``dynamic_activation`` marks the tensor for int8 asymmetric per-token
     dynamic activation quantization (eager simulation == XNNPACK 8daXw).
     """
@@ -546,19 +662,11 @@ def _apply_hard_quantization(module, method, precision, granularity, group_size,
     if not (isinstance(precision, int) and 2 <= precision <= 8):
         raise ValueError(f"Hard quantization needs an int precision in [2, 8]; got {precision!r}.")
 
-    targets = [(module, "weight", calibration_kwargs)]
-    V = getattr(module, "linear_V", None)
-    if V is not None:
-        kw_u = dict(calibration_kwargs)
-        if "covariance" in kw_u:
-            v = V.weight.data.float()
-            kw_u["covariance"] = v @ kw_u["covariance"].float().to(v.device) @ v.T
-        targets = [(module, "weight", kw_u), (V, "weight", calibration_kwargs)]
-
-    for mod, attr, kw in targets:
+    for mod, attr, kw, source in _factor_targets(module, calibration_kwargs, lrd_factor_calibration, covariance):
         w = getattr(mod, attr).data
         if type(w) is not torch.Tensor:
             raise RuntimeError(f"{type(mod).__name__}.{attr} is already quantized.")
+        w = source.to(w.dtype)
         extra = dict(kw)
         if granularity == "per_group":
             extra["group_size"] = group_size
@@ -603,6 +711,8 @@ validate_quantization_group_size = positive_int("Quantization group_size")
 validate_quantization_group_scale_bits = positive_int("group_scale_bits", allow_none=True, high=8)
 validate_quantize_output_activation = boolean("quantize_output_activation")
 validate_qat = boolean("qat")
+validate_lrd_factor_calibration = one_of("lrd_factor_calibration", VALID_LRD_FACTOR_CALIBRATIONS)
+validate_quantize_lrd_hidden_activation = boolean("quantize_lrd_hidden_activation")
 validate_activation_scheme = one_of("Activation scheme", VALID_ACTIVATION_SCHEMES)
 
 __all__ = [
@@ -619,4 +729,6 @@ __all__ = [
     "validate_activation_scheme",
     "validate_quantize_output_activation",
     "validate_qat",
+    "validate_lrd_factor_calibration",
+    "validate_quantize_lrd_hidden_activation",
 ]

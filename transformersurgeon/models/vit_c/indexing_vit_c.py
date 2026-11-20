@@ -75,6 +75,16 @@ VIT_C_INDEXING = {
             # mask through them (see CoupledPruner.apply_chain).
             'norm_layers': ['layernorm_before', 'layernorm_after'],
         },
+        # SmoothQuant groups (compression/smoothquant.py): producer -> consumers reading its
+        # output through per-channel-commuting operations. The attention mix is linear per
+        # channel, so v_proj's output rows can absorb o_proj's input scale.
+        'smoothing': {
+            'layernorm_before': ['attention.q_proj', 'attention.k_proj', 'attention.v_proj'],
+            'layernorm_after': ['mlp.fc1'],
+            'attention.v_proj': ['attention.o_proj'],
+        },
+        # fc2 reads the GELU output: no producer to fold a scale into, so it is applied at run time.
+        'runtime_smoothing': ['mlp.fc2'],
         'path_template': "vit.layers.{block_index}.{path}",
         'preprocessing': "vit.embeddings",
         'preprocessing_conv': "vit.embeddings.patch_embeddings.projection",

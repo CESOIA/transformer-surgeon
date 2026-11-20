@@ -2,7 +2,7 @@ import torch
 
 from .validators import one_of, positive_int, positive_number
 from .abstract import Compressor
-from .lrd_methods import METHOD_FUNCTIONS
+from .lrd_methods import METHOD_FUNCTIONS, ORDERED_METHODS
 
 
 VALID_METHODS = list(METHOD_FUNCTIONS)  # lrd_methods/ is the single list of methods
@@ -18,6 +18,7 @@ class LRDer(Compressor):
         self.rank = self.config["rank"]
         self.method = self.config.get("method", "svd")
         self.eps = self.config.get("eps", 1e-6)
+        self.runtime_rank_group = self.config.get("runtime_rank_group", None)
         self.calibration_store = None
 
     def set_calibration_store(self, calibration_data):
@@ -39,6 +40,11 @@ class LRDer(Compressor):
         validate_lrd_rank(rank)
         validate_lrd_method(method)
         validate_lrd_eps(eps)
+        validate_lrd_runtime_rank_group(self.runtime_rank_group)
+        if self.runtime_rank_group is not None and method not in ORDERED_METHODS:
+            raise ValueError(f"runtime_rank_group needs factors sorted by importance; LRD method {method!r} "
+                             f"does not give them (ordered methods: {list(ORDERED_METHODS)}).")
+        self.config["runtime_rank_group"] = self.runtime_rank_group
 
         self.config["rank"] = rank
         self.config["method"] = method
@@ -90,6 +96,9 @@ class LRDer(Compressor):
                 module.weight[:, :rank].copy_(US_r)
                 module.linear_V.weight.data.copy_(V_r)
 
+        if rank:
+            module.runtime_rank_group = self.runtime_rank_group
+
         if hard:
             # The two-matmul topology (weight @ weight_2) is already the efficient
             # deployed form. Soft and hard LRD are structurally identical — this
@@ -102,6 +111,7 @@ class LRDer(Compressor):
 
         if not self._to_compress():
             self.config["rank"] = "full"
+        module.runtime_rank_group = None
 
         if not hasattr(module, "linear_V") or module.linear_V is None:
             raise AttributeError("Module does not have 'linear_V' attribute required for LRD restoration.")
@@ -115,7 +125,8 @@ class LRDer(Compressor):
         return self.rank != "full"
 
     def __repr__(self):
-        return f"LRDer(rank={self.rank}, method='{self.method}')"
+        group = f", runtime_rank_group={self.runtime_rank_group!r}" if self.runtime_rank_group is not None else ""
+        return f"LRDer(rank={self.rank}, method='{self.method}'{group})"
 
 
 ### CONFIGURATION VALIDATORS ###
@@ -124,9 +135,16 @@ validate_lrd_rank = positive_int("LRD rank", also=["full"], allow_none=True)
 validate_lrd_method = one_of("LRD method", VALID_METHODS)
 validate_lrd_eps = positive_number("LRD eps")
 
+
+def validate_lrd_runtime_rank_group(value) -> None:
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError(f"LRD runtime_rank_group must be None or a non-empty string, but got {value!r}.")
+
+
 __all__ = [
     "LRDer",
     "validate_lrd_method",
     "validate_lrd_rank",
     "validate_lrd_eps",
+    "validate_lrd_runtime_rank_group",
 ]

@@ -38,3 +38,10 @@ class OutputActivationRangeSummary(_RangeSummary):
 
     name = "output_activation_range"
     required_raw_data = ("output_activation",)
+
+
+class LowRankHiddenRangeSummary(_RangeSummary):
+    """Range of the inner activation ``h = V x`` of a low-rank layer (static quantisation of its U factor's input)."""
+
+    name = "lrd_hidden_activation_range"
+    required_raw_data = ("lrd_hidden_activation",)

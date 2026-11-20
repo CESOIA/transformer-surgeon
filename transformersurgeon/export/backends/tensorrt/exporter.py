@@ -74,19 +74,67 @@ class TensorRTExportConfig(ONNXExportConfig):
     # fp16): TensorRT's M=1 fp16 GEMV kernels accumulate in fp16, which LRD models do not
     # tolerate. See precision_passes.py.
     fp32_accumulate_lrd: bool = True
+    # Encoder exports with runtime rank inputs (ONNXExportConfig.runtime_ranks): the
+    # optimization profiles of the engine, each {group: rank} (a fixed rank) or
+    # {group: (min, opt, max)}. None: one profile over each group's exported range.
+    # A fixed-rank profile runs at the speed of an engine built for that rank (TensorRT
+    # folds the factor slices into constants: that profile then stores its own copy of
+    # the sliced weights); a range profile shares the weights but slices them on every
+    # run (slower). The manifest records them under "rank_profiles"; the session picks
+    # the profile that contains the requested ranks.
+    rank_profiles: list[dict] | None = None
 
 
 def engine_profiles(manifest: dict) -> list[OptimizationProfile]:
-    """Decode profile (+ prefill profile when the graph has a dynamic seq); none for a
-    static encoder graph."""
+    """Decode profile (+ prefill profile when the graph has a dynamic seq). An encoder graph
+    has none, or one over the lengths of its runtime rank inputs (``(min, opt, max)`` of
+    every ``runtime_ranks`` group in the manifest)."""
     if manifest.get("structure") == "transformer_encoder":
-        return []
+        specs = manifest.get("runtime_ranks", {})
+        profiles = manifest.get("rank_profiles") or [
+            {group: [spec["min"], spec["opt"], spec["max"]] for group, spec in specs.items()}]
+        dynamic = any(spec["min"] != spec["max"] for spec in specs.values())
+        if not specs or not dynamic:
+            return []
+        return [OptimizationProfile(shapes={specs[group]["input"]: tuple((v,) for v in bounds)
+                                            for group, bounds in profile.items()})
+                for profile in profiles]
     profiles = [OptimizationProfile(shapes={"input_ids": ((1,), (1,), (1,))})]
     max_input_len = int(manifest.get("max_input_len", 1))
     if max_input_len > 1:
         opt = min(128, max_input_len)
         profiles.append(OptimizationProfile(shapes={"input_ids": ((1,), (opt,), (max_input_len,))}))
     return profiles
+
+
+def resolve_rank_profiles(manifest: dict, rank_profiles: list[dict]) -> list[dict]:
+    """Normalise ``rank_profiles`` to ``[{group: [min, opt, max]}]`` (every group of the manifest, within
+    its exported range); raise for an encoder export without runtime ranks."""
+    specs = manifest.get("runtime_ranks") or {}
+    if not specs:
+        raise ValueError("rank_profiles needs an encoder export with runtime rank inputs (runtime_ranks).")
+    resolved = []
+    for profile in rank_profiles:
+        if set(profile) != set(specs):
+            raise ValueError(f"A rank profile must give every runtime rank group {sorted(specs)}, got {sorted(profile)}.")
+        entry = {}
+        for group, bounds in profile.items():
+            lo, opt, hi = (bounds,) * 3 if isinstance(bounds, int) else tuple(bounds)
+            spec = specs[group]
+            if not spec["min"] <= lo <= opt <= hi <= spec["max"]:
+                raise ValueError(f"Rank profile {profile}: group {group!r} needs "
+                                 f"{spec['min']} <= min <= opt <= max <= {spec['max']}.")
+            entry[group] = [int(lo), int(opt), int(hi)]
+        resolved.append(entry)
+    return resolved
+
+
+def _record_rank_profiles(manifest_path: str, rank_profiles: list[dict]) -> None:
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    manifest["rank_profiles"] = resolve_rank_profiles(manifest, rank_profiles)
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
 
 
 def build_engine_from_manifest(
@@ -142,6 +190,8 @@ def export_tensorrt(components: dict, config: TensorRTExportConfig) -> TensorRTE
         from .attention_passes import fp32_attention_scores
         config = dataclasses.replace(config, graph_passes=[fp32_attention_scores, *config.graph_passes])
     onnx_result = export_onnx(components, config)
+    if config.rank_profiles is not None:
+        _record_rank_profiles(onnx_result.manifest_path, config.rank_profiles)
     result = TensorRTExportResult(**vars(onnx_result))
     if config.build_engine:
         result.engine_path = build_engine_from_manifest(
@@ -186,6 +236,7 @@ __all__ = [
     "TensorRTExportResult",
     "build_engine_from_manifest",
     "engine_profiles",
+    "resolve_rank_profiles",
     "TensorRTExporter",
     "export_tensorrt",
 ]

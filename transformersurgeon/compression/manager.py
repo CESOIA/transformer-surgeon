@@ -302,12 +302,15 @@ class CompressionSchemesManager:
         for scheme in list(group.schemes):
             scheme.remove_from_group(name)
 
-    def smooth_activations(self, alpha: float = 0.5, criteria=None, max_batches: Optional[int] = None) -> dict:
+    def smooth_activations(self, alpha: float = 0.5, criteria=None, max_batches: Optional[int] = None,
+                           runtime: bool = True, runtime_alpha: Optional[float] = None) -> dict:
         """SmoothQuant: rescale producer/consumer weight pairs in place so that input
         activations of the selected linears lose their outlier channels (float result
         unchanged). Groups come from indexing['smoothing']; a group is smoothed only if
-        *all* its consumers match ``criteria``. Uses the calibration data
-        (set_calibration_data). Call before quantization (manager.apply). Returns a summary.
+        *all* its consumers match ``criteria``. With ``runtime`` the consumers listed in
+        indexing['runtime_smoothing'] (inputs without a foldable producer) get a run-time
+        input scale instead, with ``runtime_alpha`` (default ``alpha``). Uses the calibration
+        data (set_calibration_data). Call before quantization (manager.apply). Returns a summary.
         """
         from .smoothquant import apply_smoothquant
 
@@ -315,7 +318,8 @@ class CompressionSchemesManager:
             raise ValueError("smooth_activations needs calibration data: call set_calibration_data(...) first.")
         selected = {scheme.path for scheme in self.iter_filtered(criteria=criteria)}
         summary = apply_smoothquant(self.model, self.indexing, self.calibration_data, alpha=alpha,
-                                    consumers_filter=lambda path: path in selected, max_batches=max_batches)
+                                    consumers_filter=lambda path: path in selected, max_batches=max_batches,
+                                    runtime=runtime, runtime_alpha=runtime_alpha)
         return summary
 
     def auto_groups(self):

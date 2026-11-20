@@ -85,3 +85,31 @@ class OutputActivationCollector(RawDataCollector):
             emit_raw(self.name, act.float())
 
         return _hook
+
+
+class LowRankHiddenCollector(RawDataCollector):
+    """Collects the inner activation ``h = V x`` of a low-rank (LRD) layer: its V factor's output.
+
+    ``h`` is recomputed from the layer input with the layer's ``linear_V`` (the factor the U factor reads),
+    so the hook sits on the layer itself like every other collector.
+    """
+
+    name = "lrd_hidden_activation"
+
+    def __init__(self, *, offload_to_cpu: bool = False):
+        self.offload_to_cpu = offload_to_cpu
+
+    def build_forward_hook(self, *, emit_raw: Callable[[str, torch.Tensor], None]):
+        def _hook(module, inputs, _output):
+            factor = getattr(module, "linear_V", None)
+            if factor is None or not isinstance(getattr(module, "rank", "full"), int):
+                raise ValueError("lrd_hidden_activation needs a low-rank layer: apply the LRD before calibrating, "
+                                 "and ask for it (quantize_lrd_hidden_activation) on the LRD layers only.")
+            with torch.no_grad():
+                hidden = factor(inputs[0].detach())
+            hidden = hidden.reshape(-1, hidden.size(-1))
+            if self.offload_to_cpu:
+                hidden = hidden.cpu()
+            emit_raw(self.name, hidden.float())
+
+        return _hook
