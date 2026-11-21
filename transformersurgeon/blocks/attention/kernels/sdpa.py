@@ -14,8 +14,13 @@ class SdpaKernel(AttentionKernel):
         q_t = q.transpose(0, 1)
         k_t = key if kv_layout == "hsd" else key.transpose(0, 1)
         v_t = value if kv_layout == "hsd" else value.transpose(0, 1)
-        return F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask, is_causal=False,
-                                              enable_gqa=True, scale=attn.score_scale)
+        # A leading batch of 1: the ONNX translation (opset 23 Attention) takes 4-D tensors only,
+        # and refuses enable_gqa when query and key/value have the same number of heads.
+        gqa = q_t.shape[0] != k_t.shape[0]
+        out = F.scaled_dot_product_attention(q_t.unsqueeze(0), k_t.unsqueeze(0), v_t.unsqueeze(0),
+                                             attn_mask=attn_mask, is_causal=False, enable_gqa=gqa,
+                                             scale=attn.score_scale)
+        return out.squeeze(0)
 
 
 __all__ = ["SdpaKernel"]

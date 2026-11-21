@@ -201,6 +201,13 @@ Branch `draft-prolucio-lrd-export` (study: `../ambra-benchmark/`, ViT-B/16 CIFAR
   ratios (a per-channel DQ before the Slice runs fp16; TensorRT rejects sliced DQ scales).
 - `fp32_accumulate_lrd` (default True) targets M=1 GEMVs; on encoders (M=197) it only slows the engine
   (LRD r=512 ViT: 2.03 vs 1.71 ms on L4): pass `False`.
+- `fp32_attention_scores` (default True) **blocks TensorRT's fused MHA**: with the fp32 Cast between q.kᵀ and
+  Softmax, Myelin keeps MatMul/Softmax/MatMul apart (175 layers, no `_gemm_mha_v2`); with `False` each block is one
+  `_gemm_mha_v2` kernel (115 layers). ViT-B/16: dense fp16 1.67 → 1.38 ms, LRD r384 W8A8 1.25 → 0.93 ms on L4, same
+  top-1. Keep it True for decoders with large logits (NaNs otherwise); pass False for encoders after checking the
+  accuracy. `attn_impl="sdpa"` (ONNX opset-23 `Attention`, also fused) is ~5% slower than `manual` without the pass;
+  the sdpa atom adds a batch of 1 (the ONNX translation takes 4-D only) and sets `enable_gqa` only when the head
+  counts differ (`test/export/test_encoder_attention_export.py`).
 - Not done: Conv Q/DQ (patch embedding stays fp16), runtime ranks in decoder exports (`LLMWrapper` has no
   rank inputs: layers run at their stored rank), Edge-LLM INT4 plugin with sliced weights (falls back to DQ).
 
