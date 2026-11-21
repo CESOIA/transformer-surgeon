@@ -36,4 +36,8 @@ for _family in FAMILIES:
         globals()[_name] = getattr(_module, _name)
     __all__.extend(_module.__all__)
 
-del _family, _module, _name, import_module
+# Loop variables are unbound when every family failed to import (e.g. a broken transformers install):
+# the warnings above must stay the error the user sees.
+for _var in ("_family", "_module", "_name"):
+    globals().pop(_var, None)
+del _var, import_module
